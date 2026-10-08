@@ -1,0 +1,80 @@
+Decision,Authority,Domain,Decision statement,Status,Requirement
+Q1,Explicit user decision,product,Personal-first with near-term multi-user commercialization; preserve tenant and deployment foundations from the start.,Accepted planning baseline,R001
+Q2,Explicit user decision,product,Primary purpose is portfolio-aware decisions plus frequent trading signals.,Accepted planning baseline,R002
+Q3,Explicit user decision,data,A useful no-paid-market-data baseline must not require paid AI; hosting and optional providers are separate.,Accepted planning baseline,R003
+Q4,Explicit user decision,data,Mandatory discovery is US-listed stocks and ETFs with currency-aware accounts.,Accepted planning baseline,R004
+Q5,Explicit user decision,security,"First release proposes specific actions but never submits, modifies or cancels broker orders.",Accepted planning baseline,R005
+Q6,Explicit user decision,platform,Both hosted and complete self-hosted editions are release requirements.,Accepted planning baseline,R006
+Q7,Explicit user decision,compliance,Initial commercial audience includes Canadian and US residents.,Accepted planning baseline,R007
+Q8,Explicit user decision,strategies,Intraday swing discovery plus optional same-day opportunities; no sub-minute scalping requirement.,Accepted planning baseline,R008
+Q9,Explicit user decision,strategies,"Frequent evaluation means timely qualifying changes, not a quota of trades.",Accepted planning baseline,R009
+Q10,Explicit user decision,risk,Separate investing and trading allocations with portfolio-wide limits.,Accepted planning baseline,R010
+Q11,Explicit user decision,data,Free mode may require a user-connected free provider account/key.,Accepted planning baseline,R011
+Q12,Explicit user decision,portfolio,Stale or unreconciled holdings/cash block affected portfolio-specific sizing.,Accepted planning baseline,R012
+Q13,Explicit user decision,platform,Independent open-source core and complete self-hosted application; no mandatory vendor-operated service.,Accepted planning baseline,R013
+Q14,Explicit user decision,data,Prioritized live monitoring plus broader scheduled discovery; tracked and streamed universes differ.,Accepted planning baseline,R014
+Q15,Explicit user decision,ai,Auditable rules and AI research both originate proposals; a separate agent evaluates actionable AI-mode proposals.,Accepted planning baseline,R015
+Q16,Explicit user decision,onboarding,MCQs and necessary numeric/date inputs propose a policy/strategy shortlist for explicit runtime approval.,Accepted planning baseline,R016
+Q17,Explicit user decision,options,"Opt-in first-release options include long calls/puts, covered calls, cash-secured puts and defined-risk verticals.",Accepted planning baseline,R017
+Q18,Explicit user decision,ai,API and subscription access use provider-specific officially permitted routes and deployment qualification.,Accepted planning baseline,R018
+Q19,Explicit user decision,ai,Mandatory evidence/calculation verification is tiered; separate model review is required for AI-mode actions.,Accepted planning baseline,R019
+Q20,Explicit user decision,proposals,Action proposals expire and have invalidation conditions plus preserved version history.,Accepted planning baseline,R020
+Q21,Explicit user decision,compliance,Commercial legal and provider-rights clearance are release gates.,Accepted planning baseline,R021
+Q22,Explicit user decision,platform,"Apache-2.0 is the selected application license, superseding AGPL proposals.",Accepted planning baseline,R022
+Q23,Explicit user decision,ai,Support audited rules-only and AI-enabled modes; evaluator covers both proposal origins in AI mode.,Accepted planning baseline,R023
+Q24,Explicit user decision,research,"AI proposals qualify through evaluated research workflows and proposal-specific checks, not necessarily a backtested rule.",Accepted planning baseline,R024
+Q25,Explicit user decision,ai,Evaluator is a separate run/context; a different model family is optional and empirically justified.,Accepted planning baseline,R025
+Q26,Explicit user decision,ai,Material factual/evidence conflicts and hard risk failures block; forecast differences may be disclosed; revisions bounded.,Accepted planning baseline,R026
+Q27,Explicit user decision,ai,Frequent deterministic monitoring; AI on meaningful events/schedules/requests within budgets and deadlines.,Accepted planning baseline,R027
+Q28,Explicit user decision,improvement,"All six improvement targets are in scope, including code and the optimizer itself.",Accepted planning baseline,R028
+Q29,Explicit user decision,improvement,"Promotion uses predeclared scorecards with hard risk/privacy/evidence constraints, not recent returns alone.",Accepted planning baseline,R029
+Q30,Explicit user decision,improvement,"Autonomous authorized experiments, human-controlled promotion of investment-affecting or code changes.",Accepted planning baseline,R030
+Q31,Explicit user decision,privacy,Private learning per user/installation by default; cross-user use requires separate consent and permitted data.,Accepted planning baseline,R031
+Q32,Explicit user decision,improvement,Separate experiment resource budgets; current monitoring and verification take priority.,Accepted planning baseline,R032
+Q33,Explicit user decision,improvement,"All six improvement areas, code-level change and recursive optimizer change must work at first release.",Accepted planning baseline,R033
+Q34,Explicit user decision,governance,Material changes to enabled investment strategies require user adoption after release approval.,Accepted planning baseline,R034
+Q35,Explicit user decision,operations,Personal pilot incremental inference ceiling USD100/month; improvement maximum 20 percent (USD20).,Accepted planning baseline,R035
+Q36,Explicit user decision,platform,Single-machine container self-hosting without required Kubernetes/GPU/vendor service.,Accepted planning baseline,R036
+Q37,Explicit user decision,improvement,"Demonstrate V0 optimizer proposing V1, independent evaluation, human promotion, then V1 running next cycle.",Accepted planning baseline,R037
+Q38,Explicit user decision,security,"Generated code is isolated from production secrets, DB writes, unrestricted network and host control.",Accepted planning baseline,R038
+Q39,Explicit user decision,improvement,User learning is tenant-scoped; shared executable/optimizer changes are installation/release scoped.,Accepted planning baseline,R039
+Q40,Explicit user decision,research,Open evaluation framework and permitted starter corpus; distinguish synthetic/historical/prospective evidence.,Accepted planning baseline,R040
+Q41,Explicit user decision,product,Full scope and release gates take precedence over launch date; budget limits throughput rather than silently cutting scope.,Accepted planning baseline,R041
+Q42,Explicit user decision,portfolio,Partial portfolios allowed with scoped conclusions; outside-coverage assets retained with gaps.,Accepted planning baseline,R042
+Q43,Explicit user decision,portfolio,Multiple accounts/currencies with account-specific spendability and consolidated risk.,Accepted planning baseline,R043
+Q44,Explicit user decision,risk,"Stock/ETF proposals cash-funded long-only, nonleveraged/noninverse; approved options remain.",Accepted planning baseline,R044
+Q45,Explicit user decision,evidence,Primary and permitted independent sources; optional social inputs clearly distinguished from facts.,Accepted planning baseline,R045
+Q46,Explicit user decision,portfolio,"Tax-relevant records and warnings, not a comprehensive tax engine or automated tax-loss harvesting.",Accepted planning baseline,R046
+Q47,Explicit user decision,ux,"Responsive web, in-app feed, configurable email/browser push; no native mobile/SMS launch requirement.",Accepted planning baseline,R047
+Q48,Explicit user decision,integrations,Small named set of tested read-only broker sync routes; CSV/manual fallback.,Accepted planning baseline,R048
+Q49,Explicit user decision,risk,Proposals form jointly feasible sets with explicit alternatives and internal capital commitments.,Accepted planning baseline,R049
+Q50,Explicit user decision,strategies,Initial actionable intraday proposals are regular-session only; research may run outside session.,Accepted planning baseline,R050
+Q51,Explicit user decision,privacy,Hosted/self-hosted migration is supported at first release.,Accepted planning baseline,R051
+Q52,Explicit user decision,privacy,"Tamper-evident retained history, not indefinite private retention; explicit correction/deletion/backups.",Accepted planning baseline,R052
+Q53,Explicit user decision,integrations,"CIBC import, Questrade/IBKR read-only sync, plus Wealthsimple sync and Yahoo CSV interoperability.",Accepted planning baseline,R053
+Q54,Explicit user decision,operations,"Reference scale: 10 accounts, 250 instruments, 100000 records/user; hosted 100 users and 20 concurrent sessions.",Accepted planning baseline,R054
+Q55,Explicit user decision,product,Managed service pricing plus user-connected providers; independent self-hosted core and unbiased rankings.,Accepted planning baseline,R055
+Q56,Explicit user decision,ux,Dashboard-led portfolio/decision/research/governance workspaces; chat uses same verified state.,Accepted planning baseline,R056
+Q57,Explicit user decision,integrations,Yahoo tested CSV portfolio/watchlist import and compatible export; no auto-sync/data-adapter launch promise.,Accepted planning baseline,R057
+Q58,Explicit user decision,portfolio,Underlying accounts and data sources are separate; reconcile overlapping views without duplication.,Accepted planning baseline,R058
+Q59,Explicit user decision,strategies,All six versioned stock/ETF strategy families required; qualification status separate from catalogue inclusion.,Accepted planning baseline,R059
+Q60,Explicit user decision,risk,Conservative liquidity/spread/data/status-screened universe; optional speculative research cannot bypass gates.,Accepted planning baseline,R060
+Q61,Explicit user decision,strategies,"Bounded versioned strategy configuration, not unrestricted hosted arbitrary-code or visual strategy builder.",Accepted planning baseline,R061
+Q62,Explicit user decision,strategies,Free baseline supports portfolio-specific rebalancing plus a qualified non-intraday long-only strategy.,Accepted planning baseline,R062
+Q63,Explicit user decision,simulation,User-facing application-managed virtual portfolios and optional approved-policy shadow tracking.,Accepted planning baseline,R063
+Q64,Explicit user decision,analytics,Versioned goal-appropriate/cash-flow-matched benchmarks and separate actual/simulated/recommendation scorecards.,Accepted planning baseline,R064
+Q65,Explicit user decision,research,"Separate operational qualification, investment evidence and user eligibility; family-specific actionable-use gates.",Accepted planning baseline,R065
+Q66,Explicit user decision,data,Versioned feed specifications and qualified continuity/reinitialization for provider changes.,Accepted planning baseline,R066
+Q67,Explicit user decision,operations,Targets: 95 percent factual events within 5s of receipt; rules-only within 15s; AI intraday deadline at most 60s or earlier expiry.,Accepted planning baseline,R067
+Q68,Explicit user decision,risk,Explicit approved numerical account/allocation/concentration/planned-loss/scenario limits for sizing.,Accepted planning baseline,R068
+Q69,Explicit user decision,risk,Scoped loss/drawdown triggers pause new risk; monitoring and checked risk reduction continue; controlled resumption.,Accepted planning baseline,R069
+Q70,Delegated design selection,architecture,"Typed Python core, TypeScript/React, PostgreSQL, analytical file/object storage and durable jobs; three authority paths.",Accepted planning baseline,R070
+Q71,Delegated design selection,portfolio,Reconciled decimal journal with explicit effective/publication/receipt/decision times; one calculation contract.,Accepted planning baseline,R071
+Q72,Delegated design selection,strategies,Interpretable six-family starting implementations; 6-month/200-day momentum and 15-minute ORB are unqualified research defaults.,Accepted planning baseline,R072
+Q73,Delegated design selection,integrations,Capability/rights/degraded-state registry; provider/entitlement changes require reassessment.,Accepted planning baseline,R073
+Q74,Delegated design selection,ai,"Persisted bounded workflows, explicit model/runtime versions, no silent paid/provider fallback.",Accepted planning baseline,R074
+Q75,Delegated design selection,security,"Read-only operation allowlists, secrets outside agents, tenant isolation including nonowner/nonbypass DB roles.",Accepted planning baseline,R075
+Q76,Delegated design selection,improvement,gVisor initial Linux sandbox qualification target; full recursive scope; reviewed signed promotion and compatible rollback.,Accepted planning baseline,R076
+Q77,Delegated design selection,operations,"Hosted targets 99.9 percent availability, 15-minute RPO and 4-hour RTO; receipts not guarantees.",Accepted planning baseline,R077
+Q78,Delegated design selection,testing,"End-to-end release journeys cover free mode, overlap, AI, intraday, options, risk pause, simulation, improvement, migration and isolation.",Accepted planning baseline,R078
+Q79,Delegated design selection,governance,Separate design choices from factual provider/legal/security/performance/economic gates.,Accepted planning baseline,R079
