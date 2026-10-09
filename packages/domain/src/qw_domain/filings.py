@@ -10,15 +10,15 @@ availability timestamps), R071/R098. Pure parsing, normalization and queries.
   such as `0E-30` and `-0` are accepted as zero.
 - Units: an allowed ISO currency (`USD`), `shares`, `<currency>/shares` and `pure`.
   Any other unit series is refused and listed in `FactsIngest.refused`, never coerced.
-- Publication: the submissions `acceptanceDateTime` when the accession is known;
-  otherwise the conservative bound filed date D + 1 day 05:00Z (at or after the end of
-  D in New York under EST or EDT). Acceptance after our receipt, or outside
-  [D-4 days 00:00Z, D+1 05:00Z], is refused (`acceptance_filed_mismatch`). The
-  lower bound accommodates next-business-day filing dates after weekends and
-  holidays (accepted after 17:30 ET on a Friday before a Monday holiday: D is
-  Tuesday, about 3.3 days later) without a qualified calendar. Only an early
-  acceptance can leak, so a mis-stated acceptance time can make a fact knowable at
-  most about 4 days early; a qualified EDGAR business-day calendar would tighten it.
+- Publication (knowledge) time: max(submissions `acceptanceDateTime`, filed date D
+  at 05:00Z) when the accession is known, so an early or false acceptance can never
+  make a fact knowable before its filed date (`accepted_at` is kept for provenance);
+  otherwise the conservative bound D + 1 day 05:00Z (at or after the end of D in New
+  York under EST or EDT). Acceptance after our receipt, or outside
+  [D-4 days 00:00Z, D+1 05:00Z], is refused (`acceptance_filed_mismatch`); the
+  lower bound is a sanity check wide enough for next-business-day filing dates after
+  weekends and holidays (accepted after 17:30 ET on a Friday before a Monday
+  holiday: D is Tuesday) without a qualified EDGAR calendar.
 - A CIK maps to an instrument only through `SecurityMaster` links in the `sec_cik`
   namespace; otherwise the resolution is `unknown` (one CIK may be ambiguous).
 - `FactBook` is append-only. Each accession reporting a fact key is a version, so a
@@ -48,7 +48,8 @@ from qw_domain.instants import InstantError, ensure_aware_utc, parse_instant
 
 SEC_CIK_NAMESPACE = "sec_cik"
 FILED_DATE_BOUND = timedelta(days=1, hours=5)
-ACCEPTANCE_BEFORE_FILED = timedelta(days=4)  # weekend + holiday, no calendar
+ACCEPTANCE_BEFORE_FILED = timedelta(days=4)  # sanity check: weekend + holiday
+KNOWN_FROM = timedelta(hours=5)  # D 05:00Z = 00:00 EST / 01:00 EDT on the filed date
 DEFAULT_CURRENCIES = frozenset({"USD", "CAD"})
 _ACCN = re.compile(r"[0-9]{10}-[0-9]{2}-[0-9]{6}", re.ASCII)
 _FORM = re.compile(r"[A-Z0-9][A-Z0-9/-]{0,15}", re.ASCII)
@@ -174,12 +175,15 @@ class Fact:
     received_at: datetime
     feed_id: str
     feed_hash: str
+    accepted_at: datetime | None = None  # provenance; may precede `published_at`
 
     def __post_init__(self) -> None:
         if type(self.value) is not Decimal or not self.value.is_finite():
             raise TypeError("fact value must be a finite Decimal")
         for name in ("published_at", "received_at"):
             object.__setattr__(self, name, ensure_aware_utc(getattr(self, name)))
+        if self.accepted_at is not None:
+            object.__setattr__(self, "accepted_at", ensure_aware_utc(self.accepted_at))
 
     @property
     def key(self) -> FactKey:
@@ -261,13 +265,15 @@ def _fact(row: object, ctx: _Context, tax: str, concept: str, unit: Unit) -> Fac
         raise _fail("fy", fy)
     fp = None if fp is None else _text(fp, _FP, "fp")
     filing = ctx.known.get(accn)
+    day = datetime.combine(filed, time(), UTC)
+    accepted = None
     if filing is None:
-        basis = PublicationBasis.FILED_DATE_BOUND
-        published = datetime.combine(filed, time(), UTC) + FILED_DATE_BOUND
+        basis, published = PublicationBasis.FILED_DATE_BOUND, day + FILED_DATE_BOUND
     elif (filing.form, filing.filing_date) != (form, filed):
         raise _fail("filing_mismatch", accn)
     else:
-        basis, published = PublicationBasis.ACCEPTANCE, filing.accepted_at
+        accepted = filing.accepted_at
+        basis, published = PublicationBasis.ACCEPTANCE, max(accepted, day + KNOWN_FROM)
     link = ProviderId(SEC_CIK_NAMESPACE, ctx.cik)
     found = Resolution("unknown")
     if ctx.master is not None:
@@ -276,7 +282,7 @@ def _fact(row: object, ctx: _Context, tax: str, concept: str, unit: Unit) -> Fac
     value, at, feed = _value(r.get("val")), ctx.rights.received_at, ctx.rights.feed_id
     return Fact(
         ctx.cik, found, tax, concept, unit, period, fy, fp, value, accn, form, filed,
-        published, basis, at, feed, ctx.feed_hash,
+        published, basis, at, feed, ctx.feed_hash, accepted,
     )  # fmt: skip
 
 
