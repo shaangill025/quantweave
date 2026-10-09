@@ -306,7 +306,7 @@ def test_dynamic_role_change_is_rolled_back(
 
 def escaped(*statements: str) -> str:
     """SYNTHETIC: run statements as the session user from inside a DO block."""
-    inner = "".join(f"EXECUTE {s!r}; " for s in statements)
+    inner = "".join(f"EXECUTE $q${s}$q$; " for s in statements)
     return (
         f"DO $$ BEGIN EXECUTE 'RESET ROLE'; {inner}"
         "EXECUTE 'SET LOCAL ROLE qw_migrate'; END $$;"
@@ -334,7 +334,17 @@ def escaped(*statements: str) -> str:
         (escaped("ALTER DEFAULT PRIVILEGES GRANT SELECT ON TABLES TO qw_app"),
          "default ACL defined by"),
         ("DO $$ BEGIN EXECUTE 'RESET ROLE'; PERFORM lo_create(0); "
-         "EXECUTE 'SET LOCAL ROLE qw_migrate'; END $$;", "large object owned by"),
+         "EXECUTE 'SET LOCAL ROLE qw_migrate'; END $$;", "lo changed"),
+        # close-out review: ledger, database settings, any large object
+        ("SELECT lo_create(0);", "lo changed"),
+        (escaped("UPDATE public.schema_migrations SET checksum = repeat('0', 64)"),
+         "ledger changed"),
+        (escaped("INSERT INTO public.schema_migrations VALUES "
+                 "(3, '0003_future.sql', repeat('a', 64), now())"), "ledger changed"),
+        ("DO $$ BEGIN EXECUTE 'RESET ROLE'; EXECUTE format('ALTER DATABASE %I SET "
+         "log_statement = ''all''', current_database()); "
+         "EXECUTE 'SET LOCAL ROLE qw_migrate'; END $$;", "db_setting changed"),
+        (escaped("ALTER ROLE qw_app SET search_path = public"), "db_setting changed"),
         ("DO $$ BEGIN EXECUTE 'RESET ROLE'; "
          "EXECUTE format('GRANT CREATE ON DATABASE %I TO qw_app', "
          "current_database()); EXECUTE 'SET LOCAL ROLE qw_migrate'; END $$;",

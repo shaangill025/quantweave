@@ -19,12 +19,16 @@ finished under another role or session user, left a user object not owned by
 `qw_migrate` (except the ledger), left a column failing `schema_guard`, or changed
 privileges: a role or membership created, altered or dropped (outside 0001), a
 changed database, public/app schema or ledger ACL (outside 0001), any new grant to
-PUBLIC, a default ACL not defined by `qw_migrate` or removed, or a large object not
-owned by `qw_migrate`. These snapshots also catch dynamic SQL (DO blocks, built
-set_config names) that the scanner cannot see. RESET ALL stops settings such as
-search_path leaking. Not covered: effects outside the catalogues compared, such as
-NOTIFY, pg_sleep, advisory locks or a password change (pg_roles hides passwords), so
-the production migrate login should still not be a superuser. Recovery is backup
+PUBLIC, a default ACL not defined by `qw_migrate` or removed, any large object
+created or changed (metadata or content), any change to schema_migrations rows
+(the runner inserts its own row after the checks), or any change to
+pg_db_role_setting (ALTER DATABASE/ROLE ... SET). These snapshots also catch dynamic
+SQL (DO blocks, built set_config names) that the scanner cannot see. RESET ALL stops
+settings such as search_path leaking. Not covered: effects outside the compared
+catalogues, such as NOTIFY, pg_sleep, advisory locks, COPY ... TO PROGRAM or server
+files, password changes (pg_roles hides passwords), comments and security labels,
+and data in existing tables, so the production migrate login must not be a
+superuser. Recovery is backup
 plus a new forward migration. The caller supplies the autocommit connection; no
 environment is read.
 """
@@ -298,8 +302,11 @@ UNION ALL SELECT 'acl', 'ledger ' || coalesce(relacl::text, 'default')
 UNION ALL SELECT 'defacl', defaclrole::regrole::text FROM pg_catalog.pg_default_acl
 UNION ALL SELECT 'defacl_key', d::text FROM (SELECT defaclrole::regrole,
     defaclnamespace, defaclobjtype FROM pg_catalog.pg_default_acl) d
-UNION ALL SELECT 'lo', lomowner::regrole::text
-    FROM pg_catalog.pg_largeobject_metadata
+UNION ALL SELECT 'lo', m.oid || ' ' || m.lomowner::regrole || ' '
+    || coalesce(m.lomacl::text, '-') || ' ' || md5(lo_get(m.oid))
+    FROM pg_catalog.pg_largeobject_metadata m
+UNION ALL SELECT 'ledger', l::text FROM public.schema_migrations l
+UNION ALL SELECT 'db_setting', s::text FROM pg_catalog.pg_db_role_setting s
 UNION ALL SELECT 'public', o.what || ' ' || a.privilege_type FROM (
     SELECT 'database', coalesce(datacl, acldefault('d', datdba))
         FROM pg_catalog.pg_database WHERE datname = current_database()
@@ -339,19 +346,25 @@ def privilege_state(conn: psycopg.Connection[TupleRow]) -> dict[str, set[str]]:
     return state
 
 
-_STATE_KINDS = ("role", "member", "acl", "defacl", "defacl_key", "lo", "public")
+_STATE_KINDS = (
+    "role", "member", "acl", "defacl", "defacl_key", "lo", "ledger", "db_setting",
+    "public",
+)  # fmt: skip
 
 
 def privilege_violations(
     before: dict[str, set[str]], after: dict[str, set[str]], role: str, bootstrap: bool
 ) -> list[str]:
     """Refused changes: roles, memberships and the database, public/app schema and
-    ledger ACLs (except in 0001); any new PUBLIC grant; a default ACL not defined by
-    `role` or removed; a large object not owned by `role`."""
+    ledger ACLs (except in 0001); schema_migrations rows, per-database/role settings
+    and large objects (always; the runner's own insert comes after this check); any
+    new PUBLIC grant; a default ACL not defined by `role`, or removed."""
+    kinds = ("lo", "ledger", "db_setting") + (
+        () if bootstrap else ("role", "member", "acl")
+    )
     problems = [
         f"{kind} changed: {item}"
-        for kind in ("role", "member", "acl")
-        if not bootstrap
+        for kind in kinds
         for item in sorted(before[kind] ^ after[kind])
     ]
     problems += [
@@ -362,7 +375,6 @@ def privilege_violations(
     ]
     removed = before["defacl_key"] - after["defacl_key"]
     problems += [f"default ACL removed: {k}" for k in sorted(removed)]
-    problems += [f"large object owned by {r}" for r in sorted(after["lo"] - {role})]
     return problems
 
 

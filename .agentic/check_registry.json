@@ -111,7 +111,7 @@
       "configured": true,
       "observed": {
         "date": "2026-10-09",
-        "result": "exit 0, 307 passed, 0 skipped, including 86 db tests against a throwaway PostgreSQL 16.15 cluster (pytest 9.1.1, hypothesis 6.168.5 derandomized)"
+        "result": "exit 0, 312 passed, 0 skipped, including 91 db tests against a throwaway PostgreSQL 16.15 cluster (pytest 9.1.1, hypothesis 6.168.5 derandomized)"
       }
     },
     {
@@ -151,7 +151,7 @@
       "configured": true,
       "observed": {
         "date": "2026-10-09",
-        "result": "exit 0, 86 passed, 221 deselected, 0 skipped (throwaway PostgreSQL 16.15 cluster from /usr/lib/postgresql/16/bin, unix socket only)"
+        "result": "exit 0, 91 passed, 221 deselected, 0 skipped (throwaway PostgreSQL 16.15 cluster from /usr/lib/postgresql/16/bin, unix socket only)"
       },
       "local_command": "uv run pytest -m db",
       "note": "CI sets QW_TEST_DATABASE_URL to its postgres:16 service and QW_REQUIRE_DB=1, so an unavailable server fails instead of skipping. The local command skips with a reason when no server is available."
@@ -207,7 +207,7 @@
   ],
   "review": {
     "reviewer": "independent subagent running a different model from the author",
-    "outcome": "T008 review: CHANGES REQUESTED then APPROVE after fixes (docs/receipts/T008.md). T009 reviews: docs/receipts/T009.md, T009-2b.md, T009-3.md; close-out pending cross-model review"
+    "outcome": "T008 review: CHANGES REQUESTED then APPROVE after fixes (docs/receipts/T008.md). T009 reviews: docs/receipts/T009.md, T009-2b.md, T009-3.md; close-out APPROVE (0 blocking), follow-ups applied"
   },
   "bound_from": "docs/spec/handoff/check_registry.template.json"
 }
