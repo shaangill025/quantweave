@@ -37,11 +37,21 @@
     {
       "id": "CHK-PY-TOOLS",
       "purpose": "Lint, format and strict typing of tools/ scripts (host tools, not project-pinned)",
-      "command": "ruff check tools/ && ruff format --check tools/ && mypy --strict tools/check_spec_artifacts.py",
+      "command": "ruff check tools/ && ruff format --check tools/ && mypy --strict tools/",
       "configured": true,
       "observed": {
         "date": "2026-10-09",
         "result": "PASS with host ruff 0.16.8 / mypy 2.3.1"
+      }
+    },
+    {
+      "id": "CHK-CONTRACTS-001",
+      "purpose": "Contract invariants: no broker mutation route, write headers, decimal-string money/quantities, offsets on example timestamps",
+      "command": "python3 tools/check_contracts.py && python3 tools/check_contracts.py --self-test",
+      "configured": true,
+      "observed": {
+        "date": "2026-10-09",
+        "result": "PASS; self-test 16/16 defects detected"
       }
     },
     {
@@ -134,7 +144,7 @@
   ],
   "review": {
     "reviewer": "independent subagent running a different model from the author",
-    "outcome": "Integration review: CHANGES REQUESTED (0 blocking); all findings fixed or dispositioned (root CLAUDE.md fixed after owner approval and re-reviewed). See docs/receipts/T001_bootstrap_receipt.md \u00a713"
+    "outcome": "T008 review: CHANGES REQUESTED then APPROVE after fixes. See docs/receipts/T008.md"
   },
   "bound_from": "docs/spec/handoff/check_registry.template.json"
 }
