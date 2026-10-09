@@ -19,9 +19,12 @@ jobs:
     timeout-minutes: 20
     # Throwaway PostgreSQL 16 for the @pytest.mark.db tests (CHK-DB-INTEGRATION).
     # Trust auth on the job-local service, so no credential exists. Digest pin open.
+    # The Docker official image is pulled through the AWS ECR Public mirror of the
+    # docker/library namespace: anonymous Docker Hub pulls from shared runners hit
+    # the unauthenticated rate limit and fail before any test runs.
     services:
       postgres:
-        image: postgres:16
+        image: public.ecr.aws/docker/library/postgres:16
         env:
           POSTGRES_HOST_AUTH_METHOD: trust
         ports:
