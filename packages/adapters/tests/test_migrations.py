@@ -22,6 +22,7 @@ from qw_adapters.migrations import (
     load_migrations,
     migrate,
 )
+from qw_adapters.schema_guard import column_type_violations
 
 pytestmark = pytest.mark.db
 Conn = psycopg.Connection[TupleRow]
@@ -82,16 +83,12 @@ def test_baseline_roles_and_privileges(conn: Conn) -> None:
         "has_database_privilege('qw_app', current_database(), 'TEMPORARY')"
     ).fetchone()
     assert checks == (True, False, False, True, False)
-    conn.execute("CREATE ROLE qw_probe_nobody NOLOGIN")
-    try:  # roles are cluster-wide, so drop it explicitly
-        probe = conn.execute(
-            "SELECT has_database_privilege('qw_probe_nobody', current_database(), "
-            "'CONNECT'), has_schema_privilege('qw_probe_nobody', 'app', 'USAGE'), "
-            "has_schema_privilege('qw_probe_nobody', 'public', 'CREATE')"
-        ).fetchone()
-        assert probe == (False, False, False)
-    finally:
-        conn.execute("DROP ROLE qw_probe_nobody")
+    public = conn.execute(  # the PUBLIC pseudo-role
+        "SELECT has_database_privilege('public', current_database(), 'CONNECT'), "
+        "has_schema_privilege('public', 'app', 'USAGE'), "
+        "has_schema_privilege('public', 'public', 'CREATE')"
+    ).fetchone()
+    assert public == (False, False, False)
 
 
 def test_baseline_reapplies_in_second_database_and_resets_role_attributes(
@@ -122,7 +119,8 @@ def test_applies_in_order_as_qw_migrate(conn: Conn, mdir: Path) -> None:
         mdir,
         "0003_use_t.sql",
         "INSERT INTO app.t VALUES (1);\n"
-        "CREATE FUNCTION app.f() RETURNS integer LANGUAGE sql AS 'SELECT 1';",
+        "CREATE FUNCTION app.f() RETURNS integer LANGUAGE sql AS 'SELECT 1';\n"
+        "CREATE TYPE app.k AS ENUM ('a');",
     )
     assert migrate(conn, mdir) == [1, 2, 3]
     owners = conn.execute(
@@ -131,13 +129,14 @@ def test_applies_in_order_as_qw_migrate(conn: Conn, mdir: Path) -> None:
         "WHERE oid = 'app.f'::regproc"
     ).fetchall()
     assert owners == [("qw_migrate",), ("qw_migrate",)]
-    execute = conn.execute(
-        "SELECT has_function_privilege('qw_app', 'app.f()', 'EXECUTE')"
+    usable = conn.execute(
+        "SELECT has_function_privilege('qw_app', 'app.f()', 'EXECUTE'), "
+        "has_type_privilege('qw_app', 'app.k', 'USAGE')"
     ).fetchone()
-    assert execute == (False,)  # default privilege revoked from PUBLIC
+    assert usable == (False, False)  # default privileges revoked from PUBLIC
 
 
-def test_checksum_tampering_is_refused(conn: Conn, mdir: Path) -> None:
+def test_changed_applied_file_is_refused(conn: Conn, mdir: Path) -> None:
     add(mdir, "0002_create_t.sql", "CREATE TABLE app.t (id integer);")
     migrate(conn, mdir)
     add(mdir, "0002_create_t.sql", "CREATE TABLE app.t (id bigint);")
@@ -146,11 +145,8 @@ def test_checksum_tampering_is_refused(conn: Conn, mdir: Path) -> None:
         migrate(conn, mdir)
     assert versions(conn) == [1, 2]
     assert not table_exists(conn, "app.u")
-
-
-def test_renamed_or_missing_applied_file_is_refused(conn: Conn, mdir: Path) -> None:
+    (mdir / "0003_next.sql").unlink()
     add(mdir, "0002_create_t.sql", "CREATE TABLE app.t (id integer);")
-    migrate(conn, mdir)
     (mdir / "0002_create_t.sql").rename(mdir / "0002_renamed.sql")
     with pytest.raises(MigrationError, match=r"applied as 0002_create_t\.sql"):
         migrate(conn, mdir)
@@ -164,8 +160,9 @@ def test_renamed_or_missing_applied_file_is_refused(conn: Conn, mdir: Path) -> N
     [
         (["0003_c.sql"], r"contiguous .* missing \[2\]"),
         (["0002_b.sql", "0002_c.sql"], "duplicate version 2"),
-        (["2_b.sql"], "not a NNNN_lower_snake.sql"),
-        (["0002_Bad-Name.sql"], "not a NNNN_lower_snake.sql"),
+        (["2_b.sql"], "not a regular NNNN_lower_snake.sql"),
+        (["0002_Bad-Name.sql"], "not a regular NNNN_lower_snake.sql"),
+        (["0002_upper.SQL"], "not a regular NNNN_lower_snake.sql"),
     ],
 )
 def test_bad_file_sets_are_refused_before_any_change(
@@ -187,9 +184,7 @@ def test_out_of_order_history_is_refused(conn: Conn, mdir: Path) -> None:
         migrate(conn, mdir)
 
 
-def test_failing_migration_rolls_back_without_version_row(
-    conn: Conn, mdir: Path
-) -> None:
+def test_failing_migration_rolls_back(conn: Conn, mdir: Path) -> None:
     add(mdir, "0002_ok.sql", "CREATE TABLE app.ok (id integer);")
     add(mdir, "0003_fails.sql", "CREATE TABLE app.partial (id integer);\nSELECT 1/0;")
     add(mdir, "0004_never.sql", "CREATE TABLE app.never (id integer);")
@@ -202,22 +197,121 @@ def test_failing_migration_rolls_back_without_version_row(
 
 
 @pytest.mark.parametrize(
-    ("body", "message"),
+    "body",
     [
-        ("CREATE TABLE app.c (id integer);\nCOMMIT;", "ended its own transaction"),
-        ("CREATE TABLE app.c (id integer);\nRESET ROLE;", "changed the current role"),
+        "CREATE TABLE app.c (id integer);\nCOMMIT;",
+        "RESET ROLE; CREATE TABLE app.t (id int); SET LOCAL ROLE qw_migrate;",
+        "SET SESSION AUTHORIZATION DEFAULT; CREATE TABLE app.t (id int);",
+        "set local role qw_app;", "Set Session Role qw_app;", "RESET ALL;",
+        "begin;", "select 1; End", "SAVEPOINT s;", "ROLLBACK TO s;", "abort;",
+        "START TRANSACTION;", "RELEASE SAVEPOINT s;", "/* c */ commit;",
+        "SELECT 1; -- note\nPREPARE TRANSACTION 'x';", "DISCARD ALL;",
+        "CREATE FUNCTION app.f() RETURNS int LANGUAGE sql BEGIN ATOMIC SELECT 1; END;",
+    ],
+)  # fmt: skip
+def test_forbidden_statements_are_refused_before_execution(
+    mdir: Path, body: str
+) -> None:
+    add(mdir, "0002_forbidden.sql", body)
+    with pytest.raises(MigrationError, match="forbidden statement"):
+        load_migrations(mdir)
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        "SELECT 'begin; commit';", "SELECT E'it\\'s; commit';",
+        "SELECT 1 AS \"x;commit\";", "SELECT 'a''; commit';",
+        "DO $$ BEGIN PERFORM 1; END $$;", "DO $b$ BEGIN RAISE NOTICE '$$'; END $b$;",
+        "CREATE FUNCTION app.g() RETURNS int LANGUAGE plpgsql\n"
+        "AS 'BEGIN RETURN 1; END';",
+        "SET search_path = app; SET LOCAL statement_timeout = 0;",
+        "-- COMMIT;\n/* ROLLBACK; */ SELECT 1;",
+    ],
+)  # fmt: skip
+def test_scanner_ignores_quoted_and_commented_text(mdir: Path, body: str) -> None:
+    add(mdir, "0002_fine.sql", body)
+    assert [m.version for m in load_migrations(mdir)] == [1, 2]
+
+
+@pytest.mark.parametrize(
+    "body",
+    ["SELECT 'open;", "/* open", "DO $$ BEGIN", 'SELECT "x;', "SELECT E'\\'",
+     "/* nested /* */ */ commit;"],
+)  # fmt: skip
+def test_unscannable_file_is_refused(mdir: Path, body: str) -> None:
+    add(mdir, "0002_open.sql", body)
+    with pytest.raises(MigrationError, match="cannot scan: unterminated"):
+        load_migrations(mdir)
+
+
+def test_symlinked_migration_is_refused(conn: Conn, mdir: Path) -> None:
+    add(mdir.parent, "elsewhere.sql", "CREATE TABLE app.x (id integer);")
+    (mdir / "0002_link.sql").symlink_to(mdir.parent / "elsewhere.sql")
+    with pytest.raises(MigrationError, match=r"0002_link\.sql: not a regular"):
+        migrate(conn, mdir)
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        "DO $$ BEGIN EXECUTE 'RESET ROLE'; EXECUTE 'CREATE TABLE app.t (id int)'; "
+        "EXECUTE 'SET LOCAL ROLE qw_migrate'; END $$;",
+        "DO $$ BEGIN EXECUTE 'SET SESSION AUTHORIZATION DEFAULT'; "
+        "EXECUTE 'CREATE TABLE app.t (id int)'; "
+        "EXECUTE 'SET LOCAL ROLE qw_migrate'; END $$;",
+        "DO $$ BEGIN EXECUTE 'RESET ROLE'; EXECUTE 'CREATE SCHEMA rogue'; "
+        "EXECUTE 'SET LOCAL ROLE qw_migrate'; END $$;",
     ],
 )
-def test_migration_cannot_escape_transaction_or_role(
+def test_dynamic_role_escape_is_caught_by_ownership_check(
+    conn: Conn, mdir: Path, body: str
+) -> None:
+    # The scanner cannot see inside dollar quotes; the ownership check must.
+    add(mdir, "0002_escape.sql", body)
+    with pytest.raises(MigrationError, match=r"ownership: pg_(class app\.t|namespace)"):
+        migrate(conn, mdir)
+    assert versions(conn) == [1]
+    assert not table_exists(conn, "app.t")
+    gone = conn.execute("SELECT to_regnamespace('rogue') IS NULL").fetchone()
+    assert gone == (True,)
+
+
+@pytest.mark.parametrize(
+    ("body", "message"),
+    [
+        ("DO $$ BEGIN EXECUTE 'RESET ROLE'; END $$;", "changed the current role"),
+        ("DO $$ BEGIN EXECUTE 'SET SESSION AUTHORIZATION qw_app'; END $$;",
+         "changed the session authorization"),
+    ],
+)  # fmt: skip
+def test_dynamic_role_change_is_rolled_back(
     conn: Conn, mdir: Path, body: str, message: str
 ) -> None:
     add(mdir, "0002_escape.sql", body)
     with pytest.raises(MigrationError, match=message):
         migrate(conn, mdir)
     assert versions(conn) == [1]
-    # A COMMIT inside the file has already committed what preceded it; the runner
-    # can only refuse to record the version.
-    assert table_exists(conn, "app.c") == ("COMMIT" in body)
+    assert conn.execute("SELECT session_user = current_user").fetchone() == (True,)
+
+
+def test_session_settings_do_not_leak(conn: Conn, mdir: Path) -> None:
+    default = conn.execute("SHOW search_path").fetchone()
+    add(mdir, "0002_path.sql", "SET search_path = app;\nSET statement_timeout = 7;\n"
+        "CREATE TABLE t2 (id integer);")  # fmt: skip
+    assert migrate(conn, mdir) == [1, 2]
+    assert table_exists(conn, "app.t2")
+    assert conn.execute("SHOW search_path").fetchone() == default
+    assert conn.execute("SHOW statement_timeout").fetchone() == ("0",)
+
+
+def test_unlock_failure_does_not_mask_the_migration_error(
+    tmp_path: Path, conn: Conn
+) -> None:
+    add(tmp_path, "0001_kill.sql", "SELECT pg_terminate_backend(pg_backend_pid());")
+    with pytest.raises(MigrationError, match=r"0001_kill\.sql rolled back") as info:
+        migrate(conn, tmp_path)
+    assert any("advisory unlock also failed" in n for n in info.value.__notes__)
 
 
 def test_requires_autocommit_connection(database_url: str) -> None:
@@ -240,6 +334,11 @@ def test_non_utf8_database_is_refused(conn: Conn, pg_admin_url: str) -> None:
             pytest.raises(MigrationError, match="encoding must be UTF8"),
         ):
             migrate(ascii_db)
+        with (
+            psycopg.connect(url, autocommit=True) as ascii_db,
+            pytest.raises(RuntimeError, match="UTF8"),
+        ):
+            column_type_violations(ascii_db)
     finally:
         conn.execute("DROP DATABASE qw_test_ascii WITH (FORCE)")
 

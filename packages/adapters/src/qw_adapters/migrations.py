@@ -1,22 +1,24 @@
 """Forward-only PostgreSQL migration runner (ADR-013; T008 review section 5).
 
-Migrations are `NNNN_name.sql` files numbered contiguously from 0001. Each one runs
-in its own transaction and is recorded in `public.schema_migrations` with its file
-name, SHA-256 of the file bytes and applied time. Rules:
+`NNNN_name.sql` files, contiguous from 0001, each run in its own transaction and are
+recorded in `public.schema_migrations` (file name, SHA-256 of the bytes, applied
+time). A session advisory lock serialises runners on one database.
 
-- An applied file whose checksum or name changed, an applied version with no file, a
-  gap in the file numbers, or a pending file older than an applied one stops the run
-  before anything is applied. Recovery is backup plus a new forward migration.
-- A session-level advisory lock serialises concurrent runners on one database.
-- Versions after the bootstrap (0001, which creates the roles) run under
-  `SET LOCAL ROLE qw_migrate`, so the objects they create are owned by the
-  non-superuser schema owner. A migration that changes the role, ends the
-  transaction, or leaves a column that fails `schema_guard` is rolled back and not
-  recorded.
-- Migration SQL must not contain transaction control (BEGIN/COMMIT/ROLLBACK).
+Refused before anything runs: a name that is not `NNNN_lower_snake.sql` (`.SQL`
+too), a symlink, a duplicate or gap, an applied file whose checksum or name changed,
+an applied version with no file, a pending file older than an applied one, and a
+top-level statement controlling the transaction, role or session authorization
+(BEGIN, COMMIT, END, SAVEPOINT, SET ROLE, RESET ALL ...). The scanner skips comments
+and quoted or dollar-quoted text and refuses files it cannot scan; `BEGIN ATOMIC`
+bodies are refused (use quoted bodies).
 
-The caller (a composition root) supplies the autocommit connection; this module
-reads no environment and opens no connections.
+Versions after 0001 (which creates the roles) run under `SET LOCAL ROLE qw_migrate`.
+Inside the transaction a migration is rolled back if it ended the transaction,
+finished under another role or session user, left a user object not owned by
+`qw_migrate` (except the ledger), or left a column failing `schema_guard`. RESET ALL
+stops settings such as search_path leaking. Dynamic SQL can still switch roles
+mid-file; the ownership check is the backstop. Recovery is backup plus a new forward
+migration. The caller supplies the autocommit connection; no environment is read.
 """
 
 from __future__ import annotations
@@ -64,13 +66,51 @@ class Migration:
         return hashlib.sha256(self.body).hexdigest()
 
 
+_TOKEN = re.compile(
+    r"(?P<skip>\s+|--[^\n]*|/\*(?:(?!/\*)[\s\S])*?\*/)"
+    r"|(?P<quoted>[Ee]'(?:[^'\\]|\\[\s\S]|'')*'|'(?:[^']|'')*'|\"(?:[^\"]|\"\")*\""
+    r"|(?P<tag>\$(?:[A-Za-z_][A-Za-z0-9_]*)?\$)[\s\S]*?(?P=tag))"
+    r"|(?P<word>[A-Za-z_][A-Za-z0-9_$]*)|(?P<other>[\s\S])"
+)
+_OPENER = re.compile(r"['\"]|/\*|\$(?:[A-Za-z_][A-Za-z0-9_]*)?\$")
+_FORBIDDEN = re.compile(
+    r"(abort|begin|commit|end|release|rollback|savepoint|discard|reset all"
+    r"|(start|prepare) transaction"
+    r"|(re)?set( local| session)? (role|session authorization))( |$)"
+)
+
+
+def statement_heads(text: str) -> list[list[str]]:
+    """First four tokens (lowercased words, a quote mark for quoted text, or single
+    characters) of each top-level statement. Raises MigrationError for an
+    unterminated quote, dollar quote or comment, or a nested comment."""
+    heads: list[list[str]] = [[]]
+    for m in _TOKEN.finditer(text):
+        if m.group("skip") is not None:
+            continue
+        word, quoted = m.group("word"), m.group("quoted")
+        failed_e_string = word in {"e", "E"} and text.startswith("'", m.end())
+        if failed_e_string or (m.group("other") and _OPENER.match(text, m.start())):
+            raise MigrationError(f"unterminated quote or comment at {m.start()}")
+        token = "'" if quoted is not None else m.group().lower()
+        if token == ";":
+            heads.append([])
+        elif len(heads[-1]) < 4:
+            heads[-1].append(token)
+    return [h for h in heads if h]
+
+
 def load_migrations(directory: Path = MIGRATIONS_DIR) -> tuple[Migration, ...]:
     """Read and validate the migration files. Non-`.sql` files are ignored."""
     found: dict[int, Migration] = {}
-    for path in sorted(p for p in directory.iterdir() if p.suffix == ".sql"):
+    for path in sorted(directory.iterdir()):
+        if path.suffix.lower() != ".sql":
+            continue
         match = FILE_PATTERN.fullmatch(path.name)
-        if match is None or not path.is_file():
-            raise MigrationError(f"{path.name}: not a NNNN_lower_snake.sql file")
+        if match is None or path.is_symlink() or not path.is_file():
+            raise MigrationError(
+                f"{path.name}: not a regular NNNN_lower_snake.sql file"
+            )
         version = int(match.group(1))
         if version in found:
             raise MigrationError(
@@ -78,9 +118,12 @@ def load_migrations(directory: Path = MIGRATIONS_DIR) -> tuple[Migration, ...]:
             )
         body = path.read_bytes()
         try:
-            body.decode("utf-8")
-        except UnicodeDecodeError as exc:
-            raise MigrationError(f"{path.name}: not UTF-8") from exc
+            heads = statement_heads(body.decode("utf-8"))
+        except (UnicodeDecodeError, MigrationError) as exc:
+            raise MigrationError(f"{path.name}: cannot scan: {exc}") from exc
+        for head in (" ".join(h) for h in heads):
+            if _FORBIDDEN.match(head):
+                raise MigrationError(f"{path.name}: forbidden statement {head.upper()}")
         found[version] = Migration(version, path.name, body)
     expected = list(range(1, len(found) + 1))
     if sorted(found) != expected:
@@ -143,16 +186,68 @@ def migrate(
         raise MigrationError(f"database encoding must be UTF8, not {encoding!r}")
     migrations = load_migrations(directory)
     conn.execute("SELECT pg_advisory_lock(%s)", (LOCK_KEY,))
+    done: list[int] = []
     try:
         conn.execute(_CREATE_TABLE)
-        pending = pending_migrations(migrations, applied_migrations(conn))
-        done: list[int] = []
-        for migration in pending:
+        for migration in pending_migrations(migrations, applied_migrations(conn)):
             _apply(conn, migration, run_as)
             done.append(migration.version)
-        return done
-    finally:
-        conn.execute("SELECT pg_advisory_unlock(%s)", (LOCK_KEY,))
+    except BaseException as exc:
+        try:
+            conn.execute("SELECT pg_advisory_unlock(%s)", (LOCK_KEY,))
+        except psycopg.Error as unlock_exc:  # keep the original error
+            exc.add_note(f"advisory unlock also failed: {unlock_exc}")
+        raise
+    conn.execute("SELECT pg_advisory_unlock(%s)", (LOCK_KEY,))
+    return done
+
+
+# Catalogues of owned objects -> column prefix (relowner, relnamespace, relname ...).
+_NAMESPACED = {
+    "pg_class": "rel", "pg_proc": "pro", "pg_type": "typ", "pg_operator": "opr",
+    "pg_collation": "coll", "pg_conversion": "con", "pg_opclass": "opc",
+    "pg_opfamily": "opf", "pg_ts_config": "cfg", "pg_ts_dict": "dict",
+    "pg_statistic_ext": "stx",
+}  # fmt: skip
+_GLOBAL = {
+    "pg_namespace": "nsp", "pg_event_trigger": "evt", "pg_extension": "ext",
+    "pg_foreign_data_wrapper": "fdw", "pg_foreign_server": "srv",
+    "pg_publication": "pub", "pg_language": "lan",
+}  # fmt: skip
+_OWNERS_SQL = " UNION ALL ".join(
+    [
+        f"SELECT '{cat}', n.nspname || '.' || o.{p}name, o.{p}owner::regrole::text "
+        f"FROM pg_catalog.{cat} o JOIN pg_catalog.pg_namespace n "
+        f"ON n.oid = o.{p}namespace WHERE o.oid >= 16384 "
+        f"AND o.{p}owner <> %(role)s::regrole AND n.nspname !~ '^pg_' "
+        "AND n.nspname <> 'information_schema'"
+        for cat, p in _NAMESPACED.items()
+    ]
+    + [
+        f"SELECT '{cat}', o.{p}name::text, o.{p}owner::regrole::text "
+        f"FROM pg_catalog.{cat} o WHERE o.oid >= 16384 "
+        f"AND o.{p}owner <> %(role)s::regrole AND o.{p}name::text !~ '^pg_'"
+        for cat, p in _GLOBAL.items()
+    ]
+)
+_LEDGER = {
+    ("pg_class", "public.schema_migrations"),
+    ("pg_class", "public.schema_migrations_pkey"),
+    ("pg_class", "public.schema_migrations_name_key"),
+    ("pg_type", "public.schema_migrations"),
+    ("pg_type", "public._schema_migrations"),
+}
+
+
+def foreign_owned_objects(conn: psycopg.Connection[TupleRow], role: str) -> list[str]:
+    """User objects (outside pg_* and information_schema) not owned by `role`,
+    except the schema_migrations ledger."""
+    rows = conn.execute(_OWNERS_SQL, {"role": role}).fetchall()
+    return [
+        f"{cat} {name} owned by {owner}"
+        for cat, name, owner in rows
+        if (cat, name) not in _LEDGER
+    ]
 
 
 def _apply(
@@ -162,18 +257,25 @@ def _apply(
     try:
         with conn.transaction():
             xact = _scalar(conn, "SELECT pg_current_xact_id()::text")
+            session = _scalar(conn, "SELECT session_user::text")
             if role is not None:
                 conn.execute(sql.SQL("SET LOCAL ROLE {}").format(sql.Identifier(role)))
             conn.execute(migration.body)
             if _scalar(conn, "SELECT pg_current_xact_id()::text") != xact:
                 raise MigrationError("it ended its own transaction")
-            if role is not None:
-                if _scalar(conn, "SELECT current_user::text") != role:
-                    raise MigrationError("it changed the current role")
-                conn.execute("RESET ROLE")
-            problems = column_type_violations(conn)
+            if _scalar(conn, "SELECT session_user::text") != session:
+                raise MigrationError("it changed the session authorization")
+            current = _scalar(conn, "SELECT current_user::text")
+            if role is not None and current != role:
+                raise MigrationError("it changed the current role")
+            conn.execute("RESET ROLE; RESET ALL")  # RESET ALL skips the role
+            owned = foreign_owned_objects(conn, run_as) if run_as else []
+            problems = [f"ownership: {p}" for p in owned]
+            problems += [
+                f"column type policy: {p}" for p in column_type_violations(conn)
+            ]
             if problems:
-                raise MigrationError("column type policy: " + "; ".join(problems))
+                raise MigrationError("; ".join(problems))
             conn.execute(
                 "INSERT INTO public.schema_migrations (version, name, checksum) "
                 "VALUES (%s, %s, %s)",

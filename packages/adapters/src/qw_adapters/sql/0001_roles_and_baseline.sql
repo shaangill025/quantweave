@@ -1,6 +1,6 @@
 -- 0001: database roles of the protected control plane (T008 review section 5) and a
--- least-privilege baseline. This bootstrap migration runs as the session user, which
--- must be a superuser or a CREATEROLE role that is a member of qw_migrate. Later
+-- least-privilege baseline. This bootstrap migration runs as the session user; the
+-- supported path is a superuser (operator-held, deploy time only). Later
 -- migrations run as qw_migrate. Idempotent: roles are cluster-wide and may already
 -- exist from another database; their attributes are reset to the safe set.
 -- Login roles are created at deploy time as members of these group roles.
@@ -41,5 +41,6 @@ ALTER SCHEMA app OWNER TO qw_migrate;
 REVOKE ALL ON SCHEMA app FROM PUBLIC;
 GRANT USAGE ON SCHEMA app TO qw_app, qw_worker, qw_ingest, qw_assessor, qw_release;
 
--- Functions created by qw_migrate are not executable by PUBLIC unless granted.
+-- Functions and types created by qw_migrate are not usable by PUBLIC unless granted.
 ALTER DEFAULT PRIVILEGES FOR ROLE qw_migrate REVOKE EXECUTE ON FUNCTIONS FROM PUBLIC;
+ALTER DEFAULT PRIVILEGES FOR ROLE qw_migrate REVOKE USAGE ON TYPES FROM PUBLIC;

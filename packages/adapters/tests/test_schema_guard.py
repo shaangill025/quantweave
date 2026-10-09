@@ -19,6 +19,7 @@ from qw_adapters.migrations import (
     migrate,
 )
 from qw_adapters.schema_guard import (
+    EXEMPT,
     column_type_violations,
     is_money_name,
     numeric_precision_scale,
@@ -41,7 +42,12 @@ def test_numeric_typmod_decoding() -> None:
         ("amount", True), ("unit_price", True), ("fee_amount", True),
         ("planned_cost", True), ("model_cost_usd", True), ("qty", True),
         ("price_currency", False), ("price_source", False), ("costume", False),
-        ("id", False), ("amount_kind", False),
+        ("id", False), ("amount_kind", False), ("fx_rate_source", False),
+        ("created_at", False),
+        # review round 1 bypasses
+        ("unit_px", True), ("total_value", True), ("Price", True), ("pnl", True),
+        ("fx_rate", True), ("rate", True), ("equity", True), ("debit", True),
+        ("credit", True), ("dividend", True), ("unitPx", True),
     ],
 )  # fmt: skip
 def test_money_name_rule(name: str, money: bool) -> None:
@@ -55,7 +61,9 @@ def test_real_schema_has_no_violations(conn: Conn) -> None:
 
 
 @pytest.mark.db
-def test_guard_reports_each_forbidden_shape(conn: Conn) -> None:
+def test_guard_reports_each_forbidden_shape(
+    conn: Conn, monkeypatch: pytest.MonkeyPatch
+) -> None:
     migrate(conn)
     conn.execute(
         """
@@ -63,26 +71,21 @@ def test_guard_reports_each_forbidden_shape(conn: Conn) -> None:
         CREATE DOMAIN app.money_amount AS numeric(38, 12);
         CREATE TYPE app.frange AS RANGE (subtype = float8);
         CREATE TABLE app.synthetic (
-            ok_amount app.money_amount,
-            unit_price numeric(38, 12),
-            fx_multiplier numeric(24, 12),
-            model_cost_usd numeric(20, 6),
-            plain_ratio numeric,
-            a real,
-            b float,
-            c double precision[],
-            d app.score,
-            e app.frange,
-            f money,
-            cash_balance numeric,
-            fee_amount numeric(10, 2),
-            quantity bigint,
-            strike text
+            ok_amount app.money_amount, unit_price numeric(38, 12),
+            fx_multiplier numeric(24, 12), model_cost_usd numeric(20, 6),
+            plain_ratio numeric, a real, b float, c double precision[],
+            d app.score, e app.frange, f money, cash_balance numeric,
+            fee_amount numeric(10, 2), quantity bigint, strike text,
+            "Price" bigint, pnl numeric(10, 2), fx_rate numeric(10, 2),
+            rate numeric, equity text, total_value integer,
+            unit_px numeric(38, 12), weight numeric(30, 18), retries integer,
+            note text, exempted numeric
         );
         CREATE VIEW public.v AS SELECT b AS view_float FROM app.synthetic;
         CREATE TYPE public.pair AS (x real);
         """
     )
+    monkeypatch.setitem(EXEMPT, "app.synthetic.exempted", "SYNTHETIC exemption")
     found = column_type_violations(conn)
     flagged = sorted(p.split(" ", 1)[0] for p in found)
     assert flagged == sorted(
@@ -92,6 +95,9 @@ def test_guard_reports_each_forbidden_shape(conn: Conn) -> None:
             "app.synthetic.fee_amount",
             "app.synthetic.quantity",
             "app.synthetic.strike",
+            "app.synthetic.plain_ratio",
+            *(f"app.synthetic.{c}" for c in ("Price", "pnl", "fx_rate", "rate")),
+            *(f"app.synthetic.{c}" for c in ("equity", "total_value")),
             "public.v.view_float",
             "public.pair.x",
         ]
@@ -107,6 +113,9 @@ def test_guard_reports_each_forbidden_shape(conn: Conn) -> None:
         "CREATE TABLE app.t (id integer, score double precision);",
         "CREATE TABLE app.t (id integer);\nALTER TABLE app.t ADD COLUMN w real;",
         "CREATE TABLE app.t (id integer, price numeric);",
+        "CREATE TABLE app.t (id integer, pnl numeric(10, 2));",
+        'CREATE TABLE app.t (id integer, "Price" bigint);',
+        "CREATE TABLE app.t (id integer, score numeric);",
     ],
 )
 def test_migration_adding_float_or_loose_money_column_is_rolled_back(

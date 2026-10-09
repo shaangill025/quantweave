@@ -1,14 +1,8 @@
-"""PostgreSQL 16 test harness for `@pytest.mark.db` tests.
-
-Server, in order of preference:
-1. `QW_TEST_DATABASE_URL`: an existing server and a superuser URL (CI sets this for
-   its postgres:16 service container).
-2. A throwaway cluster from the host binaries in `QW_PG_BIN` (default
-   /usr/lib/postgresql/16/bin): initdb into a temporary directory, start on a free
-   localhost port, stop and delete at session end. As root, the binaries run as the
-   `postgres` OS user because initdb refuses to run as root.
-If neither is available the tests are skipped with the reason, or fail when
-`QW_REQUIRE_DB=1` (CI). Each test gets its own database, dropped afterwards.
+"""PostgreSQL 16 harness for `@pytest.mark.db` tests: `QW_TEST_DATABASE_URL` (a
+superuser URL; CI's postgres:16 service) or else a throwaway cluster from `QW_PG_BIN`
+(default /usr/lib/postgresql/16/bin) in a 0700 temporary directory, reachable only
+through its unix socket, run as the `postgres` OS user when root. Without either the
+tests skip with the reason, or fail when `QW_REQUIRE_DB=1`. One database per test.
 """
 
 from __future__ import annotations
@@ -16,7 +10,6 @@ from __future__ import annotations
 import os
 import pwd
 import shutil
-import socket
 import subprocess
 import tempfile
 import uuid
@@ -40,13 +33,6 @@ def _unavailable(reason: str) -> NoReturn:
     pytest.skip(f"no PostgreSQL {PG_MAJOR} available: {reason}")
 
 
-def _free_port() -> int:
-    with socket.socket() as s:
-        s.bind(("127.0.0.1", 0))
-        port: int = s.getsockname()[1]
-        return port
-
-
 @pytest.fixture(scope="session")
 def pg_admin_url() -> Iterator[str]:
     """Superuser conninfo for a PostgreSQL 16 server."""
@@ -55,52 +41,58 @@ def pg_admin_url() -> Iterator[str]:
         yield from _checked(url)
         return
     if not (PG_BIN / "initdb").is_file():
-        _unavailable(
-            f"QW_TEST_DATABASE_URL unset and no initdb in {PG_BIN} (set QW_PG_BIN)"
-        )
+        _unavailable(f"QW_TEST_DATABASE_URL unset and no initdb in {PG_BIN}")
     prefix: list[str] = []
-    base = Path(tempfile.mkdtemp(prefix="qw-pg-"))
     if os.geteuid() == 0:
+        runuser = shutil.which("runuser")
         try:
             pwd.getpwnam("postgres")
         except KeyError:
-            shutil.rmtree(base)
-            _unavailable("running as root and no 'postgres' OS user for initdb")
-        shutil.chown(base, "postgres")
-        prefix = ["runuser", "-u", "postgres", "--"]
-    data, port = base / "data", _free_port()
+            runuser = None
+        if runuser is None:
+            _unavailable("running as root needs runuser and a 'postgres' OS user")
+        prefix = [runuser, "-u", "postgres", "--"]
 
-    def run(*args: str) -> None:
-        subprocess.run([*prefix, *args], check=True, capture_output=True, text=True)
+    def run(*args: str, check: bool = True) -> None:
+        try:
+            subprocess.run([*prefix, *args], check=check, capture_output=True)
+        except subprocess.CalledProcessError as exc:
+            pytest.fail(f"throwaway cluster: {args[0]} failed: {exc.stderr!r}")
 
+    # 0700 directory: only its owner (and root) can reach the unix socket inside.
+    base = Path(tempfile.mkdtemp(prefix="qw-pg-"))
     try:
-        run(str(PG_BIN / "initdb"), "-D", str(data), "-U", "qw_test_admin",
-            "--auth=trust", "--encoding=UTF8", "--no-locale", "--no-sync")  # fmt: skip
-        options = f"-p {port} -k {base} -c listen_addresses=127.0.0.1 -c fsync=off"
-        run(str(PG_BIN / "pg_ctl"), "-D", str(data), "-l", str(base / "server.log"),
-            "-o", options, "-w", "start")  # fmt: skip
-    except subprocess.CalledProcessError as exc:
-        shutil.rmtree(base, ignore_errors=True)
-        pytest.fail(f"throwaway cluster failed: {exc.stderr}", pytrace=False)
-    try:
-        yield from _checked(
-            f"host=127.0.0.1 port={port} user=qw_test_admin dbname=postgres"
-        )
+        if prefix:
+            shutil.chown(base, "postgres")
+        data, pg_ctl = str(base / "data"), str(PG_BIN / "pg_ctl")
+        run(str(PG_BIN / "initdb"), "-D", data, "-U", "qw_test_admin",
+            "--auth-local=trust", "--auth-host=reject", "--encoding=UTF8",
+            "--no-locale", "--no-sync")  # fmt: skip
+        try:
+            options = f"-c listen_addresses='' -k {base} -p 5432 -c fsync=off"
+            run(pg_ctl, "-D", data, "-l", str(base / "server.log"), "-o", options,
+                "-w", "start")  # fmt: skip
+            url = f"host={base} port=5432 user=qw_test_admin dbname=postgres"
+            yield from _checked(url, socket_only=True)
+        finally:
+            run(pg_ctl, "-D", data, "-m", "fast", "-w", "stop", check=False)
     finally:
-        run(str(PG_BIN / "pg_ctl"), "-D", str(data), "-m", "fast", "-w", "stop")
         shutil.rmtree(base, ignore_errors=True)
 
 
-def _checked(url: str) -> Iterator[str]:
+def _checked(url: str, *, socket_only: bool = False) -> Iterator[str]:
     with psycopg.connect(url, autocommit=True) as conn:
         row = conn.execute(
-            "SELECT current_setting('server_version_num')::int, rolsuper "
+            "SELECT current_setting('server_version_num')::int, rolsuper, "
+            "current_setting('listen_addresses'), inet_server_addr() "
             "FROM pg_roles WHERE rolname = current_user"
         ).fetchone()
     assert row is not None
-    version, superuser = row
+    version, superuser, listen, addr = row
     if version // 10000 != PG_MAJOR or not superuser:
         pytest.fail(f"need a PostgreSQL {PG_MAJOR} superuser URL, got {version}")
+    if socket_only and (listen, addr) != ("", None):
+        pytest.fail(f"throwaway cluster must not listen on TCP: {listen!r} {addr}")
     yield url
 
 
