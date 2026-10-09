@@ -30,6 +30,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 # Money modules per ADR-013, per package. Packages that do not exist yet are skipped.
 MONEY_PATHS: dict[str, tuple[str, ...]] = {
+    "adapters": ("src",),  # PostgreSQL adapters persist money (NUMERIC <-> Decimal)
     "domain": ("src",),
     "portfolio": ("src",),
     "strategies": ("src/qw_strategies/sizing", "src/qw_strategies/valuation"),
