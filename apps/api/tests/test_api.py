@@ -5,7 +5,9 @@ login of the adapters harness. All tenants, users and passwords are SYNTHETIC.""
 from __future__ import annotations
 
 import importlib.util
+import json
 import logging
+import re
 import uuid
 from collections.abc import Iterator
 from dataclasses import dataclass
@@ -31,6 +33,7 @@ pg_admin_url, database_url = _harness.pg_admin_url, _harness.database_url
 conn, runtime_urls, app_conn = _harness.conn, _harness.runtime_urls, _harness.app_conn
 
 ORIGIN = "https://testserver"
+JSON = {"Content-Type": "application/json"}
 PASSWORD = "SYNTHETIC-correct-horse-1"
 OWNER, MEMBER = MembershipRole.TENANT_OWNER, MembershipRole.TENANT_MEMBER
 # Cheap argon2id parameters keep the suite fast; the default profile is tested below.
@@ -46,19 +49,20 @@ def client_for(url: str, **settings: Any) -> TestClient:
     return TestClient(app, ORIGIN, headers=headers, raise_server_exceptions=False)
 
 
+Ids = dict[str, uuid.UUID]
+
+
 @dataclass
 class World:
     client: TestClient
     url: str
     db: Conn  # superuser, for assertions only
     tenant_a: uuid.UUID
-    users: dict[str, uuid.UUID]
+    users: Ids
 
 
-def seed(
-    app_conn: Conn, users: dict[str, MembershipRole]
-) -> tuple[uuid.UUID, dict[str, uuid.UUID]]:
-    ids: dict[str, uuid.UUID] = {}
+def seed(app_conn: Conn, users: dict[str, MembershipRole]) -> tuple[uuid.UUID, Ids]:
+    ids: Ids = {}
     with tenancy.provision_tenant(app_conn) as tx:
         for login, role in users.items():
             ids[login] = tenancy.create_user(tx, f"SYNTHETIC {login}")
@@ -76,8 +80,10 @@ def world(runtime_urls: dict[str, str], conn: Conn, app_conn: Conn) -> Iterator[
 
 
 def login(client: TestClient, who: str, password: str = PASSWORD) -> Response:
-    body = {"login": who, "password": password}
-    return cast(Response, client.post("/api/v1/session", json=body))
+    return cast(
+        Response,
+        client.post("/api/v1/session", json={"login": who, "password": password}),
+    )
 
 
 def csrf(client: TestClient) -> dict[str, str]:
@@ -119,39 +125,40 @@ def audit(world: World, action: str) -> list[tuple[Any, ...]]:
     ).fetchall()
 
 
-def test_health_is_open_and_minimal_and_crashes_use_the_envelope() -> None:
+def test_health_caps_and_malformed_input_use_the_envelope() -> None:
+    big, url = b"x" * (64 * 1024 + 1), "/api/v1/session"
     with client_for("host=/nonexistent port=1") as client:
         response = client.get("/api/v1/health/live")
+        assert (response.status_code, response.json()) == (200, {"status": "healthy"})
+        assert "set-cookie" not in response.headers
+        assert client.head("/api/v1/health/live").status_code == 200
         crash = assert_problem(client.get("/api/v1/session"), 500, "internal_error")
-    assert (response.status_code, response.json()) == (200, {"status": "healthy"})
-    assert "set-cookie" not in response.headers
-    assert crash["retryable"] is True and "nonexistent" not in str(crash)
+        assert crash["retryable"] is True and "nonexistent" not in str(crash)
+        declared = assert_problem(
+            client.post(url, content=big), 413, "payload_too_large"
+        )
+        assert declared["detail"] == "Content-Length is too large."  # before reading
+        chunked = client.post(url, content=iter([big[:40000], big[40000:]]))
+        assert "content-length" not in chunked.request.headers
+        streamed = assert_problem(chunked, 413, "payload_too_large")
+        assert streamed["detail"] == "The streamed body is too large."
+        bad = client.post(url, content=b'{"login": "\xff"}', headers=JSON)
+        assert_problem(bad, 400, "invalid_request")
+        deep = client.post(url, content=b"[" * 50000, headers=JSON)
+        assert_problem(deep, 400, "invalid_request")
+        twice = [("Origin", ORIGIN), ("Origin", ORIGIN), *JSON.items()]
+        repeated = client.post(url, content=b"{}", headers=twice)
+        assert_problem(repeated, 403, "origin_rejected")
 
 
 def test_no_implemented_operation_accepts_a_tenant_id() -> None:
     spec = create_app(Settings(frozenset({ORIGIN})), lambda: None, AUTH).openapi()  # type: ignore[arg-type, return-value]
-    names: list[str] = []
-
-    def walk(node: Any) -> None:
-        if isinstance(node, dict):
-            if "$ref" in node:
-                walk(spec["components"]["schemas"][node["$ref"].split("/")[-1]])
-            for key, value in node.items():
-                if key == "properties":
-                    names.extend(value)
-                walk(value)
-        elif isinstance(node, list):
-            for value in node:
-                walk(value)
-
     operations = [op for item in spec["paths"].values() for op in item.values()]
-    assert len(operations) == 7
-    for op in operations:
-        names.extend(p["name"] for p in op.get("parameters", []))
-        walk(op.get("requestBody", {}))
-        walk(op.get("responses", {}))
-    assert "login" in names and "role" in names  # the walk reaches request bodies
-    assert not [n for n in names if "tenant" in n.lower()]
+    assert len(operations) == 8  # HEAD /health/live included
+    params = [p["name"] for op in operations for p in op.get("parameters", [])]
+    keys = re.findall(r'"([^"]+)": ', json.dumps(spec))  # every object key, refs too
+    assert {"login", "password", "role", "user_id", "If-Match"} <= {*keys, *params}
+    assert not [k for k in [*keys, *params] if "tenant" in k.lower()]
 
 
 def test_settings_and_hasher_defaults() -> None:

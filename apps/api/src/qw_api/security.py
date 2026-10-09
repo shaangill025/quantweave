@@ -40,13 +40,9 @@ class Identity:
 
 
 class Authenticator(Protocol):
-    def authenticate(self, conn: Conn, login: str, secret: str) -> Identity | None:
-        """The identity for valid credentials, else None (no reason given)."""
-        ...
+    def authenticate(self, conn: Conn, login: str, secret: str) -> Identity | None: ...
 
-    def reverify(self, tx: TenantTx, user_id: uuid.UUID, secret: str) -> bool:
-        """Re-check the credential of a user of `tx`'s tenant (step-up)."""
-        ...
+    def reverify(self, tx: TenantTx, user_id: uuid.UUID, secret: str) -> bool: ...
 
 
 class LocalPasswordAuthenticator:
@@ -133,8 +129,7 @@ def require_role(role: MembershipRole) -> Callable[[Principal], Principal]:
 
 
 def require_step_up(role: MembershipRole) -> Callable[..., Principal]:
-    """`require_role` plus a re-authentication on this session within
-    `Settings.step_up_window`; otherwise 401 step_up_required (RFC 9470 style)."""
+    """`require_role` plus a step-up within the window, else 401 (RFC 9470 style)."""
 
     def dependency(
         principal: Annotated[Principal, Depends(require_role(role))],

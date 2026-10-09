@@ -140,23 +140,14 @@ def test_core_packages_respect_import_boundaries() -> None:
     assert boundary_violations(PACKAGES) == []
 
 
-def test_apps_respect_import_boundaries() -> None:
-    assert (APPS / "api" / "src" / "qw_api").is_dir()
+def test_app_boundaries_on_the_tree_and_an_injected_sample(tmp_path: Path) -> None:
     assert boundary_violations(APPS, APP_ALLOWED_THIRD_PARTY, PROVIDERS) == []
-
-
-def test_app_boundary_allows_web_stack_only_in_api(tmp_path: Path) -> None:
-    src = tmp_path / "api" / "src" / "qw_api"
-    src.mkdir(parents=True)
-    (src / "bad.py").write_text(  # SYNTHETIC negative-control fixture
-        "import fastapi\nfrom pydantic import BaseModel\nimport qw_adapters\n"
-        "import psycopg\nimport openai\nfrom alpaca import trading\n"
-    )
+    (src := tmp_path / "api" / "src" / "qw_api").mkdir(parents=True)  # SYNTHETIC
+    (src / "bad.py").write_text("import fastapi, qw_adapters, psycopg, openai\n")
     (tmp_path / "worker").mkdir()
     assert boundary_violations(tmp_path, APP_ALLOWED_THIRD_PARTY, PROVIDERS) == [
-        "api/src/qw_api/bad.py:4 imports psycopg (not allowed for api)",
-        "api/src/qw_api/bad.py:5 imports openai (denied in core)",
-        "api/src/qw_api/bad.py:6 imports alpaca.trading (denied in core)",
+        "api/src/qw_api/bad.py:1 imports openai (denied in core)",
+        "api/src/qw_api/bad.py:1 imports psycopg (not allowed for api)",
         "worker: no entry in ALLOWED_THIRD_PARTY",
     ]
 

@@ -1,10 +1,6 @@
-"""Application factory, configuration and the C-01 error envelope (T010).
-
-Nothing reads the environment: the entry point passes `Settings`, a connection
-provider and an authenticator to `create_app`. Every response has a server-made
-`X-Correlation-Id`; every error body (validation and 500 included) is the
-versioned RFC 9457 envelope of T008 review C-01. Request logs hold method, route
-template, status and correlation id only, never headers, cookies or bodies.
+"""Application factory, explicit configuration (no environment reads) and the
+C-01 error envelope on every error, with a server-made `X-Correlation-Id`. Logs
+hold method, route template, status and correlation id only (T010).
 """
 
 from __future__ import annotations
@@ -19,11 +15,11 @@ from datetime import timedelta
 from http import HTTPStatus
 from typing import TYPE_CHECKING, Any
 
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from qw_adapters.tenancy import MAX_SESSION_TTL, Conn
-from starlette.exceptions import HTTPException
+from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 if TYPE_CHECKING:
@@ -38,12 +34,12 @@ _REFERER = re.compile(_ORIGIN.pattern + r"(?=/|$)")
 
 @dataclass(frozen=True, slots=True)
 class Settings:
-    """Explicit API configuration. `allowed_origins` are exact `scheme://host[:port]`
-    strings (https, or http for localhost only)."""
+    """`allowed_origins`: exact https origins (http only for localhost)."""
 
     allowed_origins: frozenset[str]
     session_ttl: timedelta = timedelta(hours=12)
     step_up_window: timedelta = timedelta(minutes=10)
+    max_body_bytes: int = 64 * 1024
 
     def __post_init__(self) -> None:
         if not self.allowed_origins or not all(
@@ -54,6 +50,8 @@ class Settings:
             raise ValueError("session_ttl must be in (0, 30 days]")
         if not timedelta(0) < self.step_up_window <= timedelta(hours=1):
             raise ValueError("step_up_window must be in (0, 1 hour]")
+        if not 0 < self.max_body_bytes <= 1 << 24:
+            raise ValueError("max_body_bytes must be in (0, 16 MiB]")
 
 
 @dataclass(frozen=True, slots=True)
@@ -117,10 +115,16 @@ async def _on_validation(request: Request, exc: Exception) -> JSONResponse:
     return problem(request, ApiError(400, "invalid_request", detail, False, errors))
 
 
+_HTTP = {400: ("invalid_request", "The body cannot be parsed."),
+         404: ("not_found", "No such operation."),
+         405: ("method_not_allowed", "No such operation."),
+         413: ("payload_too_large", "The streamed body is too large.")}  # fmt: skip
+
+
 async def _on_http(request: Request, exc: Exception) -> JSONResponse:
-    assert isinstance(exc, HTTPException)
-    code = {404: "not_found", 405: "method_not_allowed"}.get(exc.status_code, "error")
-    return problem(request, ApiError(exc.status_code, code, "No such operation."))
+    assert isinstance(exc, StarletteHTTPException)
+    code, detail = _HTTP.get(exc.status_code, ("error", "Request failed."))
+    return problem(request, ApiError(exc.status_code, code, detail))
 
 
 async def _on_crash(request: Request, exc: Exception) -> JSONResponse:
@@ -130,24 +134,29 @@ async def _on_crash(request: Request, exc: Exception) -> JSONResponse:
     )
 
 
-def _origin_of(headers: dict[bytes, bytes]) -> str | None:
-    origin = headers.get(b"origin")
-    if origin is not None:
-        return origin.decode("latin-1")
-    referer = headers.get(b"referer")
-    if referer is None:
+def _origin_of(headers: list[tuple[bytes, bytes]]) -> str | None:
+    """Origin, else the Referer's origin; "" when either is repeated or malformed."""
+    origins = [v for k, v in headers if k == b"origin"]
+    referers = [v for k, v in headers if k == b"referer"]
+    if len(origins) > 1 or len(referers) > 1:
+        return ""
+    if origins:
+        return origins[0].decode("latin-1")
+    if not referers:
         return None
-    match = _REFERER.match(referer.decode("latin-1"))
+    match = _REFERER.match(referers[0].decode("latin-1"))
     return match.group(0) if match else ""
 
 
 class Envelope:
-    """Pure ASGI middleware: correlation id, no-store, the request log line, and the
+    """Pure ASGI middleware: correlation id, no-store, the request log line, the
     Origin/Referer allowlist for every state-changing method (fail closed: a
-    missing, `null` or foreign origin is rejected before routing)."""
+    missing, repeated, `null` or foreign origin is rejected before routing) and a
+    body cap, checked on Content-Length and again on the streamed bytes."""
 
-    def __init__(self, app: ASGIApp, allowed_origins: frozenset[str]) -> None:
-        self.app, self.allowed = app, allowed_origins
+    def __init__(self, app: ASGIApp, settings: Settings) -> None:
+        self.app, self.allowed = app, settings.allowed_origins
+        self.limit = settings.max_body_bytes
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         if scope["type"] != "http":
@@ -167,15 +176,31 @@ class Envelope:
                 message = {**message, "headers": headers}
             await send(message)
 
+        seen = [0]
+
+        async def capped() -> Message:
+            message = await receive()
+            seen[0] += len(message.get("body", b""))
+            if seen[0] > self.limit:
+                raise HTTPException(413)
+            return message
+
+        lengths = [v for k, v in scope["headers"] if k == b"content-length"]
+        error = None
+        if scope["method"] not in SAFE_METHODS and (
+            _origin_of(scope["headers"]) not in self.allowed
+        ):
+            error = ApiError(403, "origin_rejected", "Cross-origin request.")
+        elif len(lengths) > 1 or (lengths and not lengths[0].isdigit()):
+            error = ApiError(400, "invalid_request", "Malformed Content-Length.")
+        elif lengths and int(lengths[0]) > self.limit:
+            error = ApiError(413, "payload_too_large", "Content-Length is too large.")
         try:
-            if scope["method"] not in SAFE_METHODS and (
-                _origin_of(dict(scope["headers"])) not in self.allowed
-            ):
-                error = ApiError(403, "origin_rejected", "Cross-origin request.")
+            if error is not None:
                 await problem(Request(scope), error)(scope, receive, send)
-                status[0] = 403
+                status[0] = error.status
             else:
-                await self.app(scope, receive, tagged)
+                await self.app(scope, capped, tagged)
         finally:
             route = getattr(scope.get("route"), "path", "-")
             log.info("%s %s %s cid=%s", scope["method"], route, status[0], cid)
@@ -196,7 +221,7 @@ def create_app(
     app.include_router(router)
     app.add_exception_handler(ApiError, problem)
     app.add_exception_handler(RequestValidationError, _on_validation)
-    app.add_exception_handler(HTTPException, _on_http)
+    app.add_exception_handler(StarletteHTTPException, _on_http)
     app.add_exception_handler(Exception, _on_crash)
-    app.add_middleware(Envelope, allowed_origins=settings.allowed_origins)
+    app.add_middleware(Envelope, settings=settings)
     return app

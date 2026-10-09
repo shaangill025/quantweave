@@ -1,9 +1,9 @@
 """T010 routes: liveness, session (login, me, logout, step-up) and memberships.
 
-Tenant-owned path ids resolve inside the session tenant only, so another tenant's id
-is 404 (C-07, A-10). Request bodies forbid unknown fields, so a client-sent
-`tenant_id` is a 400. Role changes are revisioned with If-Match (412/428). HTTP
-Idempotency-Key records (C-03) are not implemented yet (T010 increment 3).
+Path ids resolve inside the session tenant only, so another tenant's id is 404
+(C-07, A-10). Bodies forbid unknown fields, so a client `tenant_id` is a 400.
+If-Match accepts only the exact `"N"` form (no weak tags, lists or `*`): 412 on
+mismatch, 428 when absent. C-03 Idempotency-Key is T010 increment 3.
 """
 
 from __future__ import annotations
@@ -73,17 +73,16 @@ class Liveness(BaseModel):
     status: Literal["healthy"]
 
 
-def _view(session: SessionPrincipal, token: str) -> SessionView:
-    step_up_at = session.step_up_at
+def _view(s: SessionPrincipal, token: str) -> SessionView:
     return SessionView(
-        user_id=session.user_id, role=session.role.value,
-        expires_at=session.expires_at.astimezone(UTC),
-        step_up_at=step_up_at and step_up_at.astimezone(UTC),
+        user_id=s.user_id, role=s.role.value, expires_at=s.expires_at.astimezone(UTC),
+        step_up_at=s.step_up_at and s.step_up_at.astimezone(UTC),
         csrf_token=sec.csrf_token(token),
     )  # fmt: skip
 
 
-@router.get("/health/live", response_model=Liveness)
+@router.head("/health/live", response_model=Liveness, operation_id="headLive")
+@router.get("/health/live", response_model=Liveness, operation_id="readLive")
 def live() -> Liveness:
     """Unauthenticated liveness only: no version, component or dependency detail."""
     return Liveness(status="healthy")

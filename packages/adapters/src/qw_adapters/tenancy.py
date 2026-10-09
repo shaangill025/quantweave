@@ -225,8 +225,7 @@ def revoke_session(tx: TenantTx, session_id: uuid.UUID) -> bool:
 
 
 def mark_step_up(tx: TenantTx, session_id: uuid.UUID) -> datetime | None:
-    """Record a completed re-authentication on a live session (the caller must have
-    verified the credential); returns the new step_up_at, the database time."""
+    """Set step_up_at = now() on a live session after the caller re-verified."""
     row = tx.conn.execute(
         "UPDATE app.session SET step_up_at = now() WHERE tenant_id = %s AND id = %s "
         "AND revoked_at IS NULL AND expires_at > now() RETURNING step_up_at",
@@ -251,8 +250,7 @@ def list_memberships(tx: TenantTx, limit: int) -> list[tuple[Membership, str]]:
 
 
 def lock_owners(tx: TenantTx) -> frozenset[uuid.UUID]:
-    """The tenant's owners, their membership rows locked until commit so concurrent
-    role changes serialise (READ COMMITTED re-checks the role after the wait)."""
+    """The owners, rows locked until commit so concurrent role changes serialise."""
     rows = tx.conn.execute(
         "SELECT user_id FROM app.membership WHERE tenant_id = %s "
         "AND role = 'tenant_owner' ORDER BY user_id FOR UPDATE",
@@ -284,8 +282,7 @@ def set_local_credential(
 
 
 def find_credential(conn: Conn, login: str) -> tuple[uuid.UUID, uuid.UUID, str] | None:
-    """(tenant id, user id, verifier) for an installation-unique login, read before
-    any tenant context exists through the credential_by_login policy."""
+    """(tenant, user, verifier) for a login, via the pre-tenant login policy."""
     if not conn.autocommit or conn.info.transaction_status != pq.TransactionStatus.IDLE:
         raise TenancyError("find_credential needs an idle autocommit connection")
     with conn.transaction():

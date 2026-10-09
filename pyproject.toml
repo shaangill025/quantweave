@@ -1,4 +1,8 @@
 # Virtual uv workspace root: no package of its own. Members: packages/* and apps/api.
+[tool.uv]
+# Transitive pins held back to releases at least two weeks old (T010 review).
+constraint-dependencies = ["pycparser<3.1"]
+
 [tool.uv.workspace]
 members = ["packages/*", "apps/api"]
 
