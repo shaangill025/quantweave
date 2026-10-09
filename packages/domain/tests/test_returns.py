@@ -19,12 +19,16 @@ from qw_domain import returns
 from qw_domain.decimals import DOMAIN_CONTEXT, CurrencyMismatchError, Money, Ratio
 from qw_domain.instants import InstantError
 from qw_domain.returns import (
+    ApproximateReturn,
     DatedFlow,
+    ExternalFlow,
     FlowValuation,
     FxAttribution,
     MoneyWeightedReturn,
     PeriodReturn,
     fx_attribution,
+    linked_fx_attribution,
+    modified_dietz,
     money_weighted_return,
     time_weighted_return,
 )
@@ -140,6 +144,16 @@ def test_twr_is_independent_of_flow_size(
     assert out.value.value == Decimal(round((expected - 1) * 10**18)).scaleb(-18)
 
 
+def test_link_subperiods_validates_points() -> None:
+    one = Fraction(1)
+    with pytest.raises(InstantError):
+        returns.link_subperiods([(datetime(2026, 1, 1), one, one)] * 2)  # noqa: DTZ001
+    with pytest.raises(TypeError):
+        returns.link_subperiods([(T0, Decimal(1), one), (T0, one, one)])  # type: ignore[list-item]
+    with pytest.raises(TypeError):
+        returns.link_subperiods([(T0, one, 1), (T0, one, one)])  # type: ignore[list-item]
+
+
 # ---- MWR
 
 
@@ -233,6 +247,21 @@ def test_two_roots_of_opposite_sign_stay_ambiguous() -> None:
     assert len(got) == 2
     assert abs(got[0] + half_sqrt2) < Decimal("1e-15")
     assert abs(got[1] - half_sqrt2) < Decimal("1e-15")
+
+
+def test_zero_sum_term_of_the_uniqueness_bound() -> None:
+    # -100, +50, -50, +100 yearly: Descartes 3; sums from the start -100, -50, -100, 0
+    # and from the end 100, 50, 100, 0 never change sign; the flows sum to 0, so the
+    # bound is 0 + 0 + 1 = 1. NPV = (y - 1)(100y^2 + 50y + 100), whose quadratic has
+    # no real root: the unique root is r = 0. Without the zero-sum term it would be
+    # reported ambiguous.
+    items = ((0, "-100"), (365, "50"), (730, "-50"), (1095, "100"))
+    out = money_weighted_return(flows(*items))
+    assert isinstance(out, MoneyWeightedReturn) and out.status == "unique"
+    assert out.sign_changes == 3 and out.uniqueness_rule == "partial_sums"
+    assert out.period_return is not None and out.annualized is not None
+    assert abs(out.period_return.value) < Decimal("1e-18")
+    assert abs(out.annualized.value) < Decimal("1e-18")
 
 
 def test_partial_sums_from_the_end_are_checked() -> None:
@@ -356,3 +385,98 @@ def test_fx_effects_add_up(local: Ratio, fx: Ratio) -> None:
     assert isinstance(out, FxAttribution)
     exact = (1 + Fraction(local.value)) * (1 + Fraction(fx.value)) - 1
     assert abs(Fraction(out.reporting.value) - exact) <= Fraction(1, 2 * 10**18)
+
+
+def test_linked_fx_attribution_hand_computed() -> None:
+    # Sub-periods (local, fx): (+10%, +5%) then (-20%, +10%). Linked local
+    # 1.1 x 0.8 - 1 = -0.12; currency 1.05 x 1.1 - 1 = 0.155; interaction
+    # -0.12 x 0.155 = -0.0186; reporting -0.12 + 0.155 - 0.0186 = 0.0164, equal to the
+    # chained sub-period reporting returns 1.155 x 0.88 - 1.
+    out = linked_fx_attribution(
+        [(Ratio("0.10"), Ratio("0.05")), (Ratio("-0.20"), Ratio("0.10"))]
+    )
+    assert isinstance(out, FxAttribution) and out.method == returns.FX_LINKED_METHOD
+    assert (out.local, out.currency) == (Ratio("-0.12"), Ratio("0.155"))
+    assert (out.interaction, out.reporting) == (Ratio("-0.0186"), Ratio("0.0164"))
+    assert [s.reporting for s in out.subperiods] == [Ratio("0.155"), Ratio("-0.12")]
+
+
+def test_linked_fx_one_subperiod_is_num04() -> None:
+    inp, exp = ORACLES["NUM04"]["inputs"], ORACLES["NUM04"]["expected"]
+    out = linked_fx_attribution([(Ratio(inp["local_return"]), Ratio(inp["fx_return"]))])
+    assert isinstance(out, FxAttribution)
+    assert out.reporting == Ratio(exp["base_return"])
+    assert out.interaction == Ratio(exp["interaction"])
+
+
+def test_linked_fx_unavailable() -> None:
+    assert code(linked_fx_attribution([])) == "insufficient_valuations"
+    bad = [(Ratio("0.1"), Ratio("0")), (Ratio("-1"), Ratio("0"))]
+    assert code(linked_fx_attribution(bad)) == "return_below_minus_one"
+
+
+# ---- Modified Dietz (approximate)
+
+
+def xf(day: int, amount: str) -> ExternalFlow:
+    return ExternalFlow(D0 + timedelta(days=day), usd(amount))
+
+
+def dietz(
+    start: str, end: str, days: int, *items: tuple[int, str]
+) -> ApproximateReturn | Unavailable:
+    fl = [xf(d, a) for d, a in items]
+    return modified_dietz(usd(start), usd(end), D0, D0 + timedelta(days=days), fl)
+
+
+def test_dietz_hand_computed() -> None:
+    # 30 days; +100 at day 15 has weight 15/30: (1200 - 1000 - 100) / (1000 + 50)
+    # = 100/1050 = 0.095238095238095238|095... (half-even at 18 places).
+    out = dietz("1000", "1200", 30, (15, "100"))
+    assert isinstance(out, ApproximateReturn)
+    assert out.value == Ratio("0.095238095238095238")
+    assert out.approximate and out.method == returns.DIETZ_METHOD
+    assert out.method != returns.TWR_METHOD and "approximate" in out.label
+    assert out.weights == (Ratio("0.5"),)
+    # +200 at day 10 (w 2/3), -50 at day 25 (w 1/6): (1250 - 1000 - 150) /
+    # (1000 + 133.33.. - 8.33..) = 100/1125 = 0.0888..8|888 -> ...889.
+    out = dietz("1000", "1250", 30, (10, "200"), (25, "-50"))
+    assert isinstance(out, ApproximateReturn)
+    assert out.value == Ratio("0.088888888888888889")
+
+
+def test_dietz_flow_weights_at_the_bounds() -> None:
+    # A flow on the start date has weight 1 and one on the end date weight 0.
+    out = dietz("1000", "1220", 10, (0, "100"), (10, "10"))
+    assert isinstance(out, ApproximateReturn)
+    assert out.weights == (Ratio("1"), Ratio("0"))
+    assert out.value == Ratio("0.1")  # (1220 - 1000 - 110) / (1000 + 100 + 0)
+
+
+def test_dietz_unavailable() -> None:
+    # Denominator 0 + 0 x 100 = 0, and 100 - 300 x 1 < 0: no ratio is produced.
+    assert code(dietz("0", "100", 10, (10, "100"))) == "nonpositive_denominator"
+    assert code(dietz("100", "0", 10, (0, "-300"))) == "nonpositive_denominator"
+    assert code(dietz("100", "110", 0)) == "incomplete_period"
+
+
+def test_dietz_rejections() -> None:
+    with pytest.raises(ValueError, match="period"):
+        dietz("100", "110", 10, (11, "5"))
+    with pytest.raises(TypeError):
+        ExternalFlow(datetime(2025, 1, 1, tzinfo=UTC), usd("1"))
+    with pytest.raises(TypeError):
+        ExternalFlow(D0, Decimal("1"))  # type: ignore[arg-type]
+    with pytest.raises(TypeError):
+        usd(0.5)  # type: ignore[arg-type]
+    with pytest.raises(CurrencyMismatchError):
+        modified_dietz(usd("1"), Money.of("1", "CAD"), D0, D0 + timedelta(days=1), [])
+
+
+@PROFILE
+@given(st.integers(1, 10**9), st.integers(0, 10**9), st.integers(1, 3650))
+def test_dietz_without_flows_equals_twr(start: int, end: int, days: int) -> None:
+    md = dietz(str(start), str(end), days)
+    twr = time_weighted_return([pt(0, str(start)), pt(days, str(end))])
+    assert isinstance(md, ApproximateReturn) and isinstance(twr, PeriodReturn)
+    assert md.value == twr.value
