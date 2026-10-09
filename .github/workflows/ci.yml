@@ -17,9 +17,26 @@ jobs:
   python:
     runs-on: ubuntu-24.04
     timeout-minutes: 20
+    # Throwaway PostgreSQL 16 for the @pytest.mark.db tests (CHK-DB-INTEGRATION).
+    # Trust auth on the job-local service, so no credential exists. Digest pin open.
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_HOST_AUTH_METHOD: trust
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
     env:
       UV_PYTHON: "3.13"
       UV_LOCKED: "1"
+      QW_TEST_DATABASE_URL: postgresql://postgres@127.0.0.1:5432/postgres
+      # A db test that cannot reach PostgreSQL fails instead of skipping.
+      QW_REQUIRE_DB: "1"
     steps:
       # Third-party actions pinned by commit SHA (tag -> SHA read with git ls-remote).
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -30,6 +47,12 @@ jobs:
           version: "0.11.32"
       - run: uv python install 3.13
       - run: uv sync --locked
+      - name: libpq for psycopg (pure-Python build, system libpq)
+        run: |
+          dpkg -s libpq5 >/dev/null 2>&1 || {
+            sudo apt-get update && sudo apt-get install -y --no-install-recommends libpq5
+          }
+          uv run python -c "import psycopg; print('libpq', psycopg.pq.version())"
       - name: Lint and format
         run: |
           uv run ruff check .

@@ -32,6 +32,7 @@ DENIED = (
 # Third-party imports a package's non-test code may use beyond the stdlib and its own
 # name. Every directory under packages/ must have an entry (review §2 table).
 ALLOWED_THIRD_PARTY: dict[str, frozenset[str]] = {
+    "adapters": frozenset({"psycopg"}),  # the only package that may import psycopg
     "domain": frozenset(),  # stdlib only
 }
 # Standard-library modules denied in a package's non-test code (I/O, processes, code

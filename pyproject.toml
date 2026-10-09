@@ -39,3 +39,6 @@ exclude = ["^docs/"]
 [tool.pytest.ini_options]
 testpaths = ["packages", "tests"]
 addopts = ["--import-mode=importlib", "-ra", "--strict-markers", "--strict-config"]
+markers = [
+    "db: needs PostgreSQL 16 (QW_TEST_DATABASE_URL or host binaries); QW_REQUIRE_DB=1 turns a skip into a failure",
+]
