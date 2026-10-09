@@ -33,7 +33,25 @@ series stay fast. Flows are investor-perspective; same-day flows are summed.
 
 FX (`FX_METHOD`): 1 + r_reporting = (1 + r_local)(1 + r_fx), with interaction
 r_local * r_fx, so local + currency + interaction = reporting exactly. This holds for
-an unleveraged asset held unchanged; it is not a multi-flow attribution.
+an unleveraged asset held unchanged. `linked_fx_attribution` (`FX_LINKED_METHOD`)
+applies it to pathwise sub-periods of one local currency, with flows only at their
+boundaries: the products of (1 + r) over sub-periods factor the same way, so the
+linked local and currency returns are chained and the interaction is their product.
+Allocating currency effects across several currencies or accounts is a convention the
+spec does not define; it is not implemented.
+
+Modified Dietz (`DIETZ_METHOD`, approximate, never exact TWR): (V_end - V_start -
+sum CF_i) / (V_start + sum w_i CF_i), CF positive into the portfolio, w_i = (D - d_i)
+/ D for a flow d_i calendar days after the start of a D-day period (flows at the start
+of their day: weight 1 on the start date, 0 on the end date). V_start and V_end must
+be valued on the same convention as the flows: V_start at the start of the start date
+(before its flows), V_end at the end of the end date (after its flows); the caller
+supplies them and they are not checked. A non-positive denominator or a zero-day
+period is `Unavailable`.
+
+Dates (`DatedFlow.on`, `ExternalFlow.on`) are calendar dates in the account's
+reporting calendar; the caller converts event instants with the account's declared
+time zone. The spec does not define this basis.
 """
 
 from collections.abc import Sequence
@@ -42,6 +60,7 @@ from datetime import date, datetime
 from decimal import Decimal, localcontext
 from fractions import Fraction
 from itertools import accumulate, pairwise
+from math import prod
 from typing import Literal
 
 from qw_domain.decimals import (
@@ -59,6 +78,8 @@ from qw_domain.valuation import Unavailable
 TWR_METHOD = "chain_linked_twr/1"
 MWR_METHOD = "mwr_bisection_act365f/1"
 FX_METHOD = "fx_multiplicative/1"
+FX_LINKED_METHOD = "fx_multiplicative_linked/1"
+DIETZ_METHOD = "modified_dietz_approx/1"
 GROWTH_DOMAIN = (Decimal("0.000001"), Decimal(1000000))  # 1 + period return
 TOLERANCE = Decimal("1e-30")
 MAX_ITERATIONS = 200
@@ -111,31 +132,115 @@ def time_weighted_return(points: Sequence[FlowValuation]) -> PeriodReturn | Unav
     if any(type(p) is not FlowValuation for p in pts):
         raise TypeError("points must be FlowValuation")
     _same_currency([p.flow for p in pts])
-    if len(pts) < 2:
+    return link_subperiods(
+        [
+            (
+                p.at,
+                None
+                if p.value_before is None
+                else Fraction(p.value_before.amount.value),
+                Fraction(p.flow.amount.value),
+            )
+            for p in pts
+        ]
+    )
+
+
+def link_subperiods(
+    points: Sequence[tuple[datetime, Fraction | None, Fraction]],
+) -> PeriodReturn | Unavailable:
+    """TWR over exact (instant, value before the flow or None, flow) points.
+    Instants must be aware (normalized to UTC); values and flows exact `Fraction`s."""
+    points = [(ensure_aware_utc(at), v, f) for at, v, f in points]
+    if any(
+        type(f) is not Fraction or not (v is None or type(v) is Fraction)
+        for _, v, f in points
+    ):
+        raise TypeError("link_subperiods takes Fraction values and flows")
+    if len(points) < 2:
         return Unavailable("insufficient_valuations", "TWR needs a start and an end")
-    if any(b.at <= a.at for a, b in pairwise(pts)):
+    if any(b[0] <= a[0] for a, b in pairwise(points)):
         return Unavailable("ambiguous_event_order", "points must strictly increase")
     total, subs = Fraction(1), []
-    for a, b in pairwise(pts):
-        if a.value_before is None or b.value_before is None:
-            return Unavailable("missing_valuation_interval", f"no value at {a.at}")
-        if b.value_before.amount.value < 0:
-            return Unavailable("negative_end_value", f"value below zero at {b.at}")
-        start = Fraction(a.value_before.amount.value) + Fraction(a.flow.amount.value)
-        if start <= 0:
-            return Unavailable("nonpositive_denominator", f"start value at {a.at}")
-        growth = Fraction(Fraction(b.value_before.amount.value), start)
+    for (at, before, flow), (end_at, end, _) in pairwise(points):
+        if before is None or end is None:
+            return Unavailable("missing_valuation_interval", f"no value at {at}")
+        if end < 0:
+            return Unavailable("negative_end_value", f"value below zero at {end_at}")
+        if before + flow <= 0:
+            return Unavailable("nonpositive_denominator", f"start value at {at}")
+        growth = Fraction(end, before + flow)
         subs.append(_ratio(growth - 1))
         total *= growth
     return PeriodReturn(
-        _ratio(total - 1), tuple(subs), pts[0].at, pts[-1].at, True, TWR_METHOD
+        _ratio(total - 1), tuple(subs), points[0][0], points[-1][0], True, TWR_METHOD
     )
+
+
+@dataclass(frozen=True, slots=True)
+class ExternalFlow:
+    """Portfolio-perspective external flow: contributions positive, withdrawals
+    negative (spec §5 Modified Dietz sign). `on` is a reporting-calendar date."""
+
+    on: date
+    amount: Money
+
+    def __post_init__(self) -> None:
+        require_date(self.on, "flow date")
+        if type(self.amount) is not Money:
+            raise TypeError("flow amount must be Money")
+
+
+@dataclass(frozen=True, slots=True)
+class ApproximateReturn:
+    value: Ratio
+    start: date
+    end: date
+    weights: tuple[Ratio, ...]  # per flow, rounded for display; the value is exact
+    approximate: bool = True
+    label: str = "approximate (Modified Dietz), not exact TWR"
+    weighting: str = "calendar_day_start_of_day"
+    method: str = DIETZ_METHOD
+
+
+def modified_dietz(
+    start_value: Money,
+    end_value: Money,
+    start: date,
+    end: date,
+    flows: Sequence[ExternalFlow],
+) -> ApproximateReturn | Unavailable:
+    fl = tuple(flows)
+    if any(type(f) is not ExternalFlow for f in fl):
+        raise TypeError("flows must be ExternalFlow")
+    if type(start_value) is not Money or type(end_value) is not Money:
+        raise TypeError("start and end values must be Money")
+    _same_currency([start_value, end_value, *(f.amount for f in fl)])
+    require_date(start, "start")
+    days = (require_date(end, "end") - start).days
+    if any(not start <= f.on <= end for f in fl):
+        raise ValueError("flows must fall within the period")
+    if days <= 0:
+        return Unavailable(
+            "incomplete_period", "Modified Dietz needs a positive period"
+        )
+    weights = [Fraction((end - f.on).days, days) for f in fl]
+    cfs = [Fraction(f.amount.amount.value) for f in fl]
+    v0, v1 = Fraction(start_value.amount.value), Fraction(end_value.amount.value)
+    denominator = v0 + sum(
+        (w * c for w, c in zip(weights, cfs, strict=True)), Fraction()
+    )
+    if denominator <= 0:
+        return Unavailable("nonpositive_denominator", f"denominator {denominator}")
+    value = Fraction(v1 - v0 - sum(cfs, Fraction()), denominator)
+    return ApproximateReturn(_ratio(value), start, end, tuple(map(_ratio, weights)))
 
 
 @dataclass(frozen=True, slots=True)
 class DatedFlow:
     """Investor-perspective flow: contributions negative, withdrawals positive; the
-    terminal portfolio value is included once, as a positive last flow."""
+    terminal portfolio value is included once, as a positive last flow. `on` is a
+    calendar date in the account's reporting calendar (module docstring)."""
 
     on: date
     amount: Money
@@ -317,6 +422,7 @@ class FxAttribution:
     interaction: Ratio
     reporting: Ratio
     method: str = FX_METHOD
+    subperiods: tuple["FxAttribution", ...] = ()
 
 
 def fx_attribution(local: Ratio, fx: Ratio) -> FxAttribution | Unavailable:
@@ -328,3 +434,29 @@ def fx_attribution(local: Ratio, fx: Ratio) -> FxAttribution | Unavailable:
     with localcontext(DOMAIN_CONTEXT):
         reporting = Ratio(local.value + fx.value + interaction.value)
     return FxAttribution(local, fx, interaction, reporting)
+
+
+def linked_fx_attribution(
+    subperiods: Sequence[tuple[Ratio, Ratio]],
+) -> FxAttribution | Unavailable:
+    """Chain (local, fx) sub-period returns of one local currency; see the module."""
+    parts = []
+    for local, fx in subperiods:
+        part = fx_attribution(local, fx)
+        if isinstance(part, Unavailable):
+            return part
+        parts.append(part)
+    if not parts:
+        return Unavailable("insufficient_valuations", "no sub-periods")
+    growth_local = prod((1 + Fraction(p.local.value) for p in parts), start=Fraction(1))
+    growth_fx = prod((1 + Fraction(p.currency.value) for p in parts), start=Fraction(1))
+    total = fx_attribution(_ratio(growth_local - 1), _ratio(growth_fx - 1))
+    assert not isinstance(total, Unavailable)  # products of positive factors
+    return FxAttribution(
+        total.local,
+        total.currency,
+        total.interaction,
+        total.reporting,
+        FX_LINKED_METHOD,
+        tuple(parts),
+    )
