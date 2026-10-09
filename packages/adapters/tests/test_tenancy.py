@@ -16,7 +16,8 @@ from datetime import timedelta
 
 import psycopg
 import pytest
-from psycopg import errors
+from psycopg import errors, sql
+from psycopg.conninfo import make_conninfo
 from psycopg.rows import TupleRow
 from qw_adapters.tenancy import (
     MembershipRole,
@@ -137,6 +138,7 @@ def test_tables_have_forced_rls_and_no_public_grants(conn: Conn) -> None:
         "CREATE TABLE app.rogue (id integer)",
         "DROP POLICY tenant_isolation ON app.membership",
         "SELECT token_hash FROM app.session",
+        "UPDATE app.tenant SET status = 'active'",
         "UPDATE app.session SET expires_at = now()",
         "INSERT INTO app.audit_event (tenant_id, action, occurred_at) "
         "VALUES (app.current_tenant_id(), 'x.y', now() - interval '1 day')",
@@ -447,3 +449,91 @@ def test_session_requires_membership_in_the_same_tenant(app_conn: Conn) -> None:
         tenant_transaction(app_conn, a) as tx,
     ):
         create_session(tx, lonely, timedelta(hours=1))
+
+
+@pytest.mark.db
+def test_session_of_suspended_tenant_is_not_returned(
+    app_conn: Conn, conn: Conn
+) -> None:
+    a, a_user = make_tenant(app_conn, "A")
+    with tenant_transaction(app_conn, a) as tx:
+        _, token = create_session(tx, a_user, timedelta(hours=1))
+    # The superuser stands in for the (not yet built) operator suspension path.
+    conn.execute("UPDATE app.tenant SET status = 'suspended' WHERE id = %s", (a,))
+    assert lookup_session(app_conn, token) is None
+    conn.execute("UPDATE app.tenant SET status = 'active' WHERE id = %s", (a,))
+    assert lookup_session(app_conn, token) is not None
+
+
+@pytest.mark.db
+def test_session_bounds_hold_against_raw_sql(app_conn: Conn, conn: Conn) -> None:
+    a, a_user = make_tenant(app_conn, "A")
+    insert = (
+        "INSERT INTO app.session (id, tenant_id, user_id, token_hash, expires_at) "
+        "VALUES (gen_random_uuid(), %s, %s, %s, {})"
+    )
+    for expires in ("'9999-12-31T00:00:00Z'", "now() + interval '30 days 1 second'"):
+        with pytest.raises(errors.CheckViolation), tenant_transaction(app_conn, a):
+            app_conn.execute(
+                sql.SQL(insert).format(sql.SQL(expires)),
+                (a, a_user, hashlib.sha256(expires.encode()).digest()),
+            )
+    with tenant_transaction(app_conn, a) as tx:
+        session_id, token = create_session(tx, a_user, timedelta(hours=1))
+    bypasses = [
+        "UPDATE app.session SET revoked_at = now() - interval '1 minute'",
+        "UPDATE app.session SET revoked_at = created_at - interval '1 day'",
+        "UPDATE app.session SET step_up_at = now() - interval '1 hour'",
+        "UPDATE app.session SET step_up_at = now() + interval '1 hour'",
+    ]
+    for statement in bypasses:
+        with (
+            pytest.raises(errors.RaiseException, match=r"^app\.session: "),
+            tenant_transaction(app_conn, a),
+        ):
+            app_conn.execute(statement)
+    with pytest.raises(errors.InsufficientPrivilege), tenant_transaction(app_conn, a):
+        app_conn.execute("UPDATE app.session SET expires_at = '9999-12-31T00:00:00Z'")
+    with tenant_transaction(app_conn, a) as tx:
+        assert revoke_session(tx, session_id) is True
+    for statement in [
+        "UPDATE app.session SET revoked_at = NULL",  # un-revoke
+        "UPDATE app.session SET revoked_at = now()",  # re-revoke at a new time
+    ]:
+        with (
+            pytest.raises(errors.RaiseException, match="set once"),
+            tenant_transaction(app_conn, a),
+        ):
+            app_conn.execute(statement)
+    # The owner is bound by the trigger too.
+    with (
+        pytest.raises(errors.RaiseException, match="only revoked_at"),
+        conn.transaction(),
+    ):
+        conn.execute("SET LOCAL ROLE qw_migrate")
+        set_tenant(conn, a)
+        conn.execute("UPDATE app.session SET expires_at = expires_at + interval '1 h'")
+    assert lookup_session(app_conn, token) is None
+
+
+@pytest.mark.db
+def test_check_runtime_role_requires_runtime_group(
+    runtime_urls: dict[str, str], database_url: str, conn: Conn
+) -> None:
+    login = f"qwtest_nogroup_{uuid.uuid4().hex[:12]}"
+    ident = sql.Identifier(login)
+    conn.execute(sql.SQL("CREATE ROLE {} LOGIN NOBYPASSRLS").format(ident))
+    try:
+        conn.execute(
+            sql.SQL("GRANT CONNECT ON DATABASE {} TO {}").format(
+                sql.Identifier(conn.info.dbname), ident
+            )
+        )
+        with (
+            psycopg.connect(make_conninfo(database_url, user=login)) as other,
+            pytest.raises(TenancyError, match="not a member"),
+        ):
+            check_runtime_role(other)
+    finally:
+        conn.execute(sql.SQL("DROP OWNED BY {}").format(ident))
+        conn.execute(sql.SQL("DROP ROLE {}").format(ident))

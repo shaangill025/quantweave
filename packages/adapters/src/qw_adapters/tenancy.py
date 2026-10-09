@@ -168,7 +168,8 @@ def create_session(
 
 def lookup_session(conn: Conn, token: str) -> SessionPrincipal | None:
     """The live session and membership for a presented token, or None when the token
-    is malformed, unknown, expired or revoked, or the membership is gone."""
+    is malformed, unknown, expired or revoked, the membership is gone or the tenant
+    is not active."""
     try:
         digest = session_token_hash(token)
     except TenancyError:
@@ -193,12 +194,18 @@ def lookup_session(conn: Conn, token: str) -> SessionPrincipal | None:
             "set_config('app.tenant_id', %s, true)",
             (str(tenant_id),),
         )
-        membership = get_membership(TenantTx(conn, tenant_id), user_id)
-    if membership is None:
+        # The tenant must be active: checked in SQL, in the session's own context.
+        member = conn.execute(
+            "SELECT m.role::text FROM app.membership m "
+            "JOIN app.tenant t ON t.id = m.tenant_id AND t.status = 'active' "
+            "WHERE m.tenant_id = %s AND m.user_id = %s",
+            (tenant_id, user_id),
+        ).fetchone()
+    if member is None:
         return None
     return SessionPrincipal(
-        session_id, tenant_id, user_id, membership.role, created_at, expires_at,
-        step_up_at,
+        session_id, tenant_id, user_id, MembershipRole(member[0]), created_at,
+        expires_at, step_up_at,
     )  # fmt: skip
 
 
@@ -213,12 +220,16 @@ def revoke_session(tx: TenantTx, session_id: uuid.UUID) -> bool:
 
 
 def check_runtime_role(conn: Conn) -> None:
-    """Refuse a connection whose role could bypass row level security."""
+    """Refuse a connection that could bypass row level security or is not a member
+    of qw_app or qw_worker."""
     row = conn.execute(
-        "SELECT r.rolsuper, r.rolbypassrls, pg_has_role(r.oid, 'qw_migrate', 'MEMBER')"
-        " FROM pg_catalog.pg_roles r WHERE r.rolname = current_user"
+        "SELECT r.rolsuper, r.rolbypassrls, pg_has_role(r.oid, 'qw_migrate', 'MEMBER'),"
+        " pg_has_role(r.oid, 'qw_app', 'MEMBER') OR pg_has_role(r.oid, 'qw_worker',"
+        " 'MEMBER') FROM pg_catalog.pg_roles r WHERE r.rolname = current_user"
     ).fetchone()
     if row is None or row[0]:
         raise TenancyError("runtime connection is a superuser")
     if row[1] or row[2]:
         raise TenancyError("runtime connection can bypass RLS or owns the schema")
+    if not row[3]:
+        raise TenancyError("runtime connection is not a member of qw_app or qw_worker")
