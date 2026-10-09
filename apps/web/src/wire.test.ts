@@ -1,7 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { Linter } from "eslint";
-import tseslint from "typescript-eslint";
-import { moneyGuard } from "../eslint.config.js";
+import { ESLint } from "eslint";
 import {
   DecimalStringError,
   formatDecimal,
@@ -128,7 +126,7 @@ describe("formatDecimal with fractionDigits (display rounds half-even)", () => {
     expect(fmt(raw, digits)).toBe(expected);
   });
 
-  it.each([-1, 1.5, 19, Number.NaN])("rejects fractionDigits %s", (digits) => {
+  it.each([-1, 1.5, 19, NaN])("rejects fractionDigits %s", (digits) => {
     expect(() => fmt("1", digits)).toThrow(RangeError);
   });
 });
@@ -142,6 +140,18 @@ describe("formatDecimal separators", () => {
     expect(formatDecimal(value, { groupSeparator: " " })).toBe(
       "-1 234 567.25",
     );
+  });
+
+  it.each([
+    { groupSeparator: "" },
+    { decimalSeparator: "" },
+    { groupSeparator: "0" },
+    { decimalSeparator: "\u0661" },
+    { groupSeparator: "-" },
+    { groupSeparator: ".", decimalSeparator: "." },
+    { groupSeparator: ",", decimalSeparator: "," },
+  ])("rejects ambiguous separators %j", (options) => {
+    expect(() => formatDecimal(parseDecimalString("1234.5"), options)).toThrow(RangeError);
   });
 
   it("re-validates a value that was cast to the brand", () => {
@@ -194,41 +204,48 @@ describe("isProblem", () => {
   });
 });
 
-describe("money guard lint rule", () => {
-  const linter = new Linter({ configType: "flat" });
-  const lint = (code: string): string[] =>
-    linter
-      .verify(
-        code,
-        [
-          {
-            files: ["**/*.ts"],
-            languageOptions: { parser: tseslint.parser },
-            rules: { "no-restricted-syntax": ["error", ...moneyGuard] },
-          },
-        ],
-        "sample.ts",
-      )
-      .map((m) => m.message);
+describe("money guard lint rule (project eslint.config.js)", () => {
+  const eslint = new ESLint({ cwd: new URL("..", import.meta.url).pathname });
+  // Linted under the path of a real project file so the type-aware config applies; the
+  // file on disk is not read or changed.
+  const lint = async (code: string): Promise<number> => {
+    const [result] = await eslint.lintText(code, { filePath: "src/wire.ts" });
+    return (result?.messages ?? []).filter((m) => m.ruleId === "no-restricted-syntax").length;
+  };
 
   // SYNTHETIC samples.
   it.each([
-    "const a = parseFloat(amount);",
-    "const a = parseInt(amount, 10);",
-    "const a = Number(amount);",
-    "const a = new Number(amount);",
-    "const a = Number.parseFloat(amount);",
-    "const a = Number.parseInt(amount);",
-    "const f = Number.parseFloat; f(amount);",
-    "const a = +amount;",
-    "const a = +price.amount;",
-  ])("fires on %s", (code) => {
-    expect(lint(code).length).toBeGreaterThanOrEqual(1);
+    "export const a = (s: string) => parseFloat(s);",
+    "export const a = (s: string) => parseInt(s, 10);",
+    "export const a = (s: string) => Number(s);",
+    "export const a = (s: string) => new Number(s);",
+    "export const a = (s: string) => Number.parseFloat(s);",
+    "export const a = (s: string) => Number.parseInt(s);",
+    'export const a = (s: string) => Number["parseFloat"](s);',
+    "export const f = Number.parseFloat;",
+    "export const a = (s: string) => +s;",
+    'export const a = ["1"].map(Number);',
+    "const N = Number; export const a = (s: string) => N(s);",
+    "export const a = (s: string) => (0, Number)(s);",
+    "export const a = (s: string) => Reflect.apply(Number, undefined, [s]);",
+    "const { parseFloat: pf } = globalThis; export const a = (s: string) => pf(s);",
+    "const { parseFloat } = globalThis; export const a = (s: string) => parseFloat(s);",
+    "export const a = (s: string) => ({ f: Number }).f(s);",
+    "export const a = (s: string) => globalThis.Number(s);",
+    "export const a = (s: string) => window.parseFloat(s);",
+    'export const a = (s: string) => globalThis["parseInt"](s);',
+  ])("fires on %s", async (code) => {
+    expect(await lint(code)).toBeGreaterThanOrEqual(1);
   });
 
-  it("allows string and BigInt handling", () => {
-    expect(
-      lint("const n = BigInt(digits); const ok = Number.isInteger(status); const s = a + b;"),
-    ).toEqual([]);
+  it("allows string, BigInt and integer checks", async () => {
+    const code = [
+      "export const n = (d: string) => BigInt(d);",
+      "export const ok = (x: unknown) => Number.isInteger(x) || Number.isSafeInteger(x);",
+      "export const s = (a: string, b: string) => a + b;",
+      "export const p = (o: { parseFloat: string }) => o.parseFloat;",
+      'export const q = { parseFloat: "label" };',
+    ].join("\n");
+    expect(await lint(code)).toBe(0);
   });
 });

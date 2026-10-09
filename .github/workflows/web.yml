@@ -28,7 +28,8 @@ jobs:
         with:
           node-version: "22.22.0"
           package-manager-cache: false
-      - run: pnpm install --frozen-lockfile
+      # No dependency lifecycle scripts run in CI.
+      - run: pnpm install --frozen-lockfile --ignore-scripts
       - run: pnpm typecheck
       - run: pnpm lint
       - run: pnpm test

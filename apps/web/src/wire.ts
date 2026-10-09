@@ -72,6 +72,14 @@ export function formatDecimal(value: DecimalString, options: FormatOptions = {})
   ) {
     throw new RangeError(`fractionDigits must be an integer from 0 to ${String(MAX_SCALE)}`);
   }
+  // A separator that is empty, contains a digit or a minus sign, or matches the other
+  // separator would make the output ambiguous.
+  if (
+    [groupSeparator, decimalSeparator].some((sep) => sep === "" || /[\p{Nd}-]/u.test(sep)) ||
+    groupSeparator === decimalSeparator
+  ) {
+    throw new RangeError("separators must be distinct, non-empty and contain no digit or minus");
+  }
   const checked = parseDecimalString(value);
   const negative = checked.startsWith("-");
   const [intPart = "", fracPart = ""] = (negative ? checked.slice(1) : checked).split(".");
