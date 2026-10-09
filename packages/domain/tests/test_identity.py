@@ -1,7 +1,7 @@
 """Instrument identity, listings and resolution (T011; R004, C-27). SYNTHETIC data."""
 
 from contextlib import suppress
-from datetime import date, timedelta
+from datetime import UTC, date, datetime, timedelta
 from uuid import UUID
 
 import pytest
@@ -157,3 +157,36 @@ def test_property_accepted_listings_never_overlap(
         assert len(live) == len({x.instrument_id for x in live})
         for x in live:
             assert m.resolve(x.ticker, XNYS, day) == Resolution.found(x.instrument_id)
+
+
+def test_validity_dates_reject_datetime() -> None:
+    noon = datetime(2026, 1, 2, 12, tzinfo=UTC)
+    alpaca = ProviderId("alpaca", "x")
+    for bad in (
+        lambda: Listing(A, XNYS, Ticker("X"), noon),
+        lambda: Listing(A, XNYS, Ticker("X"), D(2026, 1, 1), noon),
+        lambda: ProviderLink(alpaca, A, noon),
+        lambda: ProviderLink(alpaca, A, D(2026, 1, 1), noon),
+    ):
+        with pytest.raises(TypeError):
+            bad()
+
+
+def test_rename_to_same_ticker_is_rejected() -> None:
+    m = SecurityMaster()
+    m.add_listing(Listing(A, XNYS, Ticker("AAA"), D(2020, 1, 1)))
+    with pytest.raises(IdentityError, match="same ticker"):
+        m.rename(A, XNYS, Ticker("AAA"), D(2025, 1, 1))
+    assert m.listings() == (Listing(A, XNYS, Ticker("AAA"), D(2020, 1, 1)),)
+
+
+def test_resolution_state_is_consistent() -> None:
+    assert Resolution.of(set()) == Resolution("unknown")
+    for status, iid, cands in (
+        ("found", None, ()), ("found", A, ()), ("found", A, (A, B)),
+        ("ambiguous", None, (A,)), ("ambiguous", A, (A, B)),
+        ("ambiguous", None, (B, A)), ("ambiguous", None, (A, A)),
+        ("unknown", A, ()), ("unknown", None, (A,)), ("other", None, ()),
+    ):  # fmt: skip
+        with pytest.raises(IdentityError):
+            Resolution(status, iid, cands)  # type: ignore[arg-type]

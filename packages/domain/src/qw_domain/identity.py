@@ -14,6 +14,7 @@ from typing import Literal, Self
 from uuid import UUID
 
 from qw_domain.decimals import safe_repr
+from qw_domain.instants import require_date
 
 
 class IdentityError(ValueError):
@@ -84,6 +85,9 @@ class _Dated:
     valid_to: date | None
 
     def _check_dates(self) -> None:
+        require_date(self.valid_from, "valid_from")
+        if self.valid_to is not None:
+            require_date(self.valid_to, "valid_to")
         if self.valid_to is not None and self.valid_to <= self.valid_from:
             raise IdentityError(f"empty validity interval: {self!r}")
 
@@ -130,6 +134,18 @@ class Resolution:
     instrument_id: InstrumentId | None = None
     candidates: tuple[InstrumentId, ...] = ()
 
+    def __post_init__(self) -> None:
+        cands, iid = self.candidates, self.instrument_id
+        ok = {
+            "found": iid is not None and cands == (iid,),
+            "ambiguous": iid is None
+            and len(cands) >= 2
+            and list(cands) == sorted(set(cands)),
+            "unknown": iid is None and cands == (),
+        }.get(self.status, False)
+        if not ok or type(cands) is not tuple:
+            raise IdentityError(f"inconsistent resolution: {self!r}")
+
     @classmethod
     def of(cls, ids: set[InstrumentId]) -> "Resolution":
         if len(ids) == 1:
@@ -156,6 +172,9 @@ class SecurityMaster:
     def listings(self) -> tuple[Listing, ...]:
         return tuple(self._listings)
 
+    def copy(self) -> "SecurityMaster":
+        return SecurityMaster(list(self._listings), list(self._links))
+
     def _conflict(self, new: Listing, ignore: Listing | None = None) -> None:
         for old in self._listings:
             same = old.ticker == new.ticker or old.instrument_id == new.instrument_id
@@ -170,6 +189,7 @@ class SecurityMaster:
         self, instrument_id: InstrumentId, mic: Mic, new: Ticker, effective: date
     ) -> None:
         """Close the open-ended listing at `effective` and list `new` from it."""
+        require_date(effective, "effective")
         old = [
             x
             for x in self._listings
@@ -178,6 +198,8 @@ class SecurityMaster:
         ]
         if not old:
             raise IdentityError(f"no listing of {instrument_id} on {mic} to rename")
+        if old[0].ticker == new:
+            raise IdentityError(f"rename of {instrument_id} to the same ticker")
         closed = Listing(
             instrument_id, mic, old[0].ticker, old[0].valid_from, effective
         )
