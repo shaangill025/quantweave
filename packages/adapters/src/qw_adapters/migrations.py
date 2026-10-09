@@ -8,19 +8,25 @@ Refused before anything runs: a name that is not `NNNN_lower_snake.sql` (`.SQL`
 too), a symlink, a duplicate or gap, an applied file whose checksum or name changed,
 an applied version with no file, a pending file older than an applied one, and a
 top-level statement controlling the transaction, role or session authorization
-(BEGIN, COMMIT, END, SAVEPOINT, SET ROLE, RESET ALL ...). The scanner skips comments
-and quoted or dollar-quoted text and refuses files it cannot scan; `BEGIN ATOMIC`
-bodies are refused (use quoted bodies).
+(BEGIN, COMMIT, END, SAVEPOINT, SET [LOCAL] ROLE or "role", RESET ALL ...), a
+`set_config('role' | 'session_authorization', ...)` call, and `GRANT ... TO PUBLIC`.
+The scanner skips comments and quoted or dollar-quoted text and refuses files it
+cannot scan; `BEGIN ATOMIC` bodies are refused (use quoted bodies).
 
 Versions after 0001 (which creates the roles) run under `SET LOCAL ROLE qw_migrate`.
 Inside the transaction a migration is rolled back if it ended the transaction,
 finished under another role or session user, left a user object not owned by
-`qw_migrate` (except the ledger), or left a column failing `schema_guard`. RESET ALL
-stops settings such as search_path leaking. These checks enforce object OWNERSHIP
-only. A file run by a superuser can still change roles or privileges (set_config,
-quoted GUC names, DO blocks, GRANT ... TO PUBLIC), so the production migrate login must
-not be a superuser (open gate). Recovery is backup plus a new forward
-migration. The caller supplies the autocommit connection; no environment is read.
+`qw_migrate` (except the ledger), left a column failing `schema_guard`, or changed
+privileges: a role or membership created, altered or dropped (outside 0001), a
+changed database, public/app schema or ledger ACL (outside 0001), any new grant to
+PUBLIC, a default ACL not defined by `qw_migrate` or removed, or a large object not
+owned by `qw_migrate`. These snapshots also catch dynamic SQL (DO blocks, built
+set_config names) that the scanner cannot see. RESET ALL stops settings such as
+search_path leaking. Not covered: effects outside the catalogues compared, such as
+NOTIFY, pg_sleep, advisory locks or a password change (pg_roles hides passwords), so
+the production migrate login should still not be a superuser. Recovery is backup
+plus a new forward migration. The caller supplies the autocommit connection; no
+environment is read.
 """
 
 from __future__ import annotations
@@ -78,26 +84,48 @@ _OPENER = re.compile(r"['\"]|/\*|\$(?:[A-Za-z_][A-Za-z0-9_]*)?\$")
 _FORBIDDEN = re.compile(
     r"(abort|begin|commit|end|release|rollback|savepoint|discard|reset all"
     r"|(start|prepare) transaction"
-    r"|(re)?set( local| session)? (role|session authorization))( |$)"
+    r"|(re)?set( local| session)? "
+    r"(role|\"role\"|session authorization|\"?session_authorization\"?))( |$)"
 )
+_SET_CONFIG_GUCS = {("(", "'role'"), ("(", "'session_authorization'")}
+_PUBLIC = {"public", '"public"'}
 
 
-def statement_heads(text: str) -> list[list[str]]:
-    """First four tokens (lowercased words, a quote mark for quoted text, or single
-    characters) of each top-level statement. Raises MigrationError for an
+def _forbidden(tokens: list[str]) -> str | None:
+    """Why a statement (its lowercased tokens) is refused, or None."""
+    head = " ".join(tokens[:4])
+    if _FORBIDDEN.match(head):
+        return head.upper()
+    for i, token in enumerate(tokens):
+        if token == "set_config" and tuple(tokens[i + 1 : i + 3]) in _SET_CONFIG_GUCS:
+            return f"SET_CONFIG({tokens[i + 2]})"
+        public = tokens[i + 1 : i + 2] and tokens[i + 1] in _PUBLIC
+        if token == "to" and public and "grant" in tokens[:i]:
+            return "GRANT ... TO PUBLIC"
+    return None
+
+
+def statement_tokens(text: str) -> list[list[str]]:
+    """Lowercased tokens of each top-level statement: words, single characters,
+    string literals as `'text'` (an E prefix dropped), quoted identifiers as
+    `"name"`, and `$` for a dollar-quoted body. Raises MigrationError for an
     unterminated quote, dollar quote or comment, or a nested comment."""
     heads: list[list[str]] = [[]]
     for m in _TOKEN.finditer(text):
         if m.group("skip") is not None:
             continue
-        word, quoted = m.group("word"), m.group("quoted")
+        word = m.group("word")
         failed_e_string = word in {"e", "E"} and text.startswith("'", m.end())
         if failed_e_string or (m.group("other") and _OPENER.match(text, m.start())):
             raise MigrationError(f"unterminated quote or comment at {m.start()}")
-        token = "'" if quoted is not None else m.group().lower()
+        token = m.group().lower()
+        if m.group("tag") is not None:
+            token = "$"
+        elif token.startswith("e'"):
+            token = token[1:]
         if token == ";":
             heads.append([])
-        elif len(heads[-1]) < 4:
+        else:
             heads[-1].append(token)
     return [h for h in heads if h]
 
@@ -120,12 +148,11 @@ def load_migrations(directory: Path = MIGRATIONS_DIR) -> tuple[Migration, ...]:
             )
         body = path.read_bytes()
         try:
-            heads = statement_heads(body.decode("utf-8"))
+            statements = statement_tokens(body.decode("utf-8"))
         except (UnicodeDecodeError, MigrationError) as exc:
             raise MigrationError(f"{path.name}: cannot scan: {exc}") from exc
-        for head in (" ".join(h) for h in heads):
-            if _FORBIDDEN.match(head):
-                raise MigrationError(f"{path.name}: forbidden statement {head.upper()}")
+        for why in filter(None, map(_forbidden, statements)):
+            raise MigrationError(f"{path.name}: forbidden statement {why}")
         found[version] = Migration(version, path.name, body)
     expected = list(range(1, len(found) + 1))
     if sorted(found) != expected:
@@ -252,6 +279,93 @@ def foreign_owned_objects(conn: psycopg.Connection[TupleRow], role: str) -> list
     ]
 
 
+# Role, membership and privilege state, as (kind, item) rows. Taken as the session
+# user before and after each migration, inside its transaction.
+_USER_NS = "n.nspname !~ '^pg_' AND n.nspname <> 'information_schema'"
+_PRIVILEGES_SQL = f"""
+SELECT 'role', r::text FROM (SELECT rolname, rolsuper, rolinherit, rolcreaterole,
+    rolcreatedb, rolcanlogin, rolreplication, rolbypassrls, rolconnlimit,
+    rolvaliduntil, rolconfig FROM pg_catalog.pg_roles) r
+UNION ALL SELECT 'member', m::text FROM (SELECT roleid::regrole, member::regrole,
+    grantor::regrole, admin_option, inherit_option, set_option
+    FROM pg_catalog.pg_auth_members) m
+UNION ALL SELECT 'acl', 'database ' || coalesce(datacl::text, 'default')
+    FROM pg_catalog.pg_database WHERE datname = current_database()
+UNION ALL SELECT 'acl', 'schema ' || nspname || ' ' || coalesce(nspacl::text, '-')
+    FROM pg_catalog.pg_namespace WHERE nspname IN ('public', 'app')
+UNION ALL SELECT 'acl', 'ledger ' || coalesce(relacl::text, 'default')
+    FROM pg_catalog.pg_class WHERE oid = to_regclass('public.schema_migrations')
+UNION ALL SELECT 'defacl', defaclrole::regrole::text FROM pg_catalog.pg_default_acl
+UNION ALL SELECT 'defacl_key', d::text FROM (SELECT defaclrole::regrole,
+    defaclnamespace, defaclobjtype FROM pg_catalog.pg_default_acl) d
+UNION ALL SELECT 'lo', lomowner::regrole::text
+    FROM pg_catalog.pg_largeobject_metadata
+UNION ALL SELECT 'public', o.what || ' ' || a.privilege_type FROM (
+    SELECT 'database', coalesce(datacl, acldefault('d', datdba))
+        FROM pg_catalog.pg_database WHERE datname = current_database()
+    UNION ALL SELECT 'schema ' || nspname, coalesce(nspacl, acldefault('n', nspowner))
+        FROM pg_catalog.pg_namespace n WHERE {_USER_NS}
+    UNION ALL SELECT 'relation ' || c.oid::regclass, c.relacl
+        FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n
+        ON n.oid = c.relnamespace WHERE {_USER_NS}
+    UNION ALL SELECT 'column ' || attrelid::regclass || '.' || attname, attacl
+        FROM pg_catalog.pg_attribute WHERE attacl IS NOT NULL
+    UNION ALL SELECT 'function ' || p.oid::regprocedure,
+        coalesce(p.proacl, acldefault('f', p.proowner))
+        FROM pg_catalog.pg_proc p JOIN pg_catalog.pg_namespace n
+        ON n.oid = p.pronamespace WHERE {_USER_NS}
+    UNION ALL SELECT 'type ' || t.oid::regtype,
+        coalesce(t.typacl, acldefault('T', t.typowner))
+        FROM pg_catalog.pg_type t JOIN pg_catalog.pg_namespace n
+        ON n.oid = t.typnamespace LEFT JOIN pg_catalog.pg_class c ON c.oid = t.typrelid
+        WHERE {_USER_NS} AND t.typcategory <> 'A' AND coalesce(c.relkind, 'c') = 'c'
+    UNION ALL SELECT 'default acl ' || defaclrole::regrole || defaclobjtype::text,
+        defaclacl FROM pg_catalog.pg_default_acl
+    UNION ALL SELECT 'large object ' || oid, lomacl
+        FROM pg_catalog.pg_largeobject_metadata
+    UNION ALL SELECT 'language ' || lanname, coalesce(lanacl, acldefault('l', lanowner))
+        FROM pg_catalog.pg_language
+    UNION ALL SELECT 'foreign server ' || srvname, srvacl
+        FROM pg_catalog.pg_foreign_server
+    UNION ALL SELECT 'fdw ' || fdwname, fdwacl FROM pg_catalog.pg_foreign_data_wrapper
+) o(what, acl), aclexplode(o.acl) a WHERE a.grantee = 0
+"""
+
+
+def privilege_state(conn: psycopg.Connection[TupleRow]) -> dict[str, set[str]]:
+    state: dict[str, set[str]] = {k: set() for k in _STATE_KINDS}
+    for kind, item in conn.execute(_PRIVILEGES_SQL).fetchall():
+        state[str(kind)].add(str(item))
+    return state
+
+
+_STATE_KINDS = ("role", "member", "acl", "defacl", "defacl_key", "lo", "public")
+
+
+def privilege_violations(
+    before: dict[str, set[str]], after: dict[str, set[str]], role: str, bootstrap: bool
+) -> list[str]:
+    """Refused changes: roles, memberships and the database, public/app schema and
+    ledger ACLs (except in 0001); any new PUBLIC grant; a default ACL not defined by
+    `role` or removed; a large object not owned by `role`."""
+    problems = [
+        f"{kind} changed: {item}"
+        for kind in ("role", "member", "acl")
+        if not bootstrap
+        for item in sorted(before[kind] ^ after[kind])
+    ]
+    problems += [
+        f"grant to PUBLIC: {g}" for g in sorted(after["public"] - before["public"])
+    ]
+    problems += [
+        f"default ACL defined by {r}" for r in sorted(after["defacl"] - {role})
+    ]
+    removed = before["defacl_key"] - after["defacl_key"]
+    problems += [f"default ACL removed: {k}" for k in sorted(removed)]
+    problems += [f"large object owned by {r}" for r in sorted(after["lo"] - {role})]
+    return problems
+
+
 def _apply(
     conn: psycopg.Connection[TupleRow], migration: Migration, run_as: str | None
 ) -> None:
@@ -260,6 +374,7 @@ def _apply(
         with conn.transaction():
             xact = _scalar(conn, "SELECT pg_current_xact_id()::text")
             session = _scalar(conn, "SELECT session_user::text")
+            before = privilege_state(conn)
             if role is not None:
                 conn.execute(sql.SQL("SET LOCAL ROLE {}").format(sql.Identifier(role)))
             conn.execute(migration.body)
@@ -273,6 +388,12 @@ def _apply(
             conn.execute("RESET ROLE; RESET ALL")  # RESET ALL skips the role
             owned = foreign_owned_objects(conn, run_as) if run_as else []
             problems = [f"ownership: {p}" for p in owned]
+            problems += privilege_violations(
+                before,
+                privilege_state(conn),
+                run_as or MIGRATE_ROLE,
+                migration.version == BOOTSTRAP_VERSION,
+            )
             problems += [
                 f"column type policy: {p}" for p in column_type_violations(conn)
             ]

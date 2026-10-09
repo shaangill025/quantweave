@@ -1,7 +1,7 @@
 {
   "schema": "quantweave.check_registry/1",
   "reviewed_at": "2026-10-09",
-  "task": "T001; T009 increments 1 and 2a",
+  "task": "T001; T009 (increments 1, 2a, 2b, 3 and close-out)",
   "note": "configured=true only for commands executed in the observed environment. Unbound checks stay configured=false until the code they test exists and the command has run. Python checks run through the locked uv environment (uv 0.11.32, CPython 3.13.16); dev tool pins are in pyproject.toml and uv.lock.",
   "checks": [
     {
@@ -91,7 +91,7 @@
       "configured": true,
       "observed": {
         "date": "2026-10-09",
-        "result": "exit 0, 17 files already formatted (ruff 0.16.10)"
+        "result": "exit 0, 32 files already formatted (ruff 0.16.10)"
       }
     },
     {
@@ -101,7 +101,7 @@
       "configured": true,
       "observed": {
         "date": "2026-10-09",
-        "result": "exit 0, no issues in 9 source files (mypy 2.4.0)"
+        "result": "exit 0, no issues in 21 source files (mypy 2.4.0)"
       }
     },
     {
@@ -111,7 +111,7 @@
       "configured": true,
       "observed": {
         "date": "2026-10-09",
-        "result": "exit 0, 134 passed, 0 skipped (pytest 9.1.1, hypothesis 6.168.5 derandomized)"
+        "result": "exit 0, 307 passed, 0 skipped, including 86 db tests against a throwaway PostgreSQL 16.15 cluster (pytest 9.1.1, hypothesis 6.168.5 derandomized)"
       }
     },
     {
@@ -121,29 +121,60 @@
       "configured": true,
       "observed": {
         "date": "2026-10-09",
-        "result": "exit 0, PASS: 0 problem(s) in 3 file(s)"
+        "result": "exit 0, PASS: 0 problem(s) in 9 file(s)"
       }
     },
     {
       "id": "CHK-TS-TYPE",
-      "purpose": "TypeScript typecheck for apps/web",
-      "command": null,
-      "configured": false,
-      "reason": "No web app yet; node 22.22.0, pnpm 10.28.0, tsc 6.0.2 present on host"
+      "purpose": "TypeScript typecheck for apps/web (strict tsc --noEmit)",
+      "command": "pnpm install --frozen-lockfile --ignore-scripts && pnpm typecheck",
+      "configured": true,
+      "observed": {
+        "date": "2026-10-09",
+        "result": "exit 0; 184 packages installed from pnpm-lock.yaml, tsc (typescript 6.0.3) no errors; node 22.22.0, pnpm 10.28.0"
+      }
     },
     {
       "id": "CHK-TS-TEST",
-      "purpose": "Web unit/component tests and lint",
-      "command": null,
-      "configured": false,
-      "reason": "No web app yet; test runner selected in T009"
+      "purpose": "Web lint (eslint --max-warnings=0) and unit/component tests (vitest)",
+      "command": "pnpm lint && pnpm test",
+      "configured": true,
+      "observed": {
+        "date": "2026-10-09",
+        "result": "exit 0; eslint 10.12.0 clean; vitest 5.0.3: 2 files, 124 tests passed"
+      }
     },
     {
       "id": "CHK-DB-INTEGRATION",
-      "purpose": "Integration tests against PostgreSQL with production-like roles",
-      "command": null,
-      "configured": false,
-      "reason": "PostgreSQL 16.15 binaries present (/usr/lib/postgresql/16/bin) but no cluster running and no schema yet"
+      "purpose": "Integration tests against PostgreSQL 16 (migration runner, 0001 roles and privileges, schema guard, privilege snapshots); tests connect as a superuser, non-owner login-role tests arrive with tenant tables (T010/T017)",
+      "command": "QW_REQUIRE_DB=1 uv run pytest -m db",
+      "configured": true,
+      "observed": {
+        "date": "2026-10-09",
+        "result": "exit 0, 86 passed, 221 deselected, 0 skipped (throwaway PostgreSQL 16.15 cluster from /usr/lib/postgresql/16/bin, unix socket only)"
+      },
+      "local_command": "uv run pytest -m db",
+      "note": "CI sets QW_TEST_DATABASE_URL to its postgres:16 service and QW_REQUIRE_DB=1, so an unavailable server fails instead of skipping. The local command skips with a reason when no server is available."
+    },
+    {
+      "id": "CHK-TS-BUILD",
+      "purpose": "Production build of apps/web (vite)",
+      "command": "pnpm build",
+      "configured": true,
+      "observed": {
+        "date": "2026-10-09",
+        "result": "exit 0; vite 8.3.4 built dist/index.html and one JS bundle (220.30 kB, 68.94 kB gzip); dist/ is gitignored"
+      }
+    },
+    {
+      "id": "CHK-WEB-LICENSES",
+      "purpose": "Web dependency licence gate from pnpm-lock.yaml (ADR-013 policy) with negative controls",
+      "command": "node tools/check_web_licenses.mjs --self-test && node tools/check_web_licenses.mjs",
+      "configured": true,
+      "observed": {
+        "date": "2026-10-09",
+        "result": "exit 0; self-test 25/25 cases as expected; 207 package versions (184 installed, 23 off-platform with registry-recorded licences), PASS: no denied, unknown or unreviewed licences"
+      }
     },
     {
       "id": "CHK-CONTAINER",
@@ -176,7 +207,7 @@
   ],
   "review": {
     "reviewer": "independent subagent running a different model from the author",
-    "outcome": "T008 review: CHANGES REQUESTED then APPROVE after fixes. See docs/receipts/T008.md; T009 increment 1 review recorded in docs/receipts/T009.md; increment 2a pending cross-model review"
+    "outcome": "T008 review: CHANGES REQUESTED then APPROVE after fixes (docs/receipts/T008.md). T009 reviews: docs/receipts/T009.md, T009-2b.md, T009-3.md; close-out pending cross-model review"
   },
   "bound_from": "docs/spec/handoff/check_registry.template.json"
 }
