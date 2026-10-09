@@ -384,6 +384,11 @@ def test_client_address_trusts_only_configured_proxies() -> None:
     assert client_address(req("203.0.113.9", "198.51.100.1"), plain) == "203.0.113.9"
     spoofed = req("10.0.0.1", "198.51.100.66, 192.0.2.7, 10.0.0.1")
     assert client_address(spoofed, proxied) == "192.0.2.7"  # rightmost untrusted hop
+    cidr = Settings(frozenset({ORIGIN}), KEY, trusted_proxies=frozenset({"10.0.0.0/8"}))
+    chain = req("10.1.2.3", "2001:DB8::0001, 10.9.9.9")
+    assert client_address(chain, cidr) == "2001:db8::1"  # canonicalised
+    with pytest.raises(ValueError):
+        Settings(frozenset({ORIGIN}), KEY, trusted_proxies=frozenset({"10.0.0.1/33"}))
 
 
 @pytest.mark.db
@@ -540,3 +545,55 @@ def test_bootstrap_runs_once_and_its_owner_can_log_in(
         response = login(client, "root")
         assert (response.status_code, response.json()["role"]) == (201, "tenant_owner")
         assert login(client, "root2").status_code == 401
+
+
+@pytest.mark.db
+def test_idempotency_keys_do_not_cross_sessions(world: World) -> None:
+    key = "SYNTHETIC-key-0002"
+    login(world.client, "alice")
+    body = {"password": PASSWORD}
+    url = "/api/v1/session/step-up"
+    assert world.client.post(url, json=body, headers=csrf(world.client, key)).is_success
+    attempts = "SELECT sum(attempts) FROM app.auth_throttle"
+    before = world.db.execute(attempts).fetchone()
+    malformed = world.client.post(url, json=body, headers=csrf(world.client, "bad"))
+    assert_problem(malformed, 400, "invalid_idempotency_key")
+    assert world.db.execute(attempts).fetchone() == before  # checked before counting
+    login(world.client, "alice")  # a new session reuses the step-up key
+    reused = world.client.post(url, json=body, headers=csrf(world.client, key))
+    assert_problem(reused, 409, "idempotency_key_reused")
+    assert world.client.get("/api/v1/session").json()["step_up_at"] is None
+    first = world.client.delete("/api/v1/session", headers=csrf(world.client, key))
+    assert first.status_code == 204
+    login(world.client, "alice")  # a new session reuses the logout key
+    reused = world.client.delete("/api/v1/session", headers=csrf(world.client, key))
+    assert_problem(reused, 409, "idempotency_key_reused")
+    assert world.client.get("/api/v1/session").status_code == 200  # still live
+
+
+@pytest.mark.db
+def test_throttle_rows_stay_bounded_and_only_functions_change_them(
+    world: World, conn: Conn, app_conn: Conn
+) -> None:
+    policy = tenancy.ThrottlePolicy(
+        3, timedelta(minutes=15), timedelta(minutes=1), timedelta(hours=1)
+    )
+
+    def rows() -> int:
+        found = conn.execute("SELECT count(*) FROM app.auth_throttle").fetchone()
+        return int(found[0]) if found else -1
+
+    with client_for(world.url, address_throttle=policy) as client:
+        statuses = [login(client, f"spray{n}", "x").status_code for n in range(300)]
+        assert statuses[:3] == [401] * 3 and set(statuses[3:]) == {429}
+        assert rows() == 1 + 3  # one address row, accounts only before the lock
+    old = "UPDATE app.auth_throttle SET window_start = now() - interval '2 days'"
+    conn.execute(old)  # every row is old, but the address row is still locked
+    assert tenancy.throttle_purge(app_conn) == 3 and rows() == 1
+    for statement in (
+        "UPDATE app.auth_throttle SET attempts = 0",
+        "INSERT INTO app.auth_throttle (key_hash) VALUES ('\\x00')",
+        "DELETE FROM app.auth_throttle",
+    ):
+        with pytest.raises(Exception, match="permission denied"):
+            app_conn.execute(statement)

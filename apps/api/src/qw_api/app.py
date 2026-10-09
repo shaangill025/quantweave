@@ -5,6 +5,7 @@ hold method, route template, status and correlation id only (T010).
 
 from __future__ import annotations
 
+import ipaddress
 import logging
 import re
 import secrets
@@ -44,8 +45,10 @@ _ADDRESS = ThrottlePolicy(
 class Settings:
     """`allowed_origins`: exact https origins (http only for localhost).
     `secret_key` (>= 32 random bytes, operator-held) keys request and throttle
-    HMACs. `trusted_proxies`: peer addresses whose X-Forwarded-For is believed; set
-    per deployment (empty means the socket peer is the client)."""
+    HMACs. `trusted_proxies`: IP addresses or CIDR networks whose X-Forwarded-For
+    is believed. It MUST be set per deployment behind a reverse proxy; when empty,
+    the socket peer is the client, so every user behind a proxy shares one address
+    throttle bucket (a startup warning says so)."""
 
     allowed_origins: frozenset[str]
     secret_key: bytes
@@ -58,6 +61,8 @@ class Settings:
     trusted_proxies: frozenset[str] = frozenset()
 
     def __post_init__(self) -> None:
+        for proxy in self.trusted_proxies:
+            ipaddress.ip_network(proxy)  # ValueError for a malformed entry
         if not self.allowed_origins or not all(
             _ORIGIN.fullmatch(o) for o in self.allowed_origins
         ):
@@ -238,6 +243,9 @@ def create_app(
         title="Portfolio Intelligence API", version="0.1.0", docs_url=None,
         redoc_url=None, openapi_url=None,
     )  # fmt: skip
+    if not settings.trusted_proxies:
+        log.warning("trusted_proxies is empty: behind a reverse proxy every client "
+                    "shares the proxy's address throttle bucket")  # fmt: skip
     app.state.settings = settings
     app.state.connections = connections
     app.state.authenticator = authenticator

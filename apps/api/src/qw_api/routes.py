@@ -110,9 +110,9 @@ def login(
     address = sec.mac(settings, "login-address", sec.client_address(request, settings))
     wait, newly = sec.throttle(
         conn, settings,
-        [(account, settings.account_throttle), (address, settings.address_throttle)],
+        [(address, settings.address_throttle), (account, settings.account_throttle)],
     )  # fmt: skip
-    if newly[0] and (found := tenancy.find_credential(conn, body.login)):
+    if newly[1] and (found := tenancy.find_credential(conn, body.login)):
         with tenancy.tenant_transaction(conn, found[0]) as tx:
             _audit(tx, request, "auth.locked_out", None, found[1])
     if any(newly):
@@ -171,7 +171,8 @@ def logout(
         _audit(tx, request, "session.revoked", session.user_id, session.session_id)
         return 204, b""
 
-    response = sec.idempotent(principal, request, key, {}, run)
+    bound = {"session": str(session.session_id)}  # reuse from another session: 409
+    response = sec.idempotent(principal, request, key, bound, run)
     sec.set_session_cookie(response, "", timedelta(0))
     return response
 
@@ -183,8 +184,10 @@ def step_up(
     principal: Annotated[Principal, Depends(sec.current_principal)],
     key: IdemKey,
 ) -> Response:
-    """The request HMAC excludes the password: a same-key retry replays the
-    recorded step_up_at without verifying again and without changing state."""
+    """The request HMAC binds the session but excludes the password: a same-key
+    retry on the same session replays the recorded step_up_at without verifying
+    again and without changing state; another session's reuse is 409."""
+    sec.check_idempotency_key(key)  # before anything is counted
     settings: Settings = request.app.state.settings
     authenticator: Authenticator = request.app.state.authenticator
     session = principal.session
@@ -194,9 +197,9 @@ def step_up(
     )
     wait, newly = sec.throttle(
         principal.conn, settings,
-        [(account, settings.account_throttle), (address, settings.address_throttle)],
+        [(address, settings.address_throttle), (account, settings.account_throttle)],
     )  # fmt: skip
-    if newly[0]:
+    if newly[1]:
         with principal.tx() as tx:
             _audit(tx, request, "auth.locked_out", session.user_id, session.user_id)
     if wait is not None:
@@ -211,7 +214,8 @@ def step_up(
         _audit(tx, request, "session.step_up", session.user_id, session.session_id)
         return 200, StepUpView(step_up_at=at.astimezone(UTC)).model_dump_json().encode()
 
-    response = sec.idempotent(principal, request, key, {}, run)
+    bound = {"session": str(session.session_id)}
+    response = sec.idempotent(principal, request, key, bound, run)
     if response.status_code == 200 and "idempotent-replayed" not in response.headers:
         tenancy.throttle_clear(principal.conn, account)
     return response
@@ -230,7 +234,8 @@ def _cursor_mac(settings: Settings, p: Principal, route: str, body: bytes) -> by
 def _read_cursor(settings: Settings, p: Principal, route: str, raw: str) -> uuid.UUID:
     invalid = ApiError(400, "invalid_cursor", "The cursor is not valid here.")
     try:
-        data = base64.urlsafe_b64decode(raw + "=" * (-len(raw) % 4))
+        padded = raw + "=" * (-len(raw) % 4)
+        data = base64.b64decode(padded, altchars=b"-_", validate=True)
     except ValueError:
         raise invalid from None
     body, tag = data[:24], data[24:]

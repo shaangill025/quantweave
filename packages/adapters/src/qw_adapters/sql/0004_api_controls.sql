@@ -25,7 +25,9 @@ CREATE POLICY tenant_isolation ON app.idempotency_record
 
 -- Installation-scoped throttle (attempts arrive before a tenant is known). Rows hold
 -- only an HMAC of (purpose, route, login or address) and counters, no tenant data,
--- so the policy admits every row to the runtime role.
+-- so the policy admits every row. qw_app may only read it and call the three
+-- SECURITY DEFINER functions below (fixed SQL, owned by qw_migrate): counters move
+-- only through throttle_hit, a success reset (throttle_clear) or throttle_purge.
 CREATE TABLE app.auth_throttle (
     key_hash bytea PRIMARY KEY CHECK (octet_length(key_hash) = 32),
     attempts integer NOT NULL DEFAULT 0 CHECK (attempts >= 0),
@@ -45,7 +47,7 @@ CREATE FUNCTION app.throttle_hit(
     p_key bytea, p_max integer, p_window interval, p_base interval, p_cap interval,
     OUT locked_until timestamptz, OUT newly_locked boolean
 )
-LANGUAGE plpgsql SET search_path = pg_catalog
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog
 AS $$
 DECLARE
     r app.auth_throttle;
@@ -78,6 +80,27 @@ BEGIN
         window_start = r.window_start, lockouts = r.lockouts,
         locked_until = r.locked_until
         WHERE t.key_hash = p_key;
+END
+$$;
+
+CREATE FUNCTION app.throttle_clear(p_key bytea) RETURNS void
+LANGUAGE sql SECURITY DEFINER SET search_path = pg_catalog
+AS $$ UPDATE app.auth_throttle SET attempts = 0, lockouts = 0, locked_until = NULL
+      WHERE key_hash = p_key $$;
+
+-- Bounded growth: a row quiet for a day (windows, caps and forgiveness are all at
+-- most a day, so it carries no state) is deleted. Returns the number removed.
+CREATE FUNCTION app.throttle_purge() RETURNS integer
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog
+AS $$
+DECLARE
+    n integer;
+BEGIN
+    DELETE FROM app.auth_throttle
+        WHERE window_start < now() - interval '1 day'
+        AND (locked_until IS NULL OR locked_until < now() - interval '1 day');
+    GET DIAGNOSTICS n = ROW_COUNT;
+    RETURN n;
 END
 $$;
 
@@ -123,9 +146,8 @@ $$;
 
 GRANT SELECT, INSERT (tenant_id, user_id, method, route, idem_key, request_hash,
     status_code, response_body) ON app.idempotency_record TO qw_app;
-GRANT SELECT, INSERT (key_hash), UPDATE (attempts, window_start, lockouts,
-    locked_until) ON app.auth_throttle TO qw_app;
+GRANT SELECT ON app.auth_throttle TO qw_app;
 GRANT EXECUTE ON FUNCTION app.throttle_hit(bytea, integer, interval, interval,
-    interval) TO qw_app;
+    interval), app.throttle_clear(bytea), app.throttle_purge() TO qw_app;
 GRANT SELECT (last_used_at), UPDATE (last_used_at) ON app.session TO qw_app;
 GRANT SELECT, INSERT (tenant_id) ON app.installation_bootstrap TO qw_app;

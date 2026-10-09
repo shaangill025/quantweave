@@ -389,11 +389,13 @@ def throttle_hit(
 
 
 def throttle_clear(conn: Conn, key_hash: bytes) -> None:
-    conn.execute(
-        "UPDATE app.auth_throttle SET attempts = 0, lockouts = 0, locked_until = NULL "
-        "WHERE key_hash = %s",
-        (key_hash,),
-    )
+    conn.execute("SELECT app.throttle_clear(%s)", (key_hash,))
+
+
+def throttle_purge(conn: Conn) -> int:
+    """Delete throttle rows quiet for a day; returns how many."""
+    row = conn.execute("SELECT app.throttle_purge()").fetchone()
+    return 0 if row is None else int(row[0])
 
 
 def bootstrap_installation(

@@ -14,10 +14,12 @@ mutating commands run through `idempotent` (C-03).
 
 import hashlib
 import hmac
+import ipaddress
 import json
 import logging
 import math
 import re
+import time
 import uuid
 from collections.abc import Callable, Iterator
 from contextlib import AbstractContextManager
@@ -38,6 +40,7 @@ CSRF_HEADER = "X-CSRF-Token"
 RANK = {MembershipRole.TENANT_MEMBER: 1, MembershipRole.TENANT_OWNER: 2}
 _IDEM_KEY = re.compile(r"[A-Za-z0-9_-]{16,128}")
 log = logging.getLogger("qw_api")
+_last_purge = [0]
 
 
 @dataclass(frozen=True, slots=True)
@@ -95,15 +98,31 @@ def settings_of(request: Request) -> Settings:
     return settings
 
 
+def _canonical_ip(text: str) -> str:
+    try:
+        return str(ipaddress.ip_address(text.strip()))
+    except ValueError:
+        return text.strip()
+
+
 def client_address(request: Request, settings: Settings) -> str:
-    """The socket peer, or, when the peer is a configured trusted proxy, the
-    rightmost X-Forwarded-For hop that is not itself a trusted proxy."""
-    peer = request.client.host if request.client else ""
-    if peer not in settings.trusted_proxies:
+    """The socket peer, or, when the peer is in a configured trusted-proxy network,
+    the rightmost X-Forwarded-For hop that is not itself in one (addresses are
+    canonicalised with `ipaddress`; CIDR networks are allowed)."""
+    nets = [ipaddress.ip_network(p) for p in settings.trusted_proxies]
+
+    def trusted(addr: str) -> bool:
+        try:
+            return any(ipaddress.ip_address(addr) in net for net in nets)
+        except ValueError:
+            return False
+
+    peer = _canonical_ip(request.client.host if request.client else "")
+    if not trusted(peer):
         return peer
-    hops = [h.strip() for v in request.headers.getlist("x-forwarded-for")
+    hops = [_canonical_ip(h) for v in request.headers.getlist("x-forwarded-for")
             for h in v.split(",")]  # fmt: skip
-    return next((h for h in reversed(hops) if h not in settings.trusted_proxies), peer)
+    return next((h for h in reversed(hops) if not trusted(h)), peer)
 
 
 def mac(settings: Settings, *parts: str) -> bytes:
@@ -114,10 +133,21 @@ def mac(settings: Settings, *parts: str) -> bytes:
 def throttle(
     conn: Conn, settings: Settings, hits: list[tuple[bytes, tenancy.ThrottlePolicy]]
 ) -> tuple[int | None, list[bool]]:
-    """Count one attempt on every key (outside any request transaction, so a
-    failed attempt is never rolled back). Returns the seconds until the latest lock
-    ends (None when not locked) and, per key, whether this call locked it."""
-    results = [tenancy.throttle_hit(conn, key, policy) for key, policy in hits]
+    """Count one attempt per key in order (outside any request transaction, so a
+    failed attempt is never rolled back), stopping at the first locked key: callers
+    pass the address key first, so a locked address creates no account rows.
+    Returns the seconds until the latest lock ends (None when not locked) and, per
+    key, whether this call locked it. Quiet rows are purged at most once a minute
+    per process."""
+    if time.monotonic_ns() - _last_purge[0] > 60 * 10**9:
+        _last_purge[0] = time.monotonic_ns()
+        tenancy.throttle_purge(conn)
+    results: list[tuple[datetime | None, bool]] = []
+    for key, policy in hits:
+        results.append(tenancy.throttle_hit(conn, key, policy))
+        if results[-1][0] is not None:
+            break
+    results += [(None, False)] * (len(hits) - len(results))
     ends = [until for until, _ in results if until is not None]
     if not ends:
         return None, [new for _, new in results]
@@ -125,6 +155,11 @@ def throttle(
     assert now is not None
     wait = max(1, math.ceil((max(ends) - now[0]).total_seconds()))
     return wait, [new for _, new in results]
+
+
+def check_idempotency_key(key: str) -> None:
+    if not _IDEM_KEY.fullmatch(key):
+        raise ApiError(400, "invalid_idempotency_key", "Use 16-128 of [A-Za-z0-9_-].")
 
 
 def too_many(wait: int) -> ApiError:
@@ -137,9 +172,9 @@ def idempotent(
 ) -> Response:  # fmt: skip
     """C-03: replay the stored 2xx response for the same (tenant, principal, method,
     route, key) and payload HMAC; 409 for another payload. `run` executes in the
-    same transaction as the record, so an error stores nothing."""
-    if not _IDEM_KEY.fullmatch(key):
-        raise ApiError(400, "invalid_idempotency_key", "Use 16-128 of [A-Za-z0-9_-].")
+    same transaction as the record, so an error stores nothing. Session-scoped
+    commands put the session id in `payload`, so reuse from another session is 409."""
+    check_idempotency_key(key)
     settings, route = settings_of(request), request.url.path
     scope = tenancy.IdempotencyScope(
         principal.session.user_id, request.method, route, key
