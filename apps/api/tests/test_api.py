@@ -168,7 +168,7 @@ def test_health_caps_and_malformed_input_use_the_envelope() -> None:
 def test_no_implemented_operation_accepts_a_tenant_id() -> None:
     spec = create_app(Settings(frozenset({ORIGIN}), KEY), lambda: None, AUTH).openapi()  # type: ignore[arg-type, return-value]
     operations = [op for item in spec["paths"].values() for op in item.values()]
-    assert len(operations) == 8  # HEAD /health/live included
+    assert len(operations) == 11  # HEAD /health/live and T019 policies included
     params = [p["name"] for op in operations for p in op.get("parameters", [])]
     keys = re.findall(r'"([^"]+)": ', json.dumps(spec))  # every object key, refs too
     assert {"login", "password", "role", "user_id", "If-Match"} <= {*keys, *params}
