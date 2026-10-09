@@ -5,7 +5,10 @@ through `(calendar_id, version, session_date)` on every `Session`, never inferre
 a UTC instant alone. A session is the half-open interval `[open_at, close_at)`: the
 market is open at the opening instant and closed at the closing instant. Halts are
 half-open intraday intervals, market-wide (`instrument_id is None`) or per instrument;
-an open-ended halt has `end is None`. Dates outside every version raise
+an open-ended halt has `end is None`. A session time that falls in a DST gap (does
+not exist) or fold (occurs twice) on some date raises `CalendarError` from
+`session_for` for that date: the zone is a calendar property, so the check cannot run
+inside `CalendarVersion`. Dates outside every version raise
 `CalendarCoverageError`; a calendar never guesses beyond its data. Auctions and
 pre/post-market sessions are not modelled yet.
 """
@@ -20,7 +23,7 @@ from zoneinfo import ZoneInfo
 
 from qw_domain.decimals import safe_repr
 from qw_domain.identity import InstrumentId
-from qw_domain.instants import ensure_aware_utc
+from qw_domain.instants import ensure_aware_utc, require_date
 
 
 class CalendarError(ValueError):
@@ -80,15 +83,27 @@ class CalendarVersion:
     adhoc_closures: frozenset[date] = frozenset()
 
     def __post_init__(self) -> None:
+        require_date(self.effective_from, "effective_from")
+        require_date(self.effective_to, "effective_to")
         if not self.version or self.effective_to <= self.effective_from:
             raise CalendarError(f"version {safe_repr(self.version)} has empty range")
         if not self.open < self.close:
             raise CalendarError(f"{self.version}: open must precede close")
         dates = {*self.holidays, *self.early_closes, *self.adhoc_closures}
+        for special in dates:
+            require_date(special, "special date")
         if any(not self.covers(d) for d in dates):
             raise CalendarError(f"{self.version}: special date outside its range")
         if any(not self.open < t < self.close for t in self.early_closes.values()):
             raise CalendarError(f"{self.version}: early close outside regular hours")
+        if any(type(d) is not int or not 0 <= d <= 6 for d in self.weekend):
+            raise CalendarError(f"{self.version}: weekend days must be ints 0..6")
+        if self.holidays & self.early_closes.keys():
+            raise CalendarError(f"{self.version}: a holiday cannot have an early close")
+        if any(
+            d.weekday() in self.weekend for d in (*self.holidays, *self.early_closes)
+        ):
+            raise CalendarError(f"{self.version}: special date on a weekend day")
 
     def covers(self, day: date) -> bool:
         return self.effective_from <= day < self.effective_to
@@ -135,6 +150,8 @@ class ExchangeCalendar:
             b.effective_from < a.effective_to for a, b in pairs
         ):
             raise CalendarError("a calendar needs non-overlapping versions")
+        if len({v.version for v in self.versions}) != len(self.versions):
+            raise CalendarError("version names must be unique within a calendar")
 
     def version_for(self, day: date) -> CalendarVersion:
         for version in self.versions:
@@ -149,7 +166,11 @@ class ExchangeCalendar:
         close = v.early_closes.get(day)
 
         def at(t: time) -> datetime:
-            return datetime.combine(day, t, tzinfo=self.tz).astimezone(UTC)
+            local = datetime.combine(day, t, tzinfo=self.tz)
+            # PEP 495: in a gap or fold the two folds give different offsets.
+            if local.utcoffset() != local.replace(fold=1).utcoffset():
+                raise CalendarError(f"{day} {t}: session time in a DST gap or fold")
+            return local.astimezone(UTC)
 
         return Session(
             self.calendar_id,
@@ -201,6 +222,8 @@ class ExchangeCalendar:
     def add_trading_days(self, day: date, n: int) -> date:
         """The n-th trading day after (n > 0) or before (n < 0) `day`; for n == 0,
         `day` itself, which must be a trading day."""
+        if type(n) is not int:
+            raise TypeError(f"n must be an int, not {type(n).__name__}")
         if n == 0:
             if not self.is_trading_day(day):
                 raise CalendarError(f"{day} is not a trading day")
@@ -212,13 +235,21 @@ class ExchangeCalendar:
         return day
 
     def trading_days_between(self, start: date, end: date) -> int:
-        """Number of trading days in [start, end)."""
+        """Number of trading days in [start, end); end before start is an error."""
+        if end < start:
+            raise CalendarError(f"end {end} is before start {start}")
         days = (start + timedelta(i) for i in range((end - start).days))
         return sum(self.is_trading_day(d) for d in days)
 
 
 def _reject_number(text: str) -> object:
     raise CalendarError(f"calendar data must not contain JSON numbers: {text}")
+
+
+def _weekend(names: list[str]) -> frozenset[int]:
+    if len(set(names)) != len(names):
+        raise CalendarError(f"duplicate weekend entries: {safe_repr(names)}")
+    return frozenset(_WEEKDAYS.index(d) for d in names)
 
 
 def load_calendar(text: str) -> ExchangeCalendar:
@@ -232,7 +263,7 @@ def load_calendar(text: str) -> ExchangeCalendar:
                 effective_to=date.fromisoformat(v["effective_to"]),
                 open=time.fromisoformat(v["open"]),
                 close=time.fromisoformat(v["close"]),
-                weekend=frozenset(_WEEKDAYS.index(d) for d in v["weekend"]),
+                weekend=_weekend(v["weekend"]),
                 holidays=frozenset(map(date.fromisoformat, v["holidays"])),
                 early_closes={
                     date.fromisoformat(d): time.fromisoformat(t)
