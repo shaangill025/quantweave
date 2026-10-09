@@ -1,0 +1,176 @@
+{
+  "version": "1",
+  "canonical_spec": "spec/02_USER_WORKFLOWS.md",
+  "questions": [
+    {
+      "id": "ONB01",
+      "input": "Analysis scope",
+      "choices_or_validation": "Selected accounts; all disclosed investment accounts; hypothetical only",
+      "effect": "Scope and completeness language",
+      "answer_version_required": true,
+      "draft_only_until_policy_adoption": true
+    },
+    {
+      "id": "ONB02",
+      "input": "Residency",
+      "choices_or_validation": "Canada + province; US + state; other/unknown",
+      "effect": "Permitted commercial feature matrix, not trading exchange",
+      "answer_version_required": true,
+      "draft_only_until_policy_adoption": true
+    },
+    {
+      "id": "ONB03",
+      "input": "Reporting currency",
+      "choices_or_validation": "CAD or USD initially",
+      "effect": "Display and benchmark currency",
+      "answer_version_required": true,
+      "draft_only_until_policy_adoption": true
+    },
+    {
+      "id": "ONB04",
+      "input": "Objectives",
+      "choices_or_validation": "Capital preservation, growth, income, active trading, learning; rank priorities",
+      "effect": "Mandates and conflicts",
+      "answer_version_required": true,
+      "draft_only_until_policy_adoption": true
+    },
+    {
+      "id": "ONB05",
+      "input": "Horizon",
+      "choices_or_validation": "<1y, 1\u20133y, 3\u20137y, >7y; exact goal date optional",
+      "effect": "Strategy eligibility",
+      "answer_version_required": true,
+      "draft_only_until_policy_adoption": true
+    },
+    {
+      "id": "ONB06",
+      "input": "Liquidity need",
+      "choices_or_validation": "None known, periodic, known dated need, uncertain; amount/date when relevant",
+      "effect": "Reserved cash and incompatible horizons",
+      "answer_version_required": true,
+      "draft_only_until_policy_adoption": true
+    },
+    {
+      "id": "ONB07",
+      "input": "Loss capacity",
+      "choices_or_validation": "Essential spending affected, goal delayed, financially manageable, uncertain",
+      "effect": "Proposed reviewed risk template, never a sole score",
+      "answer_version_required": true,
+      "draft_only_until_policy_adoption": true
+    },
+    {
+      "id": "ONB08",
+      "input": "Drawdown response",
+      "choices_or_validation": "Reduce, review, hold, add, unsure",
+      "effect": "Behavioural discussion; not permission to increase risk",
+      "answer_version_required": true,
+      "draft_only_until_policy_adoption": true
+    },
+    {
+      "id": "ONB09",
+      "input": "Experience",
+      "choices_or_validation": "Beginner; stocks/ETFs; options; active trader",
+      "effect": "Education and instrument permissions",
+      "answer_version_required": true,
+      "draft_only_until_policy_adoption": true
+    },
+    {
+      "id": "ONB10",
+      "input": "Attention",
+      "choices_or_validation": "Monthly, weekly, daily, regular-session availability",
+      "effect": "Monitoring-compatible strategy selection",
+      "answer_version_required": true,
+      "draft_only_until_policy_adoption": true
+    },
+    {
+      "id": "ONB11",
+      "input": "Instruments",
+      "choices_or_validation": "Stocks; ETFs; explicitly enabled options",
+      "effect": "Hard discovery/recommendation permissions",
+      "answer_version_required": true,
+      "draft_only_until_policy_adoption": true
+    },
+    {
+      "id": "ONB12",
+      "input": "Horizons",
+      "choices_or_validation": "Long-term, swing/position, same-day",
+      "effect": "Separate strategy/latency requirements",
+      "answer_version_required": true,
+      "draft_only_until_policy_adoption": true
+    },
+    {
+      "id": "ONB13",
+      "input": "Capital allocation",
+      "choices_or_validation": "Numeric per account/currency/sleeve",
+      "effect": "No cross-account spendability assumption",
+      "answer_version_required": true,
+      "draft_only_until_policy_adoption": true
+    },
+    {
+      "id": "ONB14",
+      "input": "Numerical limits",
+      "choices_or_validation": "Cash reserve, position/issuer/sector, planned loss, drawdown, approved stress limits",
+      "effect": "Denominator/currency required; missing blocks sizing",
+      "answer_version_required": true,
+      "draft_only_until_policy_adoption": true
+    },
+    {
+      "id": "ONB15",
+      "input": "Research inputs",
+      "choices_or_validation": "Primary/reporting; optional social",
+      "effect": "Source and privacy permission",
+      "answer_version_required": true,
+      "draft_only_until_policy_adoption": true
+    },
+    {
+      "id": "ONB16",
+      "input": "AI mode",
+      "choices_or_validation": "Rules-only; AI-enabled with named proposer/evaluator configs",
+      "effect": "Mandatory AI-mode evaluation",
+      "answer_version_required": true,
+      "draft_only_until_policy_adoption": true
+    },
+    {
+      "id": "ONB17",
+      "input": "Provider privacy",
+      "choices_or_validation": "Allowed providers, purpose/data categories, retention options",
+      "effect": "No unauthorized fallback or sharing",
+      "answer_version_required": true,
+      "draft_only_until_policy_adoption": true
+    },
+    {
+      "id": "ONB18",
+      "input": "Budget",
+      "choices_or_validation": "Incremental spend and improvement sublimit",
+      "effect": "Ceiling, not consumption target",
+      "answer_version_required": true,
+      "draft_only_until_policy_adoption": true
+    },
+    {
+      "id": "ONB19",
+      "input": "Notifications",
+      "choices_or_validation": "Channel/priority/quiet hours/detail exposure",
+      "effect": "No implied read/execute acknowledgement",
+      "answer_version_required": true,
+      "draft_only_until_policy_adoption": true
+    },
+    {
+      "id": "ONB20",
+      "input": "Outside context",
+      "choices_or_validation": "Optional aggregate exposure/liabilities; unknown allowed",
+      "effect": "Qualified scope statements",
+      "answer_version_required": true,
+      "draft_only_until_policy_adoption": true
+    },
+    {
+      "id": "ONB21",
+      "input": "Review/adoption",
+      "choices_or_validation": "Show draft, contradictions, exclusions, numerical limits, change effects",
+      "effect": "Explicit user adoption receipt",
+      "answer_version_required": true,
+      "draft_only_until_policy_adoption": true
+    }
+  ],
+  "not_sure_allowed_except_explicit_adoption": true,
+  "numerical_values_require_denominator_currency_and_scope": true
+}

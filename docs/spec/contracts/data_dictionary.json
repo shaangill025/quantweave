@@ -1,0 +1,717 @@
+{
+  "version": "0.1.0-design",
+  "not_a_migration": true,
+  "decimal_rule": "Use decimal for money/quantities; each column must pin precision/scale in T008/T012; reject overflow. Statistical array floats are separate.",
+  "tenant_enforcement": "All tenant-scoped rows have tenant_id even when omitted for brevity in field summaries; composite foreign keys or equivalent prevent cross-tenant relationships.",
+  "entities": [
+    {
+      "entity": "tenant",
+      "scope": "tenant",
+      "fields": {
+        "id": "uuid pk",
+        "deployment_id": "uuid",
+        "status": "enum",
+        "retention_policy_id": "uuid"
+      },
+      "invariant": "All financial/research entities carry this scope; self-hosted is not permissionless.",
+      "indexes": "id",
+      "retention_class": "security"
+    },
+    {
+      "entity": "principal",
+      "scope": "tenant",
+      "fields": {
+        "id": "uuid pk",
+        "tenant_id": "uuid",
+        "subject": "text",
+        "auth_provider": "text",
+        "mfa_state": "enum"
+      },
+      "invariant": "Roles are assigned outside model contexts.",
+      "indexes": "tenant_id,subject unique",
+      "retention_class": "security"
+    },
+    {
+      "entity": "membership",
+      "scope": "tenant",
+      "fields": {
+        "principal_id": "uuid",
+        "tenant_id": "uuid",
+        "role": "enum",
+        "version": "int"
+      },
+      "invariant": "No self-assigned maintainer via request body.",
+      "indexes": "principal_id,tenant_id unique",
+      "retention_class": "security"
+    },
+    {
+      "entity": "instrument",
+      "scope": "reference",
+      "fields": {
+        "id": "uuid pk",
+        "kind": "enum",
+        "currency": "char3",
+        "issuer_id": "uuid nullable",
+        "status": "enum"
+      },
+      "invariant": "Stable identity; ticker not primary key. Rights apply to reference data.",
+      "indexes": "id; kind,status",
+      "retention_class": "reference"
+    },
+    {
+      "entity": "instrument_alias",
+      "scope": "reference",
+      "fields": {
+        "instrument_id": "uuid",
+        "symbol": "text",
+        "venue": "text",
+        "valid_from": "timestamp",
+        "valid_to": "timestamp nullable"
+      },
+      "invariant": "Effective-date aliases prevent historical ticker collisions.",
+      "indexes": "symbol,venue,valid_from unique",
+      "retention_class": "reference"
+    },
+    {
+      "entity": "option_terms",
+      "scope": "reference",
+      "fields": {
+        "instrument_id": "uuid",
+        "terms_version": "int",
+        "strike": "decimal",
+        "expiry": "date",
+        "right": "enum",
+        "multiplier": "decimal nullable",
+        "deliverables": "json",
+        "source_id": "uuid"
+      },
+      "invariant": "Adjusted deliverables/unknown terms cannot default to 100 shares.",
+      "indexes": "instrument_id,terms_version unique",
+      "retention_class": "reference"
+    },
+    {
+      "entity": "market_calendar",
+      "scope": "reference",
+      "fields": {
+        "id": "uuid",
+        "version": "text",
+        "timezone": "iana",
+        "session_intervals": "json",
+        "source_id": "uuid"
+      },
+      "invariant": "Holidays, short sessions and DST versioned.",
+      "indexes": "id,version unique",
+      "retention_class": "reference"
+    },
+    {
+      "entity": "account",
+      "scope": "tenant",
+      "fields": {
+        "id": "uuid pk",
+        "tenant_id": "uuid",
+        "name": "text",
+        "broker": "text",
+        "account_type": "text",
+        "revision": "bigint"
+      },
+      "invariant": "Underlying account distinct from source and sleeve.",
+      "indexes": "tenant_id,id",
+      "retention_class": "financial"
+    },
+    {
+      "entity": "source_connection",
+      "scope": "tenant",
+      "fields": {
+        "id": "uuid",
+        "tenant_id": "uuid",
+        "provider": "text",
+        "purpose": "enum",
+        "secret_reference": "opaque vault id",
+        "permissions": "json",
+        "revision": "bigint"
+      },
+      "invariant": "No secrets in user export, models or ordinary DB logs.",
+      "indexes": "tenant_id,provider,status",
+      "retention_class": "security"
+    },
+    {
+      "entity": "account_source_binding",
+      "scope": "tenant",
+      "fields": {
+        "account_id": "uuid",
+        "connection_id": "uuid nullable",
+        "source_account_ref": "text",
+        "role": "enum",
+        "valid_from": "timestamp"
+      },
+      "invariant": "Many sources can describe one account; resolve ambiguity explicitly.",
+      "indexes": "account_id,source_account_ref unique",
+      "retention_class": "financial"
+    },
+    {
+      "entity": "sleeve",
+      "scope": "tenant",
+      "fields": {
+        "id": "uuid",
+        "account_id": "uuid",
+        "purpose": "enum",
+        "allocation_policy_id": "uuid",
+        "revision": "bigint"
+      },
+      "invariant": "Logical capital policy not an additional real holding.",
+      "indexes": "account_id,id",
+      "retention_class": "financial"
+    },
+    {
+      "entity": "import_batch",
+      "scope": "tenant",
+      "fields": {
+        "id": "uuid",
+        "tenant_id": "uuid",
+        "hash": "sha256",
+        "mapping_version": "text",
+        "status": "enum",
+        "preview": "json",
+        "created_at": "timestamp"
+      },
+      "invariant": "Preview and commit separate; repeated same file cannot duplicate activity.",
+      "indexes": "tenant_id,hash,mapping_version",
+      "retention_class": "financial"
+    },
+    {
+      "entity": "source_record",
+      "scope": "tenant",
+      "fields": {
+        "id": "uuid",
+        "source_id": "uuid",
+        "source_record_key": "text",
+        "effective_at": "timestamp",
+        "received_at": "timestamp",
+        "normalized_payload": "json",
+        "hash": "sha256"
+      },
+      "invariant": "Preserve original provenance; store raw only within rights/retention.",
+      "indexes": "source_id,source_record_key,hash unique",
+      "retention_class": "financial"
+    },
+    {
+      "entity": "ledger_event",
+      "scope": "tenant",
+      "fields": {
+        "id": "uuid",
+        "account_id": "uuid",
+        "event_kind": "enum",
+        "effective_at": "timestamp",
+        "recorded_at": "timestamp",
+        "idempotency_key": "text",
+        "reverses_id": "uuid nullable"
+      },
+      "invariant": "Accepted journal append/reversal; deletion is an explicit privacy workflow.",
+      "indexes": "account_id,idempotency_key unique; account_id,effective_at",
+      "retention_class": "financial"
+    },
+    {
+      "entity": "posting",
+      "scope": "tenant",
+      "fields": {
+        "event_id": "uuid",
+        "sequence": "int",
+        "book_account": "text",
+        "commodity": "text",
+        "amount": "decimal"
+      },
+      "invariant": "Sum zero per event and commodity, not across currencies/shares.",
+      "indexes": "event_id,sequence unique",
+      "retention_class": "financial"
+    },
+    {
+      "entity": "lot",
+      "scope": "tenant",
+      "fields": {
+        "id": "uuid",
+        "account_id": "uuid",
+        "instrument_id": "uuid",
+        "acquired_at": "timestamp",
+        "quantity": "decimal",
+        "economic_cost": "decimal nullable",
+        "currency": "char3",
+        "method_version": "text"
+      },
+      "invariant": "Economic lot math is not certified tax basis.",
+      "indexes": "account_id,instrument_id,acquired_at",
+      "retention_class": "financial"
+    },
+    {
+      "entity": "reconciliation_issue",
+      "scope": "tenant",
+      "fields": {
+        "id": "uuid",
+        "account_id": "uuid",
+        "field": "text",
+        "source_ids": "uuid[]",
+        "severity": "enum",
+        "status": "enum",
+        "resolution": "json"
+      },
+      "invariant": "Material open issues block affected sizing.",
+      "indexes": "account_id,status",
+      "retention_class": "financial"
+    },
+    {
+      "entity": "account_snapshot",
+      "scope": "tenant",
+      "fields": {
+        "id": "uuid",
+        "account_id": "uuid",
+        "revision": "bigint",
+        "effective_at": "timestamp",
+        "received_at": "timestamp",
+        "cash_basis": "enum",
+        "projection_hash": "sha256"
+      },
+      "invariant": "Projection rebuildable with input revisions and policy.",
+      "indexes": "account_id,revision unique",
+      "retention_class": "financial"
+    },
+    {
+      "entity": "policy_version",
+      "scope": "tenant",
+      "fields": {
+        "id": "uuid",
+        "tenant_id": "uuid",
+        "version": "int",
+        "content": "json",
+        "hash": "sha256",
+        "state": "enum"
+      },
+      "invariant": "Draft policy confers no live sizing authority.",
+      "indexes": "tenant_id,id,version",
+      "retention_class": "policy"
+    },
+    {
+      "entity": "adoption_receipt",
+      "scope": "tenant",
+      "fields": {
+        "id": "uuid",
+        "principal_id": "uuid",
+        "object_version_id": "uuid",
+        "hash": "sha256",
+        "accepted_at": "timestamp",
+        "reauth_reference": "uuid"
+      },
+      "invariant": "Human identity and exact version required for material adoption.",
+      "indexes": "object_version_id,principal_id",
+      "retention_class": "audit"
+    },
+    {
+      "entity": "risk_pause",
+      "scope": "tenant",
+      "fields": {
+        "id": "uuid",
+        "scope_kind": "enum",
+        "scope_id": "uuid",
+        "trigger_metric": "text",
+        "period": "json",
+        "state": "enum",
+        "resumption_receipt_id": "uuid nullable"
+      },
+      "invariant": "Cash-flow changes and midnight do not silently clear breach.",
+      "indexes": "scope_id,state",
+      "retention_class": "policy"
+    },
+    {
+      "entity": "watchlist",
+      "scope": "tenant",
+      "fields": {
+        "id": "uuid",
+        "tenant_id": "uuid",
+        "name": "text",
+        "revision": "bigint"
+      },
+      "invariant": "Deleting watchlist has no ledger side effect.",
+      "indexes": "tenant_id,id",
+      "retention_class": "research"
+    },
+    {
+      "entity": "watchlist_entry",
+      "scope": "tenant",
+      "fields": {
+        "watchlist_id": "uuid",
+        "instrument_id": "uuid",
+        "thesis": "text",
+        "conditions": "json",
+        "priority": "int"
+      },
+      "invariant": "An entry is not proof of ownership.",
+      "indexes": "watchlist_id,instrument_id unique",
+      "retention_class": "research"
+    },
+    {
+      "entity": "feed_spec",
+      "scope": "reference_or_tenant",
+      "fields": {
+        "id": "uuid",
+        "version": "int",
+        "provider": "text",
+        "feed": "text",
+        "bar_rules": "json",
+        "adjustments": "text",
+        "calendar_version": "text",
+        "qualification": "enum"
+      },
+      "invariant": "Equivalent format does not establish equivalent market coverage.",
+      "indexes": "id,version",
+      "retention_class": "reference"
+    },
+    {
+      "entity": "entitlement",
+      "scope": "tenant",
+      "fields": {
+        "id": "uuid",
+        "tenant_id": "uuid",
+        "connection_id": "uuid",
+        "rights_profile": "json",
+        "quota": "json",
+        "revision": "bigint"
+      },
+      "invariant": "Display/AI/storage/redistribution separately permitted.",
+      "indexes": "connection_id,revision",
+      "retention_class": "security"
+    },
+    {
+      "entity": "market_observation",
+      "scope": "rights_scoped",
+      "fields": {
+        "id": "uuid",
+        "instrument_id": "uuid",
+        "feed_spec_id": "uuid",
+        "event_at": "timestamp",
+        "received_at": "timestamp",
+        "value": "decimal",
+        "unit": "text",
+        "quality": "enum"
+      },
+      "invariant": "No cross-user pooling without rights.",
+      "indexes": "instrument_id,feed_spec_id,event_at",
+      "retention_class": "market"
+    },
+    {
+      "entity": "evidence_record",
+      "scope": "tenant_or_permitted_public",
+      "fields": {
+        "id": "uuid",
+        "source_id": "uuid",
+        "locator": "text",
+        "hash": "sha256",
+        "published_at": "timestamp nullable",
+        "retrieved_at": "timestamp",
+        "rights_id": "uuid",
+        "availability": "enum"
+      },
+      "invariant": "Deleted source cannot remain labelled reproducible.",
+      "indexes": "source_id,hash",
+      "retention_class": "evidence"
+    },
+    {
+      "entity": "claim",
+      "scope": "tenant",
+      "fields": {
+        "id": "uuid",
+        "proposal_version_id": "uuid",
+        "kind": "enum",
+        "text": "text",
+        "verification": "enum",
+        "material": "bool"
+      },
+      "invariant": "Interpretation/forecast not reported fact.",
+      "indexes": "proposal_version_id,id",
+      "retention_class": "research"
+    },
+    {
+      "entity": "claim_evidence",
+      "scope": "tenant",
+      "fields": {
+        "claim_id": "uuid",
+        "evidence_id": "uuid",
+        "relation": "enum",
+        "support_locator": "text"
+      },
+      "invariant": "Citation relevance required; syndicated copies not independent sources.",
+      "indexes": "claim_id,evidence_id,relation",
+      "retention_class": "evidence"
+    },
+    {
+      "entity": "calculation_receipt",
+      "scope": "tenant",
+      "fields": {
+        "id": "uuid",
+        "formula_version": "text",
+        "inputs": "json",
+        "input_hash": "sha256",
+        "result": "decimal nullable",
+        "status": "enum"
+      },
+      "invariant": "Undefined and ambiguous results not replaced with zero.",
+      "indexes": "id,input_hash",
+      "retention_class": "audit"
+    },
+    {
+      "entity": "strategy_version",
+      "scope": "installation",
+      "fields": {
+        "id": "uuid",
+        "family": "enum",
+        "implementation_hash": "sha256",
+        "configuration": "json",
+        "protocol_id": "uuid",
+        "operational_status": "enum",
+        "evidence_status": "enum"
+      },
+      "invariant": "Catalogue presence and live qualification separate.",
+      "indexes": "family,id",
+      "retention_class": "release"
+    },
+    {
+      "entity": "proposal_version",
+      "scope": "tenant",
+      "fields": {
+        "id": "uuid",
+        "version": "int",
+        "account_id": "uuid",
+        "sleeve_id": "uuid",
+        "origin": "enum",
+        "mode": "enum",
+        "state": "enum",
+        "content_hash": "sha256",
+        "binding": "json",
+        "trigger_at": "timestamp",
+        "expires_at": "timestamp"
+      },
+      "invariant": "Material changes invalidate dependent review/final checks.",
+      "indexes": "id,version unique; account_id,state,expires_at",
+      "retention_class": "research"
+    },
+    {
+      "entity": "review_receipt",
+      "scope": "tenant",
+      "fields": {
+        "id": "uuid",
+        "proposal_version_id": "uuid",
+        "proposal_hash": "sha256",
+        "reviewer_run_id": "uuid",
+        "researcher_run_id": "uuid",
+        "decision": "enum",
+        "findings": "json"
+      },
+      "invariant": "Separate contexts; one bounded revision; no self-approval.",
+      "indexes": "proposal_version_id,reviewer_run_id",
+      "retention_class": "audit"
+    },
+    {
+      "entity": "planning_commitment",
+      "scope": "tenant",
+      "fields": {
+        "id": "uuid",
+        "account_id": "uuid",
+        "proposal_version_id": "uuid",
+        "amount": "decimal",
+        "currency": "char3",
+        "state": "enum",
+        "expires_at": "timestamp"
+      },
+      "invariant": "Internal planning only; holds reconciled once not broker reservation.",
+      "indexes": "account_id,state",
+      "retention_class": "financial"
+    },
+    {
+      "entity": "model_run",
+      "scope": "tenant",
+      "fields": {
+        "id": "uuid",
+        "provider_ref": "uuid",
+        "model_requested": "text",
+        "model_returned": "text nullable",
+        "runtime_version": "text",
+        "prompt_hash": "sha256",
+        "input_manifest": "json",
+        "output_hash": "sha256",
+        "tokens": "json",
+        "cost": "decimal nullable"
+      },
+      "invariant": "No credential/hidden-CoT retention; selected cloud scope explicit.",
+      "indexes": "tenant_id,created_at",
+      "retention_class": "research"
+    },
+    {
+      "entity": "budget_reservation",
+      "scope": "tenant_or_installation",
+      "fields": {
+        "id": "uuid",
+        "scope_id": "uuid",
+        "period": "text",
+        "category": "enum",
+        "reserved_usd": "decimal",
+        "actual_usd": "decimal nullable",
+        "state": "enum"
+      },
+      "invariant": "Atomic max commitment incl concurrent jobs before provider dispatch.",
+      "indexes": "scope_id,period,state",
+      "retention_class": "financial"
+    },
+    {
+      "entity": "experiment",
+      "scope": "tenant_or_installation",
+      "fields": {
+        "id": "uuid",
+        "target": "enum",
+        "baseline": "uuid",
+        "candidate": "uuid",
+        "protocol": "uuid",
+        "assessor_version": "uuid",
+        "budget_reservation": "uuid",
+        "state": "enum"
+      },
+      "invariant": "Candidate cannot mutate acceptance policy/test authority.",
+      "indexes": "target,state",
+      "retention_class": "improvement"
+    },
+    {
+      "entity": "evaluation_receipt",
+      "scope": "tenant_or_installation",
+      "fields": {
+        "id": "uuid",
+        "experiment_id": "uuid",
+        "test_manifest_hash": "sha256",
+        "environment": "json",
+        "results": "json",
+        "executed_at": "timestamp",
+        "status": "enum"
+      },
+      "invariant": "Failed candidates/trials retained subject privacy rights.",
+      "indexes": "experiment_id,id",
+      "retention_class": "improvement"
+    },
+    {
+      "entity": "release_receipt",
+      "scope": "installation",
+      "fields": {
+        "id": "uuid",
+        "candidate_hash": "sha256",
+        "approved_by": "uuid",
+        "signature_ref": "text",
+        "rollback_version": "uuid",
+        "effective_at": "timestamp"
+      },
+      "invariant": "Candidate cannot hold signing keys or grant own approval.",
+      "indexes": "candidate_hash,id",
+      "retention_class": "release"
+    },
+    {
+      "entity": "simulation_account",
+      "scope": "tenant",
+      "fields": {
+        "id": "uuid",
+        "tenant_id": "uuid",
+        "capital": "decimal",
+        "currency": "char3",
+        "execution_model": "uuid",
+        "benchmark_policy": "uuid"
+      },
+      "invariant": "Virtual ledger never contributes to real cash/exposure.",
+      "indexes": "tenant_id,id",
+      "retention_class": "simulation"
+    },
+    {
+      "entity": "simulation_order_fill",
+      "scope": "tenant",
+      "fields": {
+        "id": "uuid",
+        "simulation_account_id": "uuid",
+        "type": "enum",
+        "quantity": "decimal",
+        "price": "decimal nullable",
+        "effective_at": "timestamp",
+        "assumptions": "json"
+      },
+      "invariant": "No fill from unsupported/ambiguous observation without declared policy.",
+      "indexes": "simulation_account_id,effective_at",
+      "retention_class": "simulation"
+    },
+    {
+      "entity": "job",
+      "scope": "tenant_or_installation",
+      "fields": {
+        "id": "uuid",
+        "idempotency_key": "text",
+        "kind": "text",
+        "priority": "int",
+        "state": "enum",
+        "deadline": "timestamp nullable",
+        "attempt": "int",
+        "lease_until": "timestamp nullable"
+      },
+      "invariant": "At-least-once work, bounded retries, no reset of financial authority.",
+      "indexes": "scope_id,idempotency_key unique; state,priority,lease_until",
+      "retention_class": "operations"
+    },
+    {
+      "entity": "outbox_event",
+      "scope": "tenant_or_installation",
+      "fields": {
+        "id": "uuid",
+        "aggregate_id": "uuid",
+        "aggregate_revision": "bigint",
+        "payload": "json",
+        "created_at": "timestamp",
+        "delivered_at": "timestamp nullable"
+      },
+      "invariant": "Published after the domain transaction commits; consumers deduplicate.",
+      "indexes": "aggregate_id,aggregate_revision,event_kind unique",
+      "retention_class": "operations"
+    },
+    {
+      "entity": "notification",
+      "scope": "tenant",
+      "fields": {
+        "id": "uuid",
+        "object_version_id": "uuid",
+        "channel": "enum",
+        "state": "enum",
+        "attempt_at": "timestamp nullable",
+        "seen_at": "timestamp nullable"
+      },
+      "invariant": "Send attempt/delivery/read/action differ.",
+      "indexes": "tenant_id,state",
+      "retention_class": "operations"
+    },
+    {
+      "entity": "deletion_tombstone",
+      "scope": "tenant_or_control",
+      "fields": {
+        "id": "uuid",
+        "scope_hash": "sha256",
+        "classes": "text[]",
+        "requested_at": "timestamp",
+        "completed_at": "timestamp nullable",
+        "backup_expiry_at": "timestamp nullable"
+      },
+      "invariant": "Apply deletion suppression after restore; minimal identifiers only.",
+      "indexes": "scope_hash,requested_at",
+      "retention_class": "privacy"
+    },
+    {
+      "entity": "migration_export",
+      "scope": "tenant",
+      "fields": {
+        "id": "uuid",
+        "manifest_hash": "sha256",
+        "compatibility": "text",
+        "omissions": "json",
+        "expires_at": "timestamp"
+      },
+      "invariant": "No credentials/executable payload; import cannot grant privileges.",
+      "indexes": "tenant_id,id",
+      "retention_class": "privacy"
+    }
+  ]
+}

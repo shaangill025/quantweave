@@ -1,0 +1,161 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Ledger Event",
+  "type": "object",
+  "properties": {
+    "id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]*$"
+    },
+    "account_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]*$"
+    },
+    "tenant_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]*$"
+    },
+    "kind": {
+      "type": "string",
+      "enum": [
+        "opening_balance",
+        "deposit",
+        "withdrawal",
+        "buy",
+        "sell",
+        "fee",
+        "dividend",
+        "interest",
+        "fx_conversion",
+        "transfer",
+        "split",
+        "exercise",
+        "assignment",
+        "expiry",
+        "correction"
+      ]
+    },
+    "effective_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "recorded_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "source_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]*$"
+    },
+    "source_record_id": {
+      "type": "string"
+    },
+    "idempotency_key": {
+      "type": "string",
+      "minLength": 1
+    },
+    "status": {
+      "type": "string",
+      "enum": [
+        "observed",
+        "accepted",
+        "conflicted",
+        "reversed"
+      ]
+    },
+    "reverses_event_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "postings": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "book_account": {
+            "type": "string"
+          },
+          "commodity": {
+            "type": "string"
+          },
+          "amount": {
+            "type": "string",
+            "pattern": "^-?(0|[1-9][0-9]*)(\\.[0-9]+)?$",
+            "maxLength": 60
+          }
+        },
+        "required": [
+          "book_account",
+          "commodity",
+          "amount"
+        ],
+        "additionalProperties": false
+      },
+      "minItems": 2
+    },
+    "instrument_movements": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "instrument_id": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 128,
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]*$"
+          },
+          "quantity": {
+            "type": "string",
+            "pattern": "^-?(0|[1-9][0-9]*)(\\.[0-9]+)?$",
+            "maxLength": 60
+          }
+        },
+        "required": [
+          "instrument_id",
+          "quantity"
+        ],
+        "additionalProperties": false
+      }
+    },
+    "lot_policy_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]*$"
+    },
+    "economic_annotations": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    }
+  },
+  "required": [
+    "id",
+    "account_id",
+    "tenant_id",
+    "kind",
+    "effective_at",
+    "recorded_at",
+    "source_id",
+    "source_record_id",
+    "idempotency_key",
+    "status",
+    "reverses_event_id",
+    "postings",
+    "instrument_movements",
+    "lot_policy_id",
+    "economic_annotations"
+  ],
+  "additionalProperties": false
+}

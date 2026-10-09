@@ -1,0 +1,129 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Account Snapshot",
+  "type": "object",
+  "properties": {
+    "id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]*$"
+    },
+    "account_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]*$"
+    },
+    "revision": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "effective_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "received_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "freshness_status": {
+      "type": "string",
+      "enum": [
+        "current_under_policy",
+        "stale",
+        "unknown"
+      ]
+    },
+    "reconciliation": {
+      "type": "string",
+      "enum": [
+        "reconciled",
+        "conflicted",
+        "partial"
+      ]
+    },
+    "available_cash": {
+      "type": "array",
+      "items": {
+        "$ref": "common.schema.json#/$defs/Money"
+      }
+    },
+    "cash_basis": {
+      "type": "string",
+      "enum": [
+        "broker_available",
+        "reconciled_ledger",
+        "user_reported",
+        "unknown"
+      ]
+    },
+    "positions": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "instrument_id": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 128,
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]*$"
+          },
+          "quantity": {
+            "type": "string",
+            "pattern": "^-?(0|[1-9][0-9]*)(\\.[0-9]+)?$",
+            "maxLength": 60
+          },
+          "economic_cost": {
+            "anyOf": [
+              {
+                "$ref": "common.schema.json#/$defs/Money"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "lot_coverage": {
+            "type": "string",
+            "enum": [
+              "complete",
+              "partial",
+              "unknown"
+            ]
+          }
+        },
+        "required": [
+          "instrument_id",
+          "quantity",
+          "economic_cost",
+          "lot_coverage"
+        ],
+        "additionalProperties": false
+      }
+    },
+    "unresolved_ids": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 128,
+        "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]*$"
+      }
+    }
+  },
+  "required": [
+    "id",
+    "account_id",
+    "revision",
+    "effective_at",
+    "received_at",
+    "freshness_status",
+    "reconciliation",
+    "available_cash",
+    "cash_basis",
+    "positions",
+    "unresolved_ids"
+  ],
+  "additionalProperties": false
+}

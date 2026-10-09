@@ -1,0 +1,101 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Promotion Receipt",
+  "type": "object",
+  "properties": {
+    "id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]*$"
+    },
+    "change_kind": {
+      "type": "string",
+      "enum": [
+        "configuration",
+        "strategy",
+        "application",
+        "optimizer"
+      ]
+    },
+    "candidate_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]*$"
+    },
+    "candidate_hash": {
+      "type": "string",
+      "pattern": "^[a-f0-9]{64}$"
+    },
+    "assessment_receipt_ids": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 128,
+        "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]*$"
+      },
+      "minItems": 1
+    },
+    "approved_by": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]*$"
+    },
+    "approved_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "authority_scope": {
+      "type": "string",
+      "enum": [
+        "hosted_maintainer",
+        "self_hosted_operator",
+        "user_strategy_adoption"
+      ]
+    },
+    "rollback_version_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]*$"
+    },
+    "signature_reference": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]*$"
+    },
+    "effective_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "compatibility_result": {
+      "type": "string",
+      "enum": [
+        "passed"
+      ]
+    },
+    "user_adoption_required": {
+      "type": "boolean"
+    }
+  },
+  "required": [
+    "id",
+    "change_kind",
+    "candidate_id",
+    "candidate_hash",
+    "assessment_receipt_ids",
+    "approved_by",
+    "approved_at",
+    "authority_scope",
+    "rollback_version_id",
+    "signature_reference",
+    "effective_at",
+    "compatibility_result",
+    "user_adoption_required"
+  ],
+  "additionalProperties": false
+}

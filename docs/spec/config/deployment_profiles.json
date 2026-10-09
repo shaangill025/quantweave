@@ -1,0 +1,36 @@
+{
+  "version": "1",
+  "status": "design_targets_not_measured",
+  "shared_core": true,
+  "hosted": {
+    "onboarded_users": 100,
+    "background_monitored_users": 100,
+    "concurrent_interactive_sessions": 20,
+    "availability_target_percent": "99.9",
+    "rpo_minutes": 15,
+    "rto_hours": 4
+  },
+  "self_hosted": {
+    "reference_os": "Linux with qualified sandbox runtime",
+    "active_users": 1,
+    "vendor_service_required": false,
+    "gpu_required": false,
+    "kubernetes_required": false,
+    "provisional_test_hardware": {
+      "vcpus": 4,
+      "ram_gib": 16,
+      "ssd_gib": 100,
+      "status": "test candidate, not minimum verified hardware"
+    },
+    "non_linux_policy": "Use qualified Linux VM/sandbox combination; full release cannot omit code/recursive improvement."
+  },
+  "per_user": {
+    "accounts": 10,
+    "tracked_instruments": 250,
+    "activity_records": 100000
+  },
+  "monitoring": {
+    "live_stream_capacity": "from qualified entitlement, not tracked-universe count",
+    "history": "scheduled within rights/quotas"
+  }
+}

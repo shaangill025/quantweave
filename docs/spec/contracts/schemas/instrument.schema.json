@@ -1,0 +1,74 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Instrument",
+  "type": "object",
+  "properties": {
+    "id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]*$"
+    },
+    "symbol": {
+      "type": "string"
+    },
+    "type": {
+      "type": "string",
+      "enum": [
+        "stock",
+        "etf",
+        "option",
+        "cash",
+        "outside_coverage"
+      ]
+    },
+    "currency": {
+      "type": "string",
+      "pattern": "^[A-Z]{3}$"
+    },
+    "listing_venue": {
+      "type": "string"
+    },
+    "issuer_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "status": {
+      "type": "string",
+      "enum": [
+        "active",
+        "halted",
+        "delisted",
+        "unknown"
+      ]
+    },
+    "terms_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "coverage": {
+      "type": "string",
+      "enum": [
+        "action_eligible_candidate",
+        "research_only",
+        "tracked_only"
+      ]
+    }
+  },
+  "required": [
+    "id",
+    "symbol",
+    "type",
+    "currency",
+    "listing_venue",
+    "issuer_id",
+    "status",
+    "terms_id",
+    "coverage"
+  ],
+  "additionalProperties": false
+}

@@ -1,0 +1,140 @@
+{
+  "schema": "quantweave.check_registry/1",
+  "reviewed_at": "2026-10-09",
+  "task": "T001",
+  "note": "configured=true only for commands executed in the observed environment. Unbound checks stay configured=false until the code they test exists and the command has run.",
+  "checks": [
+    {
+      "id": "CHK-REPO-001",
+      "purpose": "Working tree state recorded in every evidence receipt",
+      "command": "git status --porcelain",
+      "configured": true,
+      "observed": {
+        "date": "2026-10-09",
+        "result": "point-in-time; recorded per receipt"
+      }
+    },
+    {
+      "id": "CHK-SPEC-001",
+      "purpose": "docs/spec matches the package manifest (no missing, unlisted, duplicate, unsafe or altered files outside the documented working-state set); backlog statuses valid and CSV/JSON consistent",
+      "command": "python3 tools/check_spec_artifacts.py",
+      "configured": true,
+      "observed": {
+        "date": "2026-10-09",
+        "result": "PASS (207 listed files)"
+      }
+    },
+    {
+      "id": "CHK-SPEC-001-SELFTEST",
+      "purpose": "Negative controls for CHK-SPEC-001 (10 injected defects)",
+      "command": "python3 tools/check_spec_artifacts.py --self-test",
+      "configured": true,
+      "observed": {
+        "date": "2026-10-09",
+        "result": "PASS: 10/10 injected defects reported; unmodified package passes"
+      }
+    },
+    {
+      "id": "CHK-PY-TOOLS",
+      "purpose": "Lint, format and strict typing of tools/ scripts (host tools, not project-pinned)",
+      "command": "ruff check tools/ && ruff format --check tools/ && mypy --strict tools/check_spec_artifacts.py",
+      "configured": true,
+      "observed": {
+        "date": "2026-10-09",
+        "result": "PASS with host ruff 0.16.8 / mypy 2.3.1"
+      }
+    },
+    {
+      "id": "CHK-SPEC-002",
+      "purpose": "Package validator: structure, traceability, task DAG, JSON Schemas, contract refs, examples, API invariants, numerical oracles, scope, links, sources, cross-file consistency. Artifact checks only, not application tests",
+      "command": "python3 docs/spec/tools/validate_spec.py",
+      "configured": true,
+      "observed": {
+        "date": "2026-10-09",
+        "result": "PASS 12/12 (jsonschema 4.26.0, PyYAML 6.0.1 already on host). Rewrites docs/spec/reports/VALIDATION.md and validation_results.json"
+      }
+    },
+    {
+      "id": "CHK-PY-LINT",
+      "purpose": "Python lint",
+      "command": null,
+      "configured": false,
+      "reason": "No Python code yet; ruff 0.16.8 present on host but tool choice and pin belong to T009"
+    },
+    {
+      "id": "CHK-PY-FORMAT",
+      "purpose": "Python formatting",
+      "command": null,
+      "configured": false,
+      "reason": "No Python code yet; ruff/black present on host; selection in T009"
+    },
+    {
+      "id": "CHK-PY-TYPE",
+      "purpose": "Python static typing",
+      "command": null,
+      "configured": false,
+      "reason": "No Python code yet; mypy 2.3.1 and pyright 1.1.414 present on host; selection in T009"
+    },
+    {
+      "id": "CHK-PY-UNIT",
+      "purpose": "Python unit and property tests (ledger, calculations, state machines)",
+      "command": null,
+      "configured": false,
+      "reason": "No tests yet; pytest 9.1.1 exists only as an isolated uv tool, hypothesis not installed; project environment created in T009"
+    },
+    {
+      "id": "CHK-TS-TYPE",
+      "purpose": "TypeScript typecheck for apps/web",
+      "command": null,
+      "configured": false,
+      "reason": "No web app yet; node 22.22.0, pnpm 10.28.0, tsc 6.0.2 present on host"
+    },
+    {
+      "id": "CHK-TS-TEST",
+      "purpose": "Web unit/component tests and lint",
+      "command": null,
+      "configured": false,
+      "reason": "No web app yet; test runner selected in T009"
+    },
+    {
+      "id": "CHK-DB-INTEGRATION",
+      "purpose": "Integration tests against PostgreSQL with production-like roles",
+      "command": null,
+      "configured": false,
+      "reason": "PostgreSQL 16.15 binaries present (/usr/lib/postgresql/16/bin) but no cluster running and no schema yet"
+    },
+    {
+      "id": "CHK-CONTAINER",
+      "purpose": "Container build of the self-hosted reference profile",
+      "command": null,
+      "configured": false,
+      "reason": "Docker client 29.8.2 present; no daemon reachable at /var/run/docker.sock in this session"
+    },
+    {
+      "id": "CHK-SANDBOX",
+      "purpose": "gVisor-bounded candidate execution (T007)",
+      "command": null,
+      "configured": false,
+      "reason": "runsc not installed; sandbox qualification is T007 and needs an authorized reference Linux host"
+    },
+    {
+      "id": "CHK-OPENAPI",
+      "purpose": "OpenAPI 3.1 conformance of contracts/openapi.yaml",
+      "command": null,
+      "configured": false,
+      "reason": "contracts/openapi.yaml now present and reference-checked by CHK-SPEC-002, but no dedicated OpenAPI 3.1 conformance validator is installed; selection in T009"
+    },
+    {
+      "id": "CHK-E2E",
+      "purpose": "End-to-end release journeys",
+      "command": null,
+      "configured": false,
+      "reason": "No application exists"
+    }
+  ],
+  "review": {
+    "reviewer": "independent subagent running a different model from the author",
+    "outcome": "Integration review: CHANGES REQUESTED (0 blocking); all findings fixed or dispositioned (root CLAUDE.md fixed after owner approval and re-reviewed). See docs/receipts/T001_bootstrap_receipt.md \u00a713"
+  },
+  "bound_from": "docs/spec/handoff/check_registry.template.json"
+}

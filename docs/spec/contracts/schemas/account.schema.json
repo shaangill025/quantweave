@@ -1,0 +1,86 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Account",
+  "type": "object",
+  "properties": {
+    "id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]*$"
+    },
+    "owner_tenant_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]*$"
+    },
+    "name": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 100
+    },
+    "broker": {
+      "type": "string"
+    },
+    "account_type": {
+      "type": "string"
+    },
+    "reporting_currency": {
+      "type": "string",
+      "pattern": "^[A-Z]{3}$"
+    },
+    "analysis_scope": {
+      "type": "string",
+      "enum": [
+        "complete_declared",
+        "partial_declared",
+        "hypothetical"
+      ]
+    },
+    "revision": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "source_ids": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 128,
+        "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]*$"
+      }
+    },
+    "status": {
+      "type": "string",
+      "enum": [
+        "active",
+        "archived",
+        "conflicted"
+      ]
+    },
+    "cash_basis": {
+      "type": "string",
+      "enum": [
+        "broker_available",
+        "reconciled_ledger",
+        "user_reported",
+        "unknown"
+      ]
+    }
+  },
+  "required": [
+    "id",
+    "owner_tenant_id",
+    "name",
+    "broker",
+    "account_type",
+    "reporting_currency",
+    "analysis_scope",
+    "revision",
+    "source_ids",
+    "status",
+    "cash_basis"
+  ],
+  "additionalProperties": false
+}

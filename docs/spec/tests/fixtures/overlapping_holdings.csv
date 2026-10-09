@@ -1,0 +1,4 @@
+underlying_account,source,symbol,quantity,currency
+SYN-WS,SYN-BROKER,SYNTH,50,USD
+SYN-WS,SYN-YAHOO-MIRROR,SYNTH,50,USD
+SYN-OTHER,SYN-BROKER-2,SYNTH,50,USD

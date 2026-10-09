@@ -1,0 +1,76 @@
+{
+  "kind": "specification_artifact_validation_only",
+  "status": "passed",
+  "executed_at": "2026-10-09T06:27:23.550241+00:00",
+  "python": "3.13.16",
+  "checks": [
+    {
+      "check": "Structured files",
+      "status": "passed",
+      "detail": "54 JSON and 1 YAML files parse."
+    },
+    {
+      "check": "Requirements traceability",
+      "status": "passed",
+      "detail": "79 decisions; 99 requirements covered by 66 tasks and 99 acceptance specifications."
+    },
+    {
+      "check": "Task dependencies",
+      "status": "passed",
+      "detail": "66 tasks form an acyclic dependency graph; task files exist."
+    },
+    {
+      "check": "JSON Schema metaschemas",
+      "status": "passed",
+      "detail": "26 Draft 2020-12 schema documents pass metaschema checks."
+    },
+    {
+      "check": "Local contract references",
+      "status": "passed",
+      "detail": "250 local schema/OpenAPI references resolve without network."
+    },
+    {
+      "check": "Positive and negative examples",
+      "status": "passed",
+      "detail": "7 valid/invalid synthetic examples meet expected schema outcomes; semantic application checks are separate."
+    },
+    {
+      "check": "Designed API invariants",
+      "status": "passed",
+      "detail": "72 unique designed operations; path parameters and write headers match; no live broker-order route. Not a full OpenAPI conformance certification."
+    },
+    {
+      "check": "Numerical oracle checks",
+      "status": "passed",
+      "detail": "20 independent arithmetic/scenario expectations recomputed; NOT application tests or empirical investment results."
+    },
+    {
+      "check": "Mandatory scope and honest status",
+      "status": "passed",
+      "detail": "All six strategies and improvement targets required; USD100/20 caps retained; application/release claims disabled."
+    },
+    {
+      "check": "Local document links",
+      "status": "passed",
+      "detail": "35 local Markdown links resolve."
+    },
+    {
+      "check": "License and source references",
+      "status": "passed",
+      "detail": "Apache-2.0 terms present; 26 dated source entries and spec citations resolve."
+    },
+    {
+      "check": "Cross-file semantic consistency",
+      "status": "passed",
+      "detail": "Six canonical strategy IDs, 21 onboarding IDs, 24 qualification references and 18 risk/gate mappings are consistent."
+    }
+  ],
+  "application_tests_executed": false,
+  "limitations": [
+    "No application implementation exercised.",
+    "No broker/model/provider API called.",
+    "No legal/commercial/data rights cleared.",
+    "No strategy investment edge, resource SLO, sandbox security or full recursive implementation demonstrated.",
+    "OpenAPI checked for references, shapes and declared invariants; no dedicated full OpenAPI conformance validator installed."
+  ]
+}

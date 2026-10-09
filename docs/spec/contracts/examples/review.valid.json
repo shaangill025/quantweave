@@ -1,0 +1,20 @@
+{
+  "id": "REVIEW-SYN-1",
+  "proposal_id": "PROP-SYN-1",
+  "proposal_version": 1,
+  "proposal_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "reviewer_run_id": "RUN-EVAL",
+  "researcher_run_id": "RUN-RESEARCH",
+  "model_family_distinct": false,
+  "initial_blind_assessment": "Synthetic evaluator test receipt, not real model output.",
+  "decision": "approve_for_final_checks",
+  "claim_findings": [],
+  "introduced_claim_ids": [],
+  "revision_number": 0,
+  "completed_at": "2026-10-08T14:45:00Z",
+  "expires_at": "2026-10-08T15:45:00Z",
+  "cost": {
+    "amount": "0.01",
+    "currency": "USD"
+  }
+}

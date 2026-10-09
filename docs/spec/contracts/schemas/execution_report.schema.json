@@ -1,0 +1,80 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Execution Report",
+  "type": "object",
+  "properties": {
+    "id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]*$"
+    },
+    "proposal_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "account_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]*$"
+    },
+    "instrument_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]*$"
+    },
+    "side": {
+      "type": "string",
+      "enum": [
+        "buy",
+        "sell"
+      ]
+    },
+    "quantity": {
+      "type": "string",
+      "pattern": "^(0|[1-9][0-9]*)(\\.[0-9]+)?$",
+      "maxLength": 60
+    },
+    "price": {
+      "$ref": "common.schema.json#/$defs/Money"
+    },
+    "fees": {
+      "$ref": "common.schema.json#/$defs/Money"
+    },
+    "effective_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "source": {
+      "const": "user_reported"
+    },
+    "broker_confirmed": {
+      "const": false
+    },
+    "external_reference": {
+      "type": [
+        "string",
+        "null"
+      ]
+    }
+  },
+  "required": [
+    "id",
+    "proposal_id",
+    "account_id",
+    "instrument_id",
+    "side",
+    "quantity",
+    "price",
+    "fees",
+    "effective_at",
+    "source",
+    "broker_confirmed",
+    "external_reference"
+  ],
+  "additionalProperties": false
+}

@@ -1,0 +1,44 @@
+{
+  "configured": false,
+  "registry_kind": "proposed_not_installed",
+  "existing_ac_registry_must_be_preserved": true,
+  "checks": [
+    {
+      "id": "spec-artifacts",
+      "command": "python tools/validate_spec.py",
+      "kind": "artifact_only",
+      "bound": true,
+      "application_test": false
+    },
+    {
+      "id": "python-domain",
+      "command": null,
+      "kind": "unit",
+      "bound": false
+    },
+    {
+      "id": "web",
+      "command": null,
+      "kind": "ui",
+      "bound": false
+    },
+    {
+      "id": "security",
+      "command": null,
+      "kind": "security",
+      "bound": false
+    },
+    {
+      "id": "integration",
+      "command": null,
+      "kind": "integration",
+      "bound": false
+    },
+    {
+      "id": "load-recovery",
+      "command": null,
+      "kind": "operational",
+      "bound": false
+    }
+  ]
+}

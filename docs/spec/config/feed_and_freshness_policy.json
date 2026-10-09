@@ -1,0 +1,20 @@
+{
+  "version": "0.1.0-design",
+  "free_default_candidate": "Alpaca Basic IEX",
+  "default_live_capacity_from_provider": true,
+  "current_documented_stock_stream_cap": 30,
+  "documented_as_of": "2026-10-08",
+  "historical_feed_explicit": true,
+  "raw_vs_adjusted_series_separate": true,
+  "account_sync_not_price_freshness": true,
+  "critical_note": "SnapTrade documents Wealthsimple/Questrade trade detection at five-minute-or-longer intervals; no 5s broker-state guarantee.",
+  "strategy_freshness_thresholds": {
+    "status": "not_qualified",
+    "price_age_seconds": null,
+    "account_age_seconds": null,
+    "action_window_seconds": null
+  },
+  "unconfigured_thresholds": "block affected time-sensitive sizing until W0 qualification binds approved per-strategy/deployment values",
+  "user_attestation_resets_broker_timestamp": false,
+  "fallback": "qualified equivalent switch with continuity check; rebuild materially different feed; otherwise pause affected actions"
+}

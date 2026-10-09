@@ -1,0 +1,66 @@
+{
+  "version": "1",
+  "all_required_at_first_release": true,
+  "targets": [
+    {
+      "id": "personal_adaptation",
+      "release_required": true,
+      "scope": "tenant",
+      "operational_status": "not_tested",
+      "human_promotion_required": true,
+      "changes_user_investment_semantics_require_adoption": true
+    },
+    {
+      "id": "research",
+      "release_required": true,
+      "scope": "tenant_or_installation",
+      "operational_status": "not_tested",
+      "human_promotion_required": true,
+      "changes_user_investment_semantics_require_adoption": true
+    },
+    {
+      "id": "strategy",
+      "release_required": true,
+      "scope": "tenant_or_installation",
+      "operational_status": "not_tested",
+      "human_promotion_required": true,
+      "changes_user_investment_semantics_require_adoption": true
+    },
+    {
+      "id": "evaluator",
+      "release_required": true,
+      "scope": "tenant_or_installation",
+      "operational_status": "not_tested",
+      "human_promotion_required": true,
+      "changes_user_investment_semantics_require_adoption": true
+    },
+    {
+      "id": "application_code",
+      "release_required": true,
+      "scope": "installation",
+      "operational_status": "not_tested",
+      "human_promotion_required": true,
+      "changes_user_investment_semantics_require_adoption": true
+    },
+    {
+      "id": "recursive_optimizer",
+      "release_required": true,
+      "scope": "installation",
+      "operational_status": "not_tested",
+      "human_promotion_required": true,
+      "changes_user_investment_semantics_require_adoption": true
+    }
+  ],
+  "recursive_acceptance": "V0 produces assessed V1; human promotes; actual V1 runs next cycle; preserve identity/hashes/receipts",
+  "protected_from_candidate": [
+    "assessment criteria",
+    "hidden evaluation access",
+    "promotion keys",
+    "user policy",
+    "risk limits",
+    "budgets",
+    "provider rights",
+    "privacy consent"
+  ],
+  "automatic_production_promotion": false
+}

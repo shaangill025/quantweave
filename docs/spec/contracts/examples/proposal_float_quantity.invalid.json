@@ -1,0 +1,56 @@
+{
+  "id": "PROP-SYN-1",
+  "version": 1,
+  "content_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "tenant_id": "TENANT-SYN",
+  "account_id": "ACCOUNT-SYN",
+  "sleeve_id": "SLEEVE-SYN",
+  "origin": "rules",
+  "mode": "ai_enabled",
+  "state": "active",
+  "action": "buy",
+  "horizon": "swing_position",
+  "trigger_at": "2026-10-08T14:45:00Z",
+  "received_at": "2026-10-08T14:45:00Z",
+  "created_at": "2026-10-08T14:45:00Z",
+  "expires_at": "2026-10-08T15:45:00Z",
+  "binding": {
+    "account_revision": 7,
+    "policy_version_id": "POL-SYN-1",
+    "strategy_version_id": "STR-TREND-001",
+    "feed_spec_id": "FEED-SYN-1",
+    "entitlement_revision": 1,
+    "portfolio_snapshot_id": "SNAP-SYN-7"
+  },
+  "legs": [
+    {
+      "instrument_id": "INSTRUMENT-SYN",
+      "side": "buy",
+      "quantity": 10.0,
+      "quantity_basis": "sized",
+      "estimated_cash_effect": {
+        "amount": "-501.00",
+        "currency": "USD"
+      }
+    }
+  ],
+  "conditions": [],
+  "invalidation_conditions": [],
+  "claim_ids": [],
+  "evidence_ids": [],
+  "calculation_ids": [],
+  "review_id": "REVIEW-SYN-1",
+  "final_check_receipt_id": "CHECK-SYN-1",
+  "qualification": {
+    "operational": "passed",
+    "investment_evidence": "limited",
+    "user_eligibility": "eligible",
+    "policy_version_id": "QUAL-POL-1",
+    "reason_codes": []
+  },
+  "risk_summary": "Synthetic research candidate only; no live recommendation.",
+  "alternatives_group_id": null,
+  "joint_set_id": null,
+  "execution_state": "none",
+  "reason_codes": []
+}

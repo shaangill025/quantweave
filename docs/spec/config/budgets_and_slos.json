@@ -1,0 +1,24 @@
+{
+  "version": "1",
+  "spending_authorized_by_this_package": false,
+  "pilot_monthly_usd": "100.00",
+  "improvement_monthly_usd_max": "20.00",
+  "budget_scope": "one personal pilot; excludes existing subscription, hosting, premium data and other users",
+  "reserve_before_dispatch": true,
+  "unknown_price_policy": "block or use explicitly approved bounded entitlement; never imply unmetered API",
+  "priorities": [
+    "monitoring",
+    "verification",
+    "research",
+    "improvement"
+  ],
+  "timing": {
+    "factual_p95_seconds_from_receipt": 5,
+    "rules_only_action_p95_seconds_from_receipt": 15,
+    "ai_intraday_max_seconds_from_original_trigger": 60,
+    "source_freshness_checked_separately": true,
+    "deadline_misses_in_denominator": true,
+    "remaining_action_window_required": true,
+    "external_delivery_is_separate": true
+  }
+}

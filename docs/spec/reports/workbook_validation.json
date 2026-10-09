@@ -1,0 +1,14 @@
+{
+  "kind": "workbook_artifact_validation",
+  "sheets": 8,
+  "metric_results": {
+    "tasks": 66,
+    "requirements": 99,
+    "open_gates": 16,
+    "completed_tasks": 0,
+    "ready_tasks": 1
+  },
+  "formula_error_scan": "{\"kind\":\"notice\",\"message\":\"Cell search matched 0 entries.\"}",
+  "preview": "Overview A1:H28 visually inspected",
+  "application_readiness_proven": false
+}

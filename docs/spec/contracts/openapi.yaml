@@ -1,0 +1,3588 @@
+openapi: 3.1.0
+info:
+  title: Portfolio Intelligence application contract
+  version: 0.1.0-design
+  description: Designed API; no implementation. Tenant is server-derived. No live
+    broker mutation endpoint. Feature rights and runtime approvals apply.
+servers:
+- url: /api/v1
+security:
+- sessionCookie: []
+paths:
+  /health:
+    get:
+      operationId: readHealth
+      summary: Read component health
+      description: All access and state transitions require server-side scope, permission,
+        version and eligibility checks.
+      parameters: []
+      responses:
+        '200':
+          description: Success.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Health'
+        default:
+          description: Typed validation, authorization, conflict, capacity or dependency
+            failure; never a synthetic success.
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+  /capabilities:
+    get:
+      operationId: readCapabilities
+      summary: Read qualified and unavailable capabilities
+      description: All access and state transitions require server-side scope, permission,
+        version and eligibility checks.
+      parameters: []
+      responses:
+        '200':
+          description: Success.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Capabilities'
+        default:
+          description: Typed validation, authorization, conflict, capacity or dependency
+            failure; never a synthetic success.
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+  /accounts:
+    get:
+      operationId: listAccounts
+      summary: List underlying accounts
+      description: All access and state transitions require server-side scope, permission,
+        version and eligibility checks.
+      parameters:
+      - name: cursor
+        in: query
+        schema:
+          type: string
+      - name: limit
+        in: query
+        schema:
+          type: integer
+          minimum: 1
+          maximum: 200
+        description: Server-bounded page size; tenant derived from session.
+      responses:
+        '200':
+          description: Success.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/accountPage'
+        default:
+          description: Typed validation, authorization, conflict, capacity or dependency
+            failure; never a synthetic success.
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+    post:
+      operationId: createAccount
+      summary: Create underlying account
+      description: All access and state transitions require server-side scope, permission,
+        version and eligibility checks.
+      parameters:
+      - name: Idempotency-Key
+        in: header
+        required: true
+        schema:
+          type: string
+          minLength: 1
+      - name: X-CSRF-Token
+        in: header
+        required: true
+        schema:
+          type: string
+          minLength: 1
+      responses:
+        '201':
+          description: Success.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/account'
+        default:
+          description: Typed validation, authorization, conflict, capacity or dependency
+            failure; never a synthetic success.
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateAccount'
+  /accounts/{account_id}:
+    get:
+      operationId: readAccount
+      summary: Read account metadata
+      description: All access and state transitions require server-side scope, permission,
+        version and eligibility checks.
+      parameters:
+      - name: account_id
+        in: path
+        required: true
+        schema: &id001
+          type: string
+          minLength: 1
+          maxLength: 128
+          pattern: ^[A-Za-z0-9][A-Za-z0-9_.:-]*$
+      responses:
+        '200':
+          description: Success.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/account'
+        default:
+          description: Typed validation, authorization, conflict, capacity or dependency
+            failure; never a synthetic success.
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+    patch:
+      operationId: updateAccount
+      summary: Update account metadata
+      description: All access and state transitions require server-side scope, permission,
+        version and eligibility checks.
+      parameters:
+      - name: account_id
+        in: path
+        required: true
+        schema: *id001
+      - name: Idempotency-Key
+        in: header
+        required: true
+        schema:
+          type: string
+          minLength: 1
+      - name: X-CSRF-Token
+        in: header
+        required: true
+        schema:
+          type: string
+          minLength: 1
+      - name: If-Match
+        in: header
+        required: true
+        schema:
+          type: string
+        description: Expected resource revision/ETag; stale values return 409.
+      responses:
+        '200':
+          description: Success.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/account'
+        default:
+          description: Typed validation, authorization, conflict, capacity or dependency
+            failure; never a synthetic success.
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateAccount'
+  /accounts/{account_id}/snapshot:
+    get:
+      operationId: readSnapshot
+      summary: Read snapshot, freshness and conflicts
+      description: All access and state transitions require server-side scope, permission,
+        version and eligibility checks.
+      parameters:
+      - name: account_id
+        in: path
+        required: true
+        schema: *id001
+      responses:
+        '200':
+          description: Success.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/account_snapshot'
+        default:
+          description: Typed validation, authorization, conflict, capacity or dependency
+            failure; never a synthetic success.
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+  /accounts/{account_id}/ledger:
+    get:
+      operationId: listLedger
+      summary: List reconciled activity
+      description: All access and state transitions require server-side scope, permission,
+        version and eligibility checks.
+      parameters:
+      - name: account_id
+        in: path
+        required: true
+        schema: *id001
+      - name: cursor
+        in: query
+        schema:
+          type: string
+      - name: limit
+        in: query
+        schema:
+          type: integer
+          minimum: 1
+          maximum: 200
+        description: Server-bounded page size; tenant derived from session.
+      responses:
+        '200':
+          description: Success.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ledger_eventPage'
+        default:
+          description: Typed validation, authorization, conflict, capacity or dependency
+            failure; never a synthetic success.
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+  /accounts/{account_id}/reconcile:
+    post:
+      operationId: reconcileAccount
+      summary: Reconcile source observations
+      description: All access and state transitions require server-side scope, permission,
+        version and eligibility checks.
+      parameters:
+      - name: account_id
+        in: path
+        required: true
+        schema: *id001
+      - name: Idempotency-Key
+        in: header
+        required: true
+        schema:
+          type: string
+          minLength: 1
+      - name: X-CSRF-Token
+        in: header
+        required: true
+        schema:
+          type: string
+          minLength: 1
+      responses:
+        '202':
+          description: Success; asynchronous work returns persisted job identifier.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/job'
+        default:
+          description: Typed validation, authorization, conflict, capacity or dependency
+            failure; never a synthetic success.
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RevisionAction'
+  /accounts/{account_id}/execution-reports:
+    post:
+      operationId: reportExternalExecution
+      summary: Record user-reported external execution; NOT submit an order
+      description: All access and state transitions require server-side scope, permission,
+        version and eligibility checks.
+      parameters:
+      - name: account_id
+        in: path
+        required: true
+        schema: *id001
+      - name: Idempotency-Key
+        in: header
+        required: true
+        schema:
+          type: string
+          minLength: 1
+      - name: X-CSRF-Token
+        in: header
+        required: true
+        schema:
+          type: string
+          minLength: 1
+      responses:
+        '201':
+          description: Success.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/execution_report'
+        default:
+          description: Typed validation, authorization, conflict, capacity or dependency
+            failure; never a synthetic success.
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ExecutionReportRequest'
+  /imports:
+    post:
+      operationId: createImport
+      summary: Create canonical import job
+      description: All access and state transitions require server-side scope, permission,
+        version and eligibility checks.
+      parameters:
+      - name: Idempotency-Key
+        in: header
+        required: true
+        schema:
+          type: string
+          minLength: 1
+      - name: X-CSRF-Token
+        in: header
+        required: true
+        schema:
+          type: string
+          minLength: 1
+      responses:
+        '202':
+          description: Success; asynchronous work returns persisted job identifier.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/job'
+        default:
+          description: Typed validation, authorization, conflict, capacity or dependency
+            failure; never a synthetic success.
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              properties:
+                file:
+                  type: string
+                  format: binary
+                source_kind:
+                  type: string
+                  enum:
+                  - canonical
+                  - cibc
+                  - yahoo
+                  - wealthsimple
+                  - other
+              required:
+              - file
+              - source_kind
+              additionalProperties: false
+  /imports/{import_id}:
+    get:
+      operationId: readImport
+      summary: Read mapping preview
+      description: All access and state transitions require server-side scope, permission,
+        version and eligibility checks.
+      parameters:
+      - name: import_id
+        in: path
+        required: true
+        schema: *id001
+      responses:
+        '200':
+          description: Success.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/import_preview'
+        default:
+          description: Typed validation, authorization, conflict, capacity or dependency
+            failure; never a synthetic success.
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+  /imports/{import_id}/mapping:
+    post:
+      operationId: mapImport
+      summary: Map and classify incoming source
+      description: All access and state transitions require server-side scope, permission,
+        version and eligibility checks.
+      parameters:
+      - name: import_id
+        in: path
+        required: true
+        schema: *id001
+      - name: Idempotency-Key
+        in: header
+        required: true
+        schema:
+          type: string
+          minLength: 1
+      - name: X-CSRF-Token
+        in: header
+        required: true
+        schema:
+          type: string
+          minLength: 1
+      responses:
+        '200':
+          description: Success.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/import_preview'
+        default:
+          description: Typed validation, authorization, conflict, capacity or dependency
+            failure; never a synthetic success.
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/MapImport'
+  /imports/{import_id}/commit:
+    post:
+      operationId: commitImport
+      summary: Commit validated import idempotently
+      description: All access and state transitions require server-side scope, permission,
+        version and eligibility checks.
+      parameters:
+      - name: import_id
+        in: path
+        required: true
+        schema: *id001
+      - name: Idempotency-Key
+        in: header
+        required: true
+        schema:
+          type: string
+          minLength: 1
+      - name: X-CSRF-Token
+        in: header
+        required: true
+        schema:
+          type: string
+          minLength: 1
+      - name: If-Match
+        in: header
+        required: true
+        schema:
+          type: string
+        description: Expected resource revision/ETag; stale values return 409.
+      responses:
+        '202':
+          description: Success; asynchronous work returns persisted job identifier.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/job'
+        default:
+          description: Typed validation, authorization, conflict, capacity or dependency
+            failure; never a synthetic success.
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CommitImport'
+  /instruments:
+    get:
+      operationId: searchInstruments
+      summary: Search security reference records
+      description: All access and state transitions require server-side scope, permission,
+        version and eligibility checks.
+      parameters:
+      - name: cursor
+        in: query
+        schema:
+          type: string
+      - name: limit
+        in: query
+        schema:
+          type: integer
+          minimum: 1
+          maximum: 200
+        description: Server-bounded page size; tenant derived from session.
+      responses:
+        '200':
+          description: Success.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/instrumentPage'
+        default:
+          description: Typed validation, authorization, conflict, capacity or dependency
+            failure; never a synthetic success.
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+  /instruments/{instrument_id}:
+    get:
+      operationId: readInstrument
+      summary: Read identified instrument
+      description: All access and state transitions require server-side scope, permission,
+        version and eligibility checks.
+      parameters:
+      - name: instrument_id
+        in: path
+        required: true
+        schema: *id001
+      responses:
+        '200':
+          description: Success.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/instrument'
+        default:
+          description: Typed validation, authorization, conflict, capacity or dependency
+            failure; never a synthetic success.
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+  /instruments/{instrument_id}/observations:
+    get:
+      operationId: readObservations
+      summary: Read permitted observations with feed labels
+      description: All access and state transitions require server-side scope, permission,
+        version and eligibility checks.
+      parameters:
+      - name: instrument_id
+        in: path
+        required: true
+        schema: *id001
+      - name: cursor
+        in: query
+        schema:
+          type: string
+      - name: limit
+        in: query
+        schema:
+          type: integer
+          minimum: 1
+          maximum: 200
+        description: Server-bounded page size; tenant derived from session.
+      responses:
+        '200':
+          description: Success.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/observationPage'
+        default:
+          description: Typed validation, authorization, conflict, capacity or dependency
+            failure; never a synthetic success.
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+  /instruments/{instrument_id}/option-terms:
+    get:
+      operationId: readOptionTerms
+      summary: Read verified or unknown contract terms
+      description: All access and state transitions require server-side scope, permission,
+        version and eligibility checks.
+      parameters:
+      - name: instrument_id
+        in: path
+        required: true
+        schema: *id001
+      responses:
+        '200':
+          description: Success.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/option_terms'
+        default:
+          description: Typed validation, authorization, conflict, capacity or dependency
+            failure; never a synthetic success.
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+  /watchlists:
+    get:
+      operationId: listWatchlists
+      summary: List watchlists
+      description: All access and state transitions require server-side scope, permission,
+        version and eligibility checks.
+      parameters:
+      - name: cursor
+        in: query
+        schema:
+          type: string
+      - name: limit
+        in: query
+        schema:
+          type: integer
+          minimum: 1
+          maximum: 200
+        description: Server-bounded page size; tenant derived from session.
+      responses:
+        '200':
+          description: Success.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/watchlistPage'
+        default:
+          description: Typed validation, authorization, conflict, capacity or dependency
+            failure; never a synthetic success.
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+    post:
+      operationId: createWatchlist
+      summary: Create watchlist
+      description: All access and state transitions require server-side scope, permission,
+        version and eligibility checks.
+      parameters:
+      - name: Idempotency-Key
+        in: header
+        required: true
+        schema:
+          type: string
+          minLength: 1
+      - name: X-CSRF-Token
+        in: header
+        required: true
+        schema:
+          type: string
+          minLength: 1
+      responses:
+        '201':
+          description: Success.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/watchlist'
+        default:
+          description: Typed validation, authorization, conflict, capacity or dependency
+            failure; never a synthetic success.
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateWatchlist'
+  /watchlists/{watchlist_id}:
+    get:
+      operationId: readWatchlist
+      summary: Read watchlist
+      description: All access and state transitions require server-side scope, permission,
+        version and eligibility checks.
+      parameters:
+      - name: watchlist_id
+        in: path
+        required: true
+        schema: *id001
+      responses:
+        '200':
+          description: Success.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/watchlist'
+        default:
+          description: Typed validation, authorization, conflict, capacity or dependency
+            failure; never a synthetic success.
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+    patch:
+      operationId: updateWatchlist
+      summary: Rename watchlist
+      description: All access and state transitions require server-side scope, permission,
+        version and eligibility checks.
+      parameters:
+      - name: watchlist_id
+        in: path
+        required: true
+        schema: *id001
+      - name: Idempotency-Key
+        in: header
+        required: true
+        schema:
+          type: string
+          minLength: 1
+      - name: X-CSRF-Token
+        in: header
+        required: true
+        schema:
+          type: string
+          minLength: 1
+      - name: If-Match
+        in: header
+        required: true
+        schema:
+          type: string
+        description: Expected resource revision/ETag; stale values return 409.
+      responses:
+        '200':
+          description: Success.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/watchlist'
+        default:
+          description: Typed validation, authorization, conflict, capacity or dependency
+            failure; never a synthetic success.
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateWatchlist'
+    delete:
+      operationId: deleteWatchlist
+      summary: Delete watchlist without removing positions
+      description: All access and state transitions require server-side scope, permission,
+        version and eligibility checks.
+      parameters:
+      - name: watchlist_id
+        in: path
+        required: true
+        schema: *id001
+      - name: Idempotency-Key
+        in: header
+        required: true
+        schema:
+          type: string
+          minLength: 1
+      - name: X-CSRF-Token
+        in: header
+        required: true
+        schema:
+          type: string
+          minLength: 1
+      - name: If-Match
+        in: header
+        required: true
+        schema:
+          type: string
+        description: Expected resource revision/ETag; stale values return 409.
+      responses:
+        '202':
+          description: Success; asynchronous work returns persisted job identifier.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/job'
+        default:
+          description: Typed validation, authorization, conflict, capacity or dependency
+            failure; never a synthetic success.
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+  /watchlists/{watchlist_id}/entries:
+    post:
+      operationId: addWatchlistEntry
+      summary: Add research entry
+      description: All access and state transitions require server-side scope, permission,
+        version and eligibility checks.
+      parameters:
+      - name: watchlist_id
+        in: path
+        required: true
+        schema: *id001
+      - name: Idempotency-Key
+        in: header
+        required: true
+        schema:
+          type: string
+          minLength: 1
+      - name: X-CSRF-Token
+        in: header
+        required: true
+        schema:
+          type: string
+          minLength: 1
+      responses:
+        '200':
+          description: Success.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/watchlist'
+        default:
+          description: Typed validation, authorization, conflict, capacity or dependency
+            failure; never a synthetic success.
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/WatchlistEntry'
+  /watchlists/{watchlist_id}/entries/{instrument_id}:
+    patch:
+      operationId: updateWatchlistEntry
+      summary: Update thesis and conditions
+      description: All access and state transitions require server-side scope, permission,
+        version and eligibility checks.
+      parameters:
+      - name: watchlist_id
+        in: path
+        required: true
+        schema: *id001
+      - name: instrument_id
+        in: path
+        required: true
+        schema: *id001
+      - name: Idempotency-Key
+        in: header
+        required: true
+        schema:
+          type: string
+          minLength: 1
+      - name: X-CSRF-Token
+        in: header
+        required: true
+        schema:
+          type: string
+          minLength: 1
+      - name: If-Match
+        in: header
+        required: true
+        schema:
+          type: string
+        description: Expected resource revision/ETag; stale values return 409.
+      responses:
+        '200':
+          description: Success.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/watchlist'
+        default:
+          description: Typed validation, authorization, conflict, capacity or dependency
+            failure; never a synthetic success.
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/WatchlistEntry'
+    delete:
+      operationId: deleteWatchlistEntry
+      summary: Remove entry only
+      description: All access and state transitions require server-side scope, permission,
+        version and eligibility checks.
+      parameters:
+      - name: watchlist_id
+        in: path
+        required: true
+        schema: *id001
+      - name: instrument_id
+        in: path
+        required: true
+        schema: *id001
+      - name: Idempotency-Key
+        in: header
+        required: true
+        schema:
+          type: string
+          minLength: 1
+      - name: X-CSRF-Token
+        in: header
+        required: true
+        schema:
+          type: string
+          minLength: 1
+      - name: If-Match
+        in: header
+        required: true
+        schema:
+          type: string
+        description: Expected resource revision/ETag; stale values return 409.
+      responses:
+        '200':
+          description: Success.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/watchlist'
+        default:
+          description: Typed validation, authorization, conflict, capacity or dependency
+            failure; never a synthetic success.
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+  /policies:
+    post:
+      operationId: proposePolicy
+      summary: Create proposed policy from onboarding
+      description: All access and state transitions require server-side scope, permission,
+        version and eligibility checks.
+      parameters:
+      - name: Idempotency-Key
+        in: header
+        required: true
+        schema:
+          type: string
+          minLength: 1
+      - name: X-CSRF-Token
+        in: header
+        required: true
+        schema:
+          type: string
+          minLength: 1
+      responses:
+        '201':
+          description: Success.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/policy'
+        default:
+          description: Typed validation, authorization, conflict, capacity or dependency
+            failure; never a synthetic success.
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PolicyDraft'
+  /policies/{policy_id}:
+    get:
+      operationId: readPolicy
+      summary: Read policy and version
+      description: All access and state transitions require server-side scope, permission,
+        version and eligibility checks.
+      parameters:
+      - name: policy_id
+        in: path
+        required: true
+        schema: *id001
+      responses:
+        '200':
+          description: Success.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/policy'
+        default:
+          description: Typed validation, authorization, conflict, capacity or dependency
+            failure; never a synthetic success.
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+  /policies/{policy_id}/adopt:
+    post:
+      operationId: adoptPolicy
+      summary: Explicitly adopt policy version
+      description: All access and state transitions require server-side scope, permission,
+        version and eligibility checks.
+      parameters:
+      - name: policy_id
+        in: path
+        required: true
+        schema: *id001
+      - name: Idempotency-Key
+        in: header
+        required: true
+        schema:
+          type: string
+          minLength: 1
+      - name: X-CSRF-Token
+        in: header
+        required: true
+        schema:
+          type: string
+          minLength: 1
+      - name: If-Match
+        in: header
+        required: true
+        schema:
+          type: string
+        description: Expected resource revision/ETag; stale values return 409.
+      responses:
+        '200':
+          description: Success.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/policy'
+        default:
+          description: Typed validation, authorization, conflict, capacity or dependency
+            failure; never a synthetic success.
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AdoptVersion'
+  /policies/{policy_id}/pause:
+    post:
+      operationId: pausePolicy
+      summary: Pause affected risk-increasing outputs
+      description: All access and state transitions require server-side scope, permission,
+        version and eligibility checks.
+      parameters:
+      - name: policy_id
+        in: path
+        required: true
+        schema: *id001
+      - name: Idempotency-Key
+        in: header
+        required: true
+        schema:
+          type: string
+          minLength: 1
+      - name: X-CSRF-Token
+        in: header
+        required: true
+        schema:
+          type: string
+          minLength: 1
+      responses:
+        '200':
+          description: Success.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/policy'
+        default:
+          description: Typed validation, authorization, conflict, capacity or dependency
+            failure; never a synthetic success.
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RevisionAction'
+  /policies/{policy_id}/resume:
+    post:
+      operationId: resumePolicy
+      summary: Apply reconciled-state resumption policy
+      description: All access and state transitions require server-side scope, permission,
+        version and eligibility checks.
+      parameters:
+      - name: policy_id
+        in: path
+        required: true
+        schema: *id001
+      - name: Idempotency-Key
+        in: header
+        required: true
+        schema:
+          type: string
+          minLength: 1
+      - name: X-CSRF-Token
+        in: header
+        required: true
+        schema:
+          type: string
+          minLength: 1
+      - name: If-Match
+        in: header
+        required: true
+        schema:
+          type: string
+        description: Expected resource revision/ETag; stale values return 409.
+      responses:
+        '200':
+          description: Success.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/policy'
+        default:
+          description: Typed validation, authorization, conflict, capacity or dependency
+            failure; never a synthetic success.
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RevisionAction'
+  /strategies:
+    get:
+      operationId: listStrategies
+      summary: List six families and qualification
+      description: All access and state transitions require server-side scope, permission,
+        version and eligibility checks.
+      parameters:
+      - name: cursor
+        in: query
+        schema:
+          type: string
+      - name: limit
+        in: query
+        schema:
+          type: integer
+          minimum: 1
+          maximum: 200
+        description: Server-bounded page size; tenant derived from session.
+      responses:
+        '200':
+          description: Success.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/strategy_versionPage'
+        default:
+          description: Typed validation, authorization, conflict, capacity or dependency
+            failure; never a synthetic success.
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+  /strategies/{strategy_id}:
+    get:
+      operationId: readStrategy
+      summary: Read versioned strategy
+      description: All access and state transitions require server-side scope, permission,
+        version and eligibility checks.
+      parameters:
+      - name: strategy_id
+        in: path
+        required: true
+        schema: *id001
+      responses:
+        '200':
+          description: Success.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/strategy_version'
+        default:
+          description: Typed validation, authorization, conflict, capacity or dependency
+            failure; never a synthetic success.
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+  /strategies/{strategy_id}/adopt:
+    post:
+      operationId: adoptStrategy
+      summary: Adopt material strategy configuration
+      description: All access and state transitions require server-side scope, permission,
+        version and eligibility checks.
+      parameters:
+      - name: strategy_id
+        in: path
+        required: true
+        schema: *id001
+      - name: Idempotency-Key
+        in: header
+        required: true
+        schema:
+          type: string
+          minLength: 1
+      - name: X-CSRF-Token
+        in: header
+        required: true
+        schema:
+          type: string
+          minLength: 1
+      - name: If-Match
+        in: header
+        required: true
+        schema:
+          type: string
+        description: Expected resource revision/ETag; stale values return 409.
+      responses:
+        '202':
+          description: Success; asynchronous work returns persisted job identifier.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/job'
+        default:
+          description: Typed validation, authorization, conflict, capacity or dependency
+            failure; never a synthetic success.
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AdoptVersion'
+  /proposals:
+    get:
+      operationId: listProposals
+      summary: List current proposals and historical statuses
+      description: All access and state transitions require server-side scope, permission,
+        version and eligibility checks.
+      parameters:
+      - name: cursor
+        in: query
+        schema:
+          type: string
+      - name: limit
+        in: query
+        schema:
+          type: integer
+          minimum: 1
+          maximum: 200
+        description: Server-bounded page size; tenant derived from session.
+      responses:
+        '200':
+          description: Success.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/proposalPage'
+        default:
+          description: Typed validation, authorization, conflict, capacity or dependency
+            failure; never a synthetic success.
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+  /proposals/{proposal_id}:
+    get:
+      operationId: readProposal
+      summary: Read current validity and audit binding
+      description: All access and state transitions require server-side scope, permission,
+        version and eligibility checks.
+      parameters:
+      - name: proposal_id
+        in: path
+        required: true
+        schema: *id001
+      responses:
+        '200':
+          description: Success.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/proposal'
+        default:
+          description: Typed validation, authorization, conflict, capacity or dependency
+            failure; never a synthetic success.
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+  /proposals/{proposal_id}/review:
+    get:
+      operationId: readReview
+      summary: Read separate evaluator receipt
+      description: All access and state transitions require server-side scope, permission,
+        version and eligibility checks.
+      parameters:
+      - name: proposal_id
+        in: path
+        required: true
+        schema: *id001
+      responses:
+        '200':
+          description: Success.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/review'
+        default:
+          description: Typed validation, authorization, conflict, capacity or dependency
+            failure; never a synthetic success.
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+  /proposals/select:
+    post:
+      operationId: selectProposals
+      summary: Plan jointly feasible alternatives; no broker reservation
+      description: All access and state transitions require server-side scope, permission,
+        version and eligibility checks.
+      parameters:
+      - name: Idempotency-Key
+        in: header
+        required: true
+        schema:
+          type: string
+          minLength: 1
+      - name: X-CSRF-Token
+        in: header
+        required: true
+        schema:
+          type: string
+          minLength: 1
+      - name: If-Match
+        in: header
+        required: true
+        schema:
+          type: string
+        description: Expected resource revision/ETag; stale values return 409.
+      responses:
+        '202':
+          description: Success; asynchronous work returns persisted job identifier.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/job'
+        default:
+          description: Typed validation, authorization, conflict, capacity or dependency
+            failure; never a synthetic success.
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ProposalSelection'
+  /proposals/{proposal_id}/dismiss:
+    post:
+      operationId: dismissProposal
+      summary: Dismiss without rewriting history
+      description: All access and state transitions require server-side scope, permission,
+        version and eligibility checks.
+      parameters:
+      - name: proposal_id
+        in: path
+        required: true
+        schema: *id001
+      - name: Idempotency-Key
+        in: header
+        required: true
+        schema:
+          type: string
+          minLength: 1
+      - name: X-CSRF-Token
+        in: header
+        required: true
+        schema:
+          type: string
+          minLength: 1
+      - name: If-Match
+        in: header
+        required: true
+        schema:
+          type: string
+        description: Expected resource revision/ETag; stale values return 409.
+      responses:
+        '200':
+          description: Success.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/proposal'
+        default:
+          description: Typed validation, authorization, conflict, capacity or dependency
+            failure; never a synthetic success.
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RevisionAction'
+  /research:
+    post:
+      operationId: requestResearch
+      summary: Create bounded evidence research job
+      description: All access and state transitions require server-side scope, permission,
+        version and eligibility checks.
+      parameters:
+      - name: Idempotency-Key
+        in: header
+        required: true
+        schema:
+          type: string
+          minLength: 1
+      - name: X-CSRF-Token
+        in: header
+        required: true
+        schema:
+          type: string
+          minLength: 1
+      responses:
+        '202':
+          description: Success; asynchronous work returns persisted job identifier.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/job'
+        default:
+          description: Typed validation, authorization, conflict, capacity or dependency
+            failure; never a synthetic success.
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/research_request'
+  /chat/research:
+    post:
+      operationId: requestChatResearch
+      summary: Route chat through governed research path
+      description: All access and state transitions require server-side scope, permission,
+        version and eligibility checks.
+      parameters:
+      - name: Idempotency-Key
+        in: header
+        required: true
+        schema:
+          type: string
+          minLength: 1
+      - name: X-CSRF-Token
+        in: header
+        required: true
+        schema:
+          type: string
+          minLength: 1
+      responses:
+        '202':
+          description: Success; asynchronous work returns persisted job identifier.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/job'
+        default:
+          description: Typed validation, authorization, conflict, capacity or dependency
+            failure; never a synthetic success.
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/research_request'
+  /evidence/{evidence_id}:
+    get:
+      operationId: readEvidence
+      summary: Read permitted evidence or deletion status
+      description: All access and state transitions require server-side scope, permission,
+        version and eligibility checks.
+      parameters:
+      - name: evidence_id
+        in: path
+        required: true
+        schema: *id001
+      responses:
+        '200':
+          description: Success.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/evidence'
+        default:
+          description: Typed validation, authorization, conflict, capacity or dependency
+            failure; never a synthetic success.
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+  /claims/{claim_id}:
+    get:
+      operationId: readClaim
+      summary: Read verification and contrary evidence
+      description: All access and state transitions require server-side scope, permission,
+        version and eligibility checks.
+      parameters:
+      - name: claim_id
+        in: path
+        required: true
+        schema: *id001
+      responses:
+        '200':
+          description: Success.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/claim'
+        default:
+          description: Typed validation, authorization, conflict, capacity or dependency
+            failure; never a synthetic success.
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+  /calculations/{calculation_id}:
+    get:
+      operationId: readCalculation
+      summary: Read deterministic calculation receipt
+      description: All access and state transitions require server-side scope, permission,
+        version and eligibility checks.
+      parameters:
+      - name: calculation_id
+        in: path
+        required: true
+        schema: *id001
+      responses:
+        '200':
+          description: Success.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/calculation'
+        default:
+          description: Typed validation, authorization, conflict, capacity or dependency
+            failure; never a synthetic success.
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+  /connections:
+    get:
+      operationId: listConnections
+      summary: List redacted provider connection state
+      description: All access and state transitions require server-side scope, permission,
+        version and eligibility checks.
+      parameters:
+      - name: cursor
+        in: query
+        schema:
+          type: string
+      - name: limit
+        in: query
+        schema:
+          type: integer
+          minimum: 1
+          maximum: 200
+        description: Server-bounded page size; tenant derived from session.
+      responses:
+        '200':
+          description: Success.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ConnectionPage'
+        default:
+          description: Typed validation, authorization, conflict, capacity or dependency
+            failure; never a synthetic success.
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+    post:
+      operationId: createConnection
+      summary: Create provider/deployment-qualified connection
+      description: All access and state transitions require server-side scope, permission,
+        version and eligibility checks.
+      parameters:
+      - name: Idempotency-Key
+        in: header
+        required: true
+        schema:
+          type: string
+          minLength: 1
+      - name: X-CSRF-Token
+        in: header
+        required: true
+        schema:
+          type: string
+          minLength: 1
+      responses:
+        '201':
+          description: Success.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Connection'
+        default:
+          description: Typed validation, authorization, conflict, capacity or dependency
+            failure; never a synthetic success.
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateConnection'
+  /connections/{connection_id}/authorize:
+    post:
+      operationId: authorizeConnection
+      summary: Begin provider-permitted official authentication
+      description: All access and state transitions require server-side scope, permission,
+        version and eligibility checks.
+      parameters:
+      - name: connection_id
+        in: path
+        required: true
+        schema: *id001
+      - name: Idempotency-Key
+        in: header
+        required: true
+        schema:
+          type: string
+          minLength: 1
+      - name: X-CSRF-Token
+        in: header
+        required: true
+        schema:
+          type: string
+          minLength: 1
+      responses:
+        '202':
+          description: Success; asynchronous work returns persisted job identifier.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/job'
+        default:
+          description: Typed validation, authorization, conflict, capacity or dependency
+            failure; never a synthetic success.
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ConnectionAuth'
+  /connections/{connection_id}/refresh:
+    post:
+      operationId: refreshConnection
+      summary: Refresh within provider quota and permissions
+      description: All access and state transitions require server-side scope, permission,
+        version and eligibility checks.
+      parameters:
+      - name: connection_id
+        in: path
+        required: true
+        schema: *id001
+      - name: Idempotency-Key
+        in: header
+        required: true
+        schema:
+          type: string
+          minLength: 1
+      - name: X-CSRF-Token
+        in: header
+        required: true
+        schema:
+          type: string
+          minLength: 1
+      responses:
+        '202':
+          description: Success; asynchronous work returns persisted job identifier.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/job'
+        default:
+          description: Typed validation, authorization, conflict, capacity or dependency
+            failure; never a synthetic success.
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+  /connections/{connection_id}:
+    delete:
+      operationId: revokeConnection
+      summary: Revoke connection and invalidate dependent capability
+      description: All access and state transitions require server-side scope, permission,
+        version and eligibility checks.
+      parameters:
+      - name: connection_id
+        in: path
+        required: true
+        schema: *id001
+      - name: Idempotency-Key
+        in: header
+        required: true
+        schema:
+          type: string
+          minLength: 1
+      - name: X-CSRF-Token
+        in: header
+        required: true
+        schema:
+          type: string
+          minLength: 1
+      - name: If-Match
+        in: header
+        required: true
+        schema:
+          type: string
+        description: Expected resource revision/ETag; stale values return 409.
+      responses:
+        '202':
+          description: Success; asynchronous work returns persisted job identifier.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/job'
+        default:
+          description: Typed validation, authorization, conflict, capacity or dependency
+            failure; never a synthetic success.
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+  /feeds:
+    get:
+      operationId: listFeeds
+      summary: List explicit feed specifications
+      description: All access and state transitions require server-side scope, permission,
+        version and eligibility checks.
+      parameters:
+      - name: cursor
+        in: query
+        schema:
+          type: string
+      - name: limit
+        in: query
+        schema:
+          type: integer
+          minimum: 1
+          maximum: 200
+        description: Server-bounded page size; tenant derived from session.
+      responses:
+        '200':
+          description: Success.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/feed_specPage'
+        default:
+          description: Typed validation, authorization, conflict, capacity or dependency
+            failure; never a synthetic success.
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+  /feeds/{feed_id}:
+    get:
+      operationId: readFeed
+      summary: Read feed lineage and suitability
+      description: All access and state transitions require server-side scope, permission,
+        version and eligibility checks.
+      parameters:
+      - name: feed_id
+        in: path
+        required: true
+        schema: *id001
+      responses:
+        '200':
+          description: Success.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/feed_spec'
+        default:
+          description: Typed validation, authorization, conflict, capacity or dependency
+            failure; never a synthetic success.
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+  /simulations:
+    post:
+      operationId: createSimulation
+      summary: Create separate virtual account
+      description: All access and state transitions require server-side scope, permission,
+        version and eligibility checks.
+      parameters:
+      - name: Idempotency-Key
+        in: header
+        required: true
+        schema:
+          type: string
+          minLength: 1
+      - name: X-CSRF-Token
+        in: header
+        required: true
+        schema:
+          type: string
+          minLength: 1
+      responses:
+        '201':
+          description: Success; asynchronous work returns persisted job identifier.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/job'
+        default:
+          description: Typed validation, authorization, conflict, capacity or dependency
+            failure; never a synthetic success.
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateSimulation'
+    get:
+      operationId: listSimulations
+      summary: List virtual portfolios
+      description: All access and state transitions require server-side scope, permission,
+        version and eligibility checks.
+      parameters:
+      - name: cursor
+        in: query
+        schema:
+          type: string
+      - name: limit
+        in: query
+        schema:
+          type: integer
+          minimum: 1
+          maximum: 200
+        description: Server-bounded page size; tenant derived from session.
+      responses:
+        '200':
+          description: Success.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SimulationSummaryPage'
+        default:
+          description: Typed validation, authorization, conflict, capacity or dependency
+            failure; never a synthetic success.
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+  /simulations/{simulation_id}/orders:
+    post:
+      operationId: submitVirtualOrder
+      summary: Submit simulation-only order
+      description: All access and state transitions require server-side scope, permission,
+        version and eligibility checks.
+      parameters:
+      - name: simulation_id
+        in: path
+        required: true
+        schema: *id001
+      - name: Idempotency-Key
+        in: header
+        required: true
+        schema:
+          type: string
+          minLength: 1
+      - name: X-CSRF-Token
+        in: header
+        required: true
+        schema:
+          type: string
+          minLength: 1
+      responses:
+        '201':
+          description: Success.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/simulated_order'
+        default:
+          description: Typed validation, authorization, conflict, capacity or dependency
+            failure; never a synthetic success.
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/VirtualOrderRequest'
+  /simulations/{simulation_id}/fills:
+    get:
+      operationId: listVirtualFills
+      summary: List declared-model hypothetical fills
+      description: All access and state transitions require server-side scope, permission,
+        version and eligibility checks.
+      parameters:
+      - name: simulation_id
+        in: path
+        required: true
+        schema: *id001
+      - name: cursor
+        in: query
+        schema:
+          type: string
+      - name: limit
+        in: query
+        schema:
+          type: integer
+          minimum: 1
+          maximum: 200
+        description: Server-bounded page size; tenant derived from session.
+      responses:
+        '200':
+          description: Success.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/simulated_fillPage'
+        default:
+          description: Typed validation, authorization, conflict, capacity or dependency
+            failure; never a synthetic success.
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+  /simulations/{simulation_id}/results:
+    get:
+      operationId: readSimulationResults
+      summary: Read simulation scorecards
+      description: All access and state transitions require server-side scope, permission,
+        version and eligibility checks.
+      parameters:
+      - name: simulation_id
+        in: path
+        required: true
+        schema: *id001
+      - name: cursor
+        in: query
+        schema:
+          type: string
+      - name: limit
+        in: query
+        schema:
+          type: integer
+          minimum: 1
+          maximum: 200
+        description: Server-bounded page size; tenant derived from session.
+      responses:
+        '200':
+          description: Success.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/calculationPage'
+        default:
+          description: Typed validation, authorization, conflict, capacity or dependency
+            failure; never a synthetic success.
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+  /benchmarks:
+    get:
+      operationId: listBenchmarks
+      summary: List frozen benchmark policies
+      description: All access and state transitions require server-side scope, permission,
+        version and eligibility checks.
+      parameters:
+      - name: cursor
+        in: query
+        schema:
+          type: string
+      - name: limit
+        in: query
+        schema:
+          type: integer
+          minimum: 1
+          maximum: 200
+        description: Server-bounded page size; tenant derived from session.
+      responses:
+        '200':
+          description: Success.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BenchmarkPolicyPage'
+        default:
+          description: Typed validation, authorization, conflict, capacity or dependency
+            failure; never a synthetic success.
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+  /feedback:
+    post:
+      operationId: submitFeedback
+      summary: Record private feedback without implicit sharing
+      description: All access and state transitions require server-side scope, permission,
+        version and eligibility checks.
+      parameters:
+      - name: Idempotency-Key
+        in: header
+        required: true
+        schema:
+          type: string
+          minLength: 1
+      - name: X-CSRF-Token
+        in: header
+        required: true
+        schema:
+          type: string
+          minLength: 1
+      responses:
+        '202':
+          description: Success; asynchronous work returns persisted job identifier.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/job'
+        default:
+          description: Typed validation, authorization, conflict, capacity or dependency
+            failure; never a synthetic success.
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Feedback'
+  /experiments:
+    get:
+      operationId: listExperiments
+      summary: List scope-authorized experiments
+      description: All access and state transitions require server-side scope, permission,
+        version and eligibility checks.
+      parameters:
+      - name: cursor
+        in: query
+        schema:
+          type: string
+      - name: limit
+        in: query
+        schema:
+          type: integer
+          minimum: 1
+          maximum: 200
+        description: Server-bounded page size; tenant derived from session.
+      responses:
+        '200':
+          description: Success.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/experimentPage'
+        default:
+          description: Typed validation, authorization, conflict, capacity or dependency
+            failure; never a synthetic success.
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+    post:
+      operationId: requestExperiment
+      summary: Schedule separately budgeted sandbox experiment
+      description: All access and state transitions require server-side scope, permission,
+        version and eligibility checks.
+      parameters:
+      - name: Idempotency-Key
+        in: header
+        required: true
+        schema:
+          type: string
+          minLength: 1
+      - name: X-CSRF-Token
+        in: header
+        required: true
+        schema:
+          type: string
+          minLength: 1
+      responses:
+        '201':
+          description: Success.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/experiment'
+        default:
+          description: Typed validation, authorization, conflict, capacity or dependency
+            failure; never a synthetic success.
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RunExperiment'
+  /experiments/{experiment_id}:
+    get:
+      operationId: readExperiment
+      summary: Read evaluation and version lineage
+      description: All access and state transitions require server-side scope, permission,
+        version and eligibility checks.
+      parameters:
+      - name: experiment_id
+        in: path
+        required: true
+        schema: *id001
+      responses:
+        '200':
+          description: Success.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/experiment'
+        default:
+          description: Typed validation, authorization, conflict, capacity or dependency
+            failure; never a synthetic success.
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+  /experiments/{experiment_id}/cancel:
+    post:
+      operationId: cancelExperiment
+      summary: Cancel bounded experiment
+      description: All access and state transitions require server-side scope, permission,
+        version and eligibility checks.
+      parameters:
+      - name: experiment_id
+        in: path
+        required: true
+        schema: *id001
+      - name: Idempotency-Key
+        in: header
+        required: true
+        schema:
+          type: string
+          minLength: 1
+      - name: X-CSRF-Token
+        in: header
+        required: true
+        schema:
+          type: string
+          minLength: 1
+      responses:
+        '200':
+          description: Success.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/experiment'
+        default:
+          description: Typed validation, authorization, conflict, capacity or dependency
+            failure; never a synthetic success.
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RevisionAction'
+  /experiments/{experiment_id}/promote:
+    post:
+      operationId: promoteExperiment
+      summary: Human-authorized release only; user adoption remains separate
+      description: All access and state transitions require server-side scope, permission,
+        version and eligibility checks.
+      parameters:
+      - name: experiment_id
+        in: path
+        required: true
+        schema: *id001
+      - name: Idempotency-Key
+        in: header
+        required: true
+        schema:
+          type: string
+          minLength: 1
+      - name: X-CSRF-Token
+        in: header
+        required: true
+        schema:
+          type: string
+          minLength: 1
+      - name: If-Match
+        in: header
+        required: true
+        schema:
+          type: string
+        description: Expected resource revision/ETag; stale values return 409.
+      responses:
+        '200':
+          description: Success.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/promotion_receipt'
+        default:
+          description: Typed validation, authorization, conflict, capacity or dependency
+            failure; never a synthetic success.
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PromoteCandidate'
+  /releases/{release_id}/rollback:
+    post:
+      operationId: rollbackRelease
+      summary: Restore compatible approved version without rewriting history
+      description: All access and state transitions require server-side scope, permission,
+        version and eligibility checks.
+      parameters:
+      - name: release_id
+        in: path
+        required: true
+        schema: *id001
+      - name: Idempotency-Key
+        in: header
+        required: true
+        schema:
+          type: string
+          minLength: 1
+      - name: X-CSRF-Token
+        in: header
+        required: true
+        schema:
+          type: string
+          minLength: 1
+      responses:
+        '202':
+          description: Success; asynchronous work returns persisted job identifier.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/job'
+        default:
+          description: Typed validation, authorization, conflict, capacity or dependency
+            failure; never a synthetic success.
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RevisionAction'
+  /budgets:
+    get:
+      operationId: listBudgets
+      summary: Read per-scope budget reservations and usage
+      description: All access and state transitions require server-side scope, permission,
+        version and eligibility checks.
+      parameters:
+      - name: cursor
+        in: query
+        schema:
+          type: string
+      - name: limit
+        in: query
+        schema:
+          type: integer
+          minimum: 1
+          maximum: 200
+        description: Server-bounded page size; tenant derived from session.
+      responses:
+        '200':
+          description: Success.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BudgetSummaryPage'
+        default:
+          description: Typed validation, authorization, conflict, capacity or dependency
+            failure; never a synthetic success.
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+  /notifications:
+    get:
+      operationId: listNotifications
+      summary: Read attempts separately from seen/acted
+      description: All access and state transitions require server-side scope, permission,
+        version and eligibility checks.
+      parameters:
+      - name: cursor
+        in: query
+        schema:
+          type: string
+      - name: limit
+        in: query
+        schema:
+          type: integer
+          minimum: 1
+          maximum: 200
+        description: Server-bounded page size; tenant derived from session.
+      responses:
+        '200':
+          description: Success.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/NotificationPage'
+        default:
+          description: Typed validation, authorization, conflict, capacity or dependency
+            failure; never a synthetic success.
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+  /notifications/preferences:
+    patch:
+      operationId: setNotificationPreferences
+      summary: Set opt-in channels and redaction
+      description: All access and state transitions require server-side scope, permission,
+        version and eligibility checks.
+      parameters:
+      - name: Idempotency-Key
+        in: header
+        required: true
+        schema:
+          type: string
+          minLength: 1
+      - name: X-CSRF-Token
+        in: header
+        required: true
+        schema:
+          type: string
+          minLength: 1
+      - name: If-Match
+        in: header
+        required: true
+        schema:
+          type: string
+        description: Expected resource revision/ETag; stale values return 409.
+      responses:
+        '200':
+          description: Success.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/NotificationPreferences'
+        default:
+          description: Typed validation, authorization, conflict, capacity or dependency
+            failure; never a synthetic success.
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/NotificationPreferences'
+  /exports:
+    post:
+      operationId: requestExport
+      summary: Build permitted credential-free migration export
+      description: All access and state transitions require server-side scope, permission,
+        version and eligibility checks.
+      parameters:
+      - name: Idempotency-Key
+        in: header
+        required: true
+        schema:
+          type: string
+          minLength: 1
+      - name: X-CSRF-Token
+        in: header
+        required: true
+        schema:
+          type: string
+          minLength: 1
+      responses:
+        '202':
+          description: Success; asynchronous work returns persisted job identifier.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/job'
+        default:
+          description: Typed validation, authorization, conflict, capacity or dependency
+            failure; never a synthetic success.
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ExportRequest'
+  /exports/{export_id}:
+    get:
+      operationId: readExportManifest
+      summary: Read compatible export manifest
+      description: All access and state transitions require server-side scope, permission,
+        version and eligibility checks.
+      parameters:
+      - name: export_id
+        in: path
+        required: true
+        schema: *id001
+      responses:
+        '200':
+          description: Success.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/export_manifest'
+        default:
+          description: Typed validation, authorization, conflict, capacity or dependency
+            failure; never a synthetic success.
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+  /privacy/deletions:
+    post:
+      operationId: requestDeletion
+      summary: Request scoped deletion with retention reconciliation
+      description: All access and state transitions require server-side scope, permission,
+        version and eligibility checks.
+      parameters:
+      - name: Idempotency-Key
+        in: header
+        required: true
+        schema:
+          type: string
+          minLength: 1
+      - name: X-CSRF-Token
+        in: header
+        required: true
+        schema:
+          type: string
+          minLength: 1
+      responses:
+        '202':
+          description: Success; asynchronous work returns persisted job identifier.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/job'
+        default:
+          description: Typed validation, authorization, conflict, capacity or dependency
+            failure; never a synthetic success.
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/DeleteRequest'
+  /jobs/{job_id}:
+    get:
+      operationId: readJob
+      summary: Read idempotent asynchronous result
+      description: All access and state transitions require server-side scope, permission,
+        version and eligibility checks.
+      parameters:
+      - name: job_id
+        in: path
+        required: true
+        schema: *id001
+      responses:
+        '200':
+          description: Success; asynchronous work returns persisted job identifier.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/job'
+        default:
+          description: Typed validation, authorization, conflict, capacity or dependency
+            failure; never a synthetic success.
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+  /jobs/{job_id}/cancel:
+    post:
+      operationId: cancelJob
+      summary: Cancel cancellable work without resetting budget history
+      description: All access and state transitions require server-side scope, permission,
+        version and eligibility checks.
+      parameters:
+      - name: job_id
+        in: path
+        required: true
+        schema: *id001
+      - name: Idempotency-Key
+        in: header
+        required: true
+        schema:
+          type: string
+          minLength: 1
+      - name: X-CSRF-Token
+        in: header
+        required: true
+        schema:
+          type: string
+          minLength: 1
+      responses:
+        '202':
+          description: Success; asynchronous work returns persisted job identifier.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/job'
+        default:
+          description: Typed validation, authorization, conflict, capacity or dependency
+            failure; never a synthetic success.
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RevisionAction'
+components:
+  securitySchemes:
+    sessionCookie:
+      type: apiKey
+      in: cookie
+      name: pi_session
+      description: HttpOnly Secure SameSite session; state-changing operations also
+        require origin/CSRF validation.
+  schemas:
+    CreateAccount:
+      type: object
+      properties:
+        name:
+          type: string
+          minLength: 1
+        broker:
+          type: string
+        account_type:
+          type: string
+        reporting_currency:
+          type: string
+          pattern: ^[A-Z]{3}$
+        analysis_scope:
+          type: string
+          enum:
+          - complete_declared
+          - partial_declared
+          - hypothetical
+      required:
+      - name
+      - broker
+      - account_type
+      - reporting_currency
+      - analysis_scope
+      additionalProperties: false
+    RevisionAction:
+      type: object
+      properties:
+        expected_revision:
+          type: integer
+          minimum: 1
+        acknowledgement:
+          type: string
+          minLength: 1
+        reason:
+          type: string
+      required:
+      - expected_revision
+      - acknowledgement
+      - reason
+      additionalProperties: false
+    MapImport:
+      type: object
+      properties:
+        classification:
+          type: string
+          enum:
+          - new_account
+          - existing_account_view
+          - watchlist
+          - hypothetical
+        target_account_id:
+          type:
+          - string
+          - 'null'
+        column_mapping:
+          type: array
+          items:
+            type: object
+            properties:
+              source_column:
+                type: string
+              canonical_field:
+                type: string
+            required:
+            - source_column
+            - canonical_field
+            additionalProperties: false
+        source_timezone:
+          type: string
+        currency_policy:
+          type: string
+      required:
+      - classification
+      - target_account_id
+      - column_mapping
+      - source_timezone
+      - currency_policy
+      additionalProperties: false
+    CommitImport:
+      type: object
+      properties:
+        preview_id: *id001
+        commit_token:
+          type: string
+        expected_account_revision:
+          type: integer
+          minimum: 0
+      required:
+      - preview_id
+      - commit_token
+      - expected_account_revision
+      additionalProperties: false
+    CreateWatchlist:
+      type: object
+      properties:
+        name:
+          type: string
+          minLength: 1
+        description:
+          type: string
+      required:
+      - name
+      - description
+      additionalProperties: false
+    WatchlistEntry:
+      type: object
+      properties:
+        instrument_id: *id001
+        thesis:
+          type: string
+        tags:
+          type: array
+          items:
+            type: string
+        monitoring_priority:
+          type: integer
+          minimum: 0
+          maximum: 100
+        conditions:
+          type: array
+          items:
+            $ref: ./schemas/common.schema.json#/$defs/Condition
+        invalidation_text:
+          type: string
+      required:
+      - instrument_id
+      - thesis
+      - tags
+      - monitoring_priority
+      - conditions
+      - invalidation_text
+      additionalProperties: false
+    PolicyDraft:
+      type: object
+      properties:
+        scope_account_ids:
+          type: array
+          items: *id001
+          minItems: 1
+        goal:
+          type: string
+        horizons:
+          type: array
+          items:
+            type: string
+            enum:
+            - long_term
+            - swing_position
+            - intraday
+        answers:
+          type: array
+          items:
+            type: object
+            properties:
+              question_id: *id001
+              values:
+                type: array
+                items:
+                  type: string
+            required:
+            - question_id
+            - values
+            additionalProperties: false
+      required:
+      - scope_account_ids
+      - goal
+      - horizons
+      - answers
+      additionalProperties: false
+    AdoptVersion:
+      type: object
+      properties:
+        version_id: *id001
+        content_hash: &id002
+          type: string
+          pattern: ^[a-f0-9]{64}$
+        expected_revision:
+          type: integer
+          minimum: 1
+        acknowledgement:
+          type: string
+          minLength: 1
+      required:
+      - version_id
+      - content_hash
+      - expected_revision
+      - acknowledgement
+      additionalProperties: false
+    CreateConnection:
+      type: object
+      properties:
+        provider:
+          type: string
+        purpose:
+          type: string
+          enum:
+          - read_only_account
+          - market_data
+          - model_api
+          - model_native_runtime
+        deployment_profile_id: *id001
+        permission_profile_id: *id001
+      required:
+      - provider
+      - purpose
+      - deployment_profile_id
+      - permission_profile_id
+      additionalProperties: false
+    ConnectionAuth:
+      type: object
+      properties:
+        connection_id: *id001
+        auth_method:
+          type: string
+          enum:
+          - official_redirect
+          - secret_vault_form
+          - native_runtime
+        return_path:
+          type: string
+          pattern: ^/
+      required:
+      - connection_id
+      - auth_method
+      - return_path
+      additionalProperties: false
+    RunExperiment:
+      type: object
+      properties:
+        target:
+          type: string
+          enum:
+          - personal_adaptation
+          - research
+          - strategy
+          - evaluator
+          - application_code
+          - recursive_optimizer
+        protocol_id: *id001
+        baseline_version_id: *id001
+        scope_id: *id001
+        budget_cap_usd: &id003
+          type: string
+          pattern: ^(0|[1-9][0-9]*)(\.[0-9]+)?$
+          maxLength: 60
+        sandbox_profile_id: *id001
+      required:
+      - target
+      - protocol_id
+      - baseline_version_id
+      - scope_id
+      - budget_cap_usd
+      - sandbox_profile_id
+      additionalProperties: false
+    PromoteCandidate:
+      type: object
+      properties:
+        candidate_id: *id001
+        candidate_hash: *id002
+        assessment_receipt_ids:
+          type: array
+          items: *id001
+          minItems: 1
+        rollback_version_id: *id001
+        reauthentication_receipt_id: *id001
+        acknowledgement:
+          type: string
+          minLength: 1
+      required:
+      - candidate_id
+      - candidate_hash
+      - assessment_receipt_ids
+      - rollback_version_id
+      - reauthentication_receipt_id
+      - acknowledgement
+      additionalProperties: false
+    CreateSimulation:
+      type: object
+      properties:
+        name:
+          type: string
+        base_currency:
+          type: string
+          pattern: ^[A-Z]{3}$
+        starting_cash: *id003
+        execution_model_id: *id001
+        benchmark_policy_id: *id001
+        mode:
+          type: string
+          enum:
+          - manual
+          - approved_policy_shadow
+      required:
+      - name
+      - base_currency
+      - starting_cash
+      - execution_model_id
+      - benchmark_policy_id
+      - mode
+      additionalProperties: false
+    ExportRequest:
+      type: object
+      properties:
+        scope_account_ids:
+          type: array
+          items: *id001
+        include_private_learning: &id004
+          type: boolean
+        include_permitted_evidence: *id004
+        reauthentication_receipt_id: *id001
+      required:
+      - scope_account_ids
+      - include_private_learning
+      - include_permitted_evidence
+      - reauthentication_receipt_id
+      additionalProperties: false
+    DeleteRequest:
+      type: object
+      properties:
+        scope_id: *id001
+        classes:
+          type: array
+          items:
+            type: string
+        reauthentication_receipt_id: *id001
+        acknowledgement:
+          type: string
+          minLength: 1
+      required:
+      - scope_id
+      - classes
+      - reauthentication_receipt_id
+      - acknowledgement
+      additionalProperties: false
+    NotificationPreferences:
+      type: object
+      properties:
+        in_app: *id004
+        email: *id004
+        browser_push: *id004
+        quiet_hours_timezone:
+          type: string
+        quiet_hours:
+          type: array
+          items:
+            type: string
+        redact_financial_values: *id004
+      required:
+      - in_app
+      - email
+      - browser_push
+      - quiet_hours_timezone
+      - quiet_hours
+      - redact_financial_values
+      additionalProperties: false
+    ProposalSelection:
+      type: object
+      properties:
+        proposal_version_ids:
+          type: array
+          items: *id001
+          minItems: 1
+        expected_account_revision:
+          type: integer
+          minimum: 1
+        mode:
+          type: string
+          enum:
+          - planned
+          - dismissed
+      required:
+      - proposal_version_ids
+      - expected_account_revision
+      - mode
+      additionalProperties: false
+    Feedback:
+      type: object
+      properties:
+        object_id: *id001
+        category:
+          type: string
+          enum:
+          - incorrect_fact
+          - irrelevant
+          - clear
+          - unclear
+          - missed_risk
+          - other
+        message:
+          type: string
+          maxLength: 4000
+        cross_user_contribution_consent:
+          const: false
+      required:
+      - object_id
+      - category
+      - message
+      - cross_user_contribution_consent
+      additionalProperties: false
+    Page:
+      type: object
+      properties:
+        items:
+          type: array
+          items:
+            type: object
+        next_cursor:
+          type:
+          - string
+          - 'null'
+      required:
+      - items
+      - next_cursor
+      additionalProperties: false
+    Health:
+      type: object
+      properties:
+        status:
+          type: string
+          enum:
+          - healthy
+          - degraded
+          - unavailable
+        component:
+          type: string
+        checked_at: &id005
+          type: string
+          format: date-time
+      required:
+      - status
+      - component
+      - checked_at
+      additionalProperties: false
+    Capabilities:
+      type: object
+      properties:
+        deployment:
+          type: string
+          enum:
+          - hosted
+          - self_hosted
+        features:
+          type: array
+          items:
+            type: object
+            properties:
+              id: *id001
+              enabled: *id004
+              reason_codes:
+                type: array
+                items: *id001
+            required:
+            - id
+            - enabled
+            - reason_codes
+            additionalProperties: false
+      required:
+      - deployment
+      - features
+      additionalProperties: false
+    Connection:
+      type: object
+      properties:
+        id: *id001
+        provider:
+          type: string
+        purpose:
+          type: string
+        status:
+          type: string
+          enum:
+          - unconfigured
+          - awaiting_auth
+          - connected
+          - expired
+          - degraded
+          - revoked
+        permissions:
+          type: array
+          items:
+            type: string
+        last_success_at:
+          type:
+          - string
+          - 'null'
+          format: date-time
+      required:
+      - id
+      - provider
+      - purpose
+      - status
+      - permissions
+      - last_success_at
+      additionalProperties: false
+    Notification:
+      type: object
+      properties:
+        id: *id001
+        object_id: *id001
+        channel:
+          type: string
+          enum:
+          - in_app
+          - email
+          - browser_push
+        status:
+          type: string
+          enum:
+          - queued
+          - attempted
+          - delivered
+          - failed
+          - unknown
+        current_object_state:
+          type: string
+      required:
+      - id
+      - object_id
+      - channel
+      - status
+      - current_object_state
+      additionalProperties: false
+    account:
+      $ref: ./schemas/account.schema.json
+    instrument:
+      $ref: ./schemas/instrument.schema.json
+    option_terms:
+      $ref: ./schemas/option_terms.schema.json
+    observation:
+      $ref: ./schemas/observation.schema.json
+    ledger_event:
+      $ref: ./schemas/ledger_event.schema.json
+    account_snapshot:
+      $ref: ./schemas/account_snapshot.schema.json
+    policy:
+      $ref: ./schemas/policy.schema.json
+    watchlist:
+      $ref: ./schemas/watchlist.schema.json
+    feed_spec:
+      $ref: ./schemas/feed_spec.schema.json
+    strategy_version:
+      $ref: ./schemas/strategy_version.schema.json
+    evidence:
+      $ref: ./schemas/evidence.schema.json
+    claim:
+      $ref: ./schemas/claim.schema.json
+    proposal:
+      $ref: ./schemas/proposal.schema.json
+    review:
+      $ref: ./schemas/review.schema.json
+    calculation:
+      $ref: ./schemas/calculation.schema.json
+    experiment:
+      $ref: ./schemas/experiment.schema.json
+    promotion_receipt:
+      $ref: ./schemas/promotion_receipt.schema.json
+    budget_reservation:
+      $ref: ./schemas/budget_reservation.schema.json
+    simulated_order:
+      $ref: ./schemas/simulated_order.schema.json
+    simulated_fill:
+      $ref: ./schemas/simulated_fill.schema.json
+    export_manifest:
+      $ref: ./schemas/export_manifest.schema.json
+    job:
+      $ref: ./schemas/job.schema.json
+    import_preview:
+      $ref: ./schemas/import_preview.schema.json
+    execution_report:
+      $ref: ./schemas/execution_report.schema.json
+    research_request:
+      $ref: ./schemas/research_request.schema.json
+    Problem:
+      $ref: ./schemas/common.schema.json#/$defs/Problem
+    ExecutionReportRequest:
+      type: object
+      properties:
+        proposal_id:
+          type:
+          - string
+          - 'null'
+        account_id: *id001
+        instrument_id: *id001
+        side:
+          type: string
+          enum:
+          - buy
+          - sell
+        quantity: *id003
+        price:
+          $ref: ./schemas/common.schema.json#/$defs/Money
+        fees:
+          $ref: ./schemas/common.schema.json#/$defs/Money
+        effective_at: *id005
+        external_reference:
+          type:
+          - string
+          - 'null'
+      required:
+      - proposal_id
+      - account_id
+      - instrument_id
+      - side
+      - quantity
+      - price
+      - fees
+      - effective_at
+      - external_reference
+      additionalProperties: false
+    VirtualOrderRequest:
+      type: object
+      properties:
+        proposal_id:
+          type:
+          - string
+          - 'null'
+        submitted_at: *id005
+        side:
+          type: string
+          enum:
+          - buy
+          - sell
+        instrument_id: *id001
+        quantity: *id003
+        order_style:
+          type: string
+          enum:
+          - market
+          - limit
+          - stop
+          - stop_limit
+        limit_price:
+          anyOf:
+          - $ref: ./schemas/common.schema.json#/$defs/Money
+          - type: 'null'
+        stop_price:
+          anyOf:
+          - $ref: ./schemas/common.schema.json#/$defs/Money
+          - type: 'null'
+        execution_model_id: *id001
+      required:
+      - proposal_id
+      - submitted_at
+      - side
+      - instrument_id
+      - quantity
+      - order_style
+      - limit_price
+      - stop_price
+      - execution_model_id
+      additionalProperties: false
+    SimulationSummary:
+      type: object
+      properties:
+        id: &id006
+          type: string
+        name: *id006
+        execution_model_id: *id006
+        benchmark_policy_id: *id006
+        mode:
+          enum:
+          - manual
+          - approved_policy_shadow
+        separate_from_actual:
+          const: true
+      required:
+      - id
+      - name
+      - execution_model_id
+      - benchmark_policy_id
+      - mode
+      - separate_from_actual
+      additionalProperties: false
+    BenchmarkPolicy:
+      type: object
+      properties:
+        id: *id006
+        version: *id006
+        currency: *id006
+        reference_instrument_id: *id006
+        reinvestment_rule: *id006
+        cost_model_id: *id006
+        selected_at:
+          type: string
+          format: date-time
+      required:
+      - id
+      - version
+      - currency
+      - reference_instrument_id
+      - reinvestment_rule
+      - cost_model_id
+      - selected_at
+      additionalProperties: false
+    BudgetSummary:
+      type: object
+      properties:
+        scope_id: *id006
+        period: *id006
+        category: *id006
+        cap_usd:
+          $ref: ./schemas/common.schema.json#/$defs/NonnegativeDecimal
+        spent_usd:
+          $ref: ./schemas/common.schema.json#/$defs/NonnegativeDecimal
+        reserved_usd:
+          $ref: ./schemas/common.schema.json#/$defs/NonnegativeDecimal
+        available_usd:
+          $ref: ./schemas/common.schema.json#/$defs/Decimal
+      required:
+      - scope_id
+      - period
+      - category
+      - cap_usd
+      - spent_usd
+      - reserved_usd
+      - available_usd
+      additionalProperties: false
+    accountPage:
+      type: object
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/account'
+        next_cursor:
+          type:
+          - string
+          - 'null'
+      required:
+      - items
+      - next_cursor
+      additionalProperties: false
+    ledger_eventPage:
+      type: object
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/ledger_event'
+        next_cursor:
+          type:
+          - string
+          - 'null'
+      required:
+      - items
+      - next_cursor
+      additionalProperties: false
+    instrumentPage:
+      type: object
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/instrument'
+        next_cursor:
+          type:
+          - string
+          - 'null'
+      required:
+      - items
+      - next_cursor
+      additionalProperties: false
+    observationPage:
+      type: object
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/observation'
+        next_cursor:
+          type:
+          - string
+          - 'null'
+      required:
+      - items
+      - next_cursor
+      additionalProperties: false
+    watchlistPage:
+      type: object
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/watchlist'
+        next_cursor:
+          type:
+          - string
+          - 'null'
+      required:
+      - items
+      - next_cursor
+      additionalProperties: false
+    strategy_versionPage:
+      type: object
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/strategy_version'
+        next_cursor:
+          type:
+          - string
+          - 'null'
+      required:
+      - items
+      - next_cursor
+      additionalProperties: false
+    proposalPage:
+      type: object
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/proposal'
+        next_cursor:
+          type:
+          - string
+          - 'null'
+      required:
+      - items
+      - next_cursor
+      additionalProperties: false
+    ConnectionPage:
+      type: object
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/Connection'
+        next_cursor:
+          type:
+          - string
+          - 'null'
+      required:
+      - items
+      - next_cursor
+      additionalProperties: false
+    feed_specPage:
+      type: object
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/feed_spec'
+        next_cursor:
+          type:
+          - string
+          - 'null'
+      required:
+      - items
+      - next_cursor
+      additionalProperties: false
+    SimulationSummaryPage:
+      type: object
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/SimulationSummary'
+        next_cursor:
+          type:
+          - string
+          - 'null'
+      required:
+      - items
+      - next_cursor
+      additionalProperties: false
+    simulated_fillPage:
+      type: object
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/simulated_fill'
+        next_cursor:
+          type:
+          - string
+          - 'null'
+      required:
+      - items
+      - next_cursor
+      additionalProperties: false
+    calculationPage:
+      type: object
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/calculation'
+        next_cursor:
+          type:
+          - string
+          - 'null'
+      required:
+      - items
+      - next_cursor
+      additionalProperties: false
+    BenchmarkPolicyPage:
+      type: object
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/BenchmarkPolicy'
+        next_cursor:
+          type:
+          - string
+          - 'null'
+      required:
+      - items
+      - next_cursor
+      additionalProperties: false
+    experimentPage:
+      type: object
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/experiment'
+        next_cursor:
+          type:
+          - string
+          - 'null'
+      required:
+      - items
+      - next_cursor
+      additionalProperties: false
+    BudgetSummaryPage:
+      type: object
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/BudgetSummary'
+        next_cursor:
+          type:
+          - string
+          - 'null'
+      required:
+      - items
+      - next_cursor
+      additionalProperties: false
+    NotificationPage:
+      type: object
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/Notification'
+        next_cursor:
+          type:
+          - string
+          - 'null'
+      required:
+      - items
+      - next_cursor
+      additionalProperties: false

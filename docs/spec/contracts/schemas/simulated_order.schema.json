@@ -1,0 +1,113 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Simulated Order",
+  "type": "object",
+  "properties": {
+    "id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]*$"
+    },
+    "simulation_account_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]*$"
+    },
+    "proposal_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "submitted_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "side": {
+      "type": "string",
+      "enum": [
+        "buy",
+        "sell"
+      ]
+    },
+    "instrument_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]*$"
+    },
+    "quantity": {
+      "type": "string",
+      "pattern": "^(0|[1-9][0-9]*)(\\.[0-9]+)?$",
+      "maxLength": 60
+    },
+    "order_style": {
+      "type": "string",
+      "enum": [
+        "market",
+        "limit",
+        "stop",
+        "stop_limit"
+      ]
+    },
+    "limit_price": {
+      "anyOf": [
+        {
+          "$ref": "common.schema.json#/$defs/Money"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "stop_price": {
+      "anyOf": [
+        {
+          "$ref": "common.schema.json#/$defs/Money"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "execution_model_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]*$"
+    },
+    "status": {
+      "type": "string",
+      "enum": [
+        "submitted",
+        "partially_filled",
+        "filled",
+        "unfilled",
+        "cancelled",
+        "expired",
+        "unsupported"
+      ]
+    },
+    "broker_submission": {
+      "const": false
+    }
+  },
+  "required": [
+    "id",
+    "simulation_account_id",
+    "proposal_id",
+    "submitted_at",
+    "side",
+    "instrument_id",
+    "quantity",
+    "order_style",
+    "limit_price",
+    "stop_price",
+    "execution_model_id",
+    "status",
+    "broker_submission"
+  ],
+  "additionalProperties": false
+}

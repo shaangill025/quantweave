@@ -1,0 +1,39 @@
+{
+  "examples": [
+    {
+      "path": "proposal_candidate.valid.json",
+      "schema": "proposal",
+      "expected_valid": true
+    },
+    {
+      "path": "proposal_active_synthetic.valid.json",
+      "schema": "proposal",
+      "expected_valid": true
+    },
+    {
+      "path": "proposal_missing_review.invalid.json",
+      "schema": "proposal",
+      "expected_valid": false
+    },
+    {
+      "path": "proposal_float_quantity.invalid.json",
+      "schema": "proposal",
+      "expected_valid": false
+    },
+    {
+      "path": "review.valid.json",
+      "schema": "review",
+      "expected_valid": true
+    },
+    {
+      "path": "experiment_recursive.valid.json",
+      "schema": "experiment",
+      "expected_valid": true
+    },
+    {
+      "path": "experiment_self_promotion.invalid.json",
+      "schema": "experiment",
+      "expected_valid": false
+    }
+  ]
+}

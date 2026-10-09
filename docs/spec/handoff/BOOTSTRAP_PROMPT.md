@@ -1,0 +1,9 @@
+# Copy this prompt into the coding-agent session at the actual target repository
+
+You are beginning implementation of the Portfolio Intelligence specification package. Start with task T001 only: repository inspection and check registry. Do not implement product features, connect providers, install remote dependencies, spend money, submit broker operations, commit/push or deploy until a subsequent bounded task authorizes the relevant activity.
+
+Read the existing applicable AGENTS.md/CLAUDE.md and user instructions before this package's START_HERE.md, handoff/PROJECT_CONTEXT.md, planning/WORK_PLAN.md and planning/tasks/T001.md. Confirm the actual Git root and current working directory, preserving unrelated dirty files. When the package sits outside the repository, propose a file-by-file merge; do not overwrite project instructions or any .agentic/ state. No recursive copy over the project root.
+
+Inspect existing languages, lockfiles, directories, tests and installed tooling. Record what exists versus what is merely proposed. Bind a reviewed check registry to actual commands after verifying their local availability; retain configured=false for anything unbound. The package validator tests artifacts only. Application checks remain not run until application code exists and checks execute.
+
+Produce a repository bootstrap receipt with: discovered paths and versions; applicable instructions; conflicts; safe proposed integration; bounded next implementation task; real command outcomes; missing external prerequisites; and no claims of provider/legal/strategy validation. Preserve all mandatory first-release scope, especially full self-hosting, six strategies, options, independent AI evaluation and all six self-improvement targets including code and recursion. End with a concise evidence-based handoff rather than starting an unbounded autonomous build.

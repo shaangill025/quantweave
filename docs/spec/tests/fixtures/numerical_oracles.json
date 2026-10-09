@@ -1,0 +1,303 @@
+{
+  "synthetic": true,
+  "not_market_data": true,
+  "option_scope": "Idealized same-expiry terminal payoffs before costs unless inputs specify costs; not execution/pathwise risk guarantee.",
+  "oracles": [
+    {
+      "id": "NUM01",
+      "case": "buy_and_partial_sell",
+      "inputs": {
+        "deposit": "1000",
+        "buy_qty": "10",
+        "buy_price": "50",
+        "buy_fee": "1",
+        "sell_qty": "4",
+        "sell_price": "60",
+        "sell_fee": "1",
+        "mark": "60"
+      },
+      "expected": {
+        "cash": "738",
+        "remaining_qty": "6",
+        "remaining_cost": "300.60",
+        "realized": "38.60",
+        "unrealized": "59.40",
+        "nav": "1098",
+        "total_gain": "98"
+      }
+    },
+    {
+      "id": "NUM02",
+      "case": "split",
+      "inputs": {
+        "quantity": "6",
+        "economic_cost": "300.60",
+        "old_price": "60",
+        "ratio": "2"
+      },
+      "expected": {
+        "quantity": "12",
+        "cost_per_unit": "25.05",
+        "new_price": "30",
+        "value": "360"
+      }
+    },
+    {
+      "id": "NUM03",
+      "case": "twr",
+      "inputs": {
+        "start": "1000",
+        "before_flow": "1100",
+        "contribution": "1000",
+        "end": "2310"
+      },
+      "expected": {
+        "return": "0.21"
+      }
+    },
+    {
+      "id": "NUM04",
+      "case": "fx",
+      "inputs": {
+        "local_return": "0.10",
+        "fx_return": "0.05"
+      },
+      "expected": {
+        "base_return": "0.155",
+        "interaction": "0.005"
+      }
+    },
+    {
+      "id": "NUM05",
+      "case": "mwr_multiple_roots",
+      "inputs": {
+        "annual_cashflows": [
+          "-100",
+          "230",
+          "-132"
+        ]
+      },
+      "expected": {
+        "status": "ambiguous",
+        "roots": [
+          "0.10",
+          "0.20"
+        ]
+      }
+    },
+    {
+      "id": "NUM06",
+      "case": "capital_alternatives",
+      "inputs": {
+        "available": "5000",
+        "proposals": [
+          "4000",
+          "4000"
+        ]
+      },
+      "expected": {
+        "jointly_feasible": false,
+        "each_individually_feasible": true
+      }
+    },
+    {
+      "id": "NUM07",
+      "case": "planned_stop_loss",
+      "inputs": {
+        "quantity": "100",
+        "entry": "50",
+        "stop": "48",
+        "cost": "2"
+      },
+      "expected": {
+        "planned_loss": "202",
+        "guaranteed_maximum": false
+      }
+    },
+    {
+      "id": "NUM08",
+      "case": "long_call",
+      "inputs": {
+        "strike": "50",
+        "premium": "3",
+        "terminal_spot": "60",
+        "multiplier": "100"
+      },
+      "expected": {
+        "expiry_pnl": "700",
+        "premium_at_risk": "300"
+      }
+    },
+    {
+      "id": "NUM09",
+      "case": "long_put",
+      "inputs": {
+        "strike": "50",
+        "premium": "3",
+        "terminal_spot": "40",
+        "multiplier": "100"
+      },
+      "expected": {
+        "expiry_pnl": "700",
+        "premium_at_risk": "300"
+      }
+    },
+    {
+      "id": "NUM10",
+      "case": "bull_call_debit",
+      "inputs": {
+        "low_strike": "50",
+        "high_strike": "55",
+        "net_debit": "2",
+        "terminal_spot": "60",
+        "multiplier": "100"
+      },
+      "expected": {
+        "expiry_pnl": "300",
+        "expiry_max_loss": "200",
+        "expiry_max_gain": "300"
+      }
+    },
+    {
+      "id": "NUM11",
+      "case": "bear_put_debit",
+      "inputs": {
+        "low_strike": "45",
+        "high_strike": "50",
+        "net_debit": "2",
+        "terminal_spot": "40",
+        "multiplier": "100"
+      },
+      "expected": {
+        "expiry_pnl": "300",
+        "expiry_max_loss": "200",
+        "expiry_max_gain": "300"
+      }
+    },
+    {
+      "id": "NUM12",
+      "case": "bull_put_credit",
+      "inputs": {
+        "long_strike": "45",
+        "short_strike": "50",
+        "net_credit": "2",
+        "terminal_spot": "40",
+        "multiplier": "100"
+      },
+      "expected": {
+        "expiry_pnl": "-300",
+        "expiry_max_loss": "300",
+        "expiry_max_gain": "200"
+      }
+    },
+    {
+      "id": "NUM13",
+      "case": "bear_call_credit",
+      "inputs": {
+        "short_strike": "50",
+        "long_strike": "55",
+        "net_credit": "2",
+        "terminal_spot": "60",
+        "multiplier": "100"
+      },
+      "expected": {
+        "expiry_pnl": "-300",
+        "expiry_max_loss": "300",
+        "expiry_max_gain": "200"
+      }
+    },
+    {
+      "id": "NUM14",
+      "case": "covered_call",
+      "inputs": {
+        "share_cost": "48",
+        "strike": "50",
+        "premium": "2",
+        "terminal_spot": "60",
+        "multiplier": "100"
+      },
+      "expected": {
+        "expiry_pnl": "400",
+        "shares_required": "100"
+      }
+    },
+    {
+      "id": "NUM15",
+      "case": "cash_secured_put",
+      "inputs": {
+        "strike": "50",
+        "premium": "2",
+        "terminal_spot": "40",
+        "multiplier": "100"
+      },
+      "expected": {
+        "expiry_pnl": "-800",
+        "gross_assignment_cash": "5000"
+      }
+    },
+    {
+      "id": "NUM16",
+      "case": "unknown_adjusted_contract",
+      "inputs": {
+        "multiplier": null,
+        "adjusted": true
+      },
+      "expected": {
+        "sizing_allowed": false
+      }
+    },
+    {
+      "id": "NUM17",
+      "case": "budget_race",
+      "inputs": {
+        "monthly_cap": "100",
+        "already_spent": "75",
+        "reserved": "10",
+        "new_request": "20"
+      },
+      "expected": {
+        "available": "15",
+        "new_request_allowed": false
+      }
+    },
+    {
+      "id": "NUM18",
+      "case": "quote_does_not_refresh_account",
+      "inputs": {
+        "account_age_seconds": 360,
+        "quote_age_seconds": 1,
+        "approved_account_max_age_seconds": 300
+      },
+      "expected": {
+        "sizing_allowed": false
+      }
+    },
+    {
+      "id": "NUM19",
+      "case": "timely_review_invalid_setup",
+      "inputs": {
+        "review_elapsed_seconds": 45,
+        "deadline_seconds": 60,
+        "setup_valid_until_seconds": 20
+      },
+      "expected": {
+        "publish_action": false
+      }
+    },
+    {
+      "id": "NUM20",
+      "case": "cashflow_neutral_drawdown",
+      "inputs": {
+        "units": "10",
+        "initial_unit_value": "100",
+        "current_unit_value": "80",
+        "deposit": "200"
+      },
+      "expected": {
+        "drawdown": "-0.20",
+        "new_units": "12.5",
+        "unit_value_after_deposit": "80"
+      }
+    }
+  ]
+}
