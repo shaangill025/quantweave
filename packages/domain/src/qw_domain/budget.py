@@ -114,6 +114,8 @@ class Reservation:
     status: Status = Status.RESERVED
     dispatched: bool = False
     actual: UsdBudget | None = None
+    sends: int = 0  # attempts begun (`begin_send`)
+    returned: int = 0  # begun attempts whose call has returned
 
     @property
     def charge(self) -> tuple[UsdBudget, UsdBudget]:
@@ -243,6 +245,25 @@ class BudgetBook:
         if at >= r.deadline:
             raise BudgetError("deadline_passed", r.reservation_id)
         return self if r.dispatched else self._with(replace(r, dispatched=True))
+
+    def begin_send(self, reservation_id: str, at: datetime, limit: int) -> "BudgetBook":
+        """Begin one attempt: refused while one is in flight, after `limit`, and
+        under the `dispatched` guards. Installed by compare-and-set, each attempt
+        is begun once."""
+        self.dispatched(reservation_id, at)  # its guards only: one version step
+        r = self.get(reservation_id)
+        if r.returned != r.sends:
+            raise BudgetError("send_in_flight", reservation_id)
+        if r.sends >= limit:
+            raise BudgetError("attempts_exhausted", reservation_id)
+        return self._with(replace(r, dispatched=True, sends=r.sends + 1))
+
+    def end_send(self, reservation_id: str) -> "BudgetBook":
+        """Record that the attempt in flight returned without a settlement."""
+        r = _open(self.get(reservation_id), Status.RESERVED)
+        if r.returned >= r.sends:
+            raise BudgetError("no_send_in_flight", reservation_id)
+        return self._with(replace(r, returned=r.returned + 1))
 
     def release(self, reservation_id: str) -> "BudgetBook":
         """Only for a reservation never dispatched: a sent call may still bill."""
