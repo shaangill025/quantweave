@@ -170,6 +170,7 @@ def test_boundary_check_fires_on_injected_sample(tmp_path: Path) -> None:
         f"{bad}15 imports urllib.request (stdlib module denied for domain)",
         f"{bad}16 imports asyncio.subprocess (stdlib module denied for domain)",
         f"{bad}17 imports asyncio.subprocess (stdlib module denied for domain)",
+        f"{bad}18 imports asyncio (stdlib module denied for domain)",
         f"{stray}1 imports requests (not allowed for domain)",
         f"{stray}2 imports subprocess (stdlib module denied for domain)",
         f"{test_x}2 imports starlette.status (denied in core)",
