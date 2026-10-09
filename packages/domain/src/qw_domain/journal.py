@@ -90,6 +90,18 @@ class Journal:
         self._by_id: dict[str, Entry] = {}
         self.conflicts: list[Conflict] = []
 
+    def copy(self) -> "Journal":
+        """An independent journal with the same entries (entries are immutable)."""
+        out = Journal()
+        out._entries, out.conflicts = list(self._entries), list(self.conflicts)
+        out._by_key, out._by_id = dict(self._by_key), dict(self._by_id)
+        return out
+
+    def revision(self, account_id: str) -> int:
+        """Account revision: 1 + the account's entries. The journal is append-only,
+        so any change to the account raises it (T008 C-04: revisions start at 1)."""
+        return 1 + sum(e.event.account_id == account_id for e in self._entries)
+
     def _check(
         self,
         event: JournalEvent,
