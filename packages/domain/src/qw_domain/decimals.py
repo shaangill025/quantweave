@@ -7,10 +7,11 @@ Out-of-bounds input is rejected and never rounded. Rounding happens only in
 """
 
 import decimal
+import numbers
 import re
 from collections.abc import Mapping
 from decimal import Context, Decimal, InvalidOperation, localcontext, setcontext
-from enum import StrEnum
+from enum import Enum
 from functools import total_ordering
 from typing import ClassVar, Self
 
@@ -44,17 +45,37 @@ class CurrencyMismatchError(ValueError):
     """Arithmetic or comparison between amounts in different currencies."""
 
 
-class Rounding(StrEnum):
-    """Named rounding policies (review §3.2); values are `decimal` rounding modes."""
+class Rounding(Enum):
+    """Named rounding policies (review §3.2). Distinct members, so the policy applied
+    is recorded even when two policies share a `decimal` mode (`.mode`)."""
 
-    # Costs, commitments and reservations: magnitude rounds up (away from zero).
-    COST = decimal.ROUND_UP
-    # Planned proceeds: magnitude rounds down (toward zero).
-    PROCEEDS = decimal.ROUND_DOWN
-    # Sized quantities round down; an alias of PROCEEDS.
-    LOT = decimal.ROUND_DOWN
-    # Display only: banker's rounding.
-    DISPLAY = decimal.ROUND_HALF_EVEN
+    COST = "cost"  # costs, commitments, reservations: magnitude rounds up
+    PROCEEDS = "proceeds"  # planned proceeds: magnitude rounds down
+    LOT = "lot"  # sized quantities round down (power-of-ten increments only)
+    DISPLAY = "display"  # display only: banker's rounding
+
+    @property
+    def mode(self) -> str:
+        return _ROUNDING_MODES[self]
+
+
+_ROUNDING_MODES = {
+    Rounding.COST: decimal.ROUND_UP,
+    Rounding.PROCEEDS: decimal.ROUND_DOWN,
+    Rounding.LOT: decimal.ROUND_DOWN,
+    Rounding.DISPLAY: decimal.ROUND_HALF_EVEN,
+}
+
+
+def safe_repr(value: object, limit: int = 64) -> str:
+    """`repr` capped for error messages, so hostile input cannot flood logs."""
+    text = repr(value)
+    return text if len(text) <= limit else f"{text[: limit - 3]}..."
+
+
+def _numeric_like(value: object) -> bool:
+    """Types whose comparison with a value type is a likely unit or float bug."""
+    return isinstance(value, numbers.Number | str | bytes | BoundedDecimal | Money)
 
 
 def _reject_non_decimal(value: object) -> None:
@@ -77,7 +98,9 @@ class BoundedDecimal:
         _reject_non_decimal(value)
         if isinstance(value, str):
             if self._pattern.fullmatch(value) is None:
-                raise DecimalValueError("decimal_format", f"{value!r} is malformed")
+                raise DecimalValueError(
+                    "decimal_format", f"{safe_repr(value)} is malformed"
+                )
             value = Decimal(value)
         elif isinstance(value, int):
             value = Decimal(value)
@@ -123,7 +146,9 @@ class BoundedDecimal:
             code = "decimal_not_positive"
         else:
             return value
-        raise DecimalValueError(code, f"{cls.__name__} {cls.bounds()}: {value}")
+        raise DecimalValueError(
+            code, f"{cls.__name__} {cls.bounds()}: {safe_repr(value)}"
+        )
 
     @classmethod
     def bounds(cls) -> str:
@@ -138,31 +163,44 @@ class BoundedDecimal:
         )
         return out
 
-    def _same(self, other: object) -> Decimal:
-        if type(other) is not type(self):
+    def _same(self, other: object) -> Decimal | None:
+        """The other value if it has the same class; None for unrelated types."""
+        if type(other) is type(self):
+            return other._value
+        if _numeric_like(other):
             raise TypeError(f"cannot combine {self!r} with {type(other).__name__}")
-        return other._value
+        return None
+
+    def __reduce__(self) -> tuple[type[Self], tuple[str]]:
+        # copy, deepcopy and pickle rebuild through the validating constructor.
+        return (type(self), (self.to_wire(),))
 
     def __setattr__(self, name: str, value: object) -> None:
         raise AttributeError(f"{type(self).__name__} is immutable")
 
     def __add__(self, other: Self) -> Self:
+        if (value := self._same(other)) is None:
+            return NotImplemented
         with localcontext(DOMAIN_CONTEXT):
-            return self._result(self._value + self._same(other))
+            return self._result(self._value + value)
 
     def __sub__(self, other: Self) -> Self:
+        if (value := self._same(other)) is None:
+            return NotImplemented
         with localcontext(DOMAIN_CONTEXT):
-            return self._result(self._value - self._same(other))
+            return self._result(self._value - value)
 
     def __neg__(self) -> Self:
         with localcontext(DOMAIN_CONTEXT):
             return self._result(-self._value)
 
     def __eq__(self, other: object) -> bool:
-        return self._value == self._same(other)
+        value = self._same(other)
+        return NotImplemented if value is None else self._value == value
 
     def __lt__(self, other: Self) -> bool:
-        return self._value < self._same(other)
+        value = self._same(other)
+        return NotImplemented if value is None else self._value < value
 
     def __hash__(self) -> int:
         return hash((type(self).__name__, self._value))
@@ -172,34 +210,42 @@ class BoundedDecimal:
 
 
 class MoneyAmount(BoundedDecimal):
+    __slots__ = ()
     INT_DIGITS, SCALE = 26, 12
 
 
 class Price(BoundedDecimal):
+    __slots__ = ()
     INT_DIGITS, SCALE = 26, 12
 
 
 class Quantity(BoundedDecimal):
+    __slots__ = ()
     INT_DIGITS, SCALE = 26, 12
 
 
 class PositiveQuantity(BoundedDecimal):
+    __slots__ = ()
     INT_DIGITS, SCALE, POSITIVE = 26, 12, True
 
 
 class Multiplier(BoundedDecimal):
+    __slots__ = ()
     INT_DIGITS, SCALE, POSITIVE = 12, 12, True
 
 
 class FxRate(BoundedDecimal):
+    __slots__ = ()
     INT_DIGITS, SCALE, POSITIVE = 12, 18, True
 
 
 class Ratio(BoundedDecimal):
+    __slots__ = ()
     INT_DIGITS, SCALE = 12, 18
 
 
 class UsdBudget(BoundedDecimal):
+    __slots__ = ()
     INT_DIGITS, SCALE = 14, 6
 
 
@@ -209,13 +255,19 @@ def quantize[T: BoundedDecimal](
     """Round `value` to `quantum` (a power of ten) by a named policy; check as `cls`."""
     if not isinstance(value, Decimal) or not isinstance(quantum, Decimal):
         raise TypeError("quantize takes Decimal value and quantum")
-    if not quantum.is_finite() or quantum.as_tuple().digits != (1,):
-        raise DecimalValueError("decimal_quantum", f"{quantum} is not a power of ten")
+    if (
+        not quantum.is_finite()
+        or quantum.is_signed()
+        or quantum.as_tuple().digits != (1,)
+    ):
+        raise DecimalValueError(
+            "decimal_quantum", f"{safe_repr(quantum)} is not a positive power of ten"
+        )
     with localcontext(DOMAIN_CONTEXT):
         try:
-            rounded = value.quantize(quantum, rounding=rounding.value)
+            rounded = value.quantize(quantum, rounding=rounding.mode)
         except InvalidOperation:
-            raise DecimalValueError("decimal_out_of_range", str(value)) from None
+            raise DecimalValueError("decimal_out_of_range", safe_repr(value)) from None
         return cls._result(rounded)
 
 
@@ -224,7 +276,8 @@ _CURRENCY = re.compile(r"[A-Z]{3}", re.ASCII)
 
 @total_ordering
 class Money:
-    """An amount in one ISO 4217 currency. Mixing currencies raises an error."""
+    """An amount in one ISO 4217 currency. Arithmetic and ordering across currencies
+    raise `CurrencyMismatchError`; equality across currencies is False."""
 
     __slots__ = ("amount", "currency")
     amount: MoneyAmount
@@ -234,7 +287,9 @@ class Money:
         if type(amount) is not MoneyAmount:
             raise TypeError(f"amount must be MoneyAmount, not {type(amount).__name__}")
         if not isinstance(currency, str) or _CURRENCY.fullmatch(currency) is None:
-            raise DecimalValueError("currency_code", f"{currency!r} is not ISO 4217")
+            raise DecimalValueError(
+                "currency_code", f"{safe_repr(currency)} is not ISO 4217"
+            )
         object.__setattr__(self, "amount", amount)
         object.__setattr__(self, "currency", currency)
 
@@ -254,27 +309,44 @@ class Money:
     def to_wire(self) -> dict[str, str]:
         return {"amount": self.amount.to_wire(), "currency": self.currency}
 
-    def _same(self, other: object) -> MoneyAmount:
-        if type(other) is not Money:
+    def _same(self, other: object) -> MoneyAmount | None:
+        """Same-currency amount for arithmetic and ordering; None if unrelated."""
+        if type(other) is Money:
+            if other.currency != self.currency:
+                raise CurrencyMismatchError(f"{self.currency} vs {other.currency}")
+            return other.amount
+        if _numeric_like(other):
             raise TypeError(f"cannot combine Money with {type(other).__name__}")
-        if other.currency != self.currency:
-            raise CurrencyMismatchError(f"{self.currency} vs {other.currency}")
-        return other.amount
+        return None
+
+    def __reduce__(self) -> tuple[type["Money"], tuple[MoneyAmount, str]]:
+        return (Money, (self.amount, self.currency))
 
     def __setattr__(self, name: str, value: object) -> None:
         raise AttributeError("Money is immutable")
 
     def __add__(self, other: "Money") -> "Money":
-        return Money(self.amount + self._same(other), self.currency)
+        if (amount := self._same(other)) is None:
+            return NotImplemented
+        return Money(self.amount + amount, self.currency)
 
     def __sub__(self, other: "Money") -> "Money":
-        return Money(self.amount - self._same(other), self.currency)
+        if (amount := self._same(other)) is None:
+            return NotImplemented
+        return Money(self.amount - amount, self.currency)
 
     def __eq__(self, other: object) -> bool:
-        return self.amount == self._same(other)
+        # Equality needs no FX rate: different currencies are never equal. Returning
+        # False (not raising) keeps sets and dicts of mixed currencies total.
+        if type(other) is Money:
+            return self.currency == other.currency and self.amount == other.amount
+        if _numeric_like(other):
+            raise TypeError(f"cannot compare Money with {type(other).__name__}")
+        return NotImplemented
 
     def __lt__(self, other: "Money") -> bool:
-        return self.amount < self._same(other)
+        amount = self._same(other)
+        return NotImplemented if amount is None else self.amount < amount
 
     def __hash__(self) -> int:
         return hash((self.currency, self.amount))

@@ -3,6 +3,9 @@
 Expected values are hand-computed.
 """
 
+import copy
+import decimal
+import pickle
 import re
 from decimal import Decimal, FloatOperation, localcontext
 
@@ -130,7 +133,17 @@ def test_arithmetic_exact_and_bounded() -> None:
 
 def test_mixed_types_raise() -> None:
     a = MoneyAmount("1")
-    for other in (1.0, 0.5, 1, Decimal("1"), Price("1"), None):
+    for other in (
+        1.0,
+        0.5,
+        1,
+        True,
+        Decimal("1"),
+        Price("1"),
+        "1",
+        b"1",
+        Money.of(1, "USD"),
+    ):
         with pytest.raises(TypeError):
             a == other  # noqa: B015
         with pytest.raises(TypeError):
@@ -154,8 +167,9 @@ def test_money_currency_rules() -> None:
         usd < cad  # noqa: B015
     with pytest.raises(CurrencyMismatchError):
         usd >= cad  # noqa: B015
-    with pytest.raises(CurrencyMismatchError):
-        usd == cad  # noqa: B015
+    assert usd != cad  # equality needs no FX: different currencies are never equal
+    assert Money.of("1", "USD") != cad
+    assert len({usd, cad, Money.of("10.250", "USD")}) == 2  # mixed sets never raise
     with pytest.raises(TypeError):
         usd + 1.5  # type: ignore[operator]
     with pytest.raises(TypeError):
@@ -285,3 +299,119 @@ def test_property_excess_scale_rejected(
         cls(value)
     with pytest.raises(DecimalValueError):
         cls.from_wire(format(value, "f"))
+
+
+def test_unrelated_types_compare_unequal_but_do_not_order() -> None:
+    """S2: `==` with a non-numeric type is NotImplemented, so False; ordering raises."""
+    for value in (MoneyAmount("1"), Money.of("1", "USD")):
+        assert value != None  # noqa: E711
+        assert value not in [None, object()]
+        assert value in [None, value]
+        with pytest.raises(TypeError):
+            value < None  # type: ignore[operator]  # noqa: B015
+        with pytest.raises(TypeError):
+            value + None  # type: ignore[operator]
+
+
+def test_copy_deepcopy_pickle_round_trip_through_constructor() -> None:
+    values: list[object] = [MoneyAmount("-1.50"), FxRate("1.000000000000000001")]
+    values += [PositiveQuantity("3"), Money.of("12.5", "EUR")]
+    for value in values:
+        for clone in (
+            copy.copy(value),
+            copy.deepcopy(value),
+            pickle.loads(pickle.dumps(value)),  # own data
+        ):
+            assert type(clone) is type(value)
+            assert clone == value
+            assert hash(clone) == hash(value)
+    assert MoneyAmount("1").__reduce__() == (MoneyAmount, ("1",))
+    forged = pickle.dumps(MoneyAmount("1"), protocol=0).replace(b"V1\n", b"V-0\n")
+    with pytest.raises(DecimalValueError):
+        pickle.loads(forged)  # crafted payload: validated
+    with pytest.raises(AttributeError):
+        MoneyAmount("1").__dict__  # noqa: B018 - subclasses keep __slots__
+    with pytest.raises(AttributeError):
+        Money.of("1", "USD").currency = "CAD"
+
+
+def test_hash_consistent_with_eq() -> None:
+    assert MoneyAmount("1.50") == MoneyAmount("1.5")
+    assert hash(MoneyAmount("1.50")) == hash(MoneyAmount("1.5"))
+    assert hash(MoneyAmount(Decimal("1E+2"))) == hash(MoneyAmount("100.000"))
+    assert len({Quantity("2"), Quantity("2.0"), Quantity("-2")}) == 2
+    assert hash(Money.of("1.0", "USD")) == hash(Money.of("1", "USD"))
+
+
+@PROFILE
+@given(st.decimals(-(10**20), 10**20, places=6, allow_nan=False, allow_infinity=False))
+def test_property_hash_ignores_trailing_zeros(value: Decimal) -> None:
+    if value.is_zero() and value.is_signed():
+        value = Decimal(0)
+    with localcontext(DOMAIN_CONTEXT):
+        padded = value.quantize(Decimal("1E-12"))  # same value, more trailing zeros
+    a, b = MoneyAmount(value), MoneyAmount(padded)
+    assert a == b
+    assert hash(a) == hash(b)
+
+
+def test_money_ordering() -> None:
+    one, two, three = (Money.of(v, "USD") for v in ("1", "2.00", "3"))
+    assert one < two <= Money.of("2", "USD") < three
+    assert three > two >= one
+    assert sorted([three, one, two]) == [one, two, three]
+    assert max([one, three, two]) == three
+
+
+@pytest.mark.parametrize(
+    ("cls", "value", "quantum", "rounding", "expected"),
+    [
+        (UsdBudget, "0.0000001", "0.000001", "COST", "0.000001"),
+        (UsdBudget, "2.1234561", "0.000001", "COST", "2.123457"),
+        (UsdBudget, "-0.0000001", "0.000001", "COST", "-0.000001"),
+        (Quantity, "10.999", "1", "LOT", "10"),
+        (Quantity, "0.1239", "0.001", "LOT", "0.123"),
+        (Price, "100.125", "0.01", "DISPLAY", "100.12"),
+        (Price, "100.135", "0.01", "DISPLAY", "100.14"),
+    ],
+)  # fmt: skip
+def test_quantize_per_class(
+    cls: type[BoundedDecimal], value: str, quantum: str, rounding: str, expected: str
+) -> None:
+    mode = Rounding[rounding]
+    q = quantize(cls, Decimal(value), quantum=Decimal(quantum), rounding=mode)
+    assert type(q) is cls
+    assert q.to_wire() == expected
+
+
+def test_quantize_rejects_finer_than_scale_and_negative_quantum() -> None:
+    cost = Rounding.COST
+    with pytest.raises(DecimalValueError):  # UsdBudget scale is 6
+        quantize(UsdBudget, Decimal(1), quantum=Decimal("1E-7"), rounding=cost)
+    for quantum in ("-0.01", "-1", "0", "-0"):
+        with pytest.raises(DecimalValueError):
+            quantize(MoneyAmount, Decimal(1), quantum=Decimal(quantum), rounding=cost)
+
+
+def test_rounding_policies_are_distinct_members() -> None:
+    # Enum iteration skips aliases, so LOT listed here is its own member.
+    assert [r.name for r in Rounding] == ["COST", "PROCEEDS", "LOT", "DISPLAY"]
+    modes = {r.name: r.mode for r in Rounding}
+    assert modes == {
+        "COST": decimal.ROUND_UP,
+        "PROCEEDS": decimal.ROUND_DOWN,
+        "LOT": decimal.ROUND_DOWN,
+        "DISPLAY": decimal.ROUND_HALF_EVEN,
+    }
+
+
+def test_error_messages_cap_input_repr() -> None:
+    huge = "9" * 10_000
+    for build in (
+        lambda: MoneyAmount(huge),
+        lambda: MoneyAmount(Decimal(huge)),
+        lambda: Money.of("1", "X" * 10_000),
+    ):
+        with pytest.raises(DecimalValueError) as info:
+            build()
+        assert len(str(info.value)) < 200

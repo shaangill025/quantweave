@@ -1,8 +1,8 @@
 {
   "schema": "quantweave.check_registry/1",
   "reviewed_at": "2026-10-09",
-  "task": "T001",
-  "note": "configured=true only for commands executed in the observed environment. Unbound checks stay configured=false until the code they test exists and the command has run.",
+  "task": "T001; T009 increments 1 and 2a",
+  "note": "configured=true only for commands executed in the observed environment. Unbound checks stay configured=false until the code they test exists and the command has run. Python checks run through the locked uv environment (uv 0.11.32, CPython 3.13.16); dev tool pins are in pyproject.toml and uv.lock.",
   "checks": [
     {
       "id": "CHK-REPO-001",
@@ -47,50 +47,82 @@
     {
       "id": "CHK-CONTRACTS-001",
       "purpose": "Contract invariants: no broker mutation route, write headers, decimal-string money/quantities, offsets on example timestamps",
-      "command": "python3 tools/check_contracts.py && python3 tools/check_contracts.py --self-test",
+      "command": "uv run python tools/check_contracts.py && uv run python tools/check_contracts.py --self-test",
       "configured": true,
       "observed": {
         "date": "2026-10-09",
-        "result": "PASS; self-test 16/16 defects detected"
+        "result": "PASS: 63 paths, 37 mutating operations, 26 schemas, 7 examples; date-time enforced: True (rfc3339-validator); self-test 16/16 defects detected"
       }
     },
     {
       "id": "CHK-SPEC-002",
-      "purpose": "Package validator: structure, traceability, task DAG, JSON Schemas, contract refs, examples, API invariants, numerical oracles, scope, links, sources, cross-file consistency. Artifact checks only, not application tests",
-      "command": "python3 docs/spec/tools/validate_spec.py",
+      "purpose": "Package validator: structure, traceability, task DAG, JSON Schemas, contract refs, examples, API invariants, numerical oracles, scope, links, sources, cross-file consistency. Artifact checks only, not application tests. Runs on a temporary copy because the validator rewrites its reports",
+      "command": "tmp=$(mktemp -d) && cp -r docs/spec \"$tmp/spec\" && uv run python \"$tmp/spec/tools/validate_spec.py\"",
       "configured": true,
       "observed": {
         "date": "2026-10-09",
-        "result": "PASS 12/12 (jsonschema 4.26.0, PyYAML 6.0.1 already on host). Rewrites docs/spec/reports/VALIDATION.md and validation_results.json"
+        "result": "PASS 12/12 (status passed) with locked jsonschema 4.26.0 / PyYAML 6.0.3; docs/spec unchanged"
+      }
+    },
+    {
+      "id": "CHK-PY-SYNC",
+      "purpose": "Create the project environment exactly from uv.lock (fails if the lock is stale)",
+      "command": "uv sync --locked",
+      "configured": true,
+      "observed": {
+        "date": "2026-10-09",
+        "result": "exit 0; 23 packages installed from a 24-entry lock (colorama is Windows-only)"
       }
     },
     {
       "id": "CHK-PY-LINT",
-      "purpose": "Python lint",
-      "command": null,
-      "configured": false,
-      "reason": "No Python code yet; ruff 0.16.8 present on host but tool choice and pin belong to T009"
+      "purpose": "Python lint (ruff; rules and banned APIs in pyproject.toml)",
+      "command": "uv run ruff check .",
+      "configured": true,
+      "observed": {
+        "date": "2026-10-09",
+        "result": "exit 0, All checks passed (ruff 0.16.10)"
+      }
     },
     {
       "id": "CHK-PY-FORMAT",
       "purpose": "Python formatting",
-      "command": null,
-      "configured": false,
-      "reason": "No Python code yet; ruff/black present on host; selection in T009"
+      "command": "uv run ruff format --check .",
+      "configured": true,
+      "observed": {
+        "date": "2026-10-09",
+        "result": "exit 0, 17 files already formatted (ruff 0.16.10)"
+      }
     },
     {
       "id": "CHK-PY-TYPE",
-      "purpose": "Python static typing",
-      "command": null,
-      "configured": false,
-      "reason": "No Python code yet; mypy 2.3.1 and pyright 1.1.414 present on host; selection in T009"
+      "purpose": "Python static typing of packages/, tools/ and tests/",
+      "command": "uv run mypy --strict",
+      "configured": true,
+      "observed": {
+        "date": "2026-10-09",
+        "result": "exit 0, no issues in 9 source files (mypy 2.4.0)"
+      }
     },
     {
       "id": "CHK-PY-UNIT",
-      "purpose": "Python unit and property tests (ledger, calculations, state machines)",
-      "command": null,
-      "configured": false,
-      "reason": "No tests yet; pytest 9.1.1 exists only as an isolated uv tool, hypothesis not installed; project environment created in T009"
+      "purpose": "Python unit and property tests (domain value types, instants, import boundaries, float ban)",
+      "command": "uv run pytest",
+      "configured": true,
+      "observed": {
+        "date": "2026-10-09",
+        "result": "exit 0, 134 passed, 0 skipped (pytest 9.1.1, hypothesis 6.168.5 derandomized)"
+      }
+    },
+    {
+      "id": "CHK-PY-NOFLOAT",
+      "purpose": "ADR-013 float ban over money modules plus package classification coverage",
+      "command": "uv run python tools/check_no_float.py",
+      "configured": true,
+      "observed": {
+        "date": "2026-10-09",
+        "result": "exit 0, PASS: 0 problem(s) in 3 file(s)"
+      }
     },
     {
       "id": "CHK-TS-TYPE",
@@ -144,7 +176,7 @@
   ],
   "review": {
     "reviewer": "independent subagent running a different model from the author",
-    "outcome": "T008 review: CHANGES REQUESTED then APPROVE after fixes. See docs/receipts/T008.md"
+    "outcome": "T008 review: CHANGES REQUESTED then APPROVE after fixes. See docs/receipts/T008.md; T009 increment 1 review recorded in docs/receipts/T009.md; increment 2a pending cross-model review"
   },
   "bound_from": "docs/spec/handoff/check_registry.template.json"
 }

@@ -29,38 +29,59 @@ DENIED = (
     "wealthsimple", "robin_stocks", "tda", "schwab", "polygon", "yfinance", "finnhub",
 )  # fmt: skip
 
-# Third-party imports a package's src/ may use beyond the stdlib and its own name.
-# Every directory under packages/ must have an entry (review §2 table).
+# Third-party imports a package's non-test code may use beyond the stdlib and its own
+# name. Every directory under packages/ must have an entry (review §2 table).
 ALLOWED_THIRD_PARTY: dict[str, frozenset[str]] = {
     "domain": frozenset(),  # stdlib only
 }
+# Standard-library modules denied in a package's non-test code (I/O, processes, code
+# loading). Matched by dotted prefix like DENIED.
+DENIED_STDLIB: dict[str, tuple[str, ...]] = {
+    "domain": (
+        "socket", "socketserver", "ssl", "http", "urllib", "ftplib", "smtplib",
+        "poplib", "imaplib", "xmlrpc", "webbrowser", "sqlite3", "dbm", "shelve",
+        "subprocess", "asyncio.subprocess", "multiprocessing", "ctypes", "pickle",
+        "marshal", "runpy", "importlib.util", "zipimport", "os", "asyncio",
+        "threading", "concurrent", "shutil", "select", "selectors", "tempfile",
+        "wsgiref",
+    ),
+}  # fmt: skip
+DYNAMIC = "<non-literal>"
+IMPORTERS = {"import_module", "__import__"}
 
 
 def imported_modules(path: Path) -> list[tuple[int, str]]:
-    """Absolute imports, plus literal targets of importlib.import_module/__import__."""
+    """Absolute imports and import_module/__import__ targets, including aliased and
+    keyword calls. A target that is not a string literal is reported as DYNAMIC."""
     tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    aliases = set(IMPORTERS)
     found: list[tuple[int, str]] = []
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
             found += [(node.lineno, alias.name) for alias in node.names]
         elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
-            found.append((node.lineno, node.module))
-        elif isinstance(node, ast.Call) and node.args:
-            func, arg = node.func, node.args[0]
-            name = (
-                func.attr
-                if isinstance(func, ast.Attribute)
-                else getattr(func, "id", "")
+            # `from asyncio import subprocess` is checked as asyncio.subprocess.
+            found += [(node.lineno, f"{node.module}.{a.name}") for a in node.names]
+            aliases |= {
+                a.asname for a in node.names if a.name in IMPORTERS and a.asname
+            }
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        name = func.attr if isinstance(func, ast.Attribute) else ""
+        if (isinstance(func, ast.Name) and func.id in aliases) or name in IMPORTERS:
+            target = node.args[0] if node.args else None
+            target = next((k.value for k in node.keywords if k.arg == "name"), target)
+            literal = target.value if isinstance(target, ast.Constant) else None
+            found.append(
+                (node.lineno, literal if isinstance(literal, str) else DYNAMIC)
             )
-            if name in {"import_module", "__import__"} and isinstance(
-                arg, ast.Constant
-            ):
-                found.append((node.lineno, str(arg.value)))
     return sorted(found)
 
 
-def _matches(module: str, prefix: str) -> bool:
-    return module == prefix or module.startswith(prefix + ".")
+def _matches(module: str, prefixes: tuple[str, ...]) -> bool:
+    return any(module == p or module.startswith(p + ".") for p in prefixes)
 
 
 def boundary_violations(packages_dir: Path) -> list[str]:
@@ -71,14 +92,24 @@ def boundary_violations(packages_dir: Path) -> list[str]:
             problems.append(f"{package.name}: no entry in ALLOWED_THIRD_PARTY")
             continue
         own = {p.name for p in (package / "src").glob("*") if p.is_dir()}
+        denied_stdlib = DENIED_STDLIB.get(package.name, ())
         for file in sorted(package.rglob("*.py")):
-            in_src = (package / "src") in file.parents
+            rel = file.relative_to(package)
+            is_test = rel.parts[0] == "tests" or rel.name == "conftest.py"
             for line, module in imported_modules(file):
                 where = f"{file.relative_to(packages_dir)}:{line} imports {module}"
                 top = module.split(".")[0]
-                if any(_matches(module, denied) for denied in DENIED):
+                if module == DYNAMIC:
+                    problems.append(f"{where} (unreviewable dynamic import)")
+                elif _matches(module, DENIED):
                     problems.append(f"{where} (denied in core)")
-                elif in_src and not (
+                elif is_test:
+                    continue
+                elif _matches(module, denied_stdlib):
+                    problems.append(
+                        f"{where} (stdlib module denied for {package.name})"
+                    )
+                elif not (
                     top in sys.stdlib_module_names or top in own or top in allowed
                 ):
                     problems.append(f"{where} (not allowed for {package.name})")
@@ -103,18 +134,47 @@ def test_boundary_check_fires_on_injected_sample(tmp_path: Path) -> None:
         "from qw_domain import decimals\n"
         "from . import sibling\n"
         "import decimal\n"
+        "from importlib import import_module as load\n"
+        "load('anthropic')\n"
+        "importlib.import_module(name='httpx')\n"
+        "importlib.import_module('open' + 'ai')\n"
+        "__import__(f'{x}')\n"
+        "import socket, urllib.request\n"
+        "from asyncio import subprocess\n"
+        "import asyncio.subprocess\n"
+        "import json, asyncio\n"
     )
     tests = tmp_path / "domain" / "tests"
     tests.mkdir()
-    (tests / "test_x.py").write_text("import pytest\nfrom starlette import status\n")
+    (tests / "test_x.py").write_text(
+        "import pytest, socket\nfrom starlette import status\n"
+        "import importlib\nimportlib.import_module(name)\n"
+    )
+    (tmp_path / "domain" / "stray.py").write_text(
+        "import requests\nimport subprocess\n"
+    )
     (tmp_path / "newpkg").mkdir()
-    problems = boundary_violations(tmp_path)
-    assert problems == [
-        "domain/src/qw_domain/bad.py:2 imports fastapi (denied in core)",
-        "domain/src/qw_domain/bad.py:3 imports openai (denied in core)",
-        "domain/src/qw_domain/bad.py:5 imports alpaca.trading (denied in core)",
-        "domain/src/qw_domain/bad.py:6 imports psycopg (not allowed for domain)",
-        "domain/tests/test_x.py:2 imports starlette (denied in core)",
+    bad, test_x, stray = (
+        f"domain/{p}:" for p in ("src/qw_domain/bad.py", "tests/test_x.py", "stray.py")
+    )
+    assert boundary_violations(tmp_path) == [
+        f"{bad}2 imports fastapi (denied in core)",
+        f"{bad}3 imports openai.OpenAI (denied in core)",
+        f"{bad}5 imports alpaca.trading (denied in core)",
+        f"{bad}6 imports psycopg (not allowed for domain)",
+        f"{bad}11 imports anthropic (denied in core)",
+        f"{bad}12 imports httpx (not allowed for domain)",
+        f"{bad}13 imports {DYNAMIC} (unreviewable dynamic import)",
+        f"{bad}14 imports {DYNAMIC} (unreviewable dynamic import)",
+        f"{bad}15 imports socket (stdlib module denied for domain)",
+        f"{bad}15 imports urllib.request (stdlib module denied for domain)",
+        f"{bad}16 imports asyncio.subprocess (stdlib module denied for domain)",
+        f"{bad}17 imports asyncio.subprocess (stdlib module denied for domain)",
+        f"{bad}18 imports asyncio (stdlib module denied for domain)",
+        f"{stray}1 imports requests (not allowed for domain)",
+        f"{stray}2 imports subprocess (stdlib module denied for domain)",
+        f"{test_x}2 imports starlette.status (denied in core)",
+        f"{test_x}4 imports {DYNAMIC} (unreviewable dynamic import)",
         "newpkg: no entry in ALLOWED_THIRD_PARTY",
     ]
 
@@ -131,7 +191,7 @@ def run_no_float(*args: str) -> subprocess.CompletedProcess[str]:
 def test_no_float_passes_on_real_money_modules() -> None:
     result = run_no_float()
     assert result.returncode == 0, result.stdout
-    assert result.stdout.startswith("PASS: 0 float use(s)")
+    assert result.stdout.startswith("PASS: 0 problem(s)")
 
 
 @pytest.mark.parametrize(
@@ -144,8 +204,19 @@ def test_no_float_passes_on_real_money_modules() -> None:
         ("def f(s: str) -> object:\n    return float(s)\n", ":2: float(...) call"),
         ("def f() -> 'list[float]':\n    return []\n", ":1: float reference"),
         ("y: 'float | None' = None\n", ":1: float reference"),
-        ("import decimal\nz = decimal.Decimal.from_float\n", ":2: Decimal.from_float"),
+        ("import decimal\nz = decimal.Decimal.from_float\n", ":2: attribute .from_"),
         ("from typing import cast\nw = cast(float, 1)\n", ":2: float reference"),
+        # increment 2a: bypasses found in review
+        ("import builtins\nf = builtins.float\n", ":2: attribute .float"),
+        ("from builtins import float as f\n", ":1: imports float from builtins"),
+        ("from builtins import float\n", ":1: imports float from builtins"),
+        ("x: list['float'] = []\n", ":1: float reference"),
+        ("x: 'dict[str, \"list[float]\"]' = {}\n", ":1: float reference"),
+        ("from typing import cast\nw = cast('float', 1)\n", ":2: float reference"),
+        ("import typing\nw = typing.cast(list['float'], [])\n", ":2: float reference"),
+        ("type T = 'float | None'\n", ":1: float reference"),
+        ("half = 1 / 2\n", ":1: true division"),
+        ("x = 4\nx /= 3\n", ":2: true division"),
     ],
 )  # fmt: skip
 def test_no_float_fires_on_injected_sample(
@@ -157,6 +228,27 @@ def test_no_float_fires_on_injected_sample(
     assert result.returncode == 1
     assert expected in result.stdout
     assert "FAIL" in result.stdout
+
+
+def test_no_float_ignores_floor_division_and_docstrings(tmp_path: Path) -> None:
+    sample = tmp_path / "synthetic_ok.py"  # SYNTHETIC positive control
+    sample.write_text('"""Never a float."""\nx: "list[int]" = [7 // 2]\n')
+    assert run_no_float(str(sample)).returncode == 0
+
+
+def test_no_float_requires_every_package_to_be_classified(tmp_path: Path) -> None:
+    for package in ("domain", "quant", "newpkg", "strategies"):
+        (tmp_path / package).mkdir()
+    (tmp_path / "domain" / "src").mkdir()
+    (tmp_path / "domain" / "src" / "m.py").write_text("x = 1\n")
+    result = run_no_float("--packages", str(tmp_path))
+    assert result.returncode == 1
+    lines = result.stdout.splitlines()
+    assert lines[0] == f"{tmp_path / 'newpkg'}: no MONEY_PATHS or NOT_MONEY entry"
+    stale = "strategies/src/qw_strategies/sizing: MONEY_PATHS entry does not exist"
+    assert lines[1] == f"{tmp_path}/{stale}"
+    assert len(lines) == 4  # unclassified, two stale paths, verdict
+    assert lines[-1] == "FAIL: 3 problem(s) in 1 file(s)"
 
 
 def test_no_float_fails_closed_without_files(tmp_path: Path) -> None:

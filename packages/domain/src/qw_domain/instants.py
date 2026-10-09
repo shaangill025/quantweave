@@ -3,6 +3,8 @@
 import re
 from datetime import UTC, datetime
 
+from qw_domain.decimals import safe_repr
+
 # C-05 layer 1 with ASCII digits. Used with fullmatch, so `$` cannot match before "\n".
 TIMESTAMP_PATTERN = (
     r"^[0-9]{4}-(0[1-9]|1[0-2])-(0[1-9]|[12][0-9]|3[01])"
@@ -22,13 +24,13 @@ def parse_instant(text: str) -> datetime:
         raise TypeError(f"timestamp must be a string, not {type(text).__name__}")
     if _TIMESTAMP.fullmatch(text) is None:
         raise InstantError(
-            f"timestamp {text!r} is not RFC 3339 with an explicit offset"
+            f"timestamp {safe_repr(text)} is not RFC 3339 with an explicit offset"
         )
     try:  # layer 2: calendar validity (2026-02-30, year 0) and UTC range
         return ensure_aware_utc(datetime.fromisoformat(text))
     except (ValueError, OverflowError) as exc:
         raise InstantError(
-            f"timestamp {text!r} is not a valid instant: {exc}"
+            f"timestamp {safe_repr(text)} is not a valid instant: {exc}"
         ) from None
 
 
@@ -38,7 +40,10 @@ def ensure_aware_utc(value: datetime) -> datetime:
         raise TypeError(f"expected datetime, not {type(value).__name__}")
     if value.tzinfo is None or value.utcoffset() is None:
         raise InstantError("naive datetime: an explicit offset is required")
-    return value.astimezone(UTC)
+    try:
+        return value.astimezone(UTC)
+    except OverflowError:
+        raise InstantError(f"{safe_repr(value)} is outside the UTC range") from None
 
 
 def format_instant(value: datetime) -> str:
