@@ -1,0 +1,386 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Proposal",
+  "type": "object",
+  "properties": {
+    "id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]*$"
+    },
+    "version": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "content_hash": {
+      "type": "string",
+      "pattern": "^[a-f0-9]{64}$"
+    },
+    "tenant_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]*$"
+    },
+    "account_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]*$"
+    },
+    "sleeve_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]*$"
+    },
+    "origin": {
+      "type": "string",
+      "enum": [
+        "rules",
+        "ai_research",
+        "user_research"
+      ]
+    },
+    "mode": {
+      "type": "string",
+      "enum": [
+        "rules_only",
+        "ai_enabled"
+      ]
+    },
+    "state": {
+      "type": "string",
+      "enum": [
+        "candidate",
+        "verifying",
+        "awaiting_review",
+        "ready_for_final_check",
+        "active",
+        "research_only",
+        "rejected",
+        "expired",
+        "invalidated",
+        "dismissed",
+        "superseded"
+      ]
+    },
+    "action": {
+      "type": "string",
+      "enum": [
+        "buy",
+        "hold",
+        "reduce",
+        "sell",
+        "wait",
+        "investigate"
+      ]
+    },
+    "horizon": {
+      "type": "string",
+      "enum": [
+        "long_term",
+        "swing_position",
+        "intraday"
+      ]
+    },
+    "trigger_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "received_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "created_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "expires_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "binding": {
+      "$ref": "common.schema.json#/$defs/VersionBinding"
+    },
+    "legs": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "instrument_id": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 128,
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]*$"
+          },
+          "side": {
+            "type": "string",
+            "enum": [
+              "buy",
+              "sell",
+              "hold"
+            ]
+          },
+          "quantity": {
+            "anyOf": [
+              {
+                "type": "string",
+                "pattern": "^(0|[1-9][0-9]*)(\\.[0-9]+)?$",
+                "maxLength": 60
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "quantity_basis": {
+            "type": "string",
+            "enum": [
+              "sized",
+              "unsized",
+              "not_applicable"
+            ]
+          },
+          "estimated_cash_effect": {
+            "anyOf": [
+              {
+                "$ref": "common.schema.json#/$defs/Money"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "required": [
+          "instrument_id",
+          "side",
+          "quantity",
+          "quantity_basis",
+          "estimated_cash_effect"
+        ],
+        "additionalProperties": false
+      }
+    },
+    "conditions": {
+      "type": "array",
+      "items": {
+        "$ref": "common.schema.json#/$defs/Condition"
+      }
+    },
+    "invalidation_conditions": {
+      "type": "array",
+      "items": {
+        "$ref": "common.schema.json#/$defs/Condition"
+      }
+    },
+    "claim_ids": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 128,
+        "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]*$"
+      }
+    },
+    "evidence_ids": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 128,
+        "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]*$"
+      }
+    },
+    "calculation_ids": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 128,
+        "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]*$"
+      }
+    },
+    "review_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "final_check_receipt_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "qualification": {
+      "$ref": "common.schema.json#/$defs/Qualification"
+    },
+    "risk_summary": {
+      "type": "string"
+    },
+    "alternatives_group_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "joint_set_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "execution_state": {
+      "type": "string",
+      "enum": [
+        "none",
+        "planned",
+        "user_reported",
+        "broker_confirmed",
+        "reconciled"
+      ]
+    },
+    "reason_codes": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 128,
+        "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]*$"
+      }
+    }
+  },
+  "required": [
+    "id",
+    "version",
+    "content_hash",
+    "tenant_id",
+    "account_id",
+    "sleeve_id",
+    "origin",
+    "mode",
+    "state",
+    "action",
+    "horizon",
+    "trigger_at",
+    "received_at",
+    "created_at",
+    "expires_at",
+    "binding",
+    "legs",
+    "conditions",
+    "invalidation_conditions",
+    "claim_ids",
+    "evidence_ids",
+    "calculation_ids",
+    "review_id",
+    "final_check_receipt_id",
+    "qualification",
+    "risk_summary",
+    "alternatives_group_id",
+    "joint_set_id",
+    "execution_state",
+    "reason_codes"
+  ],
+  "additionalProperties": false,
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "state": {
+            "const": "active"
+          },
+          "mode": {
+            "const": "ai_enabled"
+          }
+        },
+        "required": [
+          "state",
+          "mode"
+        ]
+      },
+      "then": {
+        "properties": {
+          "review_id": {
+            "type": "string",
+            "minLength": 1
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "state": {
+            "const": "active"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "final_check_receipt_id": {
+            "type": "string",
+            "minLength": 1
+          },
+          "qualification": {
+            "allOf": [
+              {
+                "$ref": "common.schema.json#/$defs/Qualification"
+              },
+              {
+                "properties": {
+                  "operational": {
+                    "const": "passed"
+                  },
+                  "user_eligibility": {
+                    "const": "eligible"
+                  }
+                }
+              }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "state": {
+            "const": "active"
+          },
+          "action": {
+            "enum": [
+              "buy",
+              "reduce",
+              "sell"
+            ]
+          }
+        },
+        "required": [
+          "state",
+          "action"
+        ]
+      },
+      "then": {
+        "properties": {
+          "legs": {
+            "minItems": 1,
+            "items": {
+              "properties": {
+                "quantity": {
+                  "$ref": "common.schema.json#/$defs/NonnegativeDecimal"
+                },
+                "quantity_basis": {
+                  "const": "sized"
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  ]
+}

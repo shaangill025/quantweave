@@ -1,0 +1,157 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Experiment",
+  "type": "object",
+  "properties": {
+    "id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]*$"
+    },
+    "target": {
+      "type": "string",
+      "enum": [
+        "personal_adaptation",
+        "research",
+        "strategy",
+        "evaluator",
+        "application_code",
+        "recursive_optimizer"
+      ]
+    },
+    "scope": {
+      "type": "string",
+      "enum": [
+        "tenant",
+        "installation"
+      ]
+    },
+    "scope_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]*$"
+    },
+    "state": {
+      "type": "string",
+      "enum": [
+        "proposed",
+        "authorized",
+        "running",
+        "evaluating",
+        "awaiting_review",
+        "rejected",
+        "approved",
+        "promoted",
+        "rolled_back",
+        "failed",
+        "cancelled"
+      ]
+    },
+    "baseline_version": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]*$"
+    },
+    "candidate_version": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]*$"
+    },
+    "hypothesis": {
+      "type": "string"
+    },
+    "protocol_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]*$"
+    },
+    "protected_assessor_version": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]*$"
+    },
+    "data_snapshot_ids": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 128,
+        "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]*$"
+      }
+    },
+    "budget_reservation_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]*$"
+    },
+    "sandbox_profile_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]*$"
+    },
+    "candidate_hash": {
+      "type": "string",
+      "pattern": "^[a-f0-9]{64}$"
+    },
+    "evaluation_receipt_ids": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 128,
+        "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]*$"
+      }
+    },
+    "parent_optimizer_version": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]*$"
+    },
+    "next_cycle_run_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "requires_human_promotion": {
+      "const": true
+    },
+    "release_receipt_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    }
+  },
+  "required": [
+    "id",
+    "target",
+    "scope",
+    "scope_id",
+    "state",
+    "baseline_version",
+    "candidate_version",
+    "hypothesis",
+    "protocol_id",
+    "protected_assessor_version",
+    "data_snapshot_ids",
+    "budget_reservation_id",
+    "sandbox_profile_id",
+    "candidate_hash",
+    "evaluation_receipt_ids",
+    "parent_optimizer_version",
+    "next_cycle_run_id",
+    "requires_human_promotion",
+    "release_receipt_id"
+  ],
+  "additionalProperties": false
+}

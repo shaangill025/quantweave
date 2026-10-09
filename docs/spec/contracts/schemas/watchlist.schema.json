@@ -1,0 +1,81 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Watchlist",
+  "type": "object",
+  "properties": {
+    "id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]*$"
+    },
+    "revision": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "name": {
+      "type": "string"
+    },
+    "entries": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "instrument_id": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 128,
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]*$"
+          },
+          "thesis": {
+            "type": "string"
+          },
+          "tags": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "review_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time"
+          },
+          "monitoring_priority": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 100
+          },
+          "conditions": {
+            "type": "array",
+            "items": {
+              "$ref": "common.schema.json#/$defs/Condition"
+            }
+          },
+          "invalidation_text": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "instrument_id",
+          "thesis",
+          "tags",
+          "review_at",
+          "monitoring_priority",
+          "conditions",
+          "invalidation_text"
+        ],
+        "additionalProperties": false
+      }
+    }
+  },
+  "required": [
+    "id",
+    "revision",
+    "name",
+    "entries"
+  ],
+  "additionalProperties": false
+}

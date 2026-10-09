@@ -1,0 +1,90 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Observation",
+  "type": "object",
+  "properties": {
+    "id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]*$"
+    },
+    "instrument_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]*$"
+    },
+    "field": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]*$"
+    },
+    "value": {
+      "type": "string",
+      "pattern": "^-?(0|[1-9][0-9]*)(\\.[0-9]+)?$",
+      "maxLength": 60
+    },
+    "unit": {
+      "type": "string"
+    },
+    "event_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "received_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "feed_spec_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]*$"
+    },
+    "provider": {
+      "type": "string"
+    },
+    "feed_label": {
+      "type": "string"
+    },
+    "quality": {
+      "type": "string",
+      "enum": [
+        "realtime_exchange_limited",
+        "realtime_consolidated",
+        "delayed",
+        "end_of_day",
+        "indicative",
+        "stale",
+        "unavailable"
+      ]
+    },
+    "sequence": {
+      "type": [
+        "integer",
+        "null"
+      ]
+    },
+    "provenance": {
+      "$ref": "common.schema.json#/$defs/Provenance"
+    }
+  },
+  "required": [
+    "id",
+    "instrument_id",
+    "field",
+    "value",
+    "unit",
+    "event_at",
+    "received_at",
+    "feed_spec_id",
+    "provider",
+    "feed_label",
+    "quality",
+    "sequence",
+    "provenance"
+  ],
+  "additionalProperties": false
+}

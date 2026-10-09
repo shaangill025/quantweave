@@ -1,0 +1,91 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Feed Spec",
+  "type": "object",
+  "properties": {
+    "id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]*$"
+    },
+    "version": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "provider": {
+      "type": "string"
+    },
+    "feed": {
+      "type": "string"
+    },
+    "coverage": {
+      "type": "string"
+    },
+    "session_calendar_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]*$"
+    },
+    "bar_construction": {
+      "type": "string"
+    },
+    "price_adjustment": {
+      "type": "string",
+      "enum": [
+        "raw",
+        "split_adjusted",
+        "total_return",
+        "not_applicable"
+      ]
+    },
+    "latency_class": {
+      "type": "string"
+    },
+    "rights_profile_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]*$"
+    },
+    "entitlement_revision": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "qualification": {
+      "type": "string",
+      "enum": [
+        "not_tested",
+        "passed",
+        "failed",
+        "suspended"
+      ]
+    },
+    "compatible_replacement_ids": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 128,
+        "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]*$"
+      }
+    }
+  },
+  "required": [
+    "id",
+    "version",
+    "provider",
+    "feed",
+    "coverage",
+    "session_calendar_id",
+    "bar_construction",
+    "price_adjustment",
+    "latency_class",
+    "rights_profile_id",
+    "entitlement_revision",
+    "qualification",
+    "compatible_replacement_ids"
+  ],
+  "additionalProperties": false
+}

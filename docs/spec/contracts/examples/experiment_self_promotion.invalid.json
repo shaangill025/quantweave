@@ -1,0 +1,23 @@
+{
+  "id": "EXP-SYN-1",
+  "target": "recursive_optimizer",
+  "scope": "installation",
+  "scope_id": "INSTALL-SYN",
+  "state": "proposed",
+  "baseline_version": "OPT-V0",
+  "candidate_version": "OPT-V1",
+  "hypothesis": "Prefer date-error cases; assess on protected varied-date suite.",
+  "protocol_id": "PROTO-SYN",
+  "protected_assessor_version": "ASSESSOR-V1",
+  "data_snapshot_ids": [
+    "DATA-SYN"
+  ],
+  "budget_reservation_id": "BUD-SYN",
+  "sandbox_profile_id": "SANDBOX-UNQUALIFIED",
+  "candidate_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "evaluation_receipt_ids": [],
+  "parent_optimizer_version": "OPT-V0",
+  "next_cycle_run_id": null,
+  "requires_human_promotion": false,
+  "release_receipt_id": null
+}

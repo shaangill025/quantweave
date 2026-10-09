@@ -5,8 +5,8 @@
 | Task | T001 Repository inspection and check registry (W0) |
 | Requirements | R070, R078, R079, R080, R088, R094 |
 | Date / times | 2026-10-08; session work about 23:04–23:20 UTC (container start to final check run; not separately instrumented) |
-| Base commit | `a6f98ba` (Initial commit), branch `claude/gifted-archimedes-usnbjn`, tree clean before changes |
-| Status | Complete for the files supplied, after cross-model review (§11). The missing package trees are a blocker for T008 (§5) |
+| Base commit | `a6f98ba` (Initial commit), tree clean before changes. Branch renamed by the owner from `claude/gifted-archimedes-usnbjn` to `gifted-archimedes-usnbjn` |
+| Status | **Completed with evidence** (2026-10-09). Sections 1–11 are the historical record of the first pass on the partial upload; their file paths (`docs/spec/BOOTSTRAP_PROMPT.md`, `derived/*.csv`, `SHA256SUMS`) no longer exist. §12–§13 record the full package integration and supersede §1–§11 where they differ |
 | Tree at completion | Committed in a single T001 commit on the working branch; `git status --porcelain` was clean after the commit |
 | Tests | Application tests: 0 run, 0 passed, 0 failed, 0 skipped (no application exists). Artifact checks: 3 configured checks run, all PASS (§4) |
 
@@ -147,3 +147,88 @@ No command logs were retained beyond the outcomes recorded in §4.
 | 7 | (nit) CHK-REPO-001 is a point-in-time result | Fixed: labelled as point-in-time |
 
 All checks in §4 were re-run after the fixes and passed.
+
+## 12. Addendum (2026-10-09): full package integrated
+
+The owner supplied `Portfolio_Intelligence_Implementation_Package_v1.0.zip`, which contains
+208 files and resolves gap 1 and gap 2 in §5.
+
+**Intake.**
+- I extracted the zip into a scratch directory after a scripted check for path traversal
+  and symlinks; there were none. No log of that check is retained. The reviewer later
+  confirmed that no symlinks are present.
+- All 207 files listed in the package's `reports/ARTIFACT_MANIFEST.json` matched their
+  SHA-256 hashes, and nothing was unlisted except the manifest itself.
+- The five files from the first upload are byte-identical to their package
+  counterparts. I removed my earlier copies, `derived/*.csv` and `SHA256SUMS`, because the
+  canonical `planning/*.csv` files now exist.
+
+**Placement.**
+- The package sits unmodified at `docs/spec/`, so its internal links and its validator
+  (whose root is the package directory) work as designed.
+- The package `LICENSE` differs from the repository `LICENSE` only in the appendix
+  placeholder brackets (`{}` instead of `[]`). Both are kept; the root `LICENSE` stays
+  canonical.
+
+**Status.** T001 is set to `Completed with evidence` in `planning/backlog.csv` and
+`planning/backlog.json`, which are canonical. Two derived copies are intentionally left
+stale, because they are hash-locked package content: `planning/tasks/T001.md` (line 3)
+and `planning/Implementation_Tracker.xlsx` both still say "Not started".
+
+**Checks (all executed 2026-10-09, all PASS).** The application tests remain 0 run.
+
+| ID | Command | Outcome |
+|---|---|---|
+| CHK-REPO-001 | `git status --porcelain` | Staged integration only; the tree is clean after commit |
+| CHK-SPEC-001 | `python3 tools/check_spec_artifacts.py` | PASS: `docs/spec` matches the package manifest, with no duplicate or unsafe entries. Four files are declared working state and are not hash-compared: the backlog pair and the regenerated validation reports. Every backlog status is in the template vocabulary, and the CSV and JSON agree. Backlog edits other than status are not detected |
+| CHK-SPEC-001-SELFTEST | `python3 tools/check_spec_artifacts.py --self-test` | PASS: 10 of 10 injected defects are reported. The cases are: edited, deleted and added file; empty, corrupt and duplicate-entry manifest; unsafe path; deleted working-state file; unknown status; status drift between CSV and JSON |
+| CHK-SPEC-002 | `python3 docs/spec/tools/validate_spec.py` | PASS: 12 of 12 artifact checks pass. 54 JSON files parse, against 52 in the package's original report. My unconfirmed guess: the original run predates the manifest and results JSON files |
+| CHK-PY-TOOLS | `ruff check tools/ && ruff format --check tools/ && mypy --strict tools/check_spec_artifacts.py` | PASS |
+
+The validator's dependencies (`jsonschema` 4.26.0, PyYAML 6.0.1) were already installed.
+Nothing was installed for this addendum. Running the validator rewrites
+`reports/VALIDATION.md` and `reports/validation_results.json`; the committed copies are from
+this run.
+
+**Instruction merge: incomplete.**
+- `docs/spec/AGENTS.md` and `docs/spec/CLAUDE.md` are kept as the package's agent
+  agreement.
+- My edit to the root `CLAUDE.md` was blocked by the session's permission policy for
+  instruction files. The edit would have pointed it at the package's reading order and
+  task files, imported the package's financial invariants, and stated that owner rules take
+  precedence.
+- The root `CLAUDE.md` still points at the removed `docs/spec/derived/` files. This needs
+  owner approval to fix.
+
+**Next bounded task.** T008, the architecture and contracts review, is now unblocked and
+is the critical path to T009. T002, T003, T004 and T007 can run in parallel once their
+external permissions, people or hardware exist.
+
+## 13. Cross-model review of the integration
+
+**Reviewer.** An independent subagent running a different model from the author. It
+modified no repository files. It ran the validator on a copy, not in place.
+
+**Independently verified:**
+- `diff -r` against the zip shows exactly the 4 working-state files differing, with no
+  extra or missing files.
+- The backlog diffs change T001's status only.
+- The report diffs change only the timestamp, the Python version and the JSON count.
+- All checks pass, including the reviewer's own negative controls.
+- The "54 vs 52" explanation is consistent and labelled as a guess.
+- The status value is in the template vocabulary.
+
+**Outcome:** CHANGES REQUESTED, with 0 blocking findings. Resolution:
+
+| # | Finding | Resolution |
+|---|---|---|
+| 1 | Status claimed before the reviewer's disposition was recorded | Fixed: recorded in this section and in the registry before commit |
+| 2 | Working-state backlog content was unchecked | Partly fixed: status vocabulary and CSV/JSON agreement are now checked and self-tested. Other backlog edits remain undetected; this is documented in the checker |
+| 3 | `tasks/T001.md` and the workbook disagree with the backlog | Documented in §12 as intentionally stale, hash-locked derived copies |
+| 4 | Root `CLAUDE.md:36` points at removed `derived/` files | Open: the edit is blocked by permission policy and needs owner approval |
+| 5 | §1–§11 mention removed paths | Fixed: the header now marks §1–§11 as a historical record |
+| 6 | (nit) Duplicate and unsafe manifest entries were not rejected; no test for a deleted working-state file | Fixed and self-tested |
+| 7 | (nit) The pre-extraction safety check is unevidenced | Stated as unlogged in §12 |
+| 8 | (nit) CHK-REPO-001 was missing from the §12 table | Added |
+
+All checks were re-run after the fixes and passed.

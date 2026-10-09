@@ -1,6 +1,6 @@
 {
   "schema": "quantweave.check_registry/1",
-  "reviewed_at": "2026-10-08",
+  "reviewed_at": "2026-10-09",
   "task": "T001",
   "note": "configured=true only for commands executed in the observed environment. Unbound checks stay configured=false until the code they test exists and the command has run.",
   "checks": [
@@ -10,28 +10,28 @@
       "command": "git status --porcelain",
       "configured": true,
       "observed": {
-        "date": "2026-10-08",
-        "result": "point-in-time: clean before T001 changes; re-run for each receipt"
+        "date": "2026-10-09",
+        "result": "point-in-time; recorded per receipt"
       }
     },
     {
       "id": "CHK-SPEC-001",
-      "purpose": "Spec artifact manifest, register counts, task DAG and requirement traceability",
+      "purpose": "docs/spec matches the package manifest (no missing, unlisted, duplicate, unsafe or altered files outside the documented working-state set); backlog statuses valid and CSV/JSON consistent",
       "command": "python3 tools/check_spec_artifacts.py",
       "configured": true,
       "observed": {
-        "date": "2026-10-08",
-        "result": "PASS"
+        "date": "2026-10-09",
+        "result": "PASS (207 listed files)"
       }
     },
     {
       "id": "CHK-SPEC-001-SELFTEST",
-      "purpose": "Negative controls for CHK-SPEC-001 (injected cycle, empty, truncated and malformed manifest must each be reported)",
+      "purpose": "Negative controls for CHK-SPEC-001 (10 injected defects)",
       "command": "python3 tools/check_spec_artifacts.py --self-test",
       "configured": true,
       "observed": {
-        "date": "2026-10-08",
-        "result": "PASS: 4/4 injected defects reported; unmodified artifacts pass"
+        "date": "2026-10-09",
+        "result": "PASS: 10/10 injected defects reported; unmodified package passes"
       }
     },
     {
@@ -40,16 +40,19 @@
       "command": "ruff check tools/ && ruff format --check tools/ && mypy --strict tools/check_spec_artifacts.py",
       "configured": true,
       "observed": {
-        "date": "2026-10-08",
+        "date": "2026-10-09",
         "result": "PASS with host ruff 0.16.8 / mypy 2.3.1"
       }
     },
     {
       "id": "CHK-SPEC-002",
-      "purpose": "Full specification package validator (52 JSON + 1 YAML, schemas, OpenAPI refs, oracles)",
-      "command": "python tools/validate_spec.py",
-      "configured": false,
-      "reason": "tools/validate_spec.py and the contracts/, planning/, fixtures/ trees it validates were not supplied with the package upload"
+      "purpose": "Package validator: structure, traceability, task DAG, JSON Schemas, contract refs, examples, API invariants, numerical oracles, scope, links, sources, cross-file consistency. Artifact checks only, not application tests",
+      "command": "python3 docs/spec/tools/validate_spec.py",
+      "configured": true,
+      "observed": {
+        "date": "2026-10-09",
+        "result": "PASS 12/12 (jsonschema 4.26.0, PyYAML 6.0.1 already on host). Rewrites docs/spec/reports/VALIDATION.md and validation_results.json"
+      }
     },
     {
       "id": "CHK-PY-LINT",
@@ -119,7 +122,7 @@
       "purpose": "OpenAPI 3.1 conformance of contracts/openapi.yaml",
       "command": null,
       "configured": false,
-      "reason": "contracts/openapi.yaml not supplied; no conformance validator installed"
+      "reason": "contracts/openapi.yaml now present and reference-checked by CHK-SPEC-002, but no dedicated OpenAPI 3.1 conformance validator is installed; selection in T009"
     },
     {
       "id": "CHK-E2E",
@@ -131,6 +134,7 @@
   ],
   "review": {
     "reviewer": "independent subagent running a different model from the author",
-    "outcome": "CHANGES REQUESTED (0 blocking, 4 should-fix, 3 nits); should-fix items and 2 nits addressed and re-verified"
-  }
+    "outcome": "Integration review: CHANGES REQUESTED (0 blocking); resolved except root CLAUDE.md path update (blocked by permission policy, awaiting owner). See docs/receipts/T001_bootstrap_receipt.md \u00a713"
+  },
+  "bound_from": "docs/spec/handoff/check_registry.template.json"
 }

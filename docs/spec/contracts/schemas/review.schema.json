@@ -1,0 +1,130 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Review",
+  "type": "object",
+  "properties": {
+    "id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]*$"
+    },
+    "proposal_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]*$"
+    },
+    "proposal_version": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "proposal_hash": {
+      "type": "string",
+      "pattern": "^[a-f0-9]{64}$"
+    },
+    "reviewer_run_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]*$"
+    },
+    "researcher_run_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]*$"
+    },
+    "model_family_distinct": {
+      "type": "boolean"
+    },
+    "initial_blind_assessment": {
+      "type": "string"
+    },
+    "decision": {
+      "type": "string",
+      "enum": [
+        "approve_for_final_checks",
+        "revise",
+        "research_only",
+        "reject",
+        "abstain"
+      ]
+    },
+    "claim_findings": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "claim_id": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 128,
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]*$"
+          },
+          "result": {
+            "type": "string",
+            "enum": [
+              "supported",
+              "unsupported",
+              "contested",
+              "requires_recheck"
+            ]
+          },
+          "reason": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "claim_id",
+          "result",
+          "reason"
+        ],
+        "additionalProperties": false
+      }
+    },
+    "introduced_claim_ids": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 128,
+        "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]*$"
+      }
+    },
+    "revision_number": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 1
+    },
+    "completed_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "expires_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "cost": {
+      "$ref": "common.schema.json#/$defs/Money"
+    }
+  },
+  "required": [
+    "id",
+    "proposal_id",
+    "proposal_version",
+    "proposal_hash",
+    "reviewer_run_id",
+    "researcher_run_id",
+    "model_family_distinct",
+    "initial_blind_assessment",
+    "decision",
+    "claim_findings",
+    "introduced_claim_ids",
+    "revision_number",
+    "completed_at",
+    "expires_at",
+    "cost"
+  ],
+  "additionalProperties": false
+}

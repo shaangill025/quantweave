@@ -1,0 +1,995 @@
+{
+  "version": "1.0.0",
+  "requirements": [
+    {
+      "requirement_id": "R001",
+      "source_decisions": "Q1",
+      "domain": "product",
+      "priority": "Release required",
+      "statement": "Personal-first with near-term multi-user commercialization; preserve tenant and deployment foundations from the start.",
+      "acceptance": "Same core runs a private account and hosted tenants without converting global financial state into user state.",
+      "status": "Specified - not implemented",
+      "test_id": "AT001"
+    },
+    {
+      "requirement_id": "R002",
+      "source_decisions": "Q2",
+      "domain": "product",
+      "priority": "Release required",
+      "statement": "Primary purpose is portfolio-aware decisions plus frequent trading signals.",
+      "acceptance": "A decision identifies its goal/account impact; frequent scans do not bypass suitability.",
+      "status": "Specified - not implemented",
+      "test_id": "AT002"
+    },
+    {
+      "requirement_id": "R003",
+      "source_decisions": "Q3",
+      "domain": "data",
+      "priority": "Release required",
+      "statement": "A useful no-paid-market-data baseline must not require paid AI; hosting and optional providers are separate.",
+      "acceptance": "Rules-only onboarding and a qualified decision workflow complete with zero paid data and zero AI calls.",
+      "status": "Specified - not implemented",
+      "test_id": "AT003"
+    },
+    {
+      "requirement_id": "R004",
+      "source_decisions": "Q4",
+      "domain": "data",
+      "priority": "Release required",
+      "statement": "Mandatory discovery is US-listed stocks and ETFs with currency-aware accounts.",
+      "acceptance": "US instrument identity and CAD/USD accounting work; outside-scope holdings remain visible.",
+      "status": "Specified - not implemented",
+      "test_id": "AT004"
+    },
+    {
+      "requirement_id": "R005",
+      "source_decisions": "Q5",
+      "domain": "security",
+      "priority": "Release required",
+      "statement": "First release proposes specific actions but never submits, modifies or cancels broker orders.",
+      "acceptance": "Broker mutation routes/tools are absent and attempted mutations are blocked at connector boundaries.",
+      "status": "Specified - not implemented",
+      "test_id": "AT005"
+    },
+    {
+      "requirement_id": "R006",
+      "source_decisions": "Q6",
+      "domain": "platform",
+      "priority": "Release required",
+      "statement": "Both hosted and complete self-hosted editions are release requirements.",
+      "acceptance": "Both deployment profiles pass core journeys and isolation checks.",
+      "status": "Specified - not implemented",
+      "test_id": "AT006"
+    },
+    {
+      "requirement_id": "R007",
+      "source_decisions": "Q7",
+      "domain": "compliance",
+      "priority": "Release required",
+      "statement": "Initial commercial audience includes Canadian and US residents.",
+      "acceptance": "Jurisdiction inventory and counsel-approved capability matrix cover intended launch customers in both countries.",
+      "status": "Specified - not implemented",
+      "test_id": "AT007"
+    },
+    {
+      "requirement_id": "R008",
+      "source_decisions": "Q8",
+      "domain": "strategies",
+      "priority": "Release required",
+      "statement": "Intraday swing discovery plus optional same-day opportunities; no sub-minute scalping requirement.",
+      "acceptance": "Qualified regular-session strategy can produce timely proposals under its data/model configuration.",
+      "status": "Specified - not implemented",
+      "test_id": "AT008"
+    },
+    {
+      "requirement_id": "R009",
+      "source_decisions": "Q9",
+      "domain": "strategies",
+      "priority": "Release required",
+      "statement": "Frequent evaluation means timely qualifying changes, not a quota of trades.",
+      "acceptance": "A no-opportunity session records zero proposals and explicit rejection reasons without manufactured trades.",
+      "status": "Specified - not implemented",
+      "test_id": "AT009"
+    },
+    {
+      "requirement_id": "R010",
+      "source_decisions": "Q10",
+      "domain": "risk",
+      "priority": "Release required",
+      "statement": "Separate investing and trading allocations with portfolio-wide limits.",
+      "acceptance": "A trading proposal cannot spend a long-term reserve and combined exposure is checked.",
+      "status": "Specified - not implemented",
+      "test_id": "AT010"
+    },
+    {
+      "requirement_id": "R011",
+      "source_decisions": "Q11",
+      "domain": "data",
+      "priority": "Release required",
+      "statement": "Free mode may require a user-connected free provider account/key.",
+      "acceptance": "Setup discloses provider account, limits and rights; key connection alone does not mark capabilities qualified.",
+      "status": "Specified - not implemented",
+      "test_id": "AT011"
+    },
+    {
+      "requirement_id": "R012",
+      "source_decisions": "Q12",
+      "domain": "portfolio",
+      "priority": "Release required",
+      "statement": "Stale or unreconciled holdings/cash block affected portfolio-specific sizing.",
+      "acceptance": "A stale account yields research or hypothetical output, not confirmed buying-power sizing.",
+      "status": "Specified - not implemented",
+      "test_id": "AT012"
+    },
+    {
+      "requirement_id": "R013",
+      "source_decisions": "Q13",
+      "domain": "platform",
+      "priority": "Release required",
+      "statement": "Independent open-source core and complete self-hosted application; no mandatory vendor-operated service.",
+      "acceptance": "Disconnect vendor services and exercise permitted core workflows with user-selected dependencies.",
+      "status": "Specified - not implemented",
+      "test_id": "AT013"
+    },
+    {
+      "requirement_id": "R014",
+      "source_decisions": "Q14",
+      "domain": "data",
+      "priority": "Release required",
+      "statement": "Prioritized live monitoring plus broader scheduled discovery; tracked and streamed universes differ.",
+      "acceptance": "Exceeding live-symbol quota produces visible prioritization, not fictitious continuous coverage.",
+      "status": "Specified - not implemented",
+      "test_id": "AT014"
+    },
+    {
+      "requirement_id": "R015",
+      "source_decisions": "Q15",
+      "domain": "ai",
+      "priority": "Release required",
+      "statement": "Auditable rules and AI research both originate proposals; a separate agent evaluates actionable AI-mode proposals.",
+      "acceptance": "An AI-only thesis can qualify without a technical trigger, but cannot bypass hard checks.",
+      "status": "Specified - not implemented",
+      "test_id": "AT015"
+    },
+    {
+      "requirement_id": "R016",
+      "source_decisions": "Q16",
+      "domain": "onboarding",
+      "priority": "Release required",
+      "statement": "MCQs and necessary numeric/date inputs propose a policy/strategy shortlist for explicit runtime approval.",
+      "acceptance": "Contradictory objectives require resolution and no policy is active merely from inferred answers.",
+      "status": "Specified - not implemented",
+      "test_id": "AT016"
+    },
+    {
+      "requirement_id": "R017",
+      "source_decisions": "Q17",
+      "domain": "options",
+      "priority": "Release required",
+      "statement": "Opt-in first-release options include long calls/puts, covered calls, cash-secured puts and defined-risk verticals.",
+      "acceptance": "All permitted structures have scenarios and checks; out-of-scope imported contracts remain represented.",
+      "status": "Specified - not implemented",
+      "test_id": "AT017"
+    },
+    {
+      "requirement_id": "R018",
+      "source_decisions": "Q18",
+      "domain": "ai",
+      "priority": "Release required",
+      "statement": "API and subscription access use provider-specific officially permitted routes and deployment qualification.",
+      "acceptance": "No session-token interception/proxy; unavailable subscription routes are reported, not emulated.",
+      "status": "Specified - not implemented",
+      "test_id": "AT018"
+    },
+    {
+      "requirement_id": "R019",
+      "source_decisions": "Q19",
+      "domain": "ai",
+      "priority": "Release required",
+      "statement": "Mandatory evidence/calculation verification is tiered; separate model review is required for AI-mode actions.",
+      "acceptance": "Factual alerts can pass without LLMs; pending AI review cannot be relabelled as reviewed.",
+      "status": "Specified - not implemented",
+      "test_id": "AT019"
+    },
+    {
+      "requirement_id": "R020",
+      "source_decisions": "Q20",
+      "domain": "proposals",
+      "priority": "Release required",
+      "statement": "Action proposals expire and have invalidation conditions plus preserved version history.",
+      "acceptance": "Late notifications resolve to current state; corrected decisions do not overwrite original results.",
+      "status": "Specified - not implemented",
+      "test_id": "AT020"
+    },
+    {
+      "requirement_id": "R021",
+      "source_decisions": "Q21",
+      "domain": "compliance",
+      "priority": "Release required",
+      "statement": "Commercial legal and provider-rights clearance are release gates.",
+      "acceptance": "Documentation access and disclaimers do not mark rights/regulatory gates passed.",
+      "status": "Specified - not implemented",
+      "test_id": "AT021"
+    },
+    {
+      "requirement_id": "R022",
+      "source_decisions": "Q22",
+      "domain": "platform",
+      "priority": "Release required",
+      "statement": "Apache-2.0 is the selected application license, superseding AGPL proposals.",
+      "acceptance": "License and dependency inventory reflect Apache choice without bundling incompatible material by assumption.",
+      "status": "Specified - not implemented",
+      "test_id": "AT022"
+    },
+    {
+      "requirement_id": "R023",
+      "source_decisions": "Q23",
+      "domain": "ai",
+      "priority": "Release required",
+      "statement": "Support audited rules-only and AI-enabled modes; evaluator covers both proposal origins in AI mode.",
+      "acceptance": "Switching modes is explicit; rule outputs are not falsely labelled AI-reviewed.",
+      "status": "Specified - not implemented",
+      "test_id": "AT023"
+    },
+    {
+      "requirement_id": "R024",
+      "source_decisions": "Q24",
+      "domain": "research",
+      "priority": "Release required",
+      "statement": "AI proposals qualify through evaluated research workflows and proposal-specific checks, not necessarily a backtested rule.",
+      "acceptance": "Workflow status/version is recorded and model changes do not silently inherit evidence.",
+      "status": "Specified - not implemented",
+      "test_id": "AT024"
+    },
+    {
+      "requirement_id": "R025",
+      "source_decisions": "Q25",
+      "domain": "ai",
+      "priority": "Release required",
+      "statement": "Evaluator is a separate run/context; a different model family is optional and empirically justified.",
+      "acceptance": "Configuration reports same-model isolation versus cross-model diversity accurately.",
+      "status": "Specified - not implemented",
+      "test_id": "AT025"
+    },
+    {
+      "requirement_id": "R026",
+      "source_decisions": "Q26",
+      "domain": "ai",
+      "priority": "Release required",
+      "statement": "Material factual/evidence conflicts and hard risk failures block; forecast differences may be disclosed; revisions bounded.",
+      "acceptance": "Reviewer disagreement cannot be bypassed by repeated sampling until an approval appears.",
+      "status": "Specified - not implemented",
+      "test_id": "AT026"
+    },
+    {
+      "requirement_id": "R027",
+      "source_decisions": "Q27",
+      "domain": "ai",
+      "priority": "Release required",
+      "statement": "Frequent deterministic monitoring; AI on meaningful events/schedules/requests within budgets and deadlines.",
+      "acceptance": "Unchanged evidence is reused lawfully; quota exhaustion cannot remove mandatory review.",
+      "status": "Specified - not implemented",
+      "test_id": "AT027"
+    },
+    {
+      "requirement_id": "R028",
+      "source_decisions": "Q28",
+      "domain": "improvement",
+      "priority": "Release required",
+      "statement": "All six improvement targets are in scope, including code and the optimizer itself.",
+      "acceptance": "Each target has a candidate/evaluation/review/promotion/rollback path.",
+      "status": "Specified - not implemented",
+      "test_id": "AT028"
+    },
+    {
+      "requirement_id": "R029",
+      "source_decisions": "Q29",
+      "domain": "improvement",
+      "priority": "Release required",
+      "statement": "Promotion uses predeclared scorecards with hard risk/privacy/evidence constraints, not recent returns alone.",
+      "acceptance": "A candidate with higher simulated P&L but a hard violation is rejected.",
+      "status": "Specified - not implemented",
+      "test_id": "AT029"
+    },
+    {
+      "requirement_id": "R030",
+      "source_decisions": "Q30",
+      "domain": "improvement",
+      "priority": "Release required",
+      "statement": "Autonomous authorized experiments, human-controlled promotion of investment-affecting or code changes.",
+      "acceptance": "A model cannot self-approve its deployment or widen permissions.",
+      "status": "Specified - not implemented",
+      "test_id": "AT030"
+    },
+    {
+      "requirement_id": "R031",
+      "source_decisions": "Q31",
+      "domain": "privacy",
+      "priority": "Release required",
+      "statement": "Private learning per user/installation by default; cross-user use requires separate consent and permitted data.",
+      "acceptance": "Another tenant cannot access or learn from private examples absent authorized transformation/consent.",
+      "status": "Specified - not implemented",
+      "test_id": "AT031"
+    },
+    {
+      "requirement_id": "R032",
+      "source_decisions": "Q32",
+      "domain": "improvement",
+      "priority": "Release required",
+      "statement": "Separate experiment resource budgets; current monitoring and verification take priority.",
+      "acceptance": "Experiment exhaustion pauses experiments while essential services remain available.",
+      "status": "Specified - not implemented",
+      "test_id": "AT032"
+    },
+    {
+      "requirement_id": "R033",
+      "source_decisions": "Q33",
+      "domain": "improvement",
+      "priority": "Release required",
+      "statement": "All six improvement areas, code-level change and recursive optimizer change must work at first release.",
+      "acceptance": "Full release cannot pass by labelling code/recursive paths future work or disabling them.",
+      "status": "Specified - not implemented",
+      "test_id": "AT033"
+    },
+    {
+      "requirement_id": "R034",
+      "source_decisions": "Q34",
+      "domain": "governance",
+      "priority": "Release required",
+      "statement": "Material changes to enabled investment strategies require user adoption after release approval.",
+      "acceptance": "Maintainer approval does not silently change an existing user's strategy semantics.",
+      "status": "Specified - not implemented",
+      "test_id": "AT034"
+    },
+    {
+      "requirement_id": "R035",
+      "source_decisions": "Q35",
+      "domain": "operations",
+      "priority": "Release required",
+      "statement": "Personal pilot incremental inference ceiling USD100/month; improvement maximum 20 percent (USD20).",
+      "acceptance": "Concurrent reservations cannot exceed either cap; unrelated subscription/hosting expenses are separately shown.",
+      "status": "Specified - not implemented",
+      "test_id": "AT035"
+    },
+    {
+      "requirement_id": "R036",
+      "source_decisions": "Q36",
+      "domain": "platform",
+      "priority": "Release required",
+      "statement": "Single-machine container self-hosting without required Kubernetes/GPU/vendor service.",
+      "acceptance": "Clean supported installation, backup restore and core workflows complete on qualified hardware.",
+      "status": "Specified - not implemented",
+      "test_id": "AT036"
+    },
+    {
+      "requirement_id": "R037",
+      "source_decisions": "Q37",
+      "domain": "improvement",
+      "priority": "Release required",
+      "statement": "Demonstrate V0 optimizer proposing V1, independent evaluation, human promotion, then V1 running next cycle.",
+      "acceptance": "Lineage and actual version receipts prove changed implementation was used, including rejected controls.",
+      "status": "Specified - not implemented",
+      "test_id": "AT037"
+    },
+    {
+      "requirement_id": "R038",
+      "source_decisions": "Q38",
+      "domain": "security",
+      "priority": "Release required",
+      "statement": "Generated code is isolated from production secrets, DB writes, unrestricted network and host control.",
+      "acceptance": "Sandbox escape/secret/egress tests fail closed with no weaker silent fallback.",
+      "status": "Specified - not implemented",
+      "test_id": "AT038"
+    },
+    {
+      "requirement_id": "R039",
+      "source_decisions": "Q39",
+      "domain": "improvement",
+      "priority": "Release required",
+      "statement": "User learning is tenant-scoped; shared executable/optimizer changes are installation/release scoped.",
+      "acceptance": "Hosted user cannot deploy a private executable fork into shared production.",
+      "status": "Specified - not implemented",
+      "test_id": "AT039"
+    },
+    {
+      "requirement_id": "R040",
+      "source_decisions": "Q40",
+      "domain": "research",
+      "priority": "Release required",
+      "statement": "Open evaluation framework and permitted starter corpus; distinguish synthetic/historical/prospective evidence.",
+      "acceptance": "Starter demonstrations never count as live trading evidence or personal learned history.",
+      "status": "Specified - not implemented",
+      "test_id": "AT040"
+    },
+    {
+      "requirement_id": "R041",
+      "source_decisions": "Q41",
+      "domain": "product",
+      "priority": "Release required",
+      "statement": "Full scope and release gates take precedence over launch date; budget limits throughput rather than silently cutting scope.",
+      "acceptance": "Required capabilities actually complete representative workloads within qualified resource constraints.",
+      "status": "Specified - not implemented",
+      "test_id": "AT041"
+    },
+    {
+      "requirement_id": "R042",
+      "source_decisions": "Q42",
+      "domain": "portfolio",
+      "priority": "Release required",
+      "statement": "Partial portfolios allowed with scoped conclusions; outside-coverage assets retained with gaps.",
+      "acceptance": "Unknown outside exposure is not zero; full-financial-situation claims are withheld.",
+      "status": "Specified - not implemented",
+      "test_id": "AT042"
+    },
+    {
+      "requirement_id": "R043",
+      "source_decisions": "Q43",
+      "domain": "portfolio",
+      "priority": "Release required",
+      "statement": "Multiple accounts/currencies with account-specific spendability and consolidated risk.",
+      "acceptance": "Cash in another account/currency cannot fund a proposal without an explicit prerequisite.",
+      "status": "Specified - not implemented",
+      "test_id": "AT043"
+    },
+    {
+      "requirement_id": "R044",
+      "source_decisions": "Q44",
+      "domain": "risk",
+      "priority": "Release required",
+      "statement": "Stock/ETF proposals cash-funded long-only, nonleveraged/noninverse; approved options remain.",
+      "acceptance": "Short/leveraged discovery cannot become a new action; existing such positions still contribute known exposure.",
+      "status": "Specified - not implemented",
+      "test_id": "AT044"
+    },
+    {
+      "requirement_id": "R045",
+      "source_decisions": "Q45",
+      "domain": "evidence",
+      "priority": "Release required",
+      "statement": "Primary and permitted independent sources; optional social inputs clearly distinguished from facts.",
+      "acceptance": "An unverified social claim is a research lead, not corroborated evidence.",
+      "status": "Specified - not implemented",
+      "test_id": "AT045"
+    },
+    {
+      "requirement_id": "R046",
+      "source_decisions": "Q46",
+      "domain": "portfolio",
+      "priority": "Release required",
+      "statement": "Tax-relevant records and warnings, not a comprehensive tax engine or automated tax-loss harvesting.",
+      "acceptance": "P&L/cost basis provenance is shown without presenting it as definitive tax liability.",
+      "status": "Specified - not implemented",
+      "test_id": "AT046"
+    },
+    {
+      "requirement_id": "R047",
+      "source_decisions": "Q47",
+      "domain": "ux",
+      "priority": "Release required",
+      "statement": "Responsive web, in-app feed, configurable email/browser push; no native mobile/SMS launch requirement.",
+      "acceptance": "Expiry-aware notifications work and self-hosting needs no proprietary notification server.",
+      "status": "Specified - not implemented",
+      "test_id": "AT047"
+    },
+    {
+      "requirement_id": "R048",
+      "source_decisions": "Q48",
+      "domain": "integrations",
+      "priority": "Release required",
+      "statement": "Small named set of tested read-only broker sync routes; CSV/manual fallback.",
+      "acceptance": "Each connector passes fields, pagination, reconnect and reconciliation tests, not only login.",
+      "status": "Specified - not implemented",
+      "test_id": "AT048"
+    },
+    {
+      "requirement_id": "R049",
+      "source_decisions": "Q49",
+      "domain": "risk",
+      "priority": "Release required",
+      "statement": "Proposals form jointly feasible sets with explicit alternatives and internal capital commitments.",
+      "acceptance": "Two USD4000 proposals cannot jointly consume USD5000; unexecuted sales do not create cash.",
+      "status": "Specified - not implemented",
+      "test_id": "AT049"
+    },
+    {
+      "requirement_id": "R050",
+      "source_decisions": "Q50",
+      "domain": "strategies",
+      "priority": "Release required",
+      "statement": "Initial actionable intraday proposals are regular-session only; research may run outside session.",
+      "acceptance": "Premarket event can create conditional research but must be refreshed before activation.",
+      "status": "Specified - not implemented",
+      "test_id": "AT050"
+    },
+    {
+      "requirement_id": "R051",
+      "source_decisions": "Q51",
+      "domain": "privacy",
+      "priority": "Release required",
+      "statement": "Hosted/self-hosted migration is supported at first release.",
+      "acceptance": "Compatible financial/policy/private-learning state transfers; credentials and executable imports do not activate silently.",
+      "status": "Specified - not implemented",
+      "test_id": "AT051"
+    },
+    {
+      "requirement_id": "R052",
+      "source_decisions": "Q52",
+      "domain": "privacy",
+      "priority": "Release required",
+      "statement": "Tamper-evident retained history, not indefinite private retention; explicit correction/deletion/backups.",
+      "acceptance": "Deleted evidence makes replay limitations visible and restoration reapplies tombstones.",
+      "status": "Specified - not implemented",
+      "test_id": "AT052"
+    },
+    {
+      "requirement_id": "R053",
+      "source_decisions": "Q53",
+      "domain": "integrations",
+      "priority": "Release required",
+      "statement": "CIBC import, Questrade/IBKR read-only sync, plus Wealthsimple sync and Yahoo CSV interoperability.",
+      "acceptance": "Named commitments each have deployment-specific qualification evidence; no silent downgrade to generic CSV.",
+      "status": "Specified - not implemented",
+      "test_id": "AT053"
+    },
+    {
+      "requirement_id": "R054",
+      "source_decisions": "Q54",
+      "domain": "operations",
+      "priority": "Release required",
+      "statement": "Reference scale: 10 accounts, 250 instruments, 100000 records/user; hosted 100 users and 20 concurrent sessions.",
+      "acceptance": "Combined workload tests retain background monitoring for all users and distinguish provider stream limits.",
+      "status": "Specified - not implemented",
+      "test_id": "AT054"
+    },
+    {
+      "requirement_id": "R055",
+      "source_decisions": "Q55",
+      "domain": "product",
+      "priority": "Release required",
+      "statement": "Managed service pricing plus user-connected providers; independent self-hosted core and unbiased rankings.",
+      "acceptance": "Billing/affiliate data cannot influence security rankings; cancelling hosting supports lawful export.",
+      "status": "Specified - not implemented",
+      "test_id": "AT055"
+    },
+    {
+      "requirement_id": "R056",
+      "source_decisions": "Q56",
+      "domain": "ux",
+      "priority": "Release required",
+      "statement": "Dashboard-led portfolio/decision/research/governance workspaces; chat uses same verified state.",
+      "acceptance": "Chat cannot emit an actionable recommendation outside the governed proposal pipeline.",
+      "status": "Specified - not implemented",
+      "test_id": "AT056"
+    },
+    {
+      "requirement_id": "R057",
+      "source_decisions": "Q57",
+      "domain": "integrations",
+      "priority": "Release required",
+      "statement": "Yahoo tested CSV portfolio/watchlist import and compatible export; no auto-sync/data-adapter launch promise.",
+      "acceptance": "Round-trip differences are shown and Yahoo watchlists never imply owned shares.",
+      "status": "Specified - not implemented",
+      "test_id": "AT057"
+    },
+    {
+      "requirement_id": "R058",
+      "source_decisions": "Q58",
+      "domain": "portfolio",
+      "priority": "Release required",
+      "statement": "Underlying accounts and data sources are separate; reconcile overlapping views without duplication.",
+      "acceptance": "A broker position mirrored in Yahoo totals once; two real accounts remain distinct.",
+      "status": "Specified - not implemented",
+      "test_id": "AT058"
+    },
+    {
+      "requirement_id": "R059",
+      "source_decisions": "Q59",
+      "domain": "strategies",
+      "priority": "Release required",
+      "statement": "All six versioned stock/ETF strategy families required; qualification status separate from catalogue inclusion.",
+      "acceptance": "Each family has documented logic/evaluation; failed variants remain research-only without edge claims.",
+      "status": "Specified - not implemented",
+      "test_id": "AT059"
+    },
+    {
+      "requirement_id": "R060",
+      "source_decisions": "Q60",
+      "domain": "risk",
+      "priority": "Release required",
+      "statement": "Conservative liquidity/spread/data/status-screened universe; optional speculative research cannot bypass gates.",
+      "acceptance": "OTC/penny/failed checks excluded from default actionable discovery while existing exposure remains tracked.",
+      "status": "Specified - not implemented",
+      "test_id": "AT060"
+    },
+    {
+      "requirement_id": "R061",
+      "source_decisions": "Q61",
+      "domain": "strategies",
+      "priority": "Release required",
+      "statement": "Bounded versioned strategy configuration, not unrestricted hosted arbitrary-code or visual strategy builder.",
+      "acceptance": "Configuration changes enter relevant validation/adoption; developer code extension remains controlled.",
+      "status": "Specified - not implemented",
+      "test_id": "AT061"
+    },
+    {
+      "requirement_id": "R062",
+      "source_decisions": "Q62",
+      "domain": "strategies",
+      "priority": "Release required",
+      "statement": "Free baseline supports portfolio-specific rebalancing plus a qualified non-intraday long-only strategy.",
+      "acceptance": "End-to-end free positive and abstention journeys pass, not only dashboards/alerts.",
+      "status": "Specified - not implemented",
+      "test_id": "AT062"
+    },
+    {
+      "requirement_id": "R063",
+      "source_decisions": "Q63",
+      "domain": "simulation",
+      "priority": "Release required",
+      "statement": "User-facing application-managed virtual portfolios and optional approved-policy shadow tracking.",
+      "acceptance": "Simulation never changes real cash and clearly labels fills, costs, assumptions and unsupported cases.",
+      "status": "Specified - not implemented",
+      "test_id": "AT063"
+    },
+    {
+      "requirement_id": "R064",
+      "source_decisions": "Q64",
+      "domain": "analytics",
+      "priority": "Release required",
+      "statement": "Versioned goal-appropriate/cash-flow-matched benchmarks and separate actual/simulated/recommendation scorecards.",
+      "acceptance": "No fabricated historical cash flows; TWR/MWR calculated only with sufficient inputs.",
+      "status": "Specified - not implemented",
+      "test_id": "AT064"
+    },
+    {
+      "requirement_id": "R065",
+      "source_decisions": "Q65",
+      "domain": "research",
+      "priority": "Release required",
+      "statement": "Separate operational qualification, investment evidence and user eligibility; family-specific actionable-use gates.",
+      "acceptance": "Limited investment evidence allowed only under predeclared human-approved policy, never an ad-hoc exception.",
+      "status": "Specified - not implemented",
+      "test_id": "AT065"
+    },
+    {
+      "requirement_id": "R066",
+      "source_decisions": "Q66",
+      "domain": "data",
+      "priority": "Release required",
+      "statement": "Versioned feed specifications and qualified continuity/reinitialization for provider changes.",
+      "acceptance": "A mid-session IEX/SIP change cannot continue the old range silently; recovered signals are retrospective.",
+      "status": "Specified - not implemented",
+      "test_id": "AT066"
+    },
+    {
+      "requirement_id": "R067",
+      "source_decisions": "Q67",
+      "domain": "operations",
+      "priority": "Release required",
+      "statement": "Targets: 95 percent factual events within 5s of receipt; rules-only within 15s; AI intraday deadline at most 60s or earlier expiry.",
+      "acceptance": "Independent event-age and remaining-window checks; misses count, retries cannot reset trigger, delivery measured separately.",
+      "status": "Specified - not implemented",
+      "test_id": "AT067"
+    },
+    {
+      "requirement_id": "R068",
+      "source_decisions": "Q68",
+      "domain": "risk",
+      "priority": "Release required",
+      "statement": "Explicit approved numerical account/allocation/concentration/planned-loss/scenario limits for sizing.",
+      "acceptance": "Denominators and currencies displayed; missing mandatory limits block sizing; stops are not loss guarantees.",
+      "status": "Specified - not implemented",
+      "test_id": "AT068"
+    },
+    {
+      "requirement_id": "R069",
+      "source_decisions": "Q69",
+      "domain": "risk",
+      "priority": "Release required",
+      "statement": "Scoped loss/drawdown triggers pause new risk; monitoring and checked risk reduction continue; controlled resumption.",
+      "acceptance": "Deposits cannot erase breaches; material resume needs reconciled state and explicit acknowledgement.",
+      "status": "Specified - not implemented",
+      "test_id": "AT069"
+    },
+    {
+      "requirement_id": "R070",
+      "source_decisions": "Q70",
+      "domain": "architecture",
+      "priority": "Release required",
+      "statement": "Typed Python core, TypeScript/React, PostgreSQL, analytical file/object storage and durable jobs; three authority paths.",
+      "acceptance": "Live, experiment and release operations share contracts but cannot share unrestricted authority.",
+      "status": "Specified - not implemented",
+      "test_id": "AT070"
+    },
+    {
+      "requirement_id": "R071",
+      "source_decisions": "Q71",
+      "domain": "portfolio",
+      "priority": "Release required",
+      "statement": "Reconciled decimal journal with explicit effective/publication/receipt/decision times; one calculation contract.",
+      "acceptance": "Source corrections update current reconstruction without rewriting historical knowledge.",
+      "status": "Specified - not implemented",
+      "test_id": "AT071"
+    },
+    {
+      "requirement_id": "R072",
+      "source_decisions": "Q72",
+      "domain": "strategies",
+      "priority": "Release required",
+      "statement": "Interpretable six-family starting implementations; 6-month/200-day momentum and 15-minute ORB are unqualified research defaults.",
+      "acceptance": "Parameter choices are labelled candidates and cannot auto-enable live strategies.",
+      "status": "Specified - not implemented",
+      "test_id": "AT072"
+    },
+    {
+      "requirement_id": "R073",
+      "source_decisions": "Q73",
+      "domain": "integrations",
+      "priority": "Release required",
+      "statement": "Capability/rights/degraded-state registry; provider/entitlement changes require reassessment.",
+      "acceptance": "Connected status does not imply qualified; tenant feed sharing requires rights and consent.",
+      "status": "Specified - not implemented",
+      "test_id": "AT073"
+    },
+    {
+      "requirement_id": "R074",
+      "source_decisions": "Q74",
+      "domain": "ai",
+      "priority": "Release required",
+      "statement": "Persisted bounded workflows, explicit model/runtime versions, no silent paid/provider fallback.",
+      "acceptance": "One evaluation plus at most one permitted revision; deadline/claim checks rerun on change.",
+      "status": "Specified - not implemented",
+      "test_id": "AT074"
+    },
+    {
+      "requirement_id": "R075",
+      "source_decisions": "Q75",
+      "domain": "security",
+      "priority": "Release required",
+      "statement": "Read-only operation allowlists, secrets outside agents, tenant isolation including nonowner/nonbypass DB roles.",
+      "acceptance": "Cross-tenant, RLS-bypass, tool mutation and secret-exfiltration tests block release.",
+      "status": "Specified - not implemented",
+      "test_id": "AT075"
+    },
+    {
+      "requirement_id": "R076",
+      "source_decisions": "Q76",
+      "domain": "improvement",
+      "priority": "Release required",
+      "statement": "gVisor initial Linux sandbox qualification target; full recursive scope; reviewed signed promotion and compatible rollback.",
+      "acceptance": "Unsupported sandbox cannot qualify full release by dropping mandatory improvement paths.",
+      "status": "Specified - not implemented",
+      "test_id": "AT076"
+    },
+    {
+      "requirement_id": "R077",
+      "source_decisions": "Q77",
+      "domain": "operations",
+      "priority": "Release required",
+      "statement": "Hosted targets 99.9 percent availability, 15-minute RPO and 4-hour RTO; receipts not guarantees.",
+      "acceptance": "Recovery and combined-budget tests demonstrate targets while external/end-to-end failures stay visible.",
+      "status": "Specified - not implemented",
+      "test_id": "AT077"
+    },
+    {
+      "requirement_id": "R078",
+      "source_decisions": "Q78",
+      "domain": "testing",
+      "priority": "Release required",
+      "statement": "End-to-end release journeys cover free mode, overlap, AI, intraday, options, risk pause, simulation, improvement, migration and isolation.",
+      "acceptance": "All required journeys tied to versioned execution evidence, including negatives and failure recovery.",
+      "status": "Specified - not implemented",
+      "test_id": "AT078"
+    },
+    {
+      "requirement_id": "R079",
+      "source_decisions": "Q79",
+      "domain": "governance",
+      "priority": "Release required",
+      "statement": "Separate design choices from factual provider/legal/security/performance/economic gates.",
+      "acceptance": "No completion claim without versioned evidence and no silent scope reduction when a gate fails.",
+      "status": "Specified - not implemented",
+      "test_id": "AT079"
+    },
+    {
+      "requirement_id": "R080",
+      "source_decisions": "Q70,Q71",
+      "domain": "architecture",
+      "priority": "Release required",
+      "statement": "All API monetary amounts/quantities use decimal strings; times use UTC with exchange calendar identity.",
+      "acceptance": "Schema rejects binary numeric money and timestamps without offsets.",
+      "status": "Specified - not implemented",
+      "test_id": "AT080"
+    },
+    {
+      "requirement_id": "R081",
+      "source_decisions": "Q58,Q71",
+      "domain": "portfolio",
+      "priority": "Release required",
+      "statement": "Immutable source observations map into balanced postings or quarantined exceptions; provisional views never double-post.",
+      "acceptance": "Journal balance, idempotency, correction reversal and lot/cash reconciliation fixtures pass.",
+      "status": "Specified - not implemented",
+      "test_id": "AT081"
+    },
+    {
+      "requirement_id": "R082",
+      "source_decisions": "Q12,Q49,Q68",
+      "domain": "risk",
+      "priority": "Release required",
+      "statement": "Final publication atomically binds policy, account and proposal-set revisions to a checked cash commitment.",
+      "acceptance": "A competing account update causes re-evaluation, never time-of-check/time-of-use overspend.",
+      "status": "Specified - not implemented",
+      "test_id": "AT082"
+    },
+    {
+      "requirement_id": "R083",
+      "source_decisions": "Q12,Q66,Q67",
+      "domain": "data",
+      "priority": "Release required",
+      "statement": "Separate price, fundamental, calendar, broker and FX freshness policies; record event age and ingestion delay.",
+      "acceptance": "Fast processing of five-minute-old broker state never labels it real-time confirmed.",
+      "status": "Specified - not implemented",
+      "test_id": "AT083"
+    },
+    {
+      "requirement_id": "R084",
+      "source_decisions": "Q24,Q29,Q40,Q65",
+      "domain": "research",
+      "priority": "Release required",
+      "statement": "Track all experiments, point-in-time universe membership, delistings, corporate actions, costs and test access.",
+      "acceptance": "A future filing, present-day survivor list or repeated final-holdout feedback cannot qualify a strategy.",
+      "status": "Specified - not implemented",
+      "test_id": "AT084"
+    },
+    {
+      "requirement_id": "R085",
+      "source_decisions": "Q19,Q20,Q74",
+      "domain": "ai",
+      "priority": "Release required",
+      "statement": "Expose structured audit rationale and evidence, not require inaccessible private model chain of thought.",
+      "acceptance": "A reviewer can validate claim/calc provenance without requesting hidden model reasoning.",
+      "status": "Specified - not implemented",
+      "test_id": "AT085"
+    },
+    {
+      "requirement_id": "R086",
+      "source_decisions": "Q26,Q38,Q75",
+      "domain": "security",
+      "priority": "Release required",
+      "statement": "Freshness/eligibility/policy/legal/release controls are enforced outside LLM contexts.",
+      "acceptance": "Prompt injection asking to remove checks cannot change the final validator outcome.",
+      "status": "Specified - not implemented",
+      "test_id": "AT086"
+    },
+    {
+      "requirement_id": "R087",
+      "source_decisions": "Q51,Q52,Q75",
+      "domain": "privacy",
+      "priority": "Release required",
+      "statement": "Evidence-derived state is deleted or invalidated under policy; archive import is not arbitrary execution.",
+      "acceptance": "Malicious archive paths, symlinks, oversized extraction and executable payloads are rejected.",
+      "status": "Specified - not implemented",
+      "test_id": "AT087"
+    },
+    {
+      "requirement_id": "R088",
+      "source_decisions": "Q70,Q77",
+      "domain": "operations",
+      "priority": "Release required",
+      "statement": "At-least-once delivery uses idempotent consumers, bounded leases/retries and dead-letter recovery.",
+      "acceptance": "Worker crash after database commit does not duplicate holdings or send duplicate actionable alerts.",
+      "status": "Specified - not implemented",
+      "test_id": "AT088"
+    },
+    {
+      "requirement_id": "R089",
+      "source_decisions": "Q17",
+      "domain": "options",
+      "priority": "Release required",
+      "statement": "Option contract deliverables, adjusted multipliers, exercise style and settlement are explicit, not defaulted blindly.",
+      "acceptance": "Nonstandard/unknown contracts remain represented but unsupported sizing/payoffs are blocked.",
+      "status": "Specified - not implemented",
+      "test_id": "AT089"
+    },
+    {
+      "requirement_id": "R090",
+      "source_decisions": "Q64",
+      "domain": "analytics",
+      "priority": "Release required",
+      "statement": "No-unique-root MWR, nonpositive equity and missing valuation intervals return explicit unavailable status.",
+      "acceptance": "Return fixtures identify ambiguity rather than invent a percentage.",
+      "status": "Specified - not implemented",
+      "test_id": "AT090"
+    },
+    {
+      "requirement_id": "R091",
+      "source_decisions": "Q50,Q66",
+      "domain": "data",
+      "priority": "Release required",
+      "statement": "Exchange sessions include holidays, DST, early closes, auctions and halts in versioned calendars.",
+      "acceptance": "ORB and expiry deadlines are session-derived rather than fixed UTC strings.",
+      "status": "Specified - not implemented",
+      "test_id": "AT091"
+    },
+    {
+      "requirement_id": "R092",
+      "source_decisions": "Q30,Q37,Q38,Q76",
+      "domain": "security",
+      "priority": "Release required",
+      "statement": "Public/community code and skill inputs are reviewed; the optimizer cannot replace protected gates or signing keys.",
+      "acceptance": "Mutation of evaluator answer keys, final thresholds or human authorization fails integrity checks.",
+      "status": "Specified - not implemented",
+      "test_id": "AT092"
+    },
+    {
+      "requirement_id": "R093",
+      "source_decisions": "Q47,Q56",
+      "domain": "ux",
+      "priority": "Release required",
+      "statement": "Keyboard-accessible financial tables and text states accompany colors; screen freshness is continuously visible.",
+      "acceptance": "Keyboard-only and screen-reader journeys cover policy, reconciliation and proposal expiry.",
+      "status": "Specified - not implemented",
+      "test_id": "AT093"
+    },
+    {
+      "requirement_id": "R094",
+      "source_decisions": "Q21,Q73,Q79",
+      "domain": "governance",
+      "priority": "Release required",
+      "statement": "All external-provider feature claims are dated and distinguish docs, permission, auth and workload evidence.",
+      "acceptance": "A docs-only record cannot become commercial-qualified without required receipts.",
+      "status": "Specified - not implemented",
+      "test_id": "AT094"
+    },
+    {
+      "requirement_id": "R095",
+      "source_decisions": "Q18,Q21",
+      "domain": "ai",
+      "priority": "Release required",
+      "statement": "Provider use permission includes financial-advice policy, allowed tools, retention and training settings.",
+      "acceptance": "Unsupported financial-use route is blocked even when OAuth or inference works.",
+      "status": "Specified - not implemented",
+      "test_id": "AT095"
+    },
+    {
+      "requirement_id": "R096",
+      "source_decisions": "Q13,Q36,Q51",
+      "domain": "operations",
+      "priority": "Release required",
+      "statement": "Self-hosted proof uses operator-controlled backup keys and no embedded universal service credentials.",
+      "acceptance": "Install and restore work without project-vendor account or secret bootstrap call.",
+      "status": "Specified - not implemented",
+      "test_id": "AT096"
+    },
+    {
+      "requirement_id": "R097",
+      "source_decisions": "Q1,Q13",
+      "domain": "product",
+      "priority": "Release required",
+      "statement": "Repository branding and production domain remain owner-configurable; no invented identity is normative.",
+      "acceptance": "Brand replacement changes metadata only, not contracts or workflow semantics.",
+      "status": "Specified - not implemented",
+      "test_id": "AT097"
+    },
+    {
+      "requirement_id": "R098",
+      "source_decisions": "Q63,Q64",
+      "domain": "simulation",
+      "priority": "Release required",
+      "statement": "A simulated fill must occur after modeled submission and under a declared available-data convention.",
+      "acceptance": "Same-bar ambiguity resolves conservatively or as indeterminate, never automatically best-case.",
+      "status": "Specified - not implemented",
+      "test_id": "AT098"
+    },
+    {
+      "requirement_id": "R099",
+      "source_decisions": "Q30,Q34,Q65",
+      "domain": "governance",
+      "priority": "Release required",
+      "statement": "Runtime approvals are typed by maintainer release, operator install and user strategy adoption; planning delegation is not runtime consent.",
+      "acceptance": "A conversational yes cannot satisfy a production promotion or investment-policy signature.",
+      "status": "Specified - not implemented",
+      "test_id": "AT099"
+    }
+  ]
+}

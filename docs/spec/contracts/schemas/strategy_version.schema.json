@@ -1,0 +1,105 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Strategy Version",
+  "type": "object",
+  "properties": {
+    "id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]*$"
+    },
+    "family": {
+      "type": "string",
+      "enum": [
+        "allocation",
+        "quality_value",
+        "income",
+        "swing_momentum",
+        "opening_range_breakout",
+        "ai_thesis"
+      ]
+    },
+    "version": {
+      "type": "string"
+    },
+    "implementation_hash": {
+      "type": "string",
+      "pattern": "^[a-f0-9]{64}$"
+    },
+    "configuration_hash": {
+      "type": "string",
+      "pattern": "^[a-f0-9]{64}$"
+    },
+    "required_feed_spec_ids": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 128,
+        "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]*$"
+      }
+    },
+    "policy_requirements": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 128,
+        "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]*$"
+      }
+    },
+    "research_protocol_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]*$"
+    },
+    "operational_status": {
+      "type": "string",
+      "enum": [
+        "not_tested",
+        "passed",
+        "failed",
+        "suspended"
+      ]
+    },
+    "evidence_status": {
+      "type": "string"
+    },
+    "action_eligible": {
+      "type": "boolean"
+    },
+    "approved_by": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "source_decisions": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 128,
+        "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]*$"
+      }
+    }
+  },
+  "required": [
+    "id",
+    "family",
+    "version",
+    "implementation_hash",
+    "configuration_hash",
+    "required_feed_spec_ids",
+    "policy_requirements",
+    "research_protocol_id",
+    "operational_status",
+    "evidence_status",
+    "action_eligible",
+    "approved_by",
+    "source_decisions"
+  ],
+  "additionalProperties": false
+}

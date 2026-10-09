@@ -1,0 +1,24 @@
+{
+  "version": "1",
+  "opt_in": true,
+  "release_required": true,
+  "allowed": [
+    "long_call",
+    "long_put",
+    "covered_call",
+    "cash_secured_put",
+    "bull_call_debit_vertical",
+    "bear_put_debit_vertical",
+    "bull_put_credit_vertical",
+    "bear_call_credit_vertical"
+  ],
+  "excluded_new_proposals": [
+    "uncovered_short_option",
+    "zero_day_expiry"
+  ],
+  "existing_exposures_preserved": true,
+  "unknown_terms_block_sizing": true,
+  "default_contract_multiplier": null,
+  "indicative_feed_execution_qualified": false,
+  "expiration_payoff_not_pathwise_guarantee": true
+}

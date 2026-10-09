@@ -1,0 +1,4 @@
+account_ref,source_ref,record_id,effective_at,kind,symbol,quantity,price,gross_cash,fee,currency
+SYN-ACCOUNT,SYN-BROKER,D1,2026-01-02T15:00:00Z,deposit,,,,1000,0,USD
+SYN-ACCOUNT,SYN-BROKER,B1,2026-01-05T15:00:00Z,buy,SYNTH,10,50,-500,1,USD
+SYN-ACCOUNT,SYN-BROKER,S1,2026-01-06T15:00:00Z,sell,SYNTH,4,60,240,1,USD

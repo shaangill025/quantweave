@@ -1,0 +1,93 @@
+{
+  "version": "0.1.0",
+  "release_required_all_families": true,
+  "default_action_eligible": false,
+  "strategies": [
+    {
+      "id": "STR-ALLOC-001",
+      "family": "allocation",
+      "version": "0.1.0-research",
+      "release_required": true,
+      "action_eligible": false,
+      "logic": "Contribution-first drift-band rebalance to adopted targets with joint account feasibility.",
+      "parameters": {
+        "target_weights": "user-approved",
+        "drift_bands": "user-approved or reviewed template then adoption"
+      },
+      "qualification": "not_tested",
+      "free_floor_candidate": true
+    },
+    {
+      "id": "STR-QUALITY-001",
+      "family": "quality_value",
+      "version": "0.1.0-research",
+      "release_required": true,
+      "action_eligible": false,
+      "logic": "Explicit sector-compatible profitability/cashflow/leverage/value ranks with point-in-time availability; missing metrics reduce coverage, not assign zero quality.",
+      "parameters": {
+        "metric_weights": "predeclared protocol before evaluation",
+        "universe_version": "required"
+      },
+      "qualification": "not_tested"
+    },
+    {
+      "id": "STR-INCOME-001",
+      "family": "income",
+      "version": "0.1.0-research",
+      "release_required": true,
+      "action_eligible": false,
+      "logic": "Distribution objective with cashflow resilience, balance-sheet and concentration checks; no yield-only buying rule.",
+      "parameters": {
+        "income_goal": "user policy",
+        "sustainability_metric_set": "versioned sector-compatible"
+      },
+      "qualification": "not_tested"
+    },
+    {
+      "id": "STR-TREND-001",
+      "family": "swing_momentum",
+      "version": "0.1.0-research",
+      "release_required": true,
+      "action_eligible": false,
+      "logic": "EOD six-month momentum + 200-session SMA filter; next-session entry evaluation, exits/sizing as spec08; no same-bar fill.",
+      "parameters": {
+        "momentum_sessions": 126,
+        "trend_sessions": 200,
+        "rebalance_review": "weekly",
+        "status": "research seed, not empirical optimum"
+      },
+      "qualification": "not_tested",
+      "free_floor_candidate": true
+    },
+    {
+      "id": "STR-ORB-001",
+      "family": "opening_range_breakout",
+      "version": "0.1.0-research",
+      "release_required": true,
+      "action_eligible": false,
+      "logic": "Build first 15 regular-session minute bars then seek qualified long breakout; no incomplete-window access; exit same session by versioned cutoff.",
+      "parameters": {
+        "opening_range_minutes": 15,
+        "signal_bar_minutes": 1,
+        "outside_regular_session": false,
+        "status": "research seed, not profitable claim"
+      },
+      "qualification": "not_tested",
+      "free_intraday_guaranteed": false
+    },
+    {
+      "id": "STR-AITHESIS-001",
+      "family": "ai_thesis",
+      "version": "0.1.0-research",
+      "release_required": true,
+      "action_eligible": false,
+      "logic": "Independent evidence-grounded mandate with counterthesis, numerical sensitivity, separate evaluator and final gates.",
+      "parameters": {
+        "horizons": "adopted policy",
+        "max_revised_submissions": 1
+      },
+      "qualification": "not_tested",
+      "requires_model": true
+    }
+  ]
+}

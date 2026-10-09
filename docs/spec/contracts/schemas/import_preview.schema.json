@@ -1,0 +1,103 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Import Preview",
+  "type": "object",
+  "properties": {
+    "id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]*$"
+    },
+    "state": {
+      "type": "string",
+      "enum": [
+        "uploaded",
+        "mapped",
+        "validated",
+        "needs_resolution",
+        "committed",
+        "rejected"
+      ]
+    },
+    "file_hash": {
+      "type": "string",
+      "pattern": "^[a-f0-9]{64}$"
+    },
+    "source_kind": {
+      "type": "string",
+      "enum": [
+        "canonical",
+        "cibc",
+        "yahoo",
+        "wealthsimple",
+        "other"
+      ]
+    },
+    "classification": {
+      "type": "string",
+      "enum": [
+        "new_account",
+        "existing_account_view",
+        "watchlist",
+        "hypothetical"
+      ]
+    },
+    "target_account_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "mapping_version_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]*$"
+    },
+    "row_count": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "accepted_rows": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "rejected_rows": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "duplicate_rows": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "issues": {
+      "type": "array",
+      "items": {
+        "$ref": "common.schema.json#/$defs/Reason"
+      }
+    },
+    "commit_token": {
+      "type": [
+        "string",
+        "null"
+      ]
+    }
+  },
+  "required": [
+    "id",
+    "state",
+    "file_hash",
+    "source_kind",
+    "classification",
+    "target_account_id",
+    "mapping_version_id",
+    "row_count",
+    "accepted_rows",
+    "rejected_rows",
+    "duplicate_rows",
+    "issues",
+    "commit_token"
+  ],
+  "additionalProperties": false
+}

@@ -1,0 +1,23 @@
+{
+  "version": "0.1.0-template",
+  "status": "draft_not_adopted",
+  "scope_account_ids": [],
+  "limits": {
+    "cash_reserve": null,
+    "issuer_concentration": null,
+    "sector_concentration": null,
+    "planned_trade_loss": null,
+    "stress_loss": null,
+    "loss_pause": null
+  },
+  "limit_format": {
+    "value": "decimal string",
+    "unit": "currency or ratio",
+    "denominator": "explicit account/sleeve/portfolio",
+    "measurement_window": "explicit"
+  },
+  "required_before_live_sizing": true,
+  "missing_value_behaviour": "block affected sizing; research and qualified unsized scenarios remain",
+  "stop_is_guarantee": false,
+  "risk_pause_resume": "reconciled state plus approved recovery process and explicit acknowledgement for material pauses"
+}

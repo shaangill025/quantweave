@@ -1,0 +1,10 @@
+{
+  "version": "1",
+  "application_implemented": false,
+  "application_tests_executed": false,
+  "commercial_cleared": false,
+  "provider_permissions_cleared": false,
+  "full_release_eligible": false,
+  "all_gates_required": true,
+  "specification_validation_is_not_product_validation": true
+}

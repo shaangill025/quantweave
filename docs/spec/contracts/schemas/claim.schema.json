@@ -1,0 +1,94 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Claim",
+  "type": "object",
+  "properties": {
+    "id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]*$"
+    },
+    "kind": {
+      "type": "string",
+      "enum": [
+        "reported_fact",
+        "calculation",
+        "assumption",
+        "forecast",
+        "interpretation"
+      ]
+    },
+    "text": {
+      "type": "string"
+    },
+    "instrument_ids": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 128,
+        "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]*$"
+      }
+    },
+    "evidence_ids": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 128,
+        "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]*$"
+      }
+    },
+    "calculation_ids": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 128,
+        "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]*$"
+      }
+    },
+    "material": {
+      "type": "boolean"
+    },
+    "verification": {
+      "type": "string",
+      "enum": [
+        "pending",
+        "supported",
+        "calculation_checked",
+        "assumption_dependent",
+        "contested",
+        "unsupported",
+        "unavailable"
+      ]
+    },
+    "counterevidence_ids": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 128,
+        "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]*$"
+      }
+    },
+    "valid_at": {
+      "type": "string",
+      "format": "date-time"
+    }
+  },
+  "required": [
+    "id",
+    "kind",
+    "text",
+    "instrument_ids",
+    "evidence_ids",
+    "calculation_ids",
+    "material",
+    "verification",
+    "counterevidence_ids",
+    "valid_at"
+  ],
+  "additionalProperties": false
+}

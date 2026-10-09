@@ -1,0 +1,75 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Research Request",
+  "type": "object",
+  "properties": {
+    "question": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 8000
+    },
+    "scope_account_ids": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 128,
+        "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]*$"
+      }
+    },
+    "instrument_ids": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 128,
+        "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]*$"
+      }
+    },
+    "horizon": {
+      "type": "string",
+      "enum": [
+        "long_term",
+        "swing_position",
+        "intraday"
+      ]
+    },
+    "mode": {
+      "type": "string",
+      "enum": [
+        "rules_only",
+        "ai_enabled"
+      ]
+    },
+    "max_incremental_cost_usd": {
+      "type": "string",
+      "pattern": "^(0|[1-9][0-9]*)(\\.[0-9]+)?$",
+      "maxLength": 60
+    },
+    "allowed_provider_connection_ids": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 128,
+        "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]*$"
+      }
+    },
+    "existing_proposal_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    }
+  },
+  "required": [
+    "question",
+    "scope_account_ids",
+    "instrument_ids",
+    "horizon",
+    "mode",
+    "max_incremental_cost_usd",
+    "allowed_provider_connection_ids"
+  ],
+  "additionalProperties": false
+}
