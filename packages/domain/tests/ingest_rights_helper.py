@@ -37,17 +37,16 @@ def _profile(missing: Use | None = None) -> RightsProfile:
     return RightsProfile(uses, {UseScope.PERSONAL: grant()}, {REGION: grant()})
 
 
-def qualified_rights(
-    feed_id: str,
-    received: datetime,
-    missing: Use | None = None,
-    registry: Registry | None = None,
-) -> IngestRights:
-    """Rights for `feed_id`, qualified for every use except `missing` in the tenant
-    entitlement; pass `registry` to use another (e.g. an empty) registry."""
-    if registry is None:
-        auth = Evidence(EvidenceKind.AUTH, "synthetic-auth", T)
-        work = Evidence(EvidenceKind.WORKLOAD, "synthetic-workload", T)
+def qualified_registry(
+    feed_ids: tuple[str, ...], missing: Use | None = None
+) -> Registry:
+    """A registry with every feed qualified and entitled to TENANT."""
+    auth = Evidence(EvidenceKind.AUTH, "synthetic-auth", T)
+    work = Evidence(EvidenceKind.WORKLOAD, "synthetic-workload", T)
+    registry = Registry().with_provider(
+        Provider("provider-synth", "SYNTHETIC provider")
+    )
+    for feed_id in feed_ids:
         feed = (
             FeedHistory.new(feed_id, "provider-synth")
             .revise("synthetic_feed", frozenset(Use), _profile(), T)
@@ -57,11 +56,19 @@ def qualified_rights(
         ent = EntitlementHistory.new(TENANT, feed_id).revise(
             EntitlementSource.INSTALLATION_LICENSE, True, _profile(missing), None, T
         )
-        registry = (
-            Registry()
-            .with_provider(Provider("provider-synth", "SYNTHETIC provider"))
-            .with_feed(feed)
-            .with_entitlement(ent)
-        )
+        registry = registry.with_feed(feed).with_entitlement(ent)
+    return registry
+
+
+def qualified_rights(
+    feed_id: str,
+    received: datetime,
+    missing: Use | None = None,
+    registry: Registry | None = None,
+) -> IngestRights:
+    """Rights for `feed_id`, qualified for every use except `missing` in the tenant
+    entitlement; pass `registry` to use another (e.g. an empty) registry."""
+    if registry is None:
+        registry = qualified_registry((feed_id,), missing)
     scope = UseScope.PERSONAL
     return IngestRights(registry, TENANT, feed_id, received, scope, REGION, KEEP)
