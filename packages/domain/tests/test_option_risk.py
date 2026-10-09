@@ -216,6 +216,45 @@ def test_european_long_does_not_cover_american_short() -> None:
     assert r.cash_required == usd(500) and Structure.SPREAD in r.structures
 
 
+@pytest.mark.parametrize(
+    ("long", "short", "premiums", "funding"),
+    [
+        ((P, "45"), (P, "50"), ("-100", "300"), 5000),  # bull put: buy at 50
+        ((C, "55"), (C, "50"), ("-100", "300"), 5500),  # bear call: exercise 55
+        ((C, "50"), (C, "55"), ("-300", "100"), 5000),  # bull call: exercise 50
+        ((P, "50"), (P, "45"), ("-300", "100"), 4500),  # bear put: buy at 45
+    ],
+)
+def test_assignment_funding_blocks(
+    long: tuple[OptionRight, str],
+    short: tuple[OptionRight, str],
+    premiums: tuple[str, str],
+    funding: int,
+) -> None:
+    # An early assignment of the American short needs cash before the long can be
+    # exercised (spec 05: a capped expiry loss does not waive it).
+    legs = [
+        leg(opt(*long), 1, premiums[0]),
+        leg(opt(short[0], short[1], 2), -1, premiums[1]),
+    ]
+    need = funding - int(premiums[0])  # the paid premium is already spent
+    ok = checked(legs, cover(str(need)))
+    assert not ok.blocked and ok.assignment_funding == usd(funding)
+    short_by_cent = checked(legs, cover(f"{need - 1}.99"))
+    assert short_by_cent.reasons == ("assignment_funding_insufficient",)
+    r = check_legging(legs, cover(f"{need - 1}.99"))
+    assert not isinstance(r, Unavailable) and r.blocked and r.worst == 1
+    eu = [
+        leg(
+            replace(x.contract, style=ExerciseStyle.EUROPEAN),
+            int(x.quantity.value),
+            x.premium.amount.to_wire(),
+        )
+        for x in legs
+    ]
+    assert checked(eu, cover("1000")).assignment_funding == usd(0)
+
+
 def test_negative_or_cash_only_deliverable_fails_closed() -> None:
     neg = replace(
         ADJ,
@@ -298,8 +337,13 @@ def test_permissions_and_currency_block() -> None:
         leg(opt(P, "50"), 0)
 
 
+def eu(right: OptionRight, strike: str, n: int = 1) -> OptionContract:
+    return replace(opt(right, strike, n), style=ExerciseStyle.EUROPEAN)
+
+
 def test_legging_checks_every_intermediate_state() -> None:
-    long45, short50 = leg(opt(P, "45"), 1, "-100"), leg(opt(P, "50", 2), -1, "300")
+    # European legs: no early-assignment funding, so only the order matters here.
+    long45, short50 = leg(eu(P, "45"), 1, "-100"), leg(eu(P, "50", 2), -1, "300")
     acct = cover("1000")
     assert not checked([long45, short50], acct).blocked  # final state needs 600
     good = check_legging([long45, short50], acct)
@@ -318,11 +362,11 @@ def test_legging_checks_every_intermediate_state() -> None:
     # Closing the long leg of an open credit spread first leaves a naked short.
     existing = [long45, short50]
     r = check_legging(
-        [leg(opt(P, "45"), -1, "50"), leg(opt(P, "50", 2), 1, "-60")], acct, existing
+        [leg(eu(P, "45"), -1, "50"), leg(eu(P, "50", 2), 1, "-60")], acct, existing
     )
     assert not isinstance(r, Unavailable) and r.blocked and r.worst == 0
     r = check_legging(
-        [leg(opt(P, "50", 2), 1, "-60"), leg(opt(P, "45"), -1, "50")], acct, existing
+        [leg(eu(P, "50", 2), 1, "-60"), leg(eu(P, "45"), -1, "50")], acct, existing
     )
     assert not isinstance(r, Unavailable) and not r.blocked
 

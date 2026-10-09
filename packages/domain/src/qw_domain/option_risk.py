@@ -11,8 +11,13 @@ R044, R068, R089; spec 09; T008 F-14).
   same right that is at least as exercisable (American covers either style; European
   covers only European) reserves the strike-payment width, which bounds the spread's
   expiry loss. Among such pairings greedy pairing may over-reserve but never
-  under-reserve. Temporary funding after an early assignment of a paired short is not
-  yet reserved (increment 2).
+  under-reserve. An early assignment of a paired American short needs temporary
+  cash before the long can be exercised (an assigned put buys at K_s*M; an assigned
+  call is delivered by exercising the long at K_l*M). That gross amount, summed as
+  if every such short were assigned at once, is `assignment_funding`. Spec 05: a
+  capped expiry loss does not waive it, so the state blocks
+  (`assignment_funding_insufficient`) unless available cash covers the funding plus
+  every non-width reserve (paid premiums, put and covered-call cash) at once.
 - Premiums are counted per call: every paid premium in `legs` is spent, and premium
   received on closing legs is not netted (conservative). `AccountCover.units` must
   already be net of other encumbrances (other proposals, other structures).
@@ -26,6 +31,7 @@ Cash is one account and currency; another currency cannot fund (R043). Exact
 
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from datetime import datetime, timedelta
 from decimal import Decimal, localcontext
 from enum import StrEnum
 from fractions import Fraction
@@ -41,7 +47,7 @@ from qw_domain.options import (
     Settlement,
     UnitDeliverable,
 )
-from qw_domain.valuation import Unavailable
+from qw_domain.valuation import Mark, Unavailable, ValuationBasis
 
 COLLATERAL_METHOD = "fully_secured_greedy_pairing/1"
 
@@ -147,7 +153,25 @@ class CoverCheck:
     cash_required: Money
     units_encumbered: tuple[tuple[InstrumentId, Fraction], ...]
     structures: frozenset[Structure]
+    assignment_funding: Money  # gross cash if paired American shorts are assigned
     method: str = COLLATERAL_METHOD
+
+
+def check_mark(
+    mark: Mark,
+    instrument_id: InstrumentId,
+    currency: str,
+    as_of: datetime,
+    max_age: timedelta,
+    what: str,
+) -> Unavailable | None:
+    """A mark is usable if it is for `instrument_id`, in `currency`, observed at or
+    before `as_of` and no older than `max_age`; otherwise a typed refusal."""
+    if mark.instrument_id != instrument_id:
+        return Unavailable("mark_instrument_mismatch", f"{what} for another instrument")
+    if mark.currency != currency:
+        return Unavailable("currency_mismatch", f"{what} not in strike currency")
+    return ValuationBasis(currency, as_of, max_age).stale(mark.observed_at, what)
 
 
 def _group(c: OptionContract, t: ContractTerms) -> tuple[object, ...]:
@@ -197,8 +221,10 @@ def check_cover(legs: Sequence[Leg], cover: AccountCover) -> CoverCheck | Unavai
     reasons: list[str] = []
     held = {i: Fraction(q.value) for i, q in cover.units.items()}
     encumbered: dict[InstrumentId, Fraction] = {}
+    funding = widths = Fraction()
     for contract, terms, qty in sorted(shorts, key=lambda s: s[1].strike_cash):
         call = contract.right is OptionRight.CALL
+        early = contract.style is ExerciseStyle.AMERICAN
         pool = [
             s
             for c, s in longs.get(_group(contract, terms), [])
@@ -207,7 +233,10 @@ def check_cover(legs: Sequence[Leg], cover: AccountCover) -> CoverCheck | Unavai
         for slot in sorted(pool, key=lambda s: _width(call, s[0], terms.strike_cash)):
             take = min(qty, slot[1])
             if take:
-                reserve += _width(call, slot[0], terms.strike_cash) * take
+                width = _width(call, slot[0], terms.strike_cash) * take
+                reserve, widths = reserve + width, widths + width
+                if early:  # assigned put: buy at K_s*M; call: exercise long at K_l*M
+                    funding += (slot[0] if call else terms.strike_cash) * take
                 slot[1] -= take
                 qty -= take
                 structures.add(Structure.SPREAD)
@@ -231,6 +260,10 @@ def check_cover(legs: Sequence[Leg], cover: AccountCover) -> CoverCheck | Unavai
     cash = _money(reserve, cover.currency)
     if cash > cover.available_cash:
         reasons.append("insufficient_cash")
+    if funding and _money(reserve - widths + funding, cover.currency) > (
+        cover.available_cash
+    ):
+        reasons.append("assignment_funding_insufficient")
     if cover.permitted is None:
         reasons.append("broker_permission_unknown")
     else:
@@ -246,6 +279,7 @@ def check_cover(legs: Sequence[Leg], cover: AccountCover) -> CoverCheck | Unavai
             sorted(encumbered.items(), key=lambda e: str(e[0].uuid))
         ),
         structures=frozenset(structures),
+        assignment_funding=_money(funding, cover.currency),
     )
 
 
