@@ -1,0 +1,17 @@
+{
+  "name": "quantweave",
+  "private": true,
+  "license": "Apache-2.0",
+  "packageManager": "pnpm@10.28.0",
+  "engines": {
+    "node": ">=22.22.0 <23",
+    "pnpm": ">=10.28.0 <11"
+  },
+  "scripts": {
+    "typecheck": "pnpm --filter @quantweave/web typecheck",
+    "lint": "pnpm --filter @quantweave/web lint",
+    "test": "pnpm --filter @quantweave/web test",
+    "build": "pnpm --filter @quantweave/web build",
+    "licenses": "node tools/check_web_licenses.mjs"
+  }
+}
