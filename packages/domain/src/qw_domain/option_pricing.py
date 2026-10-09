@@ -11,7 +11,10 @@
   (the feed spec's `latency_class`) is real time. Indicative and delayed feeds are
   research-only; an unknown class blocks live use. The latency table is a
   caller-supplied trust boundary: rights.py does not record it yet. Live use also
-  needs an `AccountCover` for the T034 coverage check.
+  needs an `AccountCover` for the T034 coverage check, and the exchange session
+  of the trade (`session`, from the calendar): a leg that expires in that session
+  (or earlier) is excluded as zero-day expiry (`excluded_new_proposals`). The
+  session must be within one day of the UTC date of `at`.
 - Each leg is priced at the conservative side, in journal sign: a long pays the
   ask, a short receives the bid, per unit x multiplier x contracts, rounded toward
   the payer. The package is then rebuilt (`build_package`) with these premiums,
@@ -26,6 +29,7 @@ from datetime import datetime, timedelta
 from enum import StrEnum
 from fractions import Fraction
 
+from qw_domain.calendars import SessionRef
 from qw_domain.decimals import Money, Price
 from qw_domain.identity import InstrumentId
 from qw_domain.instants import ensure_aware_utc
@@ -87,6 +91,27 @@ class PricingDecision:
     package: OptionPackage | None  # rebuilt with the priced premiums, if allowed
 
 
+def _session_reasons(
+    pkg: OptionPackage, session: SessionRef | None, at: datetime
+) -> list[str]:
+    """Zero-day expiry is excluded from new proposals (options_catalogue.json).
+    The caller's session must be within one day of the UTC date of `at`; a leg
+    expiring on or before the later of the two dates is zero-day (conservative)."""
+    if session is None:
+        return ["trade_session_unknown"]
+    if abs(session.session_date - at.date()) > timedelta(days=1):
+        return ["trade_session_mismatch"]
+    today = max(session.session_date, at.date())
+    out = []
+    for leg in pkg.legs:
+        expiry = leg.contract.expiry
+        if expiry.calendar_id != session.calendar_id:
+            out.append("trade_session_calendar_mismatch")
+        elif expiry.session_date <= today:
+            out.append("zero_day_expiry")
+    return out
+
+
 def price_package(
     pkg: OptionPackage,
     quotes: Mapping[InstrumentId, OptionQuote],
@@ -96,6 +121,7 @@ def price_package(
     *,
     access: FeedAccess,
     cover: AccountCover | None = None,
+    session: SessionRef | None = None,
 ) -> PricingDecision:
     at = ensure_aware_utc(at)
     basis = ValuationBasis(pkg.currency, at, max_age)
@@ -140,6 +166,8 @@ def price_package(
         priced.append(replace(leg, premium=_money(cash, pkg.currency, up=False)))
     if use is PricingUse.LIVE and cover is None:
         reasons.append("coverage_not_checked")
+    if use is PricingUse.LIVE:
+        reasons += _session_reasons(pkg, session, at)
     rebuilt = None
     if not reasons:
         args = {"fees": pkg.fees, "stock": pkg.stock, "cover": cover}
