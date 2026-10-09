@@ -16,15 +16,17 @@ caller's transaction then rolls back). The trigger assigns `account_rev` (gaples
 visible in assignment order) and `recorded_at`; only `account_rev` is a stable
 as-of key (`as_of_rev`, `revision`). `known_as_of` filters by recorded_at, which is
 informational: such a read can later gain an event stamped <= t.
-LIMITATIONS: each write replays the whole account (O(events)), so importing n events
-in one transaction costs O(n^2) (T014); a caller writing several accounts in one
-transaction must lock them in sorted order, or opposite orders can deadlock; events
-carry a source reference but no foreign key to `source_record` yet.
+LIMITATIONS: each `post` replays the whole account (O(events)); `post_many` replays
+each account once for a batch (the T014 import commit); a caller writing several
+accounts in one transaction must lock them in sorted order, or opposite orders can
+deadlock (`post_many` does); events carry a source reference but no foreign key to
+`source_record` yet.
 """
 
 from __future__ import annotations
 
 from collections import defaultdict
+from collections.abc import Sequence
 from datetime import datetime
 
 from psycopg.types.json import Jsonb
@@ -196,6 +198,27 @@ def post(tx: TenantTx, event: JournalEvent) -> Outcome:
     if outcome is Outcome.POSTED:
         _insert(tx, event)
     return outcome
+
+
+def post_many(tx: TenantTx, events: Sequence[JournalEvent]) -> list[Outcome]:
+    """`post` each event in order, replaying each account once: the accounts are
+    locked in sorted order (no opposite-order deadlock), then every event is
+    validated on its account's journal and inserted. Returns each outcome (a caller
+    expecting only new events must check for DUPLICATE). Raises like `post`; the
+    caller rolls back (or uses a savepoint) so nothing is partially written. Any
+    other exception (e.g. a database error) leaves the transaction aborted: the
+    caller must roll it back, never commit it."""
+    prepared = {a: _prepare(tx, a) for a in sorted({e.account_id for e in events})}
+    outcomes = []
+    for event in events:
+        journal, now = prepared[event.account_id]
+        outcome = journal.post(event, now)
+        if outcome is Outcome.CONFLICT:
+            _raise_conflict(journal)
+        if outcome is Outcome.POSTED:
+            _insert(tx, event)
+        outcomes.append(outcome)
+    return outcomes
 
 
 def correct(tx: TenantTx, replacement: JournalEvent) -> Outcome:
