@@ -118,8 +118,12 @@ def test_baseline_reapplies_in_second_database_and_resets_role_attributes(
 
 def test_applies_in_order_as_qw_migrate(conn: Conn, mdir: Path) -> None:
     add(mdir, "0002_create_t.sql", "CREATE TABLE app.t (id integer PRIMARY KEY);")
-    add(mdir, "0003_use_t.sql", "INSERT INTO app.t VALUES (1);\n"
-        "CREATE FUNCTION app.f() RETURNS integer LANGUAGE sql AS 'SELECT 1';")  # fmt: skip
+    add(
+        mdir,
+        "0003_use_t.sql",
+        "INSERT INTO app.t VALUES (1);\n"
+        "CREATE FUNCTION app.f() RETURNS integer LANGUAGE sql AS 'SELECT 1';",
+    )
     assert migrate(conn, mdir) == [1, 2, 3]
     owners = conn.execute(
         "SELECT relowner::regrole::text FROM pg_class WHERE oid = 'app.t'::regclass "
@@ -138,7 +142,7 @@ def test_checksum_tampering_is_refused(conn: Conn, mdir: Path) -> None:
     migrate(conn, mdir)
     add(mdir, "0002_create_t.sql", "CREATE TABLE app.t (id bigint);")
     add(mdir, "0003_next.sql", "CREATE TABLE app.u (id integer);")
-    with pytest.raises(MigrationError, match="0002_create_t.sql: checksum changed"):
+    with pytest.raises(MigrationError, match=r"0002_create_t\.sql: checksum changed"):
         migrate(conn, mdir)
     assert versions(conn) == [1, 2]
     assert not table_exists(conn, "app.u")
@@ -148,10 +152,10 @@ def test_renamed_or_missing_applied_file_is_refused(conn: Conn, mdir: Path) -> N
     add(mdir, "0002_create_t.sql", "CREATE TABLE app.t (id integer);")
     migrate(conn, mdir)
     (mdir / "0002_create_t.sql").rename(mdir / "0002_renamed.sql")
-    with pytest.raises(MigrationError, match="applied as 0002_create_t.sql"):
+    with pytest.raises(MigrationError, match=r"applied as 0002_create_t\.sql"):
         migrate(conn, mdir)
     (mdir / "0002_renamed.sql").unlink()
-    with pytest.raises(MigrationError, match="applied migration 2 .* has no file"):
+    with pytest.raises(MigrationError, match=r"applied migration 2 .* has no file"):
         migrate(conn, mdir)
 
 
@@ -179,7 +183,7 @@ def test_out_of_order_history_is_refused(conn: Conn, mdir: Path) -> None:
         add(mdir, f"000{n}_t{n}.sql", f"CREATE TABLE app.t{n} (id integer);")
     migrate(conn, mdir)
     conn.execute("DELETE FROM public.schema_migrations WHERE version = 2")
-    with pytest.raises(MigrationError, match="0002_t2.sql is pending but newer"):
+    with pytest.raises(MigrationError, match=r"0002_t2\.sql is pending but newer"):
         migrate(conn, mdir)
 
 

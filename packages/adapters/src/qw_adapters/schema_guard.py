@@ -110,8 +110,7 @@ def column_type_violations(conn: psycopg.Connection[TupleRow]) -> list[str]:
         if base in FORBIDDEN:
             problems.append(f"{where}: {FORBIDDEN[base]} is forbidden")
         elif is_money_name(str(col)) and (
-            base != NUMERIC
-            or numeric_precision_scale(base_mod) not in DECIMAL_STORAGE
+            base != NUMERIC or numeric_precision_scale(base_mod) not in DECIMAL_STORAGE
         ):
             allowed = ", ".join(f"numeric({p},{s})" for p, s in DECIMAL_STORAGE)
             problems.append(f"{where}: money-named column must be one of {allowed}")

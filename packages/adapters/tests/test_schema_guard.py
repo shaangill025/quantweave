@@ -114,7 +114,7 @@ def test_migration_adding_float_or_loose_money_column_is_rolled_back(
 ) -> None:
     shutil.copy(MIGRATIONS_DIR / "0001_roles_and_baseline.sql", tmp_path)
     (tmp_path / "0002_bad_column.sql").write_text(f"-- SYNTHETIC\n{ddl}\n")
-    with pytest.raises(MigrationError, match="column type policy: app.t"):
+    with pytest.raises(MigrationError, match=r"column type policy: app\.t\."):
         migrate(conn, tmp_path)
     assert sorted(applied_migrations(conn)) == [1]
     exists = conn.execute("SELECT to_regclass('app.t') IS NOT NULL").fetchone()
