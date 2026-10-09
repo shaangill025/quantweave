@@ -166,7 +166,7 @@
       "requirements": "R010,R042,R043,R049,R058,R081,R082",
       "deliverable": "Implement account/currency/sleeve scopes and explicit mapping of sources to underlying accounts.",
       "verification": "Yahoo/broker overlap dedupes once; genuine multiple accounts remain distinct.",
-      "status": "Not started",
+      "status": "Completed with evidence",
       "size": "M",
       "release_required": "Yes"
     },
