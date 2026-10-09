@@ -12,6 +12,9 @@ dependencies = [
     "qw-adapters",
 ]
 
+[project.scripts]
+qw-bootstrap = "qw_api.bootstrap:main"
+
 [tool.uv.sources]
 qw-adapters = { workspace = true }
 

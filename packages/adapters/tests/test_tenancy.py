@@ -38,7 +38,9 @@ from qw_adapters.tenancy import (
 
 Conn = psycopg.Connection[TupleRow]
 TABLES = ("tenant", "app_user", "membership", "session", "audit_event")
-API_TABLES = ("local_credential",)  # 0003, exercised by apps/api tests
+# 0003/0004, exercised by the apps/api tests
+API_TABLES = ("local_credential", "idempotency_record", "auth_throttle",
+              "installation_bootstrap")  # fmt: skip
 
 
 def make_tenant(conn: Conn, name: str) -> tuple[uuid.UUID, uuid.UUID]:
