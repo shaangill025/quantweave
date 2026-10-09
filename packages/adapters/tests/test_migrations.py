@@ -207,6 +207,13 @@ def test_failing_migration_rolls_back(conn: Conn, mdir: Path) -> None:
         "START TRANSACTION;", "RELEASE SAVEPOINT s;", "/* c */ commit;",
         "SELECT 1; -- note\nPREPARE TRANSACTION 'x';", "DISCARD ALL;",
         "CREATE FUNCTION app.f() RETURNS int LANGUAGE sql BEGIN ATOMIC SELECT 1; END;",
+        # review round 2
+        "SELECT set_config('role', 'adm', true); CREATE ROLE qw_rogue;",
+        "SELECT pg_catalog.set_config(E'session_authorization', 'x', false);",
+        'SET LOCAL "role" = qw_app;', "SET session_authorization = qw_app;",
+        "GRANT ALL ON SCHEMA app TO PUBLIC;", 'GRANT USAGE ON SCHEMA app TO "public";',
+        "ALTER DEFAULT PRIVILEGES FOR ROLE qw_migrate\n"
+        "GRANT SELECT ON TABLES TO public;",
     ],
 )  # fmt: skip
 def test_forbidden_statements_are_refused_before_execution(
@@ -227,6 +234,8 @@ def test_forbidden_statements_are_refused_before_execution(
         "AS 'BEGIN RETURN 1; END';",
         "SET search_path = app; SET LOCAL statement_timeout = 0;",
         "-- COMMIT;\n/* ROLLBACK; */ SELECT 1;",
+        "SELECT set_config('search_path', 'app', true);", "SELECT 'grant x to public';",
+        "GRANT USAGE ON SCHEMA app TO qw_app;", "REVOKE ALL ON SCHEMA app FROM PUBLIC;",
     ],
 )  # fmt: skip
 def test_scanner_ignores_quoted_and_commented_text(mdir: Path, body: str) -> None:
@@ -293,6 +302,73 @@ def test_dynamic_role_change_is_rolled_back(
         migrate(conn, mdir)
     assert versions(conn) == [1]
     assert conn.execute("SELECT session_user = current_user").fetchone() == (True,)
+
+
+def escaped(*statements: str) -> str:
+    """SYNTHETIC: run statements as the session user from inside a DO block."""
+    inner = "".join(f"EXECUTE $q${s}$q$; " for s in statements)
+    return (
+        f"DO $$ BEGIN EXECUTE 'RESET ROLE'; {inner}"
+        "EXECUTE 'SET LOCAL ROLE qw_migrate'; END $$;"
+    )
+
+
+@pytest.mark.parametrize(
+    ("body", "message"),
+    [
+        ("DO $$ BEGIN PERFORM set_config('ro' || 'le', session_user, true); "
+         "CREATE ROLE qw_rogue; PERFORM set_config('ro' || 'le', 'qw_migrate', true); "
+         "END $$;", "role changed"),
+        (escaped("CREATE ROLE qw_rogue"), "role changed"),
+        (escaped("ALTER ROLE qw_app CONNECTION LIMIT 3"), "role changed"),
+        (escaped("GRANT qw_app TO qw_worker"), "member changed"),
+        ("DO $$ BEGIN EXECUTE 'GRANT ALL ON SCHEMA app TO PUB' || 'LIC'; END $$;",
+         "grant to PUBLIC: schema app"),
+        ("CREATE TABLE app.p (id int);\n"
+         "DO $$ BEGIN EXECUTE 'GRANT SELECT ON app.p TO PUB' || 'LIC'; END $$;",
+         "grant to PUBLIC: relation app.p SELECT"),
+        ("DO $$ BEGIN EXECUTE 'ALTER DEFAULT PRIVILEGES GRANT SELECT ON TABLES TO "
+         "PUB' || 'LIC'; END $$;", "grant to PUBLIC: default acl"),
+        ("DO $$ BEGIN EXECUTE 'ALTER DEFAULT PRIVILEGES GRANT EXECUTE ON FUNCTIONS "
+         "TO PUB' || 'LIC'; END $$;", "default ACL removed"),
+        (escaped("ALTER DEFAULT PRIVILEGES GRANT SELECT ON TABLES TO qw_app"),
+         "default ACL defined by"),
+        ("DO $$ BEGIN EXECUTE 'RESET ROLE'; PERFORM lo_create(0); "
+         "EXECUTE 'SET LOCAL ROLE qw_migrate'; END $$;", "lo changed"),
+        # close-out review: ledger, database settings, any large object
+        ("SELECT lo_create(0);", "lo changed"),
+        (escaped("UPDATE public.schema_migrations SET checksum = repeat('0', 64)"),
+         "ledger changed"),
+        (escaped("INSERT INTO public.schema_migrations VALUES "
+                 "(3, '0003_future.sql', repeat('a', 64), now())"), "ledger changed"),
+        ("DO $$ BEGIN EXECUTE 'RESET ROLE'; EXECUTE format('ALTER DATABASE %I SET "
+         "log_statement = ''all''', current_database()); "
+         "EXECUTE 'SET LOCAL ROLE qw_migrate'; END $$;", "db_setting changed"),
+        (escaped("ALTER ROLE qw_app SET search_path = public"), "db_setting changed"),
+        ("DO $$ BEGIN EXECUTE 'RESET ROLE'; "
+         "EXECUTE format('GRANT CREATE ON DATABASE %I TO qw_app', "
+         "current_database()); EXECUTE 'SET LOCAL ROLE qw_migrate'; END $$;",
+         "acl changed: database"),
+    ],
+)  # fmt: skip
+def test_role_and_privilege_changes_are_rolled_back(
+    conn: Conn, mdir: Path, body: str, message: str
+) -> None:
+    add(mdir, "0002_privileges.sql", body)
+    with pytest.raises(MigrationError, match=message):
+        migrate(conn, mdir)
+    assert versions(conn) == [1]
+    leftovers = conn.execute(
+        "SELECT to_regrole('qw_rogue'), (SELECT count(*) FROM pg_largeobject_metadata)"
+    ).fetchone()
+    assert leftovers == (None, 0)
+
+
+def test_grants_to_runtime_roles_are_allowed(conn: Conn, mdir: Path) -> None:
+    add(mdir, "0002_grants.sql", "CREATE TABLE app.g (id int);\n"
+        "GRANT SELECT ON app.g TO qw_app;\nALTER DEFAULT PRIVILEGES IN SCHEMA app\n"
+        "GRANT SELECT ON TABLES TO qw_worker;")  # fmt: skip
+    assert migrate(conn, mdir) == [1, 2]
 
 
 def test_session_settings_do_not_leak(conn: Conn, mdir: Path) -> None:
