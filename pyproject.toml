@@ -1,0 +1,41 @@
+# Virtual uv workspace root: no package of its own. Each core package under packages/ is a member.
+[tool.uv.workspace]
+members = ["packages/*"]
+
+[dependency-groups]
+dev = [
+    "hypothesis==6.168.5",
+    "jsonschema==4.26.0",
+    "mypy==2.4.0",
+    "pytest==9.1.1",
+    "pyyaml==6.0.3",
+    "rfc3339-validator==0.1.4",
+    "ruff==0.16.10",
+]
+
+[tool.ruff]
+target-version = "py313"
+line-length = 88
+extend-exclude = ["docs/spec"]
+
+[tool.ruff.lint]
+select = ["E", "W", "F", "I", "B", "SIM", "UP", "TID", "DTZ", "RUF"]
+
+[tool.ruff.lint.per-file-ignores]
+# Pre-existing T001/T008 scripts each have one long docstring line; not rewritten here.
+"tools/check_contracts.py" = ["E501"]
+"tools/check_spec_artifacts.py" = ["E501"]
+
+[tool.ruff.lint.flake8-tidy-imports.banned-api]
+"datetime.datetime.utcnow".msg = "naive UTC; use datetime.now(UTC)"
+"datetime.datetime.utcfromtimestamp".msg = "naive UTC; use datetime.fromtimestamp(ts, UTC)"
+
+[tool.mypy]
+python_version = "3.13"
+strict = true
+files = ["packages", "tools", "tests"]
+exclude = ["^docs/"]
+
+[tool.pytest.ini_options]
+testpaths = ["packages", "tests"]
+addopts = ["--import-mode=importlib", "-ra", "--strict-markers", "--strict-config"]
