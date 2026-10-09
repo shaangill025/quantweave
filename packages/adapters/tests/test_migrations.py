@@ -104,7 +104,7 @@ def test_baseline_reapplies_in_second_database_and_resets_role_attributes(
             psycopg.conninfo.make_conninfo(pg_admin_url, dbname="qw_test_second"),
             autocommit=True,
         ) as second:
-            assert migrate(second) == [1]
+            assert migrate(second) == [m.version for m in load_migrations()]
         attrs = conn.execute(
             "SELECT rolcanlogin, rolcreatedb FROM pg_roles WHERE rolname = 'qw_app'"
         ).fetchone()
