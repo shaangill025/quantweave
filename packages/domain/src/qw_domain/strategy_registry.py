@@ -14,9 +14,9 @@ T027; spec §8 shared execution contract and three-axis qualification, §7 gate 
   evidence reaches at most `limited`. Evidence steps need a family policy approved
   before them and record it, so only a predeclared policy can permit limited evidence.
 - `status` is derived per tenant, configuration and time; no global flag (C-22).
-- LIMITATIONS: increment 1. No actionable gate (capabilities, data rights, investment
-  policy), persistence or routes. Actor roles and evidence refs are caller-asserted;
-  replay cannot re-derive a stored config hash, only its key shape and history rules.
+- LIMITATIONS: the actionable gate is `strategy_gate`; no persistence or routes.
+  Actor roles are caller-asserted; evidence refs are verified only by the gate.
+  Replay cannot re-derive a stored config hash, only its key shape and history rules.
 Stdlib only.
 """
 
@@ -118,8 +118,9 @@ def _typed(kind: ParamKind, value: object) -> bool:
 
 
 def _wire(value: ParamValue) -> str:
-    if isinstance(value, Decimal):
-        return format(value.normalize(), "f")  # 0.050 and 0.05 hash equally
+    if isinstance(value, Decimal):  # 0.050, 0.05 hash equally; so do -0 and 0
+        norm = value.normalize()
+        return format(norm.copy_abs() if norm.is_zero() else norm, "f")
     return str(value).lower() if isinstance(value, bool) else str(value)
 
 
@@ -413,7 +414,7 @@ class StrategyAdoption:
         return _hash(body | {"signed_at": format_instant(self.signed_at)})
 
 
-def _key(axis: Axis, m: StrategyManifest, *rest: str | None) -> QualKey:
+def qual_key(axis: Axis, m: StrategyManifest, *rest: str | None) -> QualKey:
     return tuple(p for p in (axis.value, m.material_hash, *rest) if p is not None)
 
 
@@ -556,6 +557,11 @@ class StrategyRegistry:
         known = [p for p in self.family_policies.get(family, ()) if p.approved_at <= at]
         return known[-1] if known else None
 
+    def step_at(self, key: QualKey, at: datetime) -> AxisStep | None:
+        """The latest step under `key` recorded at or before `at`."""
+        known = [s for s in self.qualifications.get(key, ()) if s.at <= at]
+        return known[-1] if known else None
+
     def qualify(
         self,
         axis: Axis,
@@ -578,7 +584,9 @@ class StrategyRegistry:
             (tenant is None) != (axis is not Axis.ELIGIBILITY)
         ):
             raise StrategyError("axis", f"{axis} key: config/tenant mismatch")
-        key = _key(axis, m, None if config is None else m.config_hash(config), tenant)
+        key = qual_key(
+            axis, m, None if config is None else m.config_hash(config), tenant
+        )
         steps = self.qualifications.get(key, ())
         fp = self.family_policy_at(m.family, at)
         evidence_step = axis is Axis.EVIDENCE and to is not _V.NONE
@@ -625,8 +633,8 @@ class AdoptionState(StrEnum):
 @dataclass(frozen=True, slots=True)
 class StrategyStatus:
     """The strategy card's separate fields (§13) for one tenant and configuration.
-    It is not an eligibility decision: the actionable gate (T027 increment 2) also
-    needs family capabilities, data rights and the adopted investment policy."""
+    It is not an eligibility decision: `strategy_gate.actionable` also needs family
+    capabilities, verified evidence, data rights and the adopted investment policy."""
 
     manifest_hash: str
     config_hash: str
@@ -654,10 +662,7 @@ def status(
     cfg = m.config_hash(config)
 
     def state(axis: Axis, *rest: str) -> AxisStep | None:
-        known = [
-            s for s in reg.qualifications.get(_key(axis, m, *rest), ()) if s.at <= at
-        ]
-        return known[-1] if known else None
+        return reg.step_at(qual_key(axis, m, *rest), at)
 
     ops, ev = state(Axis.OPERATIONAL), state(Axis.EVIDENCE, cfg)
     user = state(Axis.ELIGIBILITY, cfg, tenant_id)
