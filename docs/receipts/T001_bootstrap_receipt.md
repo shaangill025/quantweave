@@ -5,7 +5,7 @@
 | Task | T001 Repository inspection and check registry (W0) |
 | Requirements | R070, R078, R079, R080, R088, R094 |
 | Date / times | 2026-10-08; session work about 23:04–23:20 UTC (container start to final check run; not separately instrumented) |
-| Base commit | `a6f98ba` (Initial commit), tree clean before changes. Branch renamed by the owner from `claude/gifted-archimedes-usnbjn` to `gifted-archimedes-usnbjn` |
+| Base commit | `a6f98ba` (Initial commit), tree clean before changes. Branch renamed at the owner's request: `claude/gifted-archimedes-usnbjn` (auto-generated) → `t001-repo-bootstrap` |
 | Status | **Completed with evidence** (2026-10-09). Sections 1–11 are the historical record of the first pass on the partial upload; their file paths (`docs/spec/BOOTSTRAP_PROMPT.md`, `derived/*.csv`, `SHA256SUMS`) no longer exist. §12–§13 record the full package integration and supersede §1–§11 where they differ |
 | Tree at completion | Committed in a single T001 commit on the working branch; `git status --porcelain` was clean after the commit |
 | Tests | Application tests: 0 run, 0 passed, 0 failed, 0 skipped (no application exists). Artifact checks: 3 configured checks run, all PASS (§4) |
@@ -190,15 +190,13 @@ Nothing was installed for this addendum. Running the validator rewrites
 `reports/VALIDATION.md` and `reports/validation_results.json`; the committed copies are from
 this run.
 
-**Instruction merge: incomplete.**
+**Instruction merge.**
 - `docs/spec/AGENTS.md` and `docs/spec/CLAUDE.md` are kept as the package's agent
   agreement.
-- My edit to the root `CLAUDE.md` was blocked by the session's permission policy for
-  instruction files. The edit would have pointed it at the package's reading order and
-  task files, imported the package's financial invariants, and stated that owner rules take
-  precedence.
-- The root `CLAUDE.md` still points at the removed `docs/spec/derived/` files. This needs
-  owner approval to fix.
+- The first attempt to edit the root `CLAUDE.md` was blocked by the session's permission
+  policy for instruction files. The owner then approved the edit, and it was applied: the
+  root `CLAUDE.md` now points at the package's reading order and task files, imports the
+  package's financial invariants, and states that owner rules take precedence.
 
 **Next bounded task.** T008, the architecture and contracts review, is now unblocked and
 is the critical path to T009. T002, T003, T004 and T007 can run in parallel once their
@@ -225,10 +223,18 @@ modified no repository files. It ran the validator on a copy, not in place.
 | 1 | Status claimed before the reviewer's disposition was recorded | Fixed: recorded in this section and in the registry before commit |
 | 2 | Working-state backlog content was unchecked | Partly fixed: status vocabulary and CSV/JSON agreement are now checked and self-tested. Other backlog edits remain undetected; this is documented in the checker |
 | 3 | `tasks/T001.md` and the workbook disagree with the backlog | Documented in §12 as intentionally stale, hash-locked derived copies |
-| 4 | Root `CLAUDE.md:36` points at removed `derived/` files | Open: the edit is blocked by permission policy and needs owner approval |
+| 4 | Root `CLAUDE.md:36` points at removed `derived/` files | Fixed after owner approval (2026-10-09): `CLAUDE.md` now follows the package reading order, imports the package's financial invariants, states owner-rule precedence, and adds a task-named branch convention |
 | 5 | §1–§11 mention removed paths | Fixed: the header now marks §1–§11 as a historical record |
 | 6 | (nit) Duplicate and unsafe manifest entries were not rejected; no test for a deleted working-state file | Fixed and self-tested |
 | 7 | (nit) The pre-extraction safety check is unevidenced | Stated as unlogged in §12 |
 | 8 | (nit) CHK-REPO-001 was missing from the §12 table | Added |
 
 All checks were re-run after the fixes and passed.
+
+A second review on a different model covered the `CLAUDE.md` update and found 0 blocking
+issues. In response:
+- the precedence clause was narrowed to commits and pushes on owner-assigned tasks, with the
+  review gate kept;
+- the imported invariants now quote the source wording and are labelled as a subset;
+- "exercise" was added to the broker prohibition;
+- the registry wording now says "fixed or dispositioned".

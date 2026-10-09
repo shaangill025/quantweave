@@ -1,8 +1,16 @@
 # quantweave — agent instructions
 
 This repository implements the **Portfolio Intelligence** specification (v1.0.0, 8 Oct 2026).
-The specification lives in `docs/spec/`; start with `docs/spec/README.md`, then
-`docs/receipts/T001_bootstrap_receipt.md` for current state.
+The specification package lives in `docs/spec/` exactly as received (integrity:
+`python3 tools/check_spec_artifacts.py`). Read `docs/spec/START_HERE.md`, then
+`docs/spec/handoff/PROJECT_CONTEXT.md`, then the assigned `docs/spec/planning/tasks/Txxx.md`.
+Current state: `docs/receipts/`. Load only the spec modules relevant to the task.
+
+`docs/spec/AGENTS.md` and `docs/spec/CLAUDE.md` are the package's agent agreement and
+apply in full, merged with this file. The one difference: for owner-assigned tasks,
+commits and pushes to the session's working branch are authorized, and the cross-model
+review still precedes every commit. Every other authority limit in `AGENTS.md` (release
+promotion, account access, provider spending, deployment) is unchanged.
 
 ## Owner rules (non-negotiable)
 
@@ -20,7 +28,7 @@ The specification lives in `docs/spec/`; start with `docs/spec/README.md`, then
 
 ## Scope and authority (from the spec, §1, §16)
 
-- No broker order submission, amendment or cancellation — ever. No routes, adapters or
+- No broker order submission, amendment, cancellation or exercise — ever. No routes, adapters or
   tools that mutate broker state.
 - Do not spend money, call billable providers, collect credentials, connect accounts,
   publish or deploy without explicit owner authorization for that specific activity.
@@ -31,16 +39,36 @@ The specification lives in `docs/spec/`; start with `docs/spec/README.md`, then
 - Status vocabulary and evidence rules are in spec §16–17. A test case is not a test run;
   skips are not passes; synthetic fixtures are not real exports; never fabricate results.
 
+## Financial invariants (subset of `docs/spec/AGENTS.md`; the full list applies)
+
+- Decimal money/quantity accounting; distinguish an underlying account from its sources;
+  never double-count Yahoo mirrors or mix virtual and real holdings.
+- Financial journal, market observations, claimed executions and predictions are
+  separate records. Never reset source timestamps, trigger times or cost reservations on
+  retry.
+- Missing freshness, rights, contract terms or required account state blocks the
+  affected action; never substitute zero or model intuition.
+- Generated code experiments are untrusted and cannot control the host, runtime,
+  assessor or keys. Do not lower tests, risk thresholds, verification rules or release
+  gates to make a task pass.
+
 ## Task protocol (spec §18)
 
-inspect repo → read bounded task + requirements (`docs/spec/derived/tasks.csv`,
-`requirements.csv`) → plan → write failing/acceptance tests → smallest coherent
-increment → run real checks → cross-model review → evidence receipt in
-`docs/receipts/` → update status/handoff.
+inspect repo → read `docs/spec/planning/tasks/Txxx.md` and its requirements → plan →
+write failing/acceptance tests → smallest coherent increment → run real checks →
+cross-model review → receipt in `docs/receipts/` (template:
+`docs/spec/handoff/TASK_RECEIPT_TEMPLATE.md`) → update status in
+`docs/spec/planning/backlog.csv` and `backlog.json` only with evidence.
+
+## Branches
+
+Name each working branch after its task, e.g. `t008-architecture-contracts-review`. No
+tool or vendor prefixes.
 
 ## Checks
 
-The check registry is `.agentic/check_registry.json`. Only entries with
+The check registry is `.agentic/check_registry.json` (bound from
+`docs/spec/handoff/check_registry.template.json`). Only entries with
 `"configured": true` have been bound to commands that were actually executed here.
 Do not document or run invented application commands; bind new checks when the code
 they test exists, and record the observed outcome.

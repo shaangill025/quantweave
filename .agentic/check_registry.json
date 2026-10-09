@@ -134,7 +134,7 @@
   ],
   "review": {
     "reviewer": "independent subagent running a different model from the author",
-    "outcome": "Integration review: CHANGES REQUESTED (0 blocking); resolved except root CLAUDE.md path update (blocked by permission policy, awaiting owner). See docs/receipts/T001_bootstrap_receipt.md \u00a713"
+    "outcome": "Integration review: CHANGES REQUESTED (0 blocking); all findings fixed or dispositioned (root CLAUDE.md fixed after owner approval and re-reviewed). See docs/receipts/T001_bootstrap_receipt.md \u00a713"
   },
   "bound_from": "docs/spec/handoff/check_registry.template.json"
 }
