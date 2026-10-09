@@ -14,6 +14,7 @@ from decimal import Decimal
 import pytest
 from hypothesis import given, settings
 from hypothesis import strategies as st
+from ingest_rights_helper import qualified_rights
 from qw_domain.filings import (
     Fact,
     FactBook,
@@ -35,38 +36,13 @@ from qw_domain.identity import (
 )
 from qw_domain.ingest import IngestDenied, IngestRights
 from qw_domain.instants import InstantError
-from qw_domain.rights import (
-    EntitlementHistory,
-    EntitlementSource,
-    Evidence,
-    EvidenceKind,
-    FeedHistory,
-    FeedStatus,
-    Grant,
-    Provider,
-    Registry,
-    RightsProfile,
-    RightState,
-    Use,
-    UseScope,
-)
+from qw_domain.rights import Registry, Use
 
-T = datetime(2025, 1, 2, tzinfo=UTC)  # feed qualified; grants expire 2028
-FEED, TENANT, REGION, KEEP = "feed-synth-sec", "tenant-synth-a", "CA-ON", timedelta(365)
-PERMIT = Evidence(EvidenceKind.PERMISSION, "synthetic-permit", T, "counsel-synth")
+FEED = "feed-synth-sec"
 CIK10 = "0009990001"
 RECEIVED = datetime(2026, 10, 9, 12, tzinfo=UTC)
 PUB = KnowledgeBasis.PUBLICATION
 A1, A2, A3 = (f"{CIK10}-26-00000{i}" for i in (1, 2, 3))
-
-
-def _profile(missing: Use | None = None) -> RightsProfile:
-    def grant(use: Use | None = None) -> Grant:
-        keep = KEEP if use is Use.RETENTION else None
-        return Grant(RightState.GRANTED, PERMIT, datetime(2028, 1, 1, tzinfo=UTC), keep)
-
-    uses = {u: grant(u) for u in Use if u is not missing}
-    return RightsProfile(uses, {UseScope.PERSONAL: grant()}, {REGION: grant()})
 
 
 def rights(
@@ -74,26 +50,7 @@ def rights(
     missing: Use | None = None,
     registry: Registry | None = None,
 ) -> IngestRights:
-    if registry is None:
-        auth = Evidence(EvidenceKind.AUTH, "synthetic-auth", T)
-        work = Evidence(EvidenceKind.WORKLOAD, "synthetic-workload", T)
-        feed = (
-            FeedHistory.new(FEED, "provider-synth")
-            .revise("synthetic_sec", frozenset(Use), _profile(), T)
-            .transition(FeedStatus.CONNECTED, "operator-synth", (auth,), T)
-            .transition(FeedStatus.QUALIFIED, "operator-synth", (work, PERMIT), T)
-        )
-        ent = EntitlementHistory.new(TENANT, FEED).revise(
-            EntitlementSource.INSTALLATION_LICENSE, True, _profile(missing), None, T
-        )
-        registry = (
-            Registry()
-            .with_provider(Provider("provider-synth", "SYNTHETIC provider"))
-            .with_feed(feed)
-            .with_entitlement(ent)
-        )
-    scope = UseScope.PERSONAL
-    return IngestRights(registry, TENANT, FEED, received, scope, REGION, KEEP)
+    return qualified_rights(FEED, received, missing, registry)
 
 
 def row(val: str, accn: str, filed: str, form: str = "10-K", end: str = "31") -> str:
@@ -212,12 +169,42 @@ def test_publication_time_from_acceptance_or_conservative_filed_date() -> None:
     facts = parse_companyfacts(text, rights(), filings=filings).facts
     accepted, bound = sorted(facts, key=lambda f: f.accession)
     assert accepted.published_at == datetime(2026, 2, 1, 21, 5, tzinfo=UTC)
+    assert accepted.accepted_at == accepted.published_at
     assert accepted.publication_basis is PublicationBasis.ACCEPTANCE
+    assert bound.accepted_at is None
     # Filed date only: D+1 05:00Z, at or after the end of D in New York (EST or EDT).
     assert bound.published_at == datetime(2026, 2, 2, 5, tzinfo=UTC)
     assert bound.publication_basis is PublicationBasis.FILED_DATE_BOUND
     assert (bound.received_at, bound.feed_id, bound.form) == (RECEIVED, FEED, "10-K")
     assert (bound.fy, bound.fp, bound.period.start) == (2025, "FY", date(2025, 1, 1))
+
+
+@pytest.mark.parametrize(
+    ("accepted", "filed", "known"),
+    [
+        # Friday 17:45 ET before Presidents' Day, filed Tuesday: known Tuesday 05:00Z.
+        ("2026-02-13T22:45:00Z", "2026-02-17", "2026-02-17T05:00:00Z"),
+        ("2026-01-31T23:00:00Z", "2026-02-01", "2026-02-01T05:00:00Z"),  # D-1 evening
+        ("2026-02-01T04:59:59Z", "2026-02-01", "2026-02-01T05:00:00Z"),
+        ("2026-02-01T05:00:01Z", "2026-02-01", "2026-02-01T05:00:01Z"),
+    ],
+)
+def test_knowledge_time_is_never_before_the_filed_date(
+    accepted: str, filed: str, known: str
+) -> None:
+    filings = parse_submissions(submissions(accepted, filed), rights())
+    text = usd(row("5", A1, filed))
+    (fact,) = parse_companyfacts(text, rights(), filings=filings).facts
+    assert fact.published_at == datetime.fromisoformat(known)
+    assert fact.accepted_at == datetime.fromisoformat(accepted)  # kept for provenance
+    assert fact.publication_basis is PublicationBasis.ACCEPTANCE
+    assert (
+        FactBook()
+        .add([fact])
+        .as_of(fact.published_at - timedelta(seconds=1), PUB)
+        .facts
+        == {}
+    )
 
 
 @pytest.mark.parametrize(
