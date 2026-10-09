@@ -1,4 +1,4 @@
-"""Evidence store and claim graph (T036 increment 1; spec §10, §6, R045/R052/R087).
+"""Evidence store and claim graph (T036 increments 1-2; spec §10, §6, R045/R052/R087).
 
 Sources enter only through the T023 ingest gate and keep feed, hashes, publication,
 receipt and retention times and an origin group (normalized-text hash or a declared
@@ -11,9 +11,12 @@ a citation must match the current revision's entity, attribute, period, unit and
 value or it is refused. `support(at)` counts only citations bound to the revision
 current at `at` whose source is then published, undeleted, unexpired, has no
 withdrawn copy in its group and keeps `derived_data` rights; nothing leaves history.
-No mutation may be backdated within a tenant.
-LIMITATIONS: in-memory; non-fact claim kinds refused; contradictions are the next
-increment; no T027 binding. Stdlib only.
+Supported claims with one key (entity, attribute, period, unit) and different values
+form a contradiction and read `contested` until an append-only resolution, naming a
+preferred member, an actor and a time, binds that exact member set (claim, revision);
+a new member, a lost member or a revision reopens it. No mutation may be backdated
+within a tenant.
+LIMITATIONS: in-memory; non-fact claim kinds refused; no T027 binding. Stdlib only.
 """
 
 import hashlib
@@ -85,6 +88,7 @@ class ClaimKind(StrEnum):
 
 class Status(StrEnum):  # subset of claim.schema.json `verification`
     SUPPORTED = "supported"
+    CONTESTED = "contested"
     UNSUPPORTED = "unsupported"
 
 
@@ -177,6 +181,33 @@ class Support:
     replay_limited: bool  # cited content was deleted or purged
 
 
+type ClaimKey = tuple[InstrumentId, str, Period, str]  # entity, attribute, period, unit
+type Members = frozenset[tuple[str, int]]  # (claim id, revision)
+
+
+class ResolutionState(StrEnum):
+    UNRESOLVED = "unresolved"
+    RESOLVED = "resolved"
+
+
+@dataclass(frozen=True, slots=True)
+class Resolution:
+    tenant_id: str
+    members: Members
+    preferred: str
+    actor_id: str
+    at: datetime
+
+
+@dataclass(frozen=True, slots=True)
+class Contradiction:
+    key: ClaimKey
+    members: Members
+    values: frozenset[Decimal]
+    state: ResolutionState
+    resolution: Resolution | None
+
+
 class EvidenceStore:
     """Append-only, tenant-scoped; every lookup is keyed by (tenant, id)."""
 
@@ -188,6 +219,7 @@ class EvidenceStore:
         self._citations: dict[tuple[str, str], dict[str, Citation]] = {}
         self._withdrawn: dict[tuple[str, str], datetime] = {}  # (tenant, origin)
         self._deleted: dict[tuple[str, str], datetime] = {}
+        self._resolutions: dict[str, list[Resolution]] = {}
         self._clock: dict[str, datetime] = {}
 
     def _time(self, tenant_id: str, at: datetime) -> datetime:
@@ -430,11 +462,30 @@ class EvidenceStore:
         if rev is None:
             raise EvidenceError("not_known", claim_id)
         at = ensure_aware_utc(at)
+        valid, invalid, groups, limited = self._check(rev, at, rights)
+        status = Status.SUPPORTED if valid else Status.UNSUPPORTED
+        if valid and self._contested(rev, at, rights):
+            status = Status.CONTESTED
+        return Support(
+            claim_id,
+            rev.revision,
+            status,
+            tuple(sorted(valid)),
+            MappingProxyType(invalid),
+            len(groups),
+            len(groups) >= 2,
+            limited,
+        )
+
+    def _check(
+        self, rev: ClaimRevision, at: datetime, rights: Registry
+    ) -> tuple[list[str], dict[str, Invalid], set[str], bool]:
+        tenant_id = rev.tenant_id
         valid: list[str] = []
         invalid: dict[str, Invalid] = {}
         groups: set[str] = set()
         limited = False
-        for c in self._citations.get((tenant_id, claim_id), {}).values():
+        for c in self._citations.get((tenant_id, rev.claim_id), {}).values():
             if c.linked_at > at:
                 continue
             p = self._passages[(tenant_id, c.passage_id)]
@@ -450,17 +501,7 @@ class EvidenceStore:
                 groups.add(src.origin)
             else:
                 invalid[c.citation_id] = why
-        status = Status.SUPPORTED if valid else Status.UNSUPPORTED
-        return Support(
-            claim_id,
-            rev.revision,
-            status,
-            tuple(sorted(valid)),
-            MappingProxyType(invalid),
-            len(groups),
-            len(groups) >= 2,
-            limited,
-        )
+        return valid, invalid, groups, limited
 
     @staticmethod
     def _derived_ok(rights: Registry, src: Source, at: datetime) -> bool:
@@ -474,3 +515,66 @@ class EvidenceStore:
             jurisdiction=src.jurisdiction,
         )
         return decision.allowed
+
+    def contradictions(
+        self, tenant_id: str, at: datetime, rights: Registry
+    ) -> tuple[Contradiction, ...]:
+        """Keys whose evidence-supported claims disagree, as known at `at`."""
+        at = ensure_aware_utc(at)
+        by_key: dict[ClaimKey, list[ClaimRevision]] = {}
+        for tenant, cid in self._claims:
+            rev = self.claim_at(tenant, cid, at) if tenant == tenant_id else None
+            if rev is not None and self._check(rev, at, rights)[0]:
+                s = rev.stated
+                key = (s.entity, s.attribute, s.period, s.unit)
+                by_key.setdefault(key, []).append(rev)
+        out = []
+        for key, revs in by_key.items():
+            values = frozenset(r.stated.value for r in revs)
+            if len(values) < 2:
+                continue
+            members = frozenset((r.claim_id, r.revision) for r in revs)
+            done = [
+                r
+                for r in self._resolutions.get(tenant_id, [])
+                if r.members == members and r.at <= at
+            ]
+            last = done[-1] if done else None
+            state = ResolutionState.RESOLVED if last else ResolutionState.UNRESOLVED
+            out.append(Contradiction(key, members, values, state, last))
+        return tuple(sorted(out, key=lambda c: sorted(c.members)))
+
+    def _contested(self, rev: ClaimRevision, at: datetime, rights: Registry) -> bool:
+        for con in self.contradictions(rev.tenant_id, at, rights):
+            if (rev.claim_id, rev.revision) not in con.members:
+                continue
+            if con.resolution is None:
+                return True
+            best = self.claim_at(rev.tenant_id, con.resolution.preferred, at)
+            return best is None or best.stated.value != rev.stated.value
+        return False
+
+    def resolve(
+        self,
+        tenant_id: str,
+        members: Members,
+        preferred: str,
+        actor_id: str,
+        at: datetime,
+        rights: Registry,
+    ) -> Resolution:
+        """Record which member's value is preferred for the current member set."""
+        at = self._time(tenant_id, at)
+        _id(actor_id, "actor")
+        current = self.contradictions(tenant_id, at, rights)
+        if not any(c.members == members for c in current):
+            raise EvidenceError("stale_contradiction", "members are not current")
+        if preferred not in {cid for cid, _ in members}:
+            raise EvidenceError("preferred", "must be a member claim")
+        record = Resolution(tenant_id, members, preferred, actor_id, at)
+        self._resolutions.setdefault(tenant_id, []).append(record)
+        self._clock[tenant_id] = at
+        return record
+
+    def resolutions(self, tenant_id: str) -> tuple[Resolution, ...]:
+        return tuple(self._resolutions.get(tenant_id, ()))
