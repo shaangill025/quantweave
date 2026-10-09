@@ -127,7 +127,7 @@
       "requirements": "R006,R031,R039,R075,R086,R087",
       "deliverable": "Implement sessions, membership, least-privilege roles, step-up auth and PostgreSQL tenant enforcement.",
       "verification": "Cross-tenant DB/API/job/storage tests and privileged-role separation pass.",
-      "status": "Not started",
+      "status": "In progress",
       "size": "M",
       "release_required": "Yes"
     },
@@ -153,7 +153,7 @@
       "requirements": "R043,R046,R058,R064,R071,R080,R081,R090,R098",
       "deliverable": "Implement immutable observations, balanced unit postings, financial journal, reversal/correction and materialized positions.",
       "verification": "Ledger idempotency, balance, cash, split, fee and correction property tests plus numeric fixtures.",
-      "status": "Not started",
+      "status": "In progress",
       "size": "M",
       "release_required": "Yes"
     },
@@ -179,7 +179,7 @@
       "requirements": "R012,R042,R046,R048,R058,R081,R082,R083",
       "deliverable": "Implement strict parsing, column mapping, dedupe preview, unknown fields, transaction/snapshot distinction and commit revisions.",
       "verification": "Malformed/duplicate/mixed-currency/unknown-cost inputs rejected or quarantined with row reasons.",
-      "status": "Not started",
+      "status": "In progress",
       "size": "M",
       "release_required": "Yes"
     },
@@ -231,7 +231,7 @@
       "requirements": "R043,R046,R064,R068,R071,R080,R081,R082,R090,R098",
       "deliverable": "Implement valuation, realized/unrealized P&L, TWR, MWR, benchmark flows and FX attribution conventions.",
       "verification": "Independent numerical fixtures, multiple-IRR/no-equity/error cases and rounding tolerances.",
-      "status": "Not started",
+      "status": "In progress",
       "size": "L",
       "release_required": "Yes"
     },
@@ -244,7 +244,7 @@
       "requirements": "R010,R016,R042,R044,R061,R068,R082",
       "deliverable": "Implement conditional MCQs/numeric fields, contradiction resolution, policy proposal/review and explicit adoption.",
       "verification": "No inferred risk authorization; amount/denominator/currency limits required for affected sizing.",
-      "status": "Not started",
+      "status": "In progress",
       "size": "M",
       "release_required": "Yes"
     },
@@ -322,7 +322,7 @@
       "requirements": "R027,R032,R047,R054,R067,R070,R077,R080,R083,R088,R093",
       "deliverable": "Implement leases, retries/backoff, idempotent consumers, priorities, outbox/inbox and dead-letter handling.",
       "verification": "Crash-at-commit and duplicate delivery tests; no exactly-once marketing claim.",
-      "status": "Not started",
+      "status": "In progress",
       "size": "M",
       "release_required": "Yes"
     },
