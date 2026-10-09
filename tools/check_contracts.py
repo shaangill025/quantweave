@@ -3,16 +3,22 @@
 
 Artifact check only: it reads the designed contracts, not a running API.
 
-1. No broker order mutation route: a mutating operation whose path or operationId
-   names orders, trades, execution, exercise, withdrawals or transfers must be on the
-   simulator order path or the user-reported execution-report path, and those
-   responses must carry `broker_submission`/`broker_confirmed` const false.
+1. No broker mutation route (default deny): a mutating operation on the account,
+   connection or broker surface, or whose path or operationId contains a trading or
+   money-movement verb (order, trade, close, liquidate, buy, sell, cancel, amend,
+   place, rebalance, exercise, withdraw, transfer, ...), fails unless its (method,
+   path, operationId) is in the reviewed ALLOWED_MUTATIONS list. The simulator order and user-reported execution
+   report routes must also return `broker_submission`/`broker_confirmed` const false.
 2. Every mutating operation requires Idempotency-Key and X-CSRF-Token headers.
-3. Every money/quantity-named property is a decimal string (common Decimal,
-   NonnegativeDecimal or Money, optionally nullable or in an array), and no schema
-   anywhere uses JSON `number`.
+3. Every money/quantity-named property or parameter is a decimal string, and no schema
+   (components, files or inline under paths) uses JSON `number`. A `$ref` counts only
+   if its resolved target carries one of the reviewed decimal patterns.
 4. Every `*_at` timestamp in the contract examples is RFC 3339 with an explicit
-   offset (and not the unknown-offset `-00:00`).
+   offset, in range, not `-00:00`, and parses as a real instant.
+
+Known limits: money fields are found by name (a field called `pnl`, `nav` or
+`premium` is not checked); timestamps are checked only in examples and only under keys
+ending `_at`.
 
 It also reports, without failing, whether the installed jsonschema enforces
 `format: date-time` (T008 finding C-05). `--self-test` injects one defect per rule into
@@ -25,6 +31,7 @@ import copy
 import json
 import re
 import sys
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -34,12 +41,55 @@ ROOT = Path(__file__).resolve().parent.parent
 CONTRACTS = ROOT / "docs" / "spec" / "contracts"
 MUTATING = ("post", "put", "patch", "delete")
 
-BROKERISH = re.compile(r"order|trade|execut|exercise|withdraw|transfer", re.IGNORECASE)
-ORDER_VERB = re.compile(
-    r"(submit|place|amend|replace|cancel|modify)\w*order", re.IGNORECASE
+TRADING_VERB = re.compile(
+    r"order|trade|execut|exercis|withdraw|transfer|close|liquidat|sell|buy|cancel"
+    r"|amend|place|rebalanc|submit|fill|short|cover|assign|roll|replace|redeem|wire"
+    r"|payout|position|broker",
+    re.IGNORECASE,
+)
+BROKER_SURFACE = re.compile(
+    r"^/(accounts|connections|brokers?|orders|positions|trades)"
 )
 SIM_ORDER_PATH = "/simulations/{simulation_id}/orders"
 REPORT_PATH = "/accounts/{account_id}/execution-reports"
+# Reviewed in T008 (docs/architecture/T008_contract_review.md): none reaches a broker.
+ALLOWED_MUTATIONS = frozenset(
+    {
+        ("post", "/accounts", "createAccount"),  # application record of an account
+        ("patch", "/accounts/{account_id}", "updateAccount"),
+        (
+            "post",
+            "/accounts/{account_id}/reconcile",
+            "reconcileAccount",
+        ),  # internal journal job
+        (
+            "post",
+            REPORT_PATH,
+            "reportExternalExecution",
+        ),  # user statement, broker_confirmed=false
+        (
+            "post",
+            "/connections",
+            "createConnection",
+        ),  # read-only connector registration
+        ("post", "/connections/{connection_id}/authorize", "authorizeConnection"),
+        (
+            "post",
+            "/connections/{connection_id}/refresh",
+            "refreshConnection",
+        ),  # read sync
+        (
+            "delete",
+            "/connections/{connection_id}",
+            "revokeConnection",
+        ),  # revoke our access
+        ("post", SIM_ORDER_PATH, "submitVirtualOrder"),  # simulator ledger only
+        ("post", "/feedback", "submitFeedback"),
+        ("post", "/experiments/{experiment_id}/cancel", "cancelExperiment"),
+        ("post", "/releases/{release_id}/rollback", "rollbackRelease"),
+        ("post", "/jobs/{job_id}/cancel", "cancelJob"),
+    }
+)
 
 MONEY_NAME = re.compile(
     r"(amount|quantity|price|fees?|cash|cost|strike|multiplier|_usd|capital|balance"
@@ -50,7 +100,8 @@ DECIMAL_PATTERNS = frozenset(
 )
 DECIMAL_REFS = ("/$defs/Decimal", "/$defs/NonnegativeDecimal", "/$defs/Money")
 OFFSET_TS = re.compile(
-    r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?(Z|[+-]\d{2}:\d{2})$"
+    r"^\d{4}-(0[1-9]|1[0-2])-(0[1-9]|[12]\d|3[01])T([01]\d|2[0-3]):[0-5]\d:[0-5]\d"
+    r"(\.\d{1,6})?(Z|\+([01]\d|2[0-3]):[0-5]\d|-(?!00:00)([01]\d|2[0-3]):[0-5]\d)$"
 )
 
 Json = Any
@@ -70,26 +121,40 @@ def load() -> tuple[Json, dict[str, Json], dict[str, Json]]:
     return api, schemas, examples
 
 
-def is_decimal(node: Json) -> bool:
-    if not isinstance(node, dict):
+def is_decimal(node: Json, schemas: dict[str, Json], depth: int = 0) -> bool:
+    if not isinstance(node, dict) or depth > 8:
         return False
     ref = node.get("$ref")
     if isinstance(ref, str):
-        return ref.endswith(DECIMAL_REFS)
+        if not ref.endswith(DECIMAL_REFS):
+            return False
+        name = ref.rsplit("/", 1)[1]
+        target = schemas.get("common.schema.json", {}).get("$defs", {}).get(name)
+        if name == "Money":
+            props = target.get("properties", {}) if isinstance(target, dict) else {}
+            return is_decimal(props.get("amount"), schemas, depth + 1)
+        return is_decimal(target, schemas, depth + 1)
     for key in ("anyOf", "oneOf"):
         if key in node:
+            alts = node[key]
             return all(
-                is_decimal(x) or x == {"type": "null"} for x in node[key]
-            ) and any(is_decimal(x) for x in node[key])
+                is_decimal(x, schemas, depth + 1) or x == {"type": "null"} for x in alts
+            ) and any(is_decimal(x, schemas, depth + 1) for x in alts)
     kind = node.get("type")
     if kind == "array":
-        return is_decimal(node.get("items"))
+        return is_decimal(node.get("items"), schemas, depth + 1)
     if kind == "string" or (isinstance(kind, list) and set(kind) <= {"string", "null"}):
         return node.get("pattern") in DECIMAL_PATTERNS
     return False
 
 
-def check_decimals(name: str, node: Json, path: str = "") -> list[str]:
+def is_money_name(key: str) -> bool:
+    return bool(MONEY_NAME.search(key)) and not key.endswith(("_id", "_ids", "_basis"))
+
+
+def check_decimals(
+    name: str, node: Json, schemas: dict[str, Json], path: str = ""
+) -> list[str]:
     errors: list[str] = []
     if isinstance(node, dict):
         kind = node.get("type")
@@ -98,19 +163,24 @@ def check_decimals(name: str, node: Json, path: str = "") -> list[str]:
         props = node.get("properties")
         if isinstance(props, dict):
             for key, sub in props.items():
-                if (
-                    MONEY_NAME.search(key)
-                    and not key.endswith(("_id", "_ids", "_basis"))
-                    and not is_decimal(sub)
-                ):
+                if is_money_name(key) and not is_decimal(sub, schemas):
                     errors.append(
                         f"{name}{path}/{key}: money/quantity not a decimal string"
                     )
+        # OpenAPI parameter objects: {name, in, schema}.
+        pname = node.get("name")
+        if (
+            isinstance(pname, str)
+            and "in" in node
+            and is_money_name(pname)
+            and not is_decimal(node.get("schema"), schemas)
+        ):
+            errors.append(f"{name}{path}: money/quantity parameter {pname} not decimal")
         for key, sub in node.items():
-            errors += check_decimals(name, sub, f"{path}/{key}")
+            errors += check_decimals(name, sub, schemas, f"{path}/{key}")
     elif isinstance(node, list):
         for i, sub in enumerate(node):
-            errors += check_decimals(name, sub, f"{path}[{i}]")
+            errors += check_decimals(name, sub, schemas, f"{path}[{i}]")
     return errors
 
 
@@ -138,7 +208,15 @@ def check_routes(api: Json, schemas: dict[str, Json]) -> list[str]:
                 if needed not in headers:
                     errors.append(f"{where}: missing required {needed}")
             op_id = str(op.get("operationId", ""))
-            if not (BROKERISH.search(path) or ORDER_VERB.search(op_id)):
+            sensitive = (
+                BROKER_SURFACE.search(path)
+                or TRADING_VERB.search(path)
+                or TRADING_VERB.search(op_id)
+            )
+            if not sensitive:
+                continue
+            if (method, path, op_id) not in ALLOWED_MUTATIONS:
+                errors.append(f"{where} ({op_id}): possible broker mutation route")
                 continue
             ok = {"201", "200", "202"} & set(op["responses"])
             body: dict[str, Json] = (
@@ -147,30 +225,33 @@ def check_routes(api: Json, schemas: dict[str, Json]) -> list[str]:
             media: Json = next(iter(body.values()), {})
             ref = media.get("schema", {}).get("$ref", "")
             props = resolve(api, schemas, ref).get("properties", {}) if ref else {}
-            if path == SIM_ORDER_PATH and method == "post":
-                if props.get("broker_submission") != {"const": False}:
-                    errors.append(
-                        f"{where}: simulator order lacks broker_submission=false"
-                    )
-            elif path == REPORT_PATH and method == "post":
-                if props.get("broker_confirmed") != {"const": False}:
-                    errors.append(
-                        f"{where}: execution report lacks broker_confirmed=false"
-                    )
-            else:
-                errors.append(f"{where} ({op_id}): possible broker mutation route")
+            if path == SIM_ORDER_PATH and props.get("broker_submission") != {
+                "const": False
+            }:
+                errors.append(f"{where}: simulator order lacks broker_submission=false")
+            if path == REPORT_PATH and props.get("broker_confirmed") != {
+                "const": False
+            }:
+                errors.append(f"{where}: execution report lacks broker_confirmed=false")
     return errors
+
+
+def valid_ts(value: str) -> bool:
+    """Range-limited pattern, then a semantic parse (the pattern accepts Feb 30)."""
+    if not OFFSET_TS.match(value):
+        return False
+    try:
+        datetime.fromisoformat(value)
+    except ValueError:
+        return False
+    return True
 
 
 def check_timestamps(name: str, node: Json, path: str = "") -> list[str]:
     errors: list[str] = []
     if isinstance(node, dict):
         for key, sub in node.items():
-            if (
-                key.endswith("_at")
-                and isinstance(sub, str)
-                and (not OFFSET_TS.match(sub) or sub.endswith("-00:00"))
-            ):
+            if key.endswith("_at") and isinstance(sub, str) and not valid_ts(sub):
                 errors.append(f"{name}{path}/{key}: timestamp without offset: {sub!r}")
             errors += check_timestamps(name, sub, f"{path}/{key}")
     elif isinstance(node, list):
@@ -183,9 +264,10 @@ def run_checks(
     api: Json, schemas: dict[str, Json], examples: dict[str, Json]
 ) -> list[str]:
     errors = check_routes(api, schemas)
-    errors += check_decimals("openapi#/components", api["components"])
+    errors += check_decimals("openapi#/components", api["components"], schemas)
+    errors += check_decimals("openapi#/paths", api["paths"], schemas)
     for name, schema in schemas.items():
-        errors += check_decimals(name, schema)
+        errors += check_decimals(name, schema, schemas)
     for name, doc in examples.items():
         errors += check_timestamps(name, doc)
     return errors
@@ -229,8 +311,58 @@ def self_test(api: Json, schemas: dict[str, Json], examples: dict[str, Json]) ->
     def naive_ts(a: Json, s: Json, e: Json) -> None:
         e["review.valid.json"]["completed_at"] = "2026-10-08T14:45:00"
 
+    def close_position(a: Json, s: Json, e: Json) -> None:
+        op = copy.deepcopy(a["paths"]["/accounts/{account_id}/reconcile"]["post"])
+        a["paths"]["/accounts/{account_id}/positions/close"] = {
+            "post": op | {"operationId": "closePosition"}
+        }
+
+    def liquidate(a: Json, s: Json, e: Json) -> None:
+        op = copy.deepcopy(a["paths"]["/connections/{connection_id}/refresh"]["post"])
+        a["paths"]["/connections/{connection_id}/liquidate"] = {
+            "post": op | {"operationId": "refreshHoldings"}
+        }
+
+    def neutral_name(a: Json, s: Json, e: Json) -> None:
+        op = copy.deepcopy(a["paths"]["/accounts/{account_id}/reconcile"]["post"])
+        a["paths"]["/accounts/{account_id}/sync-holdings"] = {
+            "post": op | {"operationId": "syncHoldings"}
+        }
+
+    def loose_ref(a: Json, s: Json, e: Json) -> None:
+        s["common.schema.json"]["$defs"]["Decimal"]["pattern"] = "^.*$"
+
+    def inline_number(a: Json, s: Json, e: Json) -> None:
+        a["paths"]["/accounts"]["get"]["parameters"].append(
+            {"name": "page_weight", "in": "query", "schema": {"type": "number"}}
+        )
+
+    def money_param(a: Json, s: Json, e: Json) -> None:
+        a["paths"]["/accounts"]["get"]["parameters"].append(
+            {"name": "min_cash", "in": "query", "schema": {"type": "integer"}}
+        )
+
+    def inline_body(a: Json, s: Json, e: Json) -> None:
+        body = a["paths"]["/imports"]["post"]["requestBody"]["content"]
+        body["multipart/form-data"]["schema"]["properties"]["fee"] = {"type": "string"}
+
+    def bad_offset(a: Json, s: Json, e: Json) -> None:
+        e["review.valid.json"]["completed_at"] = "2026-10-08T14:45:00-00:00"
+
+    def bad_date(a: Json, s: Json, e: Json) -> None:
+        e["review.valid.json"]["completed_at"] = "2026-02-30T14:45:00Z"
+
     cases = {
         "broker order route": (broker_route, "possible broker mutation route"),
+        "disguised close route": (close_position, "possible broker mutation route"),
+        "connection liquidate": (liquidate, "possible broker mutation route"),
+        "unlisted account mutation": (neutral_name, "possible broker mutation route"),
+        "decimal $ref target loosened": (loose_ref, "not a decimal string"),
+        "inline number parameter": (inline_number, "JSON number type"),
+        "money parameter integer": (money_param, "parameter min_cash not decimal"),
+        "inline body money string": (inline_body, "fee: money/quantity not a decimal"),
+        "unknown offset -00:00": (bad_offset, "timestamp without offset"),
+        "impossible date": (bad_date, "timestamp without offset"),
         "order-cancel operationId": (cancel_verb, "possible broker mutation route"),
         "simulator flag removed": (sim_flag, "lacks broker_submission=false"),
         "missing idempotency": (no_idem, "missing required Idempotency-Key"),

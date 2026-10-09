@@ -21,8 +21,9 @@ binaries (T001 §3). Those are session observations. They are not project pins.
 - **Choice.** CPython 3.13 is the only supported interpreter for `packages/*` and `apps/{api,worker}`
   (`requires-python` limited to 3.13 until a superseding change). A single **uv workspace** has one
   member per package, one `uv.lock`, and `uv sync --locked` in CI.
-- **Why.** 3.13 is current, it is present on the reference host, and it has years of security support
-  ahead. uv gives one cross-platform lockfile with hashes, workspace path dependencies between packages,
+- **Why.** 3.13 is the chosen baseline: it matches the interpreter observed on the reference host
+  (3.13.16, T001) and stays in upstream security support for several more years. T009 confirms the
+  support window against python.org. uv gives one cross-platform lockfile with hashes, workspace path dependencies between packages,
   and fast reproducible installs. That serves the "lockfiles and integrity checks" rule in spec §12.
 - **Alternatives.** Poetry (workspace support is weaker and resolution slower), pip-tools (no workspace
   model, so one lock per package), Hatch (good builds but not a lock-first workflow), Python 3.12
@@ -51,7 +52,14 @@ binaries (T001 §3). Those are session observations. They are not project pins.
   not round before an explicit quantize. It traps `InvalidOperation`, `DivisionByZero`, `Overflow` and
   **`FloatOperation`**, so `Decimal(0.1)` and float/Decimal ordering comparisons raise. This was
   observed on the host's Python 3.13. Equality with a float stays silent (`Decimal("1") == 0.5` is
-  `False`), so mypy's `--strict-equality` (part of `--strict`) has to catch that case.
+  `False`). `mypy --strict` does **not** flag it: `def f(a: Decimal, b: float) -> bool: return a == b`
+  type-checks cleanly (observed with host mypy 2.3.1). The control is therefore twofold:
+  (1) a stdlib AST check in `tools/` that fails on any `float` annotation, float literal or `float(`
+  call inside the money modules (`packages/domain`, `packages/portfolio` and the sizing/valuation
+  modules of `packages/strategies`), with a short reviewed allowlist; (2) money value types
+  (`Money`, `Quantity`, `Price`) define `__eq__`/ordering that raise `TypeError` for anything other than
+  the same type, so a mixed comparison fails at runtime. T009 adds a test that injects
+  `Decimal == float` and a float literal into a fixture module and proves that both controls fire.
 - Persisted and wire values are quantized only through named functions that declare the class and
   rounding mode. Out-of-scale input is rejected and never rounded silently.
 - JSON: money fields accept strings only. FastAPI/pydantic fields use a strict decimal-string type that
@@ -65,11 +73,13 @@ binaries (T001 §3). Those are session observations. They are not project pins.
   needs an explicit quantum.
 
 ### Database: PostgreSQL 16, psycopg 3, plain SQL migrations
-- **PostgreSQL 16** for transactional state, RLS tenant isolation, leases and outbox (ADR-010). The
-  reference host already has 16 binaries. Moving to a newer major needs its own ADR and a restore drill.
+- **PostgreSQL 16** is the chosen baseline for transactional state, RLS tenant isolation, leases and
+  outbox (ADR-010), because it matches the 16.x binaries observed on the reference host (T001). T009
+  confirms the upstream support window. Moving to a newer major needs its own ADR and a restore drill.
 - **psycopg 3** is the only driver. It supports server-side binding, `COPY`, pipeline mode and async if
-  needed later, and `numeric` comes back as `Decimal`. asyncpg was rejected because it is
-  async-only, has a weaker typing story, and returns `Decimal` only with extra codecs. SQLAlchemy Core/ORM
+  needed later, and `numeric` comes back as `Decimal`. asyncpg (which also maps `numeric` to
+  `Decimal`) was rejected because it is async-only, so synchronous workers and migration code would need
+  an event loop, and it has its own SQL parameter style. SQLAlchemy Core/ORM
   was rejected because the domain does not use an ORM, and repositories are hand-written SQL in
   `packages/adapters`.
 - **Migrations: plain, forward-only SQL files** (`NNNN_description.sql`) applied by a small in-repo

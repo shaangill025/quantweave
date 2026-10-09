@@ -101,7 +101,7 @@
       "requirements": "R065,R070,R071,R075,R078,R080,R081,R084,R086,R087,R088,R099",
       "deliverable": "Review domain boundaries, schemas, financial invariants, proposed tooling and protected control plane.",
       "verification": "ADR review and resolved contract assumptions; schema-valid does not mean finance-valid.",
-      "status": "Completed with evidence",
+      "status": "Not started",
       "size": "M",
       "release_required": "Yes"
     },
