@@ -10,7 +10,13 @@ Claims pick the highest priority class with ready work, then the least recently
 served tenant in it (`app.job_pick`). Heartbeat, complete and fail need the current
 lease token and an unexpired lease, else `LeaseLost`; complete and fail run in the
 caller's `TenantTx`, so the outcome commits with the business writes and any
-`write_outbox` rows. The outbox relay is T025 increment 2.
+`write_outbox` rows. A job may carry a start-by `deadline_at`: no attempt starts
+after it and `expire_overdue` moves overdue queued jobs to `expired`.
+
+`relay_outbox` publishes due events (oldest first) and marks them published in the
+transaction that locked them, after the publish call returned: a crash in between
+publishes them again (at-least-once). `purge` applies the retention windows
+(`0006_outbox_relay_and_retention.sql`).
 """
 
 from __future__ import annotations
@@ -20,6 +26,7 @@ import uuid
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timedelta
+from enum import StrEnum
 
 from psycopg import pq
 from psycopg.types.json import Jsonb
@@ -104,24 +111,30 @@ def enqueue(
     priority: Priority,
     payload: Json,
     max_attempts: int = 5,
+    deadline_at: datetime | None = None,
 ) -> tuple[uuid.UUID, bool]:
-    """(job id, created). A repeat of the key with the same priority, payload and
-    max_attempts returns the existing job; any difference raises IdempotencyConflict."""
+    """(job id, created). A repeat of the key with the same priority, payload,
+    max_attempts and deadline returns the existing job; any difference raises
+    IdempotencyConflict. `deadline_at` (timezone-aware) is immutable."""
+    if deadline_at is not None and deadline_at.utcoffset() is None:
+        raise ValueError("deadline_at needs a timezone")
     priority, body = Priority(priority), _payload(payload)
     row = tx.conn.execute(
         "INSERT INTO app.job (id, tenant_id, kind, input_revision, priority, pool, "
-        "payload, max_attempts) VALUES (%s, %s, %s, %s, %s, %s, %s, %s) "
-        "ON CONFLICT (tenant_id, kind, input_revision) DO NOTHING RETURNING id",
+        "payload, max_attempts, deadline_at) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, "
+        "%s) ON CONFLICT (tenant_id, kind, input_revision) DO NOTHING RETURNING id",
         (uuid.uuid4(), tx.tenant_id, kind, input_revision, priority.value,
-         pool_for(priority).value, body, max_attempts),
+         pool_for(priority).value, body, max_attempts, deadline_at),
     ).fetchone()  # fmt: skip
     if row is not None:
         return row[0], True
     found = tx.conn.execute(
-        "SELECT id, priority = %s AND payload = %s AND max_attempts = %s FROM app.job "
+        "SELECT id, priority = %s AND payload = %s AND max_attempts = %s AND "
+        "deadline_at IS NOT DISTINCT FROM %s::timestamptz FROM app.job "
         "WHERE tenant_id = %s AND kind = %s AND input_revision = %s",
-        (priority.value, body, max_attempts, tx.tenant_id, kind, input_revision),
-    ).fetchone()
+        (priority.value, body, max_attempts, deadline_at, tx.tenant_id, kind,
+         input_revision),
+    ).fetchone()  # fmt: skip
     assert found is not None
     if not found[1]:
         raise IdempotencyConflict(f"{kind}:{input_revision} exists with other input")
@@ -264,6 +277,27 @@ def reap_expired(
     return done
 
 
+def expire_overdue(conn: Conn, limit: int = 100) -> list[uuid.UUID]:
+    """Move queued jobs whose deadline has passed to `expired`."""
+    _idle(conn)
+    done: list[uuid.UUID] = []
+    with conn.transaction():
+        conn.execute("SELECT set_config('app.tenant_id', '', true)")
+        rows = conn.execute("SELECT * FROM app.job_overdue(%s)", (limit,)).fetchall()
+        for tenant_id, job_id in rows:
+            conn.execute(
+                "SELECT set_config('app.tenant_id', %s, true)", (str(tenant_id),)
+            )
+            conn.execute(
+                "UPDATE app.job SET state = 'expired', last_error = 'deadline_passed', "
+                "updated_at = now() WHERE tenant_id = %s AND id = %s "
+                "AND state = 'queued'",
+                (tenant_id, job_id),
+            )
+            done.append(job_id)
+    return done
+
+
 def requeue(tx: TenantTx, job_id: uuid.UUID) -> bool:
     """Operator action: dead_letter -> queued in a new generation with a fresh
     per-generation attempt budget; total_attempts and the idempotency key are kept
@@ -325,3 +359,130 @@ def consume(
             return False
         handler(tx, event)
     return True
+
+
+class PublishError(Exception):
+    """Raised by a publisher; only the short code is stored."""
+
+    def __init__(self, code: str) -> None:
+        super().__init__(check_error_code(code))
+        self.code = code
+
+
+class Relayed(StrEnum):
+    PUBLISHED = "published"
+    RETRY = "retry"  # attempts + 1, due again after backoff
+    PARKED = "parked"  # max attempts reached: kept with parked_at, never dropped
+
+
+RELAY_BACKOFF = Backoff(base=timedelta(seconds=5), cap=timedelta(minutes=30))
+RELAY_MAX_ATTEMPTS = 10
+
+
+def relay_outbox(
+    conn: Conn,
+    publish: Callable[[OutboxEvent], None],
+    *,
+    limit: int = 50,
+    max_attempts: int = RELAY_MAX_ATTEMPTS,
+    backoff: Backoff = RELAY_BACKOFF,
+    rng: Rng | None = None,
+) -> list[tuple[uuid.UUID, Relayed]]:
+    """One relay pass: up to `limit` due events, oldest first, locked (SKIP LOCKED)
+    in one transaction; each is published, then marked. The marks commit together
+    at the end, so a crash republishes every event of the pass (at-least-once;
+    keep `limit` small). A failed publish (any Exception; PublishError gives the
+    code, else `publish_failed`) counts an attempt and waits for backoff, or parks
+    the event at `max_attempts`. created_at never changes."""
+    _idle(conn)
+    if not 1 <= limit <= 1000 or not 1 <= max_attempts <= 100:
+        raise ValueError("limit must be 1..1000 and max_attempts 1..100")
+    done: list[tuple[uuid.UUID, Relayed]] = []
+    with conn.transaction():
+        conn.execute("SELECT set_config('app.tenant_id', '', true)")
+        picked = conn.execute(
+            "SELECT tenant_id, id FROM app.outbox_pick(%s)", (limit,)
+        ).fetchall()
+        for tenant_id, event_id in picked:
+            conn.execute(
+                "SELECT set_config('app.tenant_id', %s, true)", (str(tenant_id),)
+            )
+            row = conn.execute(
+                "SELECT event_type, payload, attempts FROM app.outbox "
+                "WHERE tenant_id = %s AND id = %s",
+                (tenant_id, event_id),
+            ).fetchone()
+            assert row is not None  # locked by outbox_pick
+            event = OutboxEvent(event_id, tenant_id, row[0], row[1])
+            try:
+                publish(event)
+            except Exception as exc:
+                code = exc.code if isinstance(exc, PublishError) else "publish_failed"
+                attempts = int(row[2]) + 1
+                outcome = Relayed.PARKED if attempts >= max_attempts else Relayed.RETRY
+                delay = (
+                    backoff.delay(attempts, rng or random.SystemRandom())
+                    if outcome is Relayed.RETRY
+                    else timedelta(0)
+                )
+                conn.execute(
+                    "UPDATE app.outbox SET attempts = %s, last_error = %s, "
+                    "next_attempt_at = now() + %s, "
+                    "parked_at = CASE WHEN %s THEN now() END "
+                    "WHERE tenant_id = %s AND id = %s",
+                    (attempts, code, delay, outcome is Relayed.PARKED, tenant_id,
+                     event_id),
+                )  # fmt: skip
+            else:
+                conn.execute(
+                    "UPDATE app.outbox SET published_at = now() "
+                    "WHERE tenant_id = %s AND id = %s",
+                    (tenant_id, event_id),
+                )
+                outcome = Relayed.PUBLISHED
+            done.append((event_id, outcome))
+    return done
+
+
+# Retention windows (0006). Inbox: the window must exceed the longest time after
+# which an already processed event can still be redelivered from outside the
+# database (a transport or replay); a later redelivery runs its effect again. The
+# database also keeps inbox rows of events that can still be delivered from here.
+OUTBOX_RETENTION = timedelta(days=7)
+OUTBOX_RETENTION_MIN = timedelta(days=1)
+INBOX_RETENTION = timedelta(days=30)
+INBOX_RETENTION_MIN = timedelta(days=7)
+IDEMPOTENCY_RETENTION = timedelta(hours=24)  # A-05; also the minimum
+
+
+@dataclass(frozen=True, slots=True)
+class Purged:
+    outbox: int
+    inbox: int
+    idempotency: int
+
+
+def purge(
+    conn: Conn,
+    *,
+    outbox: timedelta = OUTBOX_RETENTION,
+    inbox: timedelta = INBOX_RETENTION,
+    idempotency: timedelta = IDEMPOTENCY_RETENTION,
+) -> Purged:
+    """Delete published outbox events, inbox rows and HTTP idempotency records older
+    than their windows; a window below its minimum raises ValueError."""
+    minimums = {"outbox": (outbox, OUTBOX_RETENTION_MIN),
+                "inbox": (inbox, INBOX_RETENTION_MIN),
+                "idempotency": (idempotency, IDEMPOTENCY_RETENTION)}  # fmt: skip
+    for name, (window, least) in minimums.items():
+        if window < least:
+            raise ValueError(f"{name} retention must be at least {least}")
+    _idle(conn)
+    with conn.transaction():
+        row = conn.execute(
+            "SELECT app.outbox_purge(%s), app.inbox_purge(%s), "
+            "app.idempotency_purge(%s)",
+            (outbox, inbox, idempotency),
+        ).fetchone()
+    assert row is not None
+    return Purged(int(row[0]), int(row[1]), int(row[2]))

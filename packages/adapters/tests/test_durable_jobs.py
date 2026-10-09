@@ -9,9 +9,10 @@ from __future__ import annotations
 
 import itertools
 import threading
+import time
 import uuid
 from collections.abc import Callable
-from datetime import timedelta
+from datetime import UTC, datetime, timedelta
 
 import psycopg
 import pytest
@@ -502,8 +503,10 @@ def test_security_definer_functions_are_hardened(conn: Conn) -> None:
         "WHERE a.privilege_type = 'EXECUTE' ORDER BY 1) FROM pg_proc p "
         "WHERE p.pronamespace = 'app'::regnamespace AND p.prosecdef ORDER BY 1"
     ).fetchall()
-    jobs = [r for r in rows if r[0].startswith("job_")]
-    assert [r[0] for r in jobs] == ["job_expired_leases", "job_pick"]
+    jobs = [r for r in rows if not r[0].startswith("throttle_")]  # 0004: qw_app
+    assert [r[0] for r in jobs] == [
+        "idempotency_purge", "inbox_purge", "job_expired_leases", "job_overdue",
+        "job_pick", "outbox_pick", "outbox_purge"]  # fmt: skip
     for _, owner, secdef, config, grantees in jobs:
         assert (owner, secdef, config) == (
             "qw_migrate",
@@ -511,3 +514,50 @@ def test_security_definer_functions_are_hardened(conn: Conn) -> None:
             ["search_path=pg_catalog"],
         )
         assert grantees == ["qw_migrate", "qw_worker"]
+
+
+@pytest.mark.db
+def test_deadline_expires_queued_jobs_and_is_never_claimed(
+    app_conn: Conn, worker_conn: Conn, conn: Conn
+) -> None:
+    tenant, _ = make_tenant(app_conn, "A")
+    soon = datetime.now(UTC) + timedelta(seconds=3)  # ample under load
+    with tenant_transaction(app_conn, tenant) as tx:
+        late = qj.enqueue(tx, "synthetic.x", "late", P.SAFETY, {}, 3, soon)[0]
+        retried = qj.enqueue(tx, "synthetic.x", "retried", P.SAFETY, {}, 3, soon)[0]
+    later = datetime.now(UTC) + timedelta(hours=1)
+    with tenant_transaction(app_conn, tenant) as tx:  # same class, enqueued later
+        open_ = qj.enqueue(tx, "synthetic.x", "open", P.SAFETY, {}, 3, later)[0]
+        assert qj.enqueue(tx, "synthetic.x", "open", P.SAFETY, {}, 3,
+                          later)[0] == open_  # fmt: skip
+        for deadline in (None, later + timedelta(seconds=1)):
+            with pytest.raises(IdempotencyConflict):
+                qj.enqueue(tx, "synthetic.x", "open", P.SAFETY, {}, 3, deadline)
+        with pytest.raises(ValueError):
+            qj.enqueue(tx, "synthetic.x", "naive", P.SAFETY, {}, 3, datetime.now())  # noqa: DTZ005
+    job = must_claim(worker_conn)  # one attempt starts before the deadline
+    with tenant_transaction(worker_conn, tenant) as tx:
+        assert qj.fail(tx, job, "upstream_timeout", retryable=True, backoff=NOW) is (
+            S.QUEUED)  # fmt: skip
+    assert qj.expire_overdue(worker_conn) == []  # not overdue yet
+    time.sleep(max(0.0, (soon - datetime.now(UTC)).total_seconds()) + 0.1)
+    assert must_claim(worker_conn).id == open_  # never the overdue safety jobs
+    assert qj.claim(worker_conn, "w", Pool.STANDARD, LEASE) is None
+    assert sorted(qj.expire_overdue(worker_conn)) == sorted([late, retried])
+    for job_id in (late, retried):  # one was claimed and retried, one never ran
+        expected = (S.EXPIRED, 1 if job_id == job.id else 0)
+        assert state(app_conn, tenant, job_id) == expected
+    assert qj.expire_overdue(worker_conn) == []
+    with (
+        pytest.raises(errors.InsufficientPrivilege),
+        tenant_transaction(worker_conn, tenant) as tx,
+    ):
+        tx.conn.execute("UPDATE app.job SET deadline_at = NULL")
+    with pytest.raises(errors.RaiseException, match="immutable"):
+        conn.execute("UPDATE app.job SET deadline_at = deadline_at + interval '1h'")
+    with (
+        pytest.raises(errors.CheckViolation),
+        tenant_transaction(app_conn, tenant) as tx,
+    ):  # a deadline must lie after the enqueue time
+        qj.enqueue(tx, "synthetic.x", "past", P.SAFETY, {}, 3,
+                   datetime.now(UTC) - timedelta(seconds=1))  # fmt: skip
