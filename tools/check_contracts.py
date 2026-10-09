@@ -44,11 +44,11 @@ MUTATING = ("post", "put", "patch", "delete")
 TRADING_VERB = re.compile(
     r"order|trade|execut|exercis|withdraw|transfer|close|liquidat|sell|buy|cancel"
     r"|amend|place|rebalanc|submit|fill|short|cover|assign|roll|replace|redeem|wire"
-    r"|payout|position|broker",
+    r"|payout|position|broker|dispos|sweep|unwind|settl|holding",
     re.IGNORECASE,
 )
 BROKER_SURFACE = re.compile(
-    r"^/(accounts|connections|brokers?|orders|positions|trades)"
+    r"^/(v\d+/)?(accounts|connections|brokers?|orders|positions|trades|holdings)"
 )
 SIM_ORDER_PATH = "/simulations/{simulation_id}/orders"
 REPORT_PATH = "/accounts/{account_id}/execution-reports"

@@ -51,7 +51,7 @@
       "configured": true,
       "observed": {
         "date": "2026-10-09",
-        "result": "PASS; self-test 7/7 defects detected"
+        "result": "PASS; self-test 16/16 defects detected"
       }
     },
     {
@@ -144,7 +144,7 @@
   ],
   "review": {
     "reviewer": "independent subagent running a different model from the author",
-    "outcome": "Integration review: CHANGES REQUESTED (0 blocking); all findings fixed or dispositioned (root CLAUDE.md fixed after owner approval and re-reviewed). See docs/receipts/T001_bootstrap_receipt.md \u00a713"
+    "outcome": "T008 review: CHANGES REQUESTED then APPROVE after fixes. See docs/receipts/T008.md"
   },
   "bound_from": "docs/spec/handoff/check_registry.template.json"
 }
