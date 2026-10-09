@@ -171,10 +171,13 @@ def create_session(
     return session_id, token
 
 
-def lookup_session(conn: Conn, token: str) -> SessionPrincipal | None:
+def lookup_session(
+    conn: Conn, token: str, idle: timedelta | None = None
+) -> SessionPrincipal | None:
     """The live session and membership for a presented token, or None when the token
-    is malformed, unknown, expired or revoked, the membership is gone or the tenant
-    is not active."""
+    is malformed, unknown, expired, revoked or (with `idle`) unused for longer than
+    `idle`, the membership is gone or the tenant is not active. With `idle`, use is
+    recorded in last_used_at at most every min(60 s, idle // 2)."""
     try:
         digest = session_token_hash(token)
     except TenancyError:
@@ -189,7 +192,10 @@ def lookup_session(conn: Conn, token: str) -> SessionPrincipal | None:
         )
         found = conn.execute(
             "SELECT id, tenant_id, user_id, created_at, expires_at, step_up_at "
-            "FROM app.session WHERE expires_at > now() AND revoked_at IS NULL"
+            "FROM app.session WHERE expires_at > now() AND revoked_at IS NULL AND "
+            "(%(idle)s::interval IS NULL OR "
+            "coalesce(last_used_at, created_at) > now() - %(idle)s::interval)",
+            {"idle": idle},
         ).fetchall()
         if len(found) != 1:
             return None
@@ -206,6 +212,12 @@ def lookup_session(conn: Conn, token: str) -> SessionPrincipal | None:
             "WHERE m.tenant_id = %s AND m.user_id = %s",
             (tenant_id, user_id),
         ).fetchone()
+        if member is not None and idle is not None:
+            conn.execute(
+                "UPDATE app.session SET last_used_at = now() WHERE id = %s AND "
+                "(last_used_at IS NULL OR last_used_at < now() - %s)",
+                (session_id, min(timedelta(seconds=60), idle // 2)),
+            )
     if member is None:
         return None
     return SessionPrincipal(
@@ -234,14 +246,16 @@ def mark_step_up(tx: TenantTx, session_id: uuid.UUID) -> datetime | None:
     return None if row is None else row[0]
 
 
-def list_memberships(tx: TenantTx, limit: int) -> list[tuple[Membership, str]]:
-    """This tenant's memberships with display names, ordered by user id."""
+def list_memberships(
+    tx: TenantTx, limit: int, after: uuid.UUID | None = None
+) -> list[tuple[Membership, str]]:
+    """This tenant's memberships with display names, by user id, after `after`."""
     rows = tx.conn.execute(
         "SELECT m.user_id, m.role::text, m.version, u.display_name "
         "FROM app.membership m JOIN app.app_user u "
-        "ON u.tenant_id = m.tenant_id AND u.id = m.user_id "
-        "WHERE m.tenant_id = %s ORDER BY m.user_id LIMIT %s",
-        (tx.tenant_id, limit),
+        "ON u.tenant_id = m.tenant_id AND u.id = m.user_id WHERE m.tenant_id = %s "
+        "AND (%s::uuid IS NULL OR m.user_id > %s) ORDER BY m.user_id LIMIT %s",
+        (tx.tenant_id, after, after, limit),
     ).fetchall()
     return [
         (Membership(tx.tenant_id, u, MembershipRole(r), int(v)), str(n))
@@ -304,6 +318,108 @@ def get_verifier(tx: TenantTx, user_id: uuid.UUID) -> str | None:
         (tx.tenant_id, user_id),
     ).fetchone()
     return None if row is None else str(row[0])
+
+
+@dataclass(frozen=True, slots=True)
+class IdempotencyScope:
+    user_id: uuid.UUID
+    method: str
+    route: str
+    key: str
+
+
+def claim_idempotency(
+    tx: TenantTx, scope: IdempotencyScope
+) -> tuple[bytes, int, bytes] | None:
+    """Serialise requests with the same scope until this transaction ends, then
+    return the stored (request hash, status, body), or None for a first use."""
+    tx.conn.execute(
+        "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
+        ("\x1f".join((str(tx.tenant_id), str(scope.user_id), scope.method,
+                      scope.route, scope.key)),),
+    )  # fmt: skip
+    row = tx.conn.execute(
+        "SELECT request_hash, status_code, response_body FROM app.idempotency_record "
+        "WHERE tenant_id = %s AND user_id = %s AND method = %s AND route = %s "
+        "AND idem_key = %s",
+        (tx.tenant_id, scope.user_id, scope.method, scope.route, scope.key),
+    ).fetchone()
+    return None if row is None else (bytes(row[0]), int(row[1]), bytes(row[2]))
+
+
+def save_idempotency(
+    tx: TenantTx, scope: IdempotencyScope, request_hash: bytes, status: int, body: bytes
+) -> None:
+    tx.conn.execute(
+        "INSERT INTO app.idempotency_record (tenant_id, user_id, method, route, "
+        "idem_key, request_hash, status_code, response_body) "
+        "VALUES (%s, %s, %s, %s, %s, %s, %s, %s)",
+        (tx.tenant_id, scope.user_id, scope.method, scope.route, scope.key,
+         request_hash, status, body),
+    )  # fmt: skip
+
+
+@dataclass(frozen=True, slots=True)
+class ThrottlePolicy:
+    """max_attempts per window; then a lock of base * 2^n, capped at cap."""
+
+    max_attempts: int
+    window: timedelta
+    base: timedelta
+    cap: timedelta
+
+    def __post_init__(self) -> None:
+        zero, day = timedelta(0), timedelta(days=1)
+        if not (self.max_attempts >= 1 and zero < self.window <= day
+                and zero < self.base <= self.cap <= day):  # fmt: skip
+            raise ValueError("throttle needs attempts >= 1, 0 < base <= cap <= 1 day")
+
+
+def throttle_hit(
+    conn: Conn, key_hash: bytes, policy: ThrottlePolicy
+) -> tuple[datetime | None, bool]:
+    """Count one attempt in its own autocommit statement, so a rolled-back request
+    still counts. Returns (lock end or None, whether this call locked the key)."""
+    row = conn.execute(
+        "SELECT * FROM app.throttle_hit(%s, %s, %s, %s, %s)",
+        (key_hash, policy.max_attempts, policy.window, policy.base, policy.cap),
+    ).fetchone()
+    assert row is not None
+    return row[0], bool(row[1])
+
+
+def throttle_clear(conn: Conn, key_hash: bytes) -> None:
+    conn.execute("SELECT app.throttle_clear(%s)", (key_hash,))
+
+
+def throttle_purge(conn: Conn) -> int:
+    """Delete throttle rows quiet for a day; returns how many."""
+    row = conn.execute("SELECT app.throttle_purge()").fetchone()
+    return 0 if row is None else int(row[0])
+
+
+def bootstrap_installation(
+    conn: Conn, display_name: str, login: str, verifier: str
+) -> tuple[uuid.UUID, uuid.UUID]:
+    """Once per installation: the first tenant, its owner and local credential.
+    Raises TenancyError when the installation was already bootstrapped (a racing
+    second run waits on the marker row and is refused too)."""
+    with provision_tenant(conn) as tx:
+        marker = conn.execute(
+            "INSERT INTO app.installation_bootstrap (tenant_id) VALUES (%s) "
+            "ON CONFLICT DO NOTHING RETURNING tenant_id",
+            (tx.tenant_id,),
+        ).fetchone()
+        if marker is None:
+            raise TenancyError("installation is already bootstrapped")
+        user_id = create_user(tx, display_name)
+        add_membership(tx, user_id, MembershipRole.TENANT_OWNER)
+        set_local_credential(tx, user_id, login, verifier)
+        append_audit_event(
+            tx, "installation.bootstrapped", actor_user_id=user_id,
+            target_id=tx.tenant_id,
+        )  # fmt: skip
+    return tx.tenant_id, user_id
 
 
 @contextmanager
