@@ -36,7 +36,8 @@ DENIED = WEB + PROVIDERS
 # Third-party imports a package's non-test code may use beyond the stdlib and its own
 # name. Every directory under packages/ must have an entry (review §2 table).
 ALLOWED_THIRD_PARTY: dict[str, frozenset[str]] = {
-    "adapters": frozenset({"psycopg"}),  # the only package that may import psycopg
+    # the only package that may import psycopg; domain per review section 2
+    "adapters": frozenset({"psycopg", "qw_domain"}),
     "domain": frozenset(),  # stdlib only
 }
 # apps/*: the API is the composition root (review §2). It reaches PostgreSQL only

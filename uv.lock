@@ -528,10 +528,14 @@ version = "0.1.0"
 source = { editable = "packages/adapters" }
 dependencies = [
     { name = "psycopg" },
+    { name = "qw-domain" },
 ]
 
 [package.metadata]
-requires-dist = [{ name = "psycopg", specifier = "==3.3.6" }]
+requires-dist = [
+    { name = "psycopg", specifier = "==3.3.6" },
+    { name = "qw-domain", editable = "packages/domain" },
+]
 
 [[package]]
 name = "qw-api"
