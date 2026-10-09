@@ -1,16 +1,20 @@
-"""API trust-boundary tests (T010 increment 2) through TestClient against a really
+"""API trust-boundary tests (T010 increments 2, 3a) through TestClient on a really
 migrated PostgreSQL 16 database, connected as the non-superuser, non-owner qw_app
 login of the adapters harness. All tenants, users and passwords are SYNTHETIC."""
 
 from __future__ import annotations
 
+import base64
 import importlib.util
+import io
 import json
 import logging
 import re
+import threading
+import time
 import uuid
 from collections.abc import Iterator
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import timedelta
 from pathlib import Path
 from typing import Any, cast
@@ -22,7 +26,13 @@ from httpx import Response
 from qw_adapters import tenancy
 from qw_adapters.tenancy import Conn, MembershipRole
 from qw_api import Settings, create_app
-from qw_api.security import SESSION_COOKIE, LocalPasswordAuthenticator, csrf_token
+from qw_api.security import (
+    SESSION_COOKIE,
+    LocalPasswordAuthenticator,
+    client_address,
+    csrf_token,
+)
+from starlette.requests import Request
 
 _path = Path(__file__).parents[3] / "packages" / "adapters" / "tests" / "conftest.py"
 _spec = importlib.util.spec_from_file_location("qw_pg_harness", _path)
@@ -33,6 +43,7 @@ pg_admin_url, database_url = _harness.pg_admin_url, _harness.database_url
 conn, runtime_urls, app_conn = _harness.conn, _harness.runtime_urls, _harness.app_conn
 
 ORIGIN = "https://testserver"
+KEY = b"SYNTHETIC-server-key-0123456789abcdef"
 JSON = {"Content-Type": "application/json"}
 PASSWORD = "SYNTHETIC-correct-horse-1"
 OWNER, MEMBER = MembershipRole.TENANT_OWNER, MembershipRole.TENANT_MEMBER
@@ -43,7 +54,7 @@ AUTH = LocalPasswordAuthenticator(
 
 
 def client_for(url: str, **settings: Any) -> TestClient:
-    config = Settings(frozenset({ORIGIN}), **settings)
+    config = Settings(frozenset({ORIGIN}), KEY, **settings)
     app = create_app(config, lambda: tenancy.runtime_connection(url), AUTH)
     headers = {"Origin": ORIGIN}
     return TestClient(app, ORIGIN, headers=headers, raise_server_exceptions=False)
@@ -86,8 +97,10 @@ def login(client: TestClient, who: str, password: str = PASSWORD) -> Response:
     )
 
 
-def csrf(client: TestClient) -> dict[str, str]:
-    return {"X-CSRF-Token": csrf_token(client.cookies[SESSION_COOKIE])}
+def csrf(client: TestClient, key: str | None = None) -> dict[str, str]:
+    """CSRF header plus an Idempotency-Key (fresh unless given)."""
+    token = csrf_token(client.cookies[SESSION_COOKIE])
+    return {"X-CSRF-Token": token, "Idempotency-Key": key or uuid.uuid4().hex}
 
 
 def step_up(client: TestClient) -> Response:
@@ -97,9 +110,10 @@ def step_up(client: TestClient) -> Response:
 
 
 def patch_role(
-    client: TestClient, user: uuid.UUID, role: str, version: int | None = 1
-) -> Response:
-    headers = {**csrf(client), **({"If-Match": f'"{version}"'} if version else {})}
+    client: TestClient, user: uuid.UUID, role: str, version: int | None = 1,
+    key: str | None = None,
+) -> Response:  # fmt: skip
+    headers = {**csrf(client, key), **({"If-Match": f'"{version}"'} if version else {})}
     url = f"/api/v1/memberships/{user}"
     return cast(Response, client.patch(url, json={"role": role}, headers=headers))
 
@@ -152,7 +166,7 @@ def test_health_caps_and_malformed_input_use_the_envelope() -> None:
 
 
 def test_no_implemented_operation_accepts_a_tenant_id() -> None:
-    spec = create_app(Settings(frozenset({ORIGIN})), lambda: None, AUTH).openapi()  # type: ignore[arg-type, return-value]
+    spec = create_app(Settings(frozenset({ORIGIN}), KEY), lambda: None, AUTH).openapi()  # type: ignore[arg-type, return-value]
     operations = [op for item in spec["paths"].values() for op in item.values()]
     assert len(operations) == 8  # HEAD /health/live included
     params = [p["name"] for op in operations for p in op.get("parameters", [])]
@@ -162,15 +176,21 @@ def test_no_implemented_operation_accepts_a_tenant_id() -> None:
 
 
 def test_settings_and_hasher_defaults() -> None:
-    settings = Settings(frozenset({ORIGIN}))
+    settings = Settings(frozenset({ORIGIN}), KEY)
+    assert settings.idle_timeout == timedelta(minutes=30)
+    assert settings.account_throttle.max_attempts == 5
     assert (settings.step_up_window, settings.session_ttl) == (
         timedelta(minutes=10), timedelta(hours=12)
     )  # fmt: skip
     for bad in ({"http://evil.example"}, {"https://a.example/path"}, set()):
         with pytest.raises(ValueError, match="origins"):
-            Settings(frozenset(bad))
+            Settings(frozenset(bad), KEY)
     with pytest.raises(ValueError, match="step_up_window"):
-        Settings(frozenset({ORIGIN}), step_up_window=timedelta(hours=2))
+        Settings(frozenset({ORIGIN}), KEY, step_up_window=timedelta(hours=2))
+    with pytest.raises(ValueError, match="secret_key"):
+        Settings(frozenset({ORIGIN}), b"short")
+    with pytest.raises(ValueError, match="throttle"):
+        tenancy.ThrottlePolicy(0, timedelta(1), timedelta(1), timedelta(1))
     verifier = LocalPasswordAuthenticator().hasher.hash("SYNTHETIC")  # RFC 9106
     assert verifier.startswith("$argon2id$v=19$m=65536,t=3,p=4$")
 
@@ -350,3 +370,173 @@ def test_client_tenant_id_and_bad_input_are_rejected(world: World) -> None:
     problem = assert_problem(response, 400, "invalid_request")
     pointers = {f["pointer"] for f in problem["field_errors"]}
     assert pointers == {"/path/user_id", "/role"}
+
+
+def test_client_address_trusts_only_configured_proxies() -> None:
+    def req(peer: str, xff: str) -> Request:
+        headers = [(b"x-forwarded-for", xff.encode())]
+        return Request({"type": "http", "client": (peer, 1), "headers": headers})
+
+    plain = Settings(frozenset({ORIGIN}), KEY)
+    proxied = Settings(
+        frozenset({ORIGIN}), KEY, trusted_proxies=frozenset({"10.0.0.1"})
+    )
+    assert client_address(req("203.0.113.9", "198.51.100.1"), plain) == "203.0.113.9"
+    spoofed = req("10.0.0.1", "198.51.100.66, 192.0.2.7, 10.0.0.1")
+    assert client_address(spoofed, proxied) == "192.0.2.7"  # rightmost untrusted hop
+
+
+@pytest.mark.db
+def test_lockout_curve_is_progressive_capped_and_hides_existence(
+    world: World, conn: Conn
+) -> None:
+    policy = tenancy.ThrottlePolicy(
+        3, timedelta(minutes=15), timedelta(minutes=1), timedelta(minutes=4)
+    )
+    limits = {"account_throttle": policy,  # wide address limit isolates the account
+              "address_throttle": replace(policy, max_attempts=1000)}  # fmt: skip
+    curves = []
+    for who in ("alice", "nobody"):
+        with client_for(world.url, **limits) as client:
+            seen = []
+            for _ in range(4):  # four lock cycles
+                statuses = [login(client, who, "wrong").status_code for _ in range(4)]
+                locked = assert_problem(login(client, who), 429, "too_many_attempts")
+                assert statuses == [401, 401, 401, 429]
+                assert locked["retry_after_s"] == int(login(client, who).headers[
+                    "retry-after"])  # fmt: skip
+                seen.append(locked["retry_after_s"])
+                conn.execute("UPDATE app.auth_throttle SET locked_until = now()")
+            curves.append(seen)
+    assert curves[0] == curves[1] == [60, 120, 240, 240]  # base * 2^n, capped
+    events = audit(world, "auth.locked_out")
+    assert [(e[1], e[2]) for e in events] == [(None, world.users["alice"])] * 4
+    with client_for(world.url, **limits) as client:
+        assert login(client, "alice").status_code == 201  # unlocked; clears the count
+        assert [login(client, "alice", "x").status_code for _ in range(3)] == [401] * 3
+
+
+@pytest.mark.db
+def test_concurrent_attempts_cannot_exceed_the_limit(
+    runtime_urls: dict[str, str],
+) -> None:
+    policy = tenancy.ThrottlePolicy(
+        5, timedelta(minutes=15), timedelta(minutes=1), timedelta(hours=1)
+    )
+    results: list[bool] = []
+    barrier = threading.Barrier(20)
+
+    def attempt() -> None:
+        with tenancy.runtime_connection(runtime_urls["qw_app"]) as c:
+            barrier.wait()
+            for _ in range(2):
+                results.append(tenancy.throttle_hit(c, b"k" * 32, policy)[0] is None)
+
+    threads = [threading.Thread(target=attempt) for _ in range(20)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert (len(results), results.count(True)) == (40, 5)
+
+
+@pytest.mark.db
+def test_idempotency_replays_and_rejects_reuse(world: World) -> None:
+    bob, key = world.users["bob"], "SYNTHETIC-key-0001"
+    login(world.client, "alice")
+    first_step = world.client.post(
+        "/api/v1/session/step-up", json={"password": PASSWORD},
+        headers=csrf(world.client, key),
+    )  # fmt: skip
+    again = world.client.post(
+        "/api/v1/session/step-up", json={"password": PASSWORD},
+        headers=csrf(world.client, key),
+    )  # fmt: skip
+    assert (
+        again.content == first_step.content and "idempotent-replayed" in again.headers
+    )
+    first = patch_role(world.client, bob, "tenant_owner", key=key)
+    replay = patch_role(world.client, bob, "tenant_owner", key=key)
+    assert (replay.status_code, replay.content) == (200, first.content)
+    assert replay.headers["etag"] == '"2"' and "idempotent-replayed" in replay.headers
+    other = patch_role(world.client, bob, "tenant_member", version=2, key=key)
+    assert_problem(other, 409, "idempotency_key_reused")
+    assert len(audit(world, "membership.role_changed")) == 1
+    assert len(audit(world, "session.step_up")) == 1
+    short = patch_role(world.client, bob, "tenant_member", version=2, key="short")
+    assert_problem(short, 400, "invalid_idempotency_key")
+    headers = {"X-CSRF-Token": csrf_token(world.client.cookies[SESSION_COOKIE])}
+    missing = world.client.delete("/api/v1/session", headers=headers)
+    assert [f["pointer"] for f in assert_problem(missing, 400, "invalid_request")[
+        "field_errors"]] == ["/header/Idempotency-Key"]  # fmt: skip
+
+
+@pytest.mark.db
+def test_idle_sessions_expire_and_last_use_only_moves_forward(
+    world: World, app_conn: Conn
+) -> None:
+    with client_for(world.url, idle_timeout=timedelta(seconds=1)) as client:
+        login(client, "alice")
+        for _ in range(2):  # each use within the timeout keeps the session alive
+            time.sleep(0.6)
+            assert client.get("/api/v1/session").status_code == 200
+        time.sleep(1.2)
+        assert_problem(client.get("/api/v1/session"), 401, "unauthenticated")
+    for shift in ("- interval '1 h'", "+ interval '1 h'"):  # backdate, or pre-date
+        with (
+            pytest.raises(Exception, match="last_used_at may only move forward"),
+            tenancy.tenant_transaction(app_conn, world.tenant_a),
+        ):
+            app_conn.execute(f"UPDATE app.session SET last_used_at = now() {shift}")
+
+
+@pytest.mark.db
+def test_cursors_page_and_are_bound_to_tenant_and_principal(
+    world: World, app_conn: Conn, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    with tenancy.tenant_transaction(app_conn, world.tenant_a) as tx:
+        for n in range(3):
+            user = tenancy.create_user(tx, f"SYNTHETIC extra {n}")
+            tenancy.add_membership(tx, user, MEMBER)
+    login(world.client, "alice")
+    url, ids, cursor = "/api/v1/memberships?limit=2", [], None
+    while True:
+        page = world.client.get(url + (f"&cursor={cursor}" if cursor else "")).json()
+        ids += [i["user_id"] for i in page["items"]]
+        if not (cursor := page["next_cursor"]):
+            break
+    assert len(ids) == 5 and ids == sorted(ids)
+    first = world.client.get(url).json()["next_cursor"]
+    raw = bytearray(base64.urlsafe_b64decode(first + "=="))
+    raw[0] ^= 1  # SYNTHETIC tampering: a different starting user id
+    forged = base64.urlsafe_b64encode(raw).decode().rstrip("=")
+    for bad in (forged, first[:-2], "!!", "A" * 54):
+        response = world.client.get(f"{url}&cursor={bad}")
+        assert_problem(response, 400, "invalid_cursor")
+    monkeypatch.setattr("qw_api.routes.CURSOR_TTL", -1)  # issued already expired
+    stale = world.client.get(url).json()["next_cursor"]
+    assert_problem(world.client.get(f"{url}&cursor={stale}"), 400, "invalid_cursor")
+    login(world.client, "bob")  # same tenant, other principal
+    assert_problem(world.client.get(f"{url}&cursor={first}"), 400, "invalid_cursor")
+    login(world.client, "carol")  # other tenant
+    assert_problem(world.client.get(f"{url}&cursor={first}"), 400, "invalid_cursor")
+
+
+@pytest.mark.db
+def test_bootstrap_runs_once_and_its_owner_can_log_in(
+    runtime_urls: dict[str, str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from qw_api.bootstrap import main
+
+    argv = ["--login", "root", "--display-name", "SYNTHETIC Root"]
+    monkeypatch.setenv("QW_DATABASE_URL", runtime_urls["qw_app"])
+    monkeypatch.setattr("sys.stdin", io.StringIO("short\n"))
+    assert main(argv) == 2
+    monkeypatch.setattr("sys.stdin", io.StringIO(PASSWORD + "\n"))
+    assert main(argv) == 0
+    monkeypatch.setattr("sys.stdin", io.StringIO(PASSWORD + "\n"))
+    assert main(["--login", "root2", "--display-name", "SYNTHETIC Again"]) == 1
+    with client_for(runtime_urls["qw_app"]) as client:
+        response = login(client, "root")
+        assert (response.status_code, response.json()["role"]) == (201, "tenant_owner")
+        assert login(client, "root2").status_code == 401

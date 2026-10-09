@@ -18,7 +18,7 @@ from typing import TYPE_CHECKING, Any
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
-from qw_adapters.tenancy import MAX_SESSION_TTL, Conn
+from qw_adapters.tenancy import MAX_SESSION_TTL, Conn, ThrottlePolicy
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
@@ -32,22 +32,42 @@ _ORIGIN = re.compile(r"(https://[a-z0-9.-]+|http://(localhost|127\.0\.0\.1))(:\d
 _REFERER = re.compile(_ORIGIN.pattern + r"(?=/|$)")
 
 
+_ACCOUNT = ThrottlePolicy(
+    5, timedelta(minutes=15), timedelta(minutes=1), timedelta(hours=1)
+)
+_ADDRESS = ThrottlePolicy(
+    50, timedelta(minutes=15), timedelta(minutes=1), timedelta(hours=1)
+)
+
+
 @dataclass(frozen=True, slots=True)
 class Settings:
-    """`allowed_origins`: exact https origins (http only for localhost)."""
+    """`allowed_origins`: exact https origins (http only for localhost).
+    `secret_key` (>= 32 random bytes, operator-held) keys request and throttle
+    HMACs. `trusted_proxies`: peer addresses whose X-Forwarded-For is believed; set
+    per deployment (empty means the socket peer is the client)."""
 
     allowed_origins: frozenset[str]
+    secret_key: bytes
     session_ttl: timedelta = timedelta(hours=12)
+    idle_timeout: timedelta = timedelta(minutes=30)
     step_up_window: timedelta = timedelta(minutes=10)
     max_body_bytes: int = 64 * 1024
+    account_throttle: ThrottlePolicy = _ACCOUNT
+    address_throttle: ThrottlePolicy = _ADDRESS
+    trusted_proxies: frozenset[str] = frozenset()
 
     def __post_init__(self) -> None:
         if not self.allowed_origins or not all(
             _ORIGIN.fullmatch(o) for o in self.allowed_origins
         ):
             raise ValueError("allowed_origins must be exact https origins")
+        if len(self.secret_key) < 32:
+            raise ValueError("secret_key must be at least 32 bytes")
         if not timedelta(0) < self.session_ttl <= MAX_SESSION_TTL:
             raise ValueError("session_ttl must be in (0, 30 days]")
+        if not timedelta(0) < self.idle_timeout <= self.session_ttl:
+            raise ValueError("idle_timeout must be in (0, session_ttl]")
         if not timedelta(0) < self.step_up_window <= timedelta(hours=1):
             raise ValueError("step_up_window must be in (0, 1 hour]")
         if not 0 < self.max_body_bytes <= 1 << 24:
@@ -68,6 +88,7 @@ class ApiError(Exception):
     detail: str
     retryable: bool = False
     field_errors: tuple[FieldError, ...] = ()
+    retry_after_s: int | None = None
 
 
 def correlation_id(request: Request) -> str:
@@ -85,7 +106,7 @@ def problem(request: Request, error: Exception) -> JSONResponse:
         "detail": error.detail,
         "correlation_id": cid,
         "retryable": error.retryable,
-        "retry_after_s": None,
+        "retry_after_s": error.retry_after_s,
         "field_errors": [
             {"pointer": f.pointer, "code": f.code, "message": f.message}
             for f in error.field_errors
@@ -93,10 +114,12 @@ def problem(request: Request, error: Exception) -> JSONResponse:
         "reasons": [],
         "error_schema": "1",
     }
+    headers = {"X-Correlation-Id": cid, "Cache-Control": "no-store"}
+    if error.retry_after_s is not None:
+        headers["Retry-After"] = str(error.retry_after_s)
     return JSONResponse(
-        body, error.status, {"X-Correlation-Id": cid, "Cache-Control": "no-store"},
-        media_type="application/problem+json",
-    )  # fmt: skip
+        body, error.status, headers, media_type="application/problem+json"
+    )
 
 
 def _pointer(loc: Iterable[Any]) -> str:
