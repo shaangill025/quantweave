@@ -46,6 +46,8 @@ JOB_TABLES = ("job", "outbox", "inbox")  # 0005, exercised by test_durable_jobs
 JOURNAL_TABLES = ("source_record", "ledger_event", "posting", "unit_posting")
 IMPORT_TABLES = ("import_preview",)  # 0008, exercised by test_import_store
 POLICY_TABLES = ("policy_version", "policy_adoption")  # 0009, test_policy_store
+# 0010, exercised by test_proposal_store
+PROPOSAL_TABLES = ("proposal_version", "proposal_event", "proposal_commitment")
 
 
 def make_tenant(conn: Conn, name: str) -> tuple[uuid.UUID, uuid.UUID]:
@@ -134,6 +136,7 @@ def test_tables_have_forced_rls_and_no_public_grants(conn: Conn) -> None:
         + JOURNAL_TABLES
         + IMPORT_TABLES
         + POLICY_TABLES
+        + PROPOSAL_TABLES
     )
     for name, rls, forced, owner, acl in rows:
         assert (rls, forced, owner) == (True, True, "qw_migrate"), name

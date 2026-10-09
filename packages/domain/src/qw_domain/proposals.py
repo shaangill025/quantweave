@@ -254,6 +254,11 @@ class ProposalVersion:
     def content_hash(self) -> str:
         return _hash(asdict(self))
 
+    @property
+    def canonical(self) -> object:
+        """The hashed content as plain JSON values (the stored form)."""
+        return json.loads(json.dumps(asdict(self), default=_wire))
+
 
 @dataclass(frozen=True, slots=True)
 class Current:
@@ -389,6 +394,15 @@ def settle(p: Proposal, cur: Current) -> tuple[Proposal, tuple[Reason, ...]]:
         return p, ()
     dst = P.EXPIRED if reasons[0].code is Code.EXPIRED else P.INVALIDATED
     return p._record(dst, cur.as_of, reasons[0].code, reasons[0].detail), reasons
+
+
+def expire(p: Proposal, as_of: datetime) -> Proposal:
+    """Record expiry of a live latest version at or after `expires_at`, exactly as
+    `settle` would; it needs no inputs, so an expiry sweep can run without them."""
+    as_of, v = ensure_aware_utc(as_of), p.latest
+    if p.state(v.version) in TERMINAL or as_of < v.expires_at:
+        return p
+    return p._record(P.EXPIRED, as_of, Code.EXPIRED, format_instant(v.expires_at))
 
 
 @dataclass(frozen=True, slots=True)
