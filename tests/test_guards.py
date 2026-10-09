@@ -41,7 +41,9 @@ DENIED_STDLIB: dict[str, tuple[str, ...]] = {
         "socket", "socketserver", "ssl", "http", "urllib", "ftplib", "smtplib",
         "poplib", "imaplib", "xmlrpc", "webbrowser", "sqlite3", "dbm", "shelve",
         "subprocess", "asyncio.subprocess", "multiprocessing", "ctypes", "pickle",
-        "marshal", "runpy", "importlib.util", "zipimport",
+        "marshal", "runpy", "importlib.util", "zipimport", "os", "asyncio",
+        "threading", "concurrent", "shutil", "select", "selectors", "tempfile",
+        "wsgiref",
     ),
 }  # fmt: skip
 DYNAMIC = "<non-literal>"
