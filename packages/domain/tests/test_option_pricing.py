@@ -120,14 +120,19 @@ QUOTES[C55.contract_id] = quote(C55, "1.40", "1.60")
 type Outcome = tuple[bool, tuple[str, ...], Money | None]
 
 
+TODAY = SessionRef(CalendarId("XNYS"), NOW.date())
+
+
 def decide(use: PricingUse, quotes: object = QUOTES, **kw: object) -> Outcome:
     d = price(use, quotes, **kw)
     return d.allowed, d.reasons, d.net_premium
 
 
 def price(use: PricingUse, quotes: object = QUOTES, **kw: object) -> PricingDecision:
-    args = {"access": access(LatencyClass.REAL_TIME), "cover": ACCOUNT} | kw
-    d = price_package(PKG, quotes, use, NOW, timedelta(seconds=30), **args)  # type: ignore[arg-type]
+    gate = access(LatencyClass.REAL_TIME)
+    args = {"access": gate, "cover": ACCOUNT, "session": TODAY} | kw
+    pkg = args.pop("pkg", PKG)
+    d = price_package(pkg, quotes, use, NOW, timedelta(seconds=30), **args)  # type: ignore[arg-type]
     assert d.allowed is (not d.reasons) and d.use is use
     assert (d.package is None) is (not d.allowed)
     return d
@@ -199,3 +204,30 @@ def test_feed_rights_and_coverage_gate() -> None:
     live = decide(PricingUse.LIVE, cover=None)
     assert live[1] == ("coverage_not_checked",)
     assert decide(PricingUse.RESEARCH, cover=None)[0]
+
+
+def test_zero_day_expiry_is_excluded_from_live_use() -> None:
+    expiry_day = SessionRef(CalendarId("XNYS"), date(2026, 11, 20))
+    elsewhere = SessionRef(CalendarId("XLON"), NOW.date())
+    cases = {
+        "trade_session_mismatch": expiry_day,  # not within a day of `at` (UTC)
+        "trade_session_unknown": None,
+        "trade_session_calendar_mismatch": elsewhere,
+    }
+    for code, session in cases.items():
+        assert decide(PricingUse.LIVE, session=session)[1] == (code,)
+        assert decide(PricingUse.RESEARCH, session=session)[0]
+
+
+def test_a_stale_session_cannot_hide_a_same_day_expiry() -> None:
+    today = TODAY  # the legs expire in today's session
+    legs = [replace(x, contract=replace(x.contract, expiry=today)) for x in LEGS]
+    same_day = build_package(PackageKind.BULL_CALL_DEBIT, legs, fees=USD0)
+    day = timedelta(days=1)
+    for session_date in (NOW.date() - day, NOW.date(), NOW.date() + day):
+        session = replace(TODAY, session_date=session_date)
+        live = decide(PricingUse.LIVE, pkg=same_day, session=session)
+        assert live[1] == ("zero_day_expiry",), session_date
+    older = replace(TODAY, session_date=NOW.date() - 2 * day)
+    reasons = decide(PricingUse.LIVE, pkg=same_day, session=older)[1]
+    assert reasons == ("trade_session_mismatch",)
