@@ -16,8 +16,10 @@ Versions after 0001 (which creates the roles) run under `SET LOCAL ROLE qw_migra
 Inside the transaction a migration is rolled back if it ended the transaction,
 finished under another role or session user, left a user object not owned by
 `qw_migrate` (except the ledger), or left a column failing `schema_guard`. RESET ALL
-stops settings such as search_path leaking. Dynamic SQL can still switch roles
-mid-file; the ownership check is the backstop. Recovery is backup plus a new forward
+stops settings such as search_path leaking. These checks enforce object OWNERSHIP
+only. A file run by a superuser can still change roles or privileges (set_config,
+quoted GUC names, DO blocks, GRANT ... TO PUBLIC), so the production migrate login must
+not be a superuser (open gate). Recovery is backup plus a new forward
 migration. The caller supplies the autocommit connection; no environment is read.
 """
 
