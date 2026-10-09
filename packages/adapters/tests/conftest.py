@@ -119,3 +119,54 @@ def database_url(pg_admin_url: str) -> Iterator[str]:
 def conn(database_url: str) -> Iterator[psycopg.Connection[TupleRow]]:
     with psycopg.connect(database_url, autocommit=True) as connection:
         yield connection
+
+
+@pytest.fixture
+def runtime_urls(
+    database_url: str, conn: psycopg.Connection[TupleRow]
+) -> Iterator[dict[str, str]]:
+    """Migrate the test database as the superuser, then create throwaway LOGIN roles
+    that are members of `qw_app` and `qw_worker` (non-superuser, non-owner,
+    NOBYPASSRLS, no password: both harness modes use trust auth). Yields
+    {"qw_app": url, "qw_worker": url}; the roles are dropped afterwards."""
+    from qw_adapters.migrations import migrate
+
+    migrate(conn)
+    suffix = uuid.uuid4().hex[:12]
+    logins = {
+        group: f"qwtest_{group[3:]}_{suffix}" for group in ("qw_app", "qw_worker")
+    }
+    try:
+        for group, login in logins.items():
+            conn.execute(
+                sql.SQL(
+                    "CREATE ROLE {} LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE "
+                    "NOREPLICATION NOBYPASSRLS INHERIT IN ROLE {}"
+                ).format(sql.Identifier(login), sql.Identifier(group))
+            )
+        yield {g: make_conninfo(database_url, user=u) for g, u in logins.items()}
+    finally:
+        for login in logins.values():
+            conn.execute(
+                sql.SQL(
+                    "SELECT pg_terminate_backend(pid) FROM pg_stat_activity "
+                    "WHERE usename = {}"
+                ).format(sql.Literal(login))
+            )
+            conn.execute(
+                sql.SQL("DROP ROLE IF EXISTS {}").format(sql.Identifier(login))
+            )
+
+
+@pytest.fixture
+def app_conn(runtime_urls: dict[str, str]) -> Iterator[psycopg.Connection[TupleRow]]:
+    with psycopg.connect(runtime_urls["qw_app"], autocommit=True) as connection:
+        yield connection
+
+
+@pytest.fixture
+def worker_conn(
+    runtime_urls: dict[str, str],
+) -> Iterator[psycopg.Connection[TupleRow]]:
+    with psycopg.connect(runtime_urls["qw_worker"], autocommit=True) as connection:
+        yield connection
