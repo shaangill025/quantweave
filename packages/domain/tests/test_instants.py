@@ -127,3 +127,22 @@ def test_schema_layers_are_weaker_than_the_parser() -> None:
     # jsonschema uses re.search, so `$` matches before a final newline; year 1 at
     # +01:00 precedes the UTC range. parse_instant rejects both.
     assert schema_only == {"2026-10-08T10:00:00Z\n", "0001-01-01T00:00:00+01:00"}
+
+
+def test_utc_overflow_is_an_instant_error() -> None:
+    minus5 = timezone(timedelta(hours=-5))
+    plus1 = timezone(timedelta(hours=1))
+    for value in (
+        datetime(9999, 12, 31, 23, tzinfo=minus5),
+        datetime(1, 1, 1, tzinfo=plus1),
+    ):
+        with pytest.raises(InstantError):
+            format_instant(value)
+        with pytest.raises(InstantError):
+            ensure_aware_utc(value)
+
+
+def test_error_messages_cap_input_repr() -> None:
+    with pytest.raises(InstantError) as info:
+        parse_instant("2026-10-08T10:00:00" + "x" * 10_000)
+    assert len(str(info.value)) < 200
