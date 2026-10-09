@@ -1,9 +1,10 @@
-# Virtual uv workspace root: no package of its own. Each core package under packages/ is a member.
+# Virtual uv workspace root: no package of its own. Members: packages/* and apps/api.
 [tool.uv.workspace]
-members = ["packages/*"]
+members = ["packages/*", "apps/api"]
 
 [dependency-groups]
 dev = [
+    "httpx==0.28.1",
     "hypothesis==6.168.5",
     "jsonschema==4.26.0",
     "mypy==2.4.0",
@@ -33,11 +34,11 @@ select = ["E", "W", "F", "I", "B", "SIM", "UP", "TID", "DTZ", "RUF"]
 [tool.mypy]
 python_version = "3.13"
 strict = true
-files = ["packages", "tools", "tests"]
+files = ["packages", "apps/api", "tools", "tests"]
 exclude = ["^docs/"]
 
 [tool.pytest.ini_options]
-testpaths = ["packages", "tests"]
+testpaths = ["packages", "apps/api", "tests"]
 addopts = ["--import-mode=importlib", "-ra", "--strict-markers", "--strict-config"]
 markers = [
     "db: needs PostgreSQL 16 (QW_TEST_DATABASE_URL or host binaries); QW_REQUIRE_DB=1 turns a skip into a failure",

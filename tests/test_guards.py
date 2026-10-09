@@ -1,4 +1,4 @@
-"""Repository guards: core import boundaries (T008 review §2), float ban (ADR-013).
+"""Repository guards: import boundaries (T008 review §2), float ban (ADR-013).
 
 Both guards get a negative control on an injected SYNTHETIC sample and a positive run
 on the real tree.
@@ -13,14 +13,17 @@ import pytest
 
 ROOT = Path(__file__).resolve().parent.parent
 PACKAGES = ROOT / "packages"
+APPS = ROOT / "apps"
 
-# Denied in every packages/* file (src and tests): web/UI frameworks, provider SDKs.
-# Matched by dotted prefix. New packages are covered without changes here.
-DENIED = (
-    # web and UI frameworks
+# Web and UI frameworks: denied in every packages/* file, allowed in apps/api only.
+WEB = (
     "fastapi", "starlette", "pydantic", "flask", "django", "uvicorn", "aiohttp.web",
     "tornado", "sanic", "litestar", "reactpy", "react", "streamlit", "gradio", "dash",
     "panel", "nicegui", "jinja2",
+)  # fmt: skip
+# Denied in every packages/* and apps/* file (src and tests). Matched by dotted
+# prefix. New packages are covered without changes here.
+PROVIDERS = (
     # model-provider SDKs
     "anthropic", "openai", "google.generativeai", "google.genai", "mistralai", "cohere",
     "langchain", "langchain_openai", "litellm", "groq", "together", "ollama",
@@ -28,12 +31,21 @@ DENIED = (
     "alpaca", "alpaca_trade_api", "ib_insync", "ib_async", "ibapi", "questrade_api",
     "wealthsimple", "robin_stocks", "tda", "schwab", "polygon", "yfinance", "finnhub",
 )  # fmt: skip
+DENIED = WEB + PROVIDERS
 
 # Third-party imports a package's non-test code may use beyond the stdlib and its own
 # name. Every directory under packages/ must have an entry (review §2 table).
 ALLOWED_THIRD_PARTY: dict[str, frozenset[str]] = {
     "adapters": frozenset({"psycopg"}),  # the only package that may import psycopg
     "domain": frozenset(),  # stdlib only
+}
+# apps/*: the API is the composition root (review §2). It reaches PostgreSQL only
+# through qw_adapters, so psycopg stays adapter-only. apps/web has no Python.
+APP_ALLOWED_THIRD_PARTY: dict[str, frozenset[str]] = {
+    "api": frozenset(
+        {"fastapi", "starlette", "pydantic", "argon2", "qw_adapters", "qw_domain"}
+    ),
+    "web": frozenset(),
 }
 # Standard-library modules denied in a package's non-test code (I/O, processes, code
 # loading). Matched by dotted prefix like DENIED.
@@ -85,10 +97,14 @@ def _matches(module: str, prefixes: tuple[str, ...]) -> bool:
     return any(module == p or module.startswith(p + ".") for p in prefixes)
 
 
-def boundary_violations(packages_dir: Path) -> list[str]:
+def boundary_violations(
+    packages_dir: Path,
+    rules: dict[str, frozenset[str]] = ALLOWED_THIRD_PARTY,
+    denied: tuple[str, ...] = DENIED,
+) -> list[str]:
     problems: list[str] = []
     for package in sorted(p for p in packages_dir.iterdir() if p.is_dir()):
-        allowed = ALLOWED_THIRD_PARTY.get(package.name)
+        allowed = rules.get(package.name)
         if allowed is None:
             problems.append(f"{package.name}: no entry in ALLOWED_THIRD_PARTY")
             continue
@@ -96,13 +112,15 @@ def boundary_violations(packages_dir: Path) -> list[str]:
         denied_stdlib = DENIED_STDLIB.get(package.name, ())
         for file in sorted(package.rglob("*.py")):
             rel = file.relative_to(package)
+            if "node_modules" in rel.parts:
+                continue
             is_test = rel.parts[0] == "tests" or rel.name == "conftest.py"
             for line, module in imported_modules(file):
                 where = f"{file.relative_to(packages_dir)}:{line} imports {module}"
                 top = module.split(".")[0]
                 if module == DYNAMIC:
                     problems.append(f"{where} (unreviewable dynamic import)")
-                elif _matches(module, DENIED):
+                elif _matches(module, denied):
                     problems.append(f"{where} (denied in core)")
                 elif is_test:
                     continue
@@ -120,6 +138,27 @@ def boundary_violations(packages_dir: Path) -> list[str]:
 def test_core_packages_respect_import_boundaries() -> None:
     assert (PACKAGES / "domain" / "src" / "qw_domain").is_dir()
     assert boundary_violations(PACKAGES) == []
+
+
+def test_apps_respect_import_boundaries() -> None:
+    assert (APPS / "api" / "src" / "qw_api").is_dir()
+    assert boundary_violations(APPS, APP_ALLOWED_THIRD_PARTY, PROVIDERS) == []
+
+
+def test_app_boundary_allows_web_stack_only_in_api(tmp_path: Path) -> None:
+    src = tmp_path / "api" / "src" / "qw_api"
+    src.mkdir(parents=True)
+    (src / "bad.py").write_text(  # SYNTHETIC negative-control fixture
+        "import fastapi\nfrom pydantic import BaseModel\nimport qw_adapters\n"
+        "import psycopg\nimport openai\nfrom alpaca import trading\n"
+    )
+    (tmp_path / "worker").mkdir()
+    assert boundary_violations(tmp_path, APP_ALLOWED_THIRD_PARTY, PROVIDERS) == [
+        "api/src/qw_api/bad.py:4 imports psycopg (not allowed for api)",
+        "api/src/qw_api/bad.py:5 imports openai (denied in core)",
+        "api/src/qw_api/bad.py:6 imports alpaca.trading (denied in core)",
+        "worker: no entry in ALLOWED_THIRD_PARTY",
+    ]
 
 
 def test_boundary_check_fires_on_injected_sample(tmp_path: Path) -> None:

@@ -38,6 +38,7 @@ from qw_adapters.tenancy import (
 
 Conn = psycopg.Connection[TupleRow]
 TABLES = ("tenant", "app_user", "membership", "session", "audit_event")
+API_TABLES = ("local_credential",)  # 0003, exercised by apps/api tests
 
 
 def make_tenant(conn: Conn, name: str) -> tuple[uuid.UUID, uuid.UUID]:
@@ -119,7 +120,7 @@ def test_tables_have_forced_rls_and_no_public_grants(conn: Conn) -> None:
         "FROM pg_class c WHERE c.relnamespace = 'app'::regnamespace "
         "AND c.relkind = 'r' ORDER BY 1"
     ).fetchall()
-    assert sorted(r[0] for r in rows) == sorted(TABLES)
+    assert sorted(r[0] for r in rows) == sorted(TABLES + API_TABLES)
     for name, rls, forced, owner, acl in rows:
         assert (rls, forced, owner) == (True, True, "qw_migrate"), name
         assert not re.search(r"(^|[{,])=", acl), f"{name} grants to PUBLIC: {acl}"
