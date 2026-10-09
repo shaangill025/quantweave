@@ -9,8 +9,8 @@ Rules, each with a reviewed per-file ALLOWLIST entry as the only exception:
 - float-import: `from builtins import float [as x]` (any module).
 - division: `/` and `/=` (true division of ints yields a float; Decimal division
   must be a reviewed, quantized step).
-- coverage: every directory under packages/ is in MONEY_PATHS or NOT_MONEY, and the
-  listed paths of an existing package exist.
+- coverage: every directory under packages/ and apps/ is in MONEY_PATHS or
+  NOT_MONEY, and the listed paths of an existing package exist.
 
 `mypy --strict` accepts `Decimal == float` and the decimal context does not trap float
 equality, so this check and the value types' typed comparisons (control 2) are the
@@ -31,6 +31,7 @@ ROOT = Path(__file__).resolve().parent.parent
 # Money modules per ADR-013, per package. Packages that do not exist yet are skipped.
 MONEY_PATHS: dict[str, tuple[str, ...]] = {
     "adapters": ("src",),  # PostgreSQL adapters persist money (NUMERIC <-> Decimal)
+    "api": ("src",),  # apps/api: the HTTP edge carries money as decimal strings
     "domain": ("src",),
     "portfolio": ("src",),
     "strategies": ("src/qw_strategies/sizing", "src/qw_strategies/valuation"),
@@ -38,6 +39,7 @@ MONEY_PATHS: dict[str, tuple[str, ...]] = {
 # Packages reviewed as float-tolerant, with the reason.
 NOT_MONEY: dict[str, str] = {
     "quant": "statistics may use floats behind declared tolerances (ADR-013)",
+    "web": "apps/web is TypeScript; decimal strings are checked by its own tests",
 }
 # Reviewed exceptions: (repo-relative file path, rule) -> reason. None are needed yet.
 ALLOWLIST: dict[tuple[str, str], str] = {}
@@ -128,13 +130,14 @@ def coverage(packages: Path) -> tuple[list[str], list[Path]]:
 
 
 def main(argv: list[str]) -> int:
-    packages = ROOT / "packages"
+    roots = [ROOT / "packages", ROOT / "apps"]
     if argv[:1] == ["--packages"]:
-        packages, argv = Path(argv[1]), argv[2:]
+        roots, argv = [Path(argv[1])], argv[2:]
     problems: list[str] = []
     targets = [Path(a) for a in argv]
-    if not targets:
-        problems, targets = coverage(packages)
+    for root in roots if not targets else []:
+        found, paths = coverage(root)
+        problems, targets = problems + found, targets + paths
     files = [t for t in targets if t.is_file()]
     files += [f for t in targets if t.is_dir() for f in sorted(t.rglob("*.py"))]
     if not files and not problems:

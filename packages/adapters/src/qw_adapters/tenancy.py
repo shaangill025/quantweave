@@ -157,6 +157,11 @@ def create_session(
     The token is returned once and is not recoverable from the database."""
     if not timedelta(0) < ttl <= MAX_SESSION_TTL:
         raise TenancyError(f"session ttl must be in (0, {MAX_SESSION_TTL}]")
+    active = tx.conn.execute(
+        "SELECT 1 FROM app.tenant WHERE id = %s AND status = 'active'", (tx.tenant_id,)
+    ).fetchone()
+    if active is None:
+        raise TenancyError("tenant is not active")
     session_id, token = uuid.uuid4(), new_session_token()
     tx.conn.execute(
         "INSERT INTO app.session (id, tenant_id, user_id, token_hash, expires_at) "
@@ -217,6 +222,96 @@ def revoke_session(tx: TenantTx, session_id: uuid.UUID) -> bool:
         (tx.tenant_id, session_id),
     )
     return cur.rowcount == 1
+
+
+def mark_step_up(tx: TenantTx, session_id: uuid.UUID) -> datetime | None:
+    """Set step_up_at = now() on a live session after the caller re-verified."""
+    row = tx.conn.execute(
+        "UPDATE app.session SET step_up_at = now() WHERE tenant_id = %s AND id = %s "
+        "AND revoked_at IS NULL AND expires_at > now() RETURNING step_up_at",
+        (tx.tenant_id, session_id),
+    ).fetchone()
+    return None if row is None else row[0]
+
+
+def list_memberships(tx: TenantTx, limit: int) -> list[tuple[Membership, str]]:
+    """This tenant's memberships with display names, ordered by user id."""
+    rows = tx.conn.execute(
+        "SELECT m.user_id, m.role::text, m.version, u.display_name "
+        "FROM app.membership m JOIN app.app_user u "
+        "ON u.tenant_id = m.tenant_id AND u.id = m.user_id "
+        "WHERE m.tenant_id = %s ORDER BY m.user_id LIMIT %s",
+        (tx.tenant_id, limit),
+    ).fetchall()
+    return [
+        (Membership(tx.tenant_id, u, MembershipRole(r), int(v)), str(n))
+        for u, r, v, n in rows
+    ]
+
+
+def lock_owners(tx: TenantTx) -> frozenset[uuid.UUID]:
+    """The owners, rows locked until commit so concurrent role changes serialise."""
+    rows = tx.conn.execute(
+        "SELECT user_id FROM app.membership WHERE tenant_id = %s "
+        "AND role = 'tenant_owner' ORDER BY user_id FOR UPDATE",
+        (tx.tenant_id,),
+    ).fetchall()
+    return frozenset(r[0] for r in rows)
+
+
+def set_member_role(
+    tx: TenantTx, user_id: uuid.UUID, role: MembershipRole, expected_version: int
+) -> Membership | None:
+    """Compare-and-set a membership role; None when the version does not match."""
+    row = tx.conn.execute(
+        "UPDATE app.membership SET role = %s, version = version + 1 "
+        "WHERE tenant_id = %s AND user_id = %s AND version = %s RETURNING version",
+        (MembershipRole(role).value, tx.tenant_id, user_id, expected_version),
+    ).fetchone()
+    return None if row is None else Membership(tx.tenant_id, user_id, role, row[0])
+
+
+def set_local_credential(
+    tx: TenantTx, user_id: uuid.UUID, login: str, verifier: str
+) -> None:
+    tx.conn.execute(
+        "INSERT INTO app.local_credential (tenant_id, user_id, login, verifier) "
+        "VALUES (%s, %s, %s, %s)",
+        (tx.tenant_id, user_id, login, verifier),
+    )
+
+
+def find_credential(conn: Conn, login: str) -> tuple[uuid.UUID, uuid.UUID, str] | None:
+    """(tenant, user, verifier) for a login, via the pre-tenant login policy."""
+    if not conn.autocommit or conn.info.transaction_status != pq.TransactionStatus.IDLE:
+        raise TenancyError("find_credential needs an idle autocommit connection")
+    with conn.transaction():
+        conn.execute(
+            "SELECT set_config('app.tenant_id', '', true), "
+            "set_config('app.login', %s, true)",
+            (login,),
+        )
+        rows = conn.execute(
+            "SELECT tenant_id, user_id, verifier FROM app.local_credential"
+        ).fetchall()
+    return (rows[0][0], rows[0][1], str(rows[0][2])) if len(rows) == 1 else None
+
+
+def get_verifier(tx: TenantTx, user_id: uuid.UUID) -> str | None:
+    row = tx.conn.execute(
+        "SELECT verifier FROM app.local_credential WHERE tenant_id = %s "
+        "AND user_id = %s",
+        (tx.tenant_id, user_id),
+    ).fetchone()
+    return None if row is None else str(row[0])
+
+
+@contextmanager
+def runtime_connection(conninfo: str) -> Iterator[Conn]:
+    """An autocommit connection that passed `check_runtime_role`."""
+    with psycopg.connect(conninfo, autocommit=True) as conn:
+        check_runtime_role(conn)
+        yield conn
 
 
 def check_runtime_role(conn: Conn) -> None:
