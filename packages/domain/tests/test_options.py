@@ -1,8 +1,9 @@
 """Option contract identity and OCC symbols (T011; R017, R089, F-14). SYNTHETIC."""
 
 from dataclasses import replace
-from datetime import date
+from datetime import UTC, date, datetime
 from decimal import Decimal
+from fractions import Fraction
 from typing import Any
 from uuid import UUID
 
@@ -14,12 +15,14 @@ from qw_domain.decimals import Money, Multiplier, PositiveQuantity, Price
 from qw_domain.identity import IdentityError, InstrumentId
 from qw_domain.options import (
     CashDeliverable,
+    CashInLieu,
     ExerciseStyle,
     OccSymbol,
     OptionContract,
     OptionRight,
     Settlement,
     UnitDeliverable,
+    UnknownDeliverable,
 )
 
 PROFILE = settings(derandomize=True, database=None, max_examples=300)
@@ -89,6 +92,9 @@ INCOMPLETE: list[dict[str, Any]] = [
 INVALID: list[dict[str, Any]] = [
     {"strike_currency": "usd"}, {"terms_version": 0}, {"strike": Price("0")},
     {"deliverables": (UnitDeliverable(CID, PositiveQuantity("1")),)},  # itself
+    {"applied_actions": (("ca-1", 1), ("ca-1", 2))},  # one event id, twice
+    {"applied_actions": [("ca-1", 1)]}, {"applied_actions": (("ca-1", True),)},
+    {"applied_actions": (("", 1),)}, {"applied_actions": (("ca-1", 1, 2),)},
 ]  # fmt: skip
 
 
@@ -167,3 +173,39 @@ def test_property_occ_round_trip(
     assert len(text) == 21
     assert OccSymbol.parse(text) == symbol
     assert OccSymbol.parse(text).format() == text
+
+
+def test_contract_shape_follow_ups() -> None:
+    usd = CashDeliverable(Money.of("1", "USD"))
+    two = UnitDeliverable(UND, PositiveQuantity("50"))
+    for change in (
+        {"terms_version": True}, {"terms_version": 1.0}, {"terms_version": "1"},
+        {"deliverables": [STANDARD.deliverables[0]]},
+        {"deliverables": (STANDARD.deliverables[0], two)},
+        {"deliverables": (STANDARD.deliverables[0], usd, usd)},
+        {"underlying_id": CID},
+    ):  # fmt: skip
+        with pytest.raises((TypeError, ValueError)):
+            replace(STANDARD, **change)
+    noon = datetime(2026, 11, 20, 12, tzinfo=UTC)
+    with pytest.raises(TypeError):
+        OccSymbol("AAPL", noon, OptionRight.CALL, Price("1"))
+
+
+def test_unknown_components_block_and_cannot_be_verified() -> None:
+    cil = CashInLieu(UND, Fraction(1, 2), "ca-1")
+    unknown = UnknownDeliverable("ca-1")
+    pending = replace(STANDARD, deliverables=(*STANDARD.deliverables, cil, unknown),
+                      adjusted=True, terms_verified=False)  # fmt: skip
+    assert pending.sizing_block_reasons() == (
+        "terms_unverified",
+        "cash_in_lieu_unknown",
+        "deliverable_terms_unknown",
+    )
+    with pytest.raises(ValueError, match="verified"):
+        replace(pending, terms_verified=True)
+    for units in (Fraction(0), Fraction(1), Fraction(3, 2), 0.5):
+        with pytest.raises((TypeError, ValueError)):
+            CashInLieu(UND, units, "ca-1")  # type: ignore[arg-type]
+    with pytest.raises(ValueError):
+        UnknownDeliverable("")

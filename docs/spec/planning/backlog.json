@@ -140,7 +140,7 @@
       "requirements": "R004,R017,R050,R060,R066,R071,R080,R081,R083,R089,R091",
       "deliverable": "Implement security/listing/provider identifiers, option identity, corporate-action mapping and versioned exchange calendars.",
       "verification": "Ticker collision, rename, DST, half-day, halt and adjusted-contract tests.",
-      "status": "Not started",
+      "status": "Completed with evidence",
       "size": "M",
       "release_required": "Yes"
     },
