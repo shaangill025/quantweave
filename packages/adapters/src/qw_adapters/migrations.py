@@ -142,7 +142,7 @@ def migrate(
     if encoding != "UTF8":
         raise MigrationError(f"database encoding must be UTF8, not {encoding!r}")
     migrations = load_migrations(directory)
-    conn.execute("SELECT %s::bigint", (LOCK_KEY,))
+    conn.execute("SELECT pg_advisory_lock(%s)", (LOCK_KEY,))
     try:
         conn.execute(_CREATE_TABLE)
         pending = pending_migrations(migrations, applied_migrations(conn))
