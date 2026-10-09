@@ -1,7 +1,7 @@
 """Aware UTC instants (T008 review C-05). Wire timestamps carry an offset."""
 
 import re
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 
 from qw_domain.decimals import safe_repr
 
@@ -49,3 +49,11 @@ def ensure_aware_utc(value: datetime) -> datetime:
 def format_instant(value: datetime) -> str:
     """Server wire form: UTC with a `Z` suffix and microseconds only when non-zero."""
     return ensure_aware_utc(value).isoformat().replace("+00:00", "Z")
+
+
+def require_date(value: object, what: str) -> date:
+    """A calendar date. `datetime` (a `date` subclass) is rejected: it would compare
+    and hash as an instant and silently carry a time of day."""
+    if type(value) is not date:
+        raise TypeError(f"{what} must be a date, not {type(value).__name__}")
+    return value

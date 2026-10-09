@@ -4,9 +4,11 @@ Expected UTC instants are hand-computed: New York is UTC-5 (EST) before 2026-03-
 from 2026-11-01, UTC-4 (EDT) in between.
 """
 
-from datetime import UTC, date, datetime, timedelta
+from datetime import UTC, date, datetime, time, timedelta
 from pathlib import Path
+from typing import Any
 from uuid import UUID
+from zoneinfo import ZoneInfo
 
 import pytest
 from hypothesis import given, settings
@@ -15,6 +17,8 @@ from qw_domain.calendars import (
     CalendarCoverageError,
     CalendarError,
     CalendarId,
+    CalendarVersion,
+    ExchangeCalendar,
     Halt,
     MarketState,
     load_calendar,
@@ -178,3 +182,67 @@ def test_property_trading_day_arithmetic_matches_session_for(
         assert _days(lo + one, hi + one) == n  # (start, end]
     else:
         assert _days(lo, hi) == -n  # [end, start)
+
+
+def _version(**kw: Any) -> CalendarVersion:
+    base: dict[str, Any] = {
+        "version": "v1", "effective_from": D(2026, 1, 1),
+        "effective_to": D(2027, 1, 1), "open": time(9, 30), "close": time(16),
+        "weekend": frozenset({5, 6}),
+    }  # fmt: skip
+    return CalendarVersion(**(base | kw))
+
+
+def test_trading_day_argument_follow_ups() -> None:
+    for n in (True, 1.0, "1"):
+        with pytest.raises(TypeError):
+            CAL.add_trading_days(D(2026, 11, 25), n)  # type: ignore[arg-type]
+    with pytest.raises(CalendarError, match="before"):
+        CAL.trading_days_between(D(2026, 11, 30), D(2026, 11, 23))
+    assert CAL.trading_days_between(D(2026, 11, 23), D(2026, 11, 23)) == 0
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        {"holidays": frozenset({D(2026, 11, 27)}),
+         "early_closes": {D(2026, 11, 27): time(13)}},  # holiday and early close
+        {"holidays": frozenset({D(2026, 11, 28)})},  # Saturday
+        {"early_closes": {D(2026, 11, 29): time(13)}},  # Sunday
+        {"weekend": frozenset({7})},
+        {"effective_from": datetime(2026, 1, 1, tzinfo=UTC)},
+    ],
+)  # fmt: skip
+def test_version_rejects_inconsistent_special_dates(change: dict[str, Any]) -> None:
+    with pytest.raises((TypeError, CalendarError)):
+        _version(**change)
+
+
+def test_duplicate_weekend_and_version_names_are_rejected() -> None:
+    old = '"weekend": ["sat", "sun"]'
+    with pytest.raises(CalendarError, match="duplicate"):
+        load_calendar(FIXTURE.replace(old, '"weekend": ["sat", "sun", "sat"]', 1))
+    with pytest.raises(CalendarError, match="unique"):
+        load_calendar(FIXTURE.replace("synthetic-2026.2", "synthetic-2026.1"))
+    a = _version(effective_to=D(2026, 6, 1))
+    b = _version(effective_from=D(2026, 6, 1))
+    with pytest.raises(CalendarError, match="unique"):
+        ExchangeCalendar(CalendarId("XNYS"), ZoneInfo("America/New_York"), (a, b))
+
+
+def test_session_times_in_dst_gap_or_fold_are_rejected() -> None:
+    # SYNTHETIC overnight-style hours: 02:30 local does not exist on 2026-03-08 (gap)
+    # and 01:30 occurs twice on 2026-11-01 (fold) in America/New_York.
+    ny = ZoneInfo("America/New_York")
+    gap = ExchangeCalendar(
+        CalendarId("XTST"), ny, [_version(open=time(2, 30), weekend=frozenset())]
+    )
+    fold = ExchangeCalendar(
+        CalendarId("XTST"), ny, [_version(open=time(1, 30), weekend=frozenset())]
+    )
+    with pytest.raises(CalendarError, match="DST"):
+        gap.session_for(D(2026, 3, 8))
+    with pytest.raises(CalendarError, match="DST"):
+        fold.session_for(D(2026, 11, 1))
+    ok = gap.session_for(D(2026, 3, 9))  # 02:30 EDT = 06:30Z
+    assert ok is not None and ok.open_at == utc(2026, 3, 9, 6, 30)
