@@ -11,16 +11,28 @@ Spec §4 "Idempotency and conflict resolution" and "Corrections and retention", 
 
 `Journal.sell` and `Journal.split` derive the held position from the journal itself.
 `post` also refuses a sale that would leave a negative position at its effective time;
-a raw split event passed to `post` still trusts its caller's snapshot.
+a raw split event passed to `post` still trusts its caller's snapshot. Both read a
+per-(account, instrument) ledger of cumulative units and cost in effective-time order
+instead of folding the journal; a holding whose cost was ever posted in two currencies
+is refused (`cost_currency_mixed`). `journal_id` and `revision` are in-memory only.
 """
 
+from bisect import bisect_right
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from datetime import datetime
+from decimal import Decimal, localcontext
 from enum import StrEnum
+from uuid import uuid4
 
 from qw_domain.corporate_actions import SourceRef, Split
-from qw_domain.decimals import Money, PositiveQuantity, Price, Quantity
+from qw_domain.decimals import (
+    DOMAIN_CONTEXT,
+    Money,
+    PositiveQuantity,
+    Price,
+    Quantity,
+)
 from qw_domain.identity import InstrumentId
 from qw_domain.instants import ensure_aware_utc
 from qw_domain.postings import (
@@ -81,14 +93,101 @@ class ObservationLog:
         return self._by_key.get(key)
 
 
+type _HoldingKey = tuple[str, InstrumentId]
+
+
+def _deltas(event: JournalEvent) -> dict[_HoldingKey, tuple[Decimal, Decimal, str]]:
+    """Per (account, instrument): position units, security cost and cost currency."""
+    out: dict[_HoldingKey, tuple[Decimal, Decimal, str]] = {}
+    with localcontext(DOMAIN_CONTEXT):
+        for u in event.units:
+            if u.account is UnitAccount.POSITION:
+                q, c, cur = out.get(
+                    (event.account_id, u.instrument_id), (_ZERO, _ZERO, "")
+                )
+                out[(event.account_id, u.instrument_id)] = (
+                    q + u.quantity.value,
+                    c,
+                    cur,
+                )
+        for p in event.money:
+            if p.account is BookAccount.SECURITY_COST and p.instrument_id is not None:
+                k = (event.account_id, p.instrument_id)
+                q, c, _ = out.get(k, (_ZERO, _ZERO, ""))
+                out[k] = (q, c + p.amount.amount.value, p.amount.currency)
+    return out
+
+
+_ZERO = Decimal(0)
+
+
+class _Ledger:
+    """One holding's cumulative units and cost in effective-time order, so a holding
+    as of a time is a bisection, not a fold over the journal. Appending in time
+    order is O(1); a back-dated event updates the later cumulative sums."""
+
+    def __init__(self) -> None:
+        self.times: list[datetime] = []
+        self.qty: list[Decimal] = []
+        self.cost: list[Decimal] = []
+        self.currencies: set[str] = set()
+
+    def copy(self) -> "_Ledger":
+        out = _Ledger()
+        out.times, out.qty, out.cost = list(self.times), list(self.qty), list(self.cost)
+        out.currencies = set(self.currencies)
+        return out
+
+    def add(self, at: datetime, dq: Decimal, dc: Decimal, cur: str) -> None:
+        i = bisect_right(self.times, at)
+        q0, c0 = (self.qty[i - 1], self.cost[i - 1]) if i else (_ZERO, _ZERO)
+        with localcontext(DOMAIN_CONTEXT):
+            self.times.insert(i, at)
+            self.qty.insert(i, q0 + dq)
+            self.cost.insert(i, c0 + dc)
+            for j in range(i + 1, len(self.times)):
+                self.qty[j] += dq
+                self.cost[j] += dc
+        if cur:
+            self.currencies.add(cur)
+
+    def at(self, t: datetime) -> tuple[Decimal, Decimal]:
+        i = bisect_right(self.times, t)
+        return (self.qty[i - 1], self.cost[i - 1]) if i else (_ZERO, _ZERO)
+
+
+def _single_currency(currencies: set[str]) -> None:
+    """A holding's cost has one currency. `materialize` cannot total mixed cost
+    currencies either (it raises CurrencyMismatchError); here it is a typed refusal."""
+    if len(currencies) > 1:
+        raise JournalError("cost_currency_mixed", f"cost in {sorted(currencies)}")
+
+
 class Journal:
     """Append-only financial journal. `recorded_at` is non-decreasing."""
 
     def __init__(self) -> None:
+        self.journal_id = uuid4().hex  # identity a preview binds to; copies differ
         self._entries: list[Entry] = []
         self._by_key: dict[tuple[str, ...], JournalEvent] = {}
         self._by_id: dict[str, Entry] = {}
+        self._counts: dict[str, int] = {}
+        self._ledgers: dict[_HoldingKey, _Ledger] = {}
         self.conflicts: list[Conflict] = []
+
+    def copy(self) -> "Journal":
+        """An independent journal (new id) with the same immutable entries."""
+        out = Journal()
+        out._entries, out.conflicts = list(self._entries), list(self.conflicts)
+        out._by_key, out._by_id = dict(self._by_key), dict(self._by_id)
+        out._counts = dict(self._counts)
+        out._ledgers = {k: v.copy() for k, v in self._ledgers.items()}
+        return out
+
+    def revision(self, account_id: str) -> int:
+        """Account revision: 1 + the account's entries. The journal is append-only,
+        so any change to the account raises it (T008 C-04: revisions start at 1)."""
+        return 1 + self._counts.get(account_id, 0)
 
     def _check(
         self,
@@ -100,8 +199,8 @@ class Journal:
         if type(event) is not JournalEvent:
             raise TypeError("post takes a JournalEvent")
         pending = pending or {}
-        keyed = {**self._by_key, **{e.key: e for e in pending.values()}}
-        prior = keyed.get(event.key)
+        keyed = {e.key: e for e in pending.values()}  # no copy of the whole index
+        prior = keyed.get(event.key) or self._by_key.get(event.key)
         if prior is not None:
             same = prior.event_id == event.event_id
             return Outcome.DUPLICATE if same else Outcome.CONFLICT
@@ -116,15 +215,22 @@ class Journal:
             if target is None or target.account_id != event.account_id:
                 raise JournalError("link_unknown", f"no event {link} in this account")
         if event.supersedes is not None and (
-            ("reversal", event.account_id, event.supersedes) not in keyed
+            (rkey := ("reversal", event.account_id, event.supersedes)) not in keyed
+            and rkey not in self._by_key
         ):
             raise JournalError("supersede_unreversed", "reverse the original first")
         if event.kind is EventKind.SELL:
-            after = [*self.events(), *pending.values(), event]
-            pos = materialize(after, effective_as_of=event.effective_at)
-            for u in event.units:
-                held = pos.holding(event.account_id, u.instrument_id).quantity
-                if u.account is UnitAccount.POSITION and held.value < 0:
+            t = event.effective_at
+            later = [e for e in pending.values() if e.effective_at <= t]
+            for k, (dq, _, cur) in _deltas(event).items():
+                ledger = self._ledgers.get(k)
+                _single_currency(
+                    {cur} - {""} | (ledger.currencies if ledger else set())
+                )
+                held = (ledger.at(t)[0] if ledger else _ZERO) + dq
+                with localcontext(DOMAIN_CONTEXT):
+                    held += sum((_deltas(e).get(k, (_ZERO,))[0] for e in later), _ZERO)
+                if held < 0:
                     raise JournalError("short_sale_unsupported", "sale exceeds units")
         return Outcome.POSTED
 
@@ -133,6 +239,9 @@ class Journal:
         self._entries.append(entry)
         self._by_key[event.key] = event
         self._by_id[event.event_id] = entry
+        self._counts[event.account_id] = self._counts.get(event.account_id, 0) + 1
+        for k, (dq, dc, cur) in _deltas(event).items():
+            self._ledgers.setdefault(k, _Ledger()).add(event.effective_at, dq, dc, cur)
 
     def _conflict(self, event: JournalEvent) -> Outcome:
         existing = self._by_key[event.key].event_id
@@ -181,8 +290,20 @@ class Journal:
         """The position at `h.effective_at` from current knowledge, ignoring any event
         already held under the same source record (so a re-import is a no-op)."""
         key = ("record", h.account_id, h.source.source_id, h.source.record_id)
-        events = [e for e in self.events() if e.key != key]
-        return materialize(events, h.effective_at).holding(h.account_id, instrument_id)
+        k, t = (h.account_id, instrument_id), h.effective_at
+        ledger = self._ledgers.get(k)
+        if ledger is None:
+            return Holding(h.account_id, instrument_id, Quantity(0), None)
+        _single_currency(ledger.currencies)
+        qty, cost = ledger.at(t)
+        own = self._by_key.get(key)
+        if own is not None and own.effective_at <= t:
+            dq, dc, _ = _deltas(own).get(k, (_ZERO, _ZERO, ""))
+            with localcontext(DOMAIN_CONTEXT):
+                qty, cost = qty - dq, cost - dc
+        cur = next(iter(ledger.currencies), "")
+        known = Money.of(cost, cur) if cost else None  # net zero is unknown, not 0
+        return Holding(h.account_id, instrument_id, Quantity(qty), known)
 
     def sell(
         self,

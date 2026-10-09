@@ -7,6 +7,7 @@ the file, or from an independent exact `Fraction` model in the test.
 
 import csv
 import json
+from collections.abc import Iterable
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from decimal import ROUND_DOWN, Decimal
@@ -19,13 +20,14 @@ import pytest
 from hypothesis import given, settings
 from hypothesis import strategies as st
 from qw_domain.corporate_actions import PositiveRatio, SourceRef, Split
-from qw_domain.decimals import Money, PositiveQuantity, Price
+from qw_domain.decimals import CurrencyMismatchError, Money, PositiveQuantity, Price
 from qw_domain.decimals import Quantity as Q
 from qw_domain.identity import InstrumentId
 from qw_domain.instants import parse_instant
 from qw_domain.journal import Journal, ObservationLog, Outcome, Positions, materialize
 from qw_domain.postings import (
     Header,
+    Holding,
     JournalError,
     JournalEvent,
     SourceObservation,
@@ -436,3 +438,125 @@ def test_average_cost_against_exact_model(
 
 def math_floor_milli(x: Fraction) -> Fraction:
     return Fraction(x.numerator * 1000 // x.denominator, 1000)
+
+
+# ---- Holding ledger (T014 A0): differential against materialize as the oracle
+
+LEDGER_OPS = st.lists(
+    st.tuples(
+        st.sampled_from(
+            ["buy", "buy", "sell", "raw_sell", "split", "reverse", "replay"]
+        ),
+        st.integers(0, 15),  # effective day, in any order, so many are back-dated
+        st.integers(1, 40),  # quantity
+        st.sampled_from([SYN, SYN2]),
+        st.integers(0, 99),  # picks an earlier event, a fee or a ratio
+    ),
+    min_size=1,
+    max_size=25,
+)
+
+
+def oracle(events: Iterable[JournalEvent], h: Header, iid: InstrumentId) -> Holding:
+    key = ("record", h.account_id, h.source.source_id, h.source.record_id)
+    rest = [e for e in events if e.key != key]
+    return materialize(rest, h.effective_at).holding(h.account_id, iid)
+
+
+def apply_op(
+    journal: Journal, n: int, op: tuple[str, int, int, InstrumentId, int]
+) -> None:
+    kind, day, q, iid, pick = op
+    h, at, events = (
+        hdr(f"{kind}{n}", day=day),
+        T0 + timedelta(minutes=n),
+        journal.events(),
+    )
+    if kind == "raw_sell":  # a stale snapshot claims enough units; the guard decides
+        actual = oracle(events, h, iid).quantity.value
+        exact = {0: actual + 1, 1: actual}.get(pick % 3, Decimal(q))
+        size = exact if exact > 0 else Decimal(q)  # one over, exactly all, or any
+        stale = Holding(ACCT, iid, Q(max(actual, Decimal(0)) + size), usd(100))
+        ev = sell(h, PositiveQuantity(size), Price(4), usd(0), stale)
+        if oracle([*events, ev], hdr("probe", day=day), iid).quantity.value < 0:
+            with pytest.raises(JournalError, match="short_sale_unsupported"):
+                journal.post(ev, at)
+        else:
+            assert journal.post(ev, at) is Outcome.POSTED
+        return
+    try:
+        if kind == "buy":
+            journal.post(buy(h, iid, PositiveQuantity(q), Price(3), usd(pick % 3)), at)
+        elif kind == "sell":
+            journal.sell(h, iid, PositiveQuantity(q), Price(4), usd(1), at)
+        elif kind == "split":
+            ratio = PositiveRatio(2, 1) if pick % 2 else PositiveRatio(1, 2)
+            journal.split(h, split_action(ratio, iid, n), at)
+        elif events and kind == "reverse":
+            target = events[pick % len(events)]
+            if target.reverses is None:
+                journal.reverse(target.event_id, SourceRef("SYN-REV", f"R{n}"), at)
+        elif events:
+            assert journal.post(events[pick % len(events)], at) is Outcome.DUPLICATE
+    except JournalError as exc:
+        assert exc.code in {
+            "short_sale_unsupported",
+            "cost_unknown",
+            "split_not_long",
+            "split_fraction",
+        }
+
+
+@PROFILE
+@given(LEDGER_OPS)
+def test_ledger_holdings_and_sell_guard_match_materialize(
+    ops: list[tuple[str, int, int, InstrumentId, int]],
+) -> None:
+    journal = Journal()
+    for n, op in enumerate(ops):
+        apply_op(journal, n, op)
+        events = journal.events()
+        own = [e.source.record_id for e in events if e.reverses is None]
+        for record in ["no-such-record", *own[-3:]]:  # own-record exclusion
+            for day in (0, op[1], 16):
+                h = hdr(record, day=day)
+                for iid in (SYN, SYN2):
+                    assert journal.holding(h, iid) == oracle(events, h, iid)
+        copy = journal.copy()
+        assert copy.events() == events and copy.journal_id != journal.journal_id
+        late = T0 + timedelta(days=1)
+        copy.post(buy(hdr("copy"), SYN, PositiveQuantity(1), Price(1), usd(0)), late)
+        h = hdr("probe", day=16)
+        assert journal.holding(h, SYN) == oracle(events, h, SYN)  # copies are deep
+        assert journal.revision(ACCT) == 1 + len(events)
+
+
+def test_mixed_cost_currencies_are_refused_like_materialize() -> None:
+    journal = Journal()
+    journal.post(buy(hdr("B1"), SYN, PositiveQuantity(5), Price(2), usd(0)), T0)
+    cad = Money.of(0, "CAD")
+    journal.post(buy(hdr("B2", day=1), SYN, PositiveQuantity(5), Price(2), cad), T0)
+    with pytest.raises(CurrencyMismatchError):
+        materialize(journal.events())
+    with pytest.raises(JournalError, match="cost_currency_mixed"):
+        journal.holding(hdr("S", day=2), SYN)
+    stale = Holding(ACCT, SYN, Q(10), usd(20))
+    raw = sell(hdr("S", day=2), PositiveQuantity(1), Price(2), usd(0), stale)
+    with pytest.raises(JournalError, match="cost_currency_mixed"):
+        journal.post(raw, T0)
+    with pytest.raises(JournalError, match="cost_currency_mixed"):
+        journal.sell(hdr("S", day=2), SYN, PositiveQuantity(1), Price(2), usd(0), T0)
+    assert len(journal.events()) == 2
+
+
+def test_sell_guard_counts_the_pending_reversal_of_a_corrected_sale() -> None:
+    journal = Journal()
+    journal.post(buy(hdr("B"), SYN, PositiveQuantity(10), Price(5), usd(0)), T0)
+    held = journal.holding(hdr("S", day=1), SYN)
+    original = sell(hdr("S", day=1), PositiveQuantity(10), Price(6), usd(0), held)
+    assert journal.post(original, T0) is Outcome.POSTED
+    fixed = sell(hdr("S-corr", day=1), PositiveQuantity(10), Price(7), usd(0), held)
+    assert journal.correct(replace(fixed, supersedes=original.event_id), T0) is (
+        Outcome.POSTED
+    )
+    assert journal.holding(hdr("probe", day=2), SYN).quantity == Q(0)
