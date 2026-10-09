@@ -28,6 +28,7 @@ from qw_domain.corporate_actions import (
     SymbolChange,
     adjust_option,
     apply_to_master,
+    replay_option,
 )
 from qw_domain.decimals import Money, Multiplier, PositiveQuantity, Price
 from qw_domain.identity import InstrumentId, Listing, Mic, Resolution, SecurityMaster
@@ -369,3 +370,63 @@ def test_property_split_conserves_entitlement(nd: tuple[int, int], cents: int) -
     rest = [d.units for d in out.deliverables if isinstance(d, CashInLieu)]
     assert whole.denominator == 1 and all(0 < r < 1 for r in rest)
     assert whole + sum(rest, Fraction(0)) == Fraction(qty) * nd[0] / nd[1]
+
+
+def test_event_is_never_applied_twice() -> None:
+    v1 = Split(**head(), ratio=PositiveRatio(2, 1))
+    once = adjust_option(contract(), v1)
+    assert once.applied_actions == (("ca-1", 1),)
+    v2 = replace(v1, version=2, known_at=KNOWN + timedelta(days=1))
+    for again in (v1, v2):  # a duplicate, or a correction stacked on v1 (not 400)
+        with pytest.raises(CorporateActionError, match="replay"):
+            adjust_option(once, again)
+
+
+def test_correction_is_absorbed_by_replay_from_base_terms() -> None:
+    log = CorporateActionLog()
+    log.record(Split(**head(), ratio=PositiveRatio(2, 1)))
+    log.record(Split(**head(version=2, known_at=KNOWN + timedelta(days=2)),
+                     ratio=PositiveRatio(3, 2)))  # fmt: skip
+    log.record(SpinOff(**head(event_id="ca-9", effective=D(2026, 11, 3)),
+                       status="terms_known", spun_off_id=NEW,
+                       units_per_share=PositiveRatio(1, 10)))  # fmt: skip
+    base = contract()
+    early = replay_option(base, log, KNOWN + timedelta(days=1))
+    # 100 x 2 = 200, then the spin-off on 200 held: 200 / 10 = 20 new.
+    assert early.deliverables == (units(UND, "200"), units(NEW, "20"))
+    assert early.applied_actions == (("ca-1", 1), ("ca-9", 1))
+    late = replay_option(base, log)  # v2 replaces v1: 150 held, 15 new
+    assert late.deliverables == (units(UND, "150"), units(NEW, "15"))
+    assert late.applied_actions == (("ca-1", 2), ("ca-9", 1))
+    assert late.terms_version == 3 and not late.terms_verified
+    assert replay_option(base, log, KNOWN - timedelta(seconds=1)) is base
+    stale = replace(base, applied_actions=(("ca-0", 1),))  # not from the log
+    for not_base in (early, stale):
+        with pytest.raises(CorporateActionError, match="no actions"):
+            replay_option(not_base, log)
+
+
+def test_correction_may_move_effective_date_but_not_instrument() -> None:
+    log = CorporateActionLog()
+    v1 = Split(**head(), ratio=PositiveRatio(2, 1))
+    log.record(v1)
+    later = KNOWN + timedelta(days=1)
+    with pytest.raises(CorporateActionError, match="instrument"):
+        log.record(replace(v1, version=2, known_at=later, instrument_id=ACQ))
+    moved = replace(v1, version=2, known_at=later, effective=D(2026, 11, 9))
+    log.record(moved)  # a revised ex/effective date is an ordinary correction
+    assert [e.effective for e in log.history("ca-1")] == [
+        D(2026, 11, 2),
+        D(2026, 11, 9),
+    ]
+
+
+def test_ratio_terms_are_bounded() -> None:
+    for text in ("1" * 5000, "0." + "0" * 30 + "1", "1" * 19):
+        with pytest.raises(CorporateActionError):
+            PositiveRatio.from_decimal(text)
+    with pytest.raises(CorporateActionError):
+        PositiveRatio.from_decimal(Decimal("1e5000"))
+    with pytest.raises(CorporateActionError):
+        PositiveRatio(10**18 + 1, 1)
+    assert PositiveRatio(10**18, 10**18 - 1).numerator == 10**18

@@ -8,7 +8,13 @@ or spin-off terms are declared (`status="terms_unknown"`), never guessed.
 Effects here are pure: `apply_to_master` returns a new `SecurityMaster` (a symbol
 change adds the new listing interval; nothing else changes identity) and
 `adjust_option` returns a new, adjusted and unverified `OptionContract` version.
-Ledger postings and unit adjustments belong to T012.
+Each event id is absorbed at most once (`applied_actions`); a correction is absorbed
+by `replay_option` from the base terms, never stacked on the superseded version.
+Ledger postings, unit adjustments and quarantine of unknown actions belong to T012.
+
+Recorded limitation: ordinary cash dividends never adjust option terms, and whether a
+dividend is `special` is supplied by the source. A mislabelled extraordinary dividend
+therefore leaves a verified contract unchanged; detecting it is T012 quarantine work.
 
 Deliverable arithmetic is per original contract: units are multiplied exactly, whole
 units stay deliverable and a fractional remainder becomes `CashInLieu` with an unknown
@@ -43,7 +49,8 @@ class CorporateActionError(ValueError):
 
 _ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}", re.ASCII)  # ledger_event ids
 _RECORD = re.compile(r"[\x20-\x7e]{1,256}", re.ASCII)
-_DECIMAL = re.compile(r"[0-9]+(\.[0-9]+)?", re.ASCII)
+_DECIMAL = re.compile(r"[0-9]{1,18}(\.[0-9]{1,18})?", re.ASCII)
+_MAX_TERM = 10**18
 
 
 def _check_id(value: object, what: str) -> None:
@@ -54,7 +61,8 @@ def _check_id(value: object, what: str) -> None:
 @dataclass(frozen=True, slots=True)
 class PositiveRatio:
     """An exact ratio `numerator:denominator` of positive ints, kept in lowest terms.
-    For a split it is new units per old unit: 2:1 forward, 1:10 reverse."""
+    For a split it is new units per old unit: 2:1 forward, 1:10 reverse. Terms are
+    bounded by 10**18 after reduction, which keeps them printable and storable."""
 
     numerator: int
     denominator: int
@@ -65,6 +73,8 @@ class PositiveRatio:
         if self.numerator < 1 or self.denominator < 1:
             raise CorporateActionError(f"ratio {self.to_wire()} must be positive")
         exact = Fraction(self.numerator, self.denominator)
+        if max(exact.numerator, exact.denominator) > _MAX_TERM:
+            raise CorporateActionError("ratio terms exceed 10**18")
         object.__setattr__(self, "numerator", exact.numerator)
         object.__setattr__(self, "denominator", exact.denominator)
 
@@ -79,7 +89,12 @@ class PositiveRatio:
             raise TypeError(f"ratio must be str or Decimal: {type(value).__name__}")
         if not value.is_finite() or value <= 0:
             raise CorporateActionError(f"ratio {safe_repr(value)} must be positive")
-        return cls(*value.as_integer_ratio())
+        try:  # e.g. the int digit limit for huge exponents
+            return cls(*value.as_integer_ratio())
+        except (ValueError, OverflowError) as exc:
+            if isinstance(exc, CorporateActionError):
+                raise
+            raise CorporateActionError(f"ratio {safe_repr(value)}: {exc}") from None
 
     def fraction(self) -> Fraction:
         return Fraction(self.numerator, self.denominator)
@@ -266,8 +281,12 @@ type CorporateAction = (
 
 
 class CorporateActionLog:
-    """Append-only versions per event id. Version n+1 must keep the event kind and be
-    known strictly later than version n; nothing recorded is ever replaced."""
+    """Append-only versions per event id. Version n+1 must keep the event kind and
+    instrument and be known strictly later than version n; nothing recorded is ever
+    replaced. A correction may change the effective date and terms (both stay visible
+    in `history`). It may not move the event to another instrument: effects already
+    derived for the first instrument would silently lose their cause, so a wrong
+    instrument is corrected by a new event id."""
 
     def __init__(self) -> None:
         self._versions: dict[str, tuple[CorporateAction, ...]] = {}
@@ -278,6 +297,8 @@ class CorporateActionLog:
             raise CorporateActionError(f"expected version {len(history) + 1}")
         if history and type(event) is not type(history[-1]):
             raise CorporateActionError("a correction cannot change the event kind")
+        if history and event.instrument_id != history[-1].instrument_id:
+            raise CorporateActionError("a correction cannot change the instrument")
         if history and event.known_at <= history[-1].known_at:
             raise CorporateActionError("a correction must be known later")
         self._versions[event.event_id] = (*history, event)
@@ -377,7 +398,7 @@ def _affects(contract: OptionContract, event: CorporateAction) -> bool:
     if isinstance(event, SymbolChange) or (
         isinstance(event, CashDividend) and not event.special
     ):
-        return False  # identity and ordinary dividends leave terms unchanged
+        return False  # identity and ordinary dividends leave terms unchanged (see top)
     held = {
         d.instrument_id for d in contract.deliverables if isinstance(d, UnitDeliverable)
     }
@@ -386,7 +407,12 @@ def _affects(contract: OptionContract, event: CorporateAction) -> bool:
 
 def adjust_option(contract: OptionContract, event: CorporateAction) -> OptionContract:
     """The next terms version after `event`, adjusted and unverified, so it stays
-    blocked from live sizing until verified (F-14); `contract` itself if unaffected."""
+    blocked from live sizing until verified (F-14); `contract` itself if unaffected.
+    An event id already in `applied_actions` is rejected, whatever its version."""
+    if any(event.event_id == applied for applied, _ in contract.applied_actions):
+        raise CorporateActionError(
+            f"{event.event_id} already applied; replay corrections from base terms"
+        )
     if not _affects(contract, event):
         return contract
     items: list[Deliverable] = []
@@ -401,4 +427,23 @@ def adjust_option(contract: OptionContract, event: CorporateAction) -> OptionCon
         adjusted=True,
         terms_verified=False,
         terms_version=contract.terms_version + 1,
+        applied_actions=(*contract.applied_actions, (event.event_id, event.version)),
     )
+
+
+def replay_option(
+    base: OptionContract,
+    log: CorporateActionLog,
+    known_as_of: datetime | None = None,
+) -> OptionContract:
+    """Rebuild terms from `base` (terms before any logged action) with the current
+    version of each logged event known at `known_as_of`, in (effective, event_id)
+    order. This is how a correction replaces the version it supersedes."""
+    if base.applied_actions:
+        raise CorporateActionError("replay starts from base terms with no actions")
+    out = base
+    for event in sorted(
+        log.events(known_as_of), key=lambda e: (e.effective, e.event_id)
+    ):
+        out = adjust_option(out, event)
+    return out

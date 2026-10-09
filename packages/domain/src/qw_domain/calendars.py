@@ -90,6 +90,8 @@ class CalendarVersion:
         if not self.open < self.close:
             raise CalendarError(f"{self.version}: open must precede close")
         dates = {*self.holidays, *self.early_closes, *self.adhoc_closures}
+        for special in dates:
+            require_date(special, "special date")
         if any(not self.covers(d) for d in dates):
             raise CalendarError(f"{self.version}: special date outside its range")
         if any(not self.open < t < self.close for t in self.early_closes.values()):

@@ -99,7 +99,10 @@ _CURRENCY = re.compile(r"[A-Z]{3}", re.ASCII)
 
 @dataclass(frozen=True, slots=True)
 class OptionContract:
-    """One version (`terms_version`) of a listed option contract's terms."""
+    """One version (`terms_version`) of a listed option contract's terms.
+
+    `applied_actions` lists the corporate actions, as (event_id, version), absorbed
+    into these terms since the base terms; an event id appears at most once."""
 
     contract_id: InstrumentId
     underlying_id: InstrumentId
@@ -114,8 +117,22 @@ class OptionContract:
     adjusted: bool
     terms_verified: bool
     terms_version: int
+    applied_actions: tuple[tuple[str, int], ...] = ()
 
     def __post_init__(self) -> None:
+        applied = self.applied_actions
+        if type(applied) is not tuple or any(
+            type(a) is not tuple
+            or len(a) != 2
+            or not isinstance(a[0], str)
+            or not a[0]
+            or type(a[1]) is not int
+            or a[1] < 1
+            for a in applied
+        ):
+            raise ValueError("applied_actions must be (event_id, version) tuples")
+        if len({event_id for event_id, _ in applied}) != len(applied):
+            raise ValueError("a corporate action is applied at most once")
         if _CURRENCY.fullmatch(self.strike_currency) is None:
             raise ValueError(f"strike currency {safe_repr(self.strike_currency)}")
         if self.strike.value <= 0:

@@ -211,11 +211,20 @@ def test_trading_day_argument_follow_ups() -> None:
         {"early_closes": {D(2026, 11, 29): time(13)}},  # Sunday
         {"weekend": frozenset({7})},
         {"effective_from": datetime(2026, 1, 1, tzinfo=UTC)},
+        {"holidays": frozenset({datetime(2026, 11, 26, tzinfo=UTC)})},
+        {"early_closes": {datetime(2026, 11, 27, tzinfo=UTC): time(13)}},
     ],
 )  # fmt: skip
 def test_version_rejects_inconsistent_special_dates(change: dict[str, Any]) -> None:
     with pytest.raises((TypeError, CalendarError)):
         _version(**change)
+
+
+def test_special_dates_must_be_dates() -> None:
+    noon = datetime(2026, 11, 26, 12, tzinfo=UTC)
+    for change in ({"holidays": frozenset({noon})}, {"early_closes": {noon: time(13)}}):
+        with pytest.raises(TypeError, match="special date"):
+            _version(**change)
 
 
 def test_duplicate_weekend_and_version_names_are_rejected() -> None:

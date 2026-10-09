@@ -92,6 +92,9 @@ INCOMPLETE: list[dict[str, Any]] = [
 INVALID: list[dict[str, Any]] = [
     {"strike_currency": "usd"}, {"terms_version": 0}, {"strike": Price("0")},
     {"deliverables": (UnitDeliverable(CID, PositiveQuantity("1")),)},  # itself
+    {"applied_actions": (("ca-1", 1), ("ca-1", 2))},  # one event id, twice
+    {"applied_actions": [("ca-1", 1)]}, {"applied_actions": (("ca-1", True),)},
+    {"applied_actions": (("", 1),)}, {"applied_actions": (("ca-1", 1, 2),)},
 ]  # fmt: skip
 
 
