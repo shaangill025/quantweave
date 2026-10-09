@@ -41,6 +41,7 @@ from qw_domain.proposals import (
     Reason,
     cash_requirement,
     dismiss,
+    expire,
     mark_planned,
     policy_mode,
     publish,
@@ -299,6 +300,10 @@ def test_late_review_and_late_decisions_cannot_activate() -> None:
     assert not gone.accepted and Code.EXPIRED in codes(gone.reasons)
     with pytest.raises(ProposalError, match="time_regressed"):
         mark_planned(q, 1, cur(AT - T(seconds=1)))
+    # The input-free sweep records exactly what settle records, and only when due.
+    assert expire(q, AT + T(minutes=30) - T(microseconds=1)) is q
+    assert expire(q, AT + T(minutes=30)) == gone.proposal
+    assert expire(gone.proposal, AT + T(hours=1)) is gone.proposal
 
 
 def test_revision_supersedes_keeps_scope_and_is_bounded() -> None:
