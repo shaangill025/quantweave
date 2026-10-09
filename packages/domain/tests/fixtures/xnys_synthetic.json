@@ -1,0 +1,15 @@
+{
+  "provenance": "SYNTHETIC TEST DATA. A small hand-picked subset of XNYS holidays and early closes for 2026-2027 test years. NOT authoritative and NOT complete; the real calendar source is a T021/T022 qualification item.",
+  "calendar_id": "XNYS",
+  "tz": "America/New_York",
+  "versions": [
+    {"version": "synthetic-2026.1", "effective_from": "2026-01-01", "effective_to": "2026-12-01",
+     "open": "09:30", "close": "16:00", "weekend": ["sat", "sun"],
+     "holidays": ["2026-07-03", "2026-11-26"], "early_closes": {"2026-11-27": "13:00"},
+     "adhoc_closures": []},
+    {"version": "synthetic-2026.2", "effective_from": "2026-12-01", "effective_to": "2028-01-01",
+     "open": "09:30", "close": "16:00", "weekend": ["sat", "sun"],
+     "holidays": ["2026-12-25", "2027-01-01"], "early_closes": {"2026-12-24": "13:00"},
+     "adhoc_closures": ["2026-12-31"]}
+  ]
+}
