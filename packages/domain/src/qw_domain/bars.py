@@ -13,12 +13,16 @@
   feed's own volume: an exchange-limited feed's volume is not consolidated volume.
 - A bar is known from `knowledge_at` (at least its end). Corrections are appended as
   new versions in `BarBook`; readers see the latest version known at their time.
+- Trailing loss (trades lost before a disconnect, with no later sequence) is only
+  detectable with end-of-interval markers or heartbeats (`Marker`). When markers are
+  given, a bin is built only if a marker known at the build time confirms it: a
+  marker whose sequence is ahead of the trades received opens a `trailing_loss` gap,
+  and everything after the last known marker is an `unconfirmed` gap. Without
+  markers (`None`) completeness at the end of an interval is not checked.
 - Live trades pass the T021 ingestion gate (`ingest.require_ingest`) at the build
-  time. `retrospective` marks bars reconstructed after the fact (recovery is
-  increment 2); a retrospective bar is a separate record, never a version of a live
-  one.
-LIMITATIONS: no coverage accounting, recovery or EOD/delayed history ingestion yet
-(increment 2); no persistence. Stdlib only.
+  time. `retrospective` marks bars reconstructed after the fact (`coverage.recover`);
+  a retrospective bar is a separate record, never a version of a live one.
+LIMITATION: no persistence. Stdlib only.
 """
 
 from bisect import bisect_right
@@ -212,6 +216,50 @@ class Gap:
 
 
 @dataclass(frozen=True, slots=True)
+class Marker:
+    """End-of-interval marker or heartbeat of one (feed, instrument) stream: every
+    trade with `event_at < at` has a sequence <= `last_sequence` (0: none yet), and
+    no later trade does."""
+
+    feed_id: str
+    instrument_id: InstrumentId
+    at: datetime
+    last_sequence: int
+    received_at: datetime
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "at", ensure_aware_utc(self.at))
+        object.__setattr__(self, "received_at", ensure_aware_utc(self.received_at))
+        if type(self.last_sequence) is not int or self.last_sequence < 0:
+            raise BarError("last_sequence must be a non-negative int")
+
+
+def _marker_gaps(
+    known: dict[int, Trade], markers: Iterable[Marker], as_of: datetime, since: datetime
+) -> list[Gap]:
+    """Trailing-loss gaps, and an `unconfirmed` gap after the last known marker.
+    Sequences are assumed to start at 1; a later marker with a lower sequence adds
+    nothing and is not flagged."""
+    gaps: list[Gap] = []
+    confirmed, sent = since, 0  # last boundary and the sequence it confirmed
+    known_marks = (m for m in markers if m.received_at <= as_of)
+    # Markers sharing a time: the highest sequence first, so input order is irrelevant.
+    for m in sorted(known_marks, key=lambda m: (m.at, -m.last_sequence)):
+        # Sequences in (sent, last] belong to trades with event_at in [confirmed, at);
+        # no order between sequence and event time is assumed inside that window.
+        seen = sum(1 for q in known if sent < q <= m.last_sequence)
+        if seen < m.last_sequence - sent:
+            top = max((q for q in known if q <= m.last_sequence), default=0)
+            why = "trailing_loss" if top < m.last_sequence else "sequence_gap"
+            end = m.at - timedelta(microseconds=1)  # the marker bound is exclusive
+            gaps.append(Gap(min(confirmed, end), end, why))
+        confirmed, sent = max(confirmed, m.at), max(sent, m.last_sequence)
+    if confirmed < as_of:
+        gaps.append(Gap(confirmed, as_of, "unconfirmed"))
+    return gaps
+
+
+@dataclass(frozen=True, slots=True)
 class BarBuild:
     bars: tuple[Bar, ...]
     rejected: tuple[tuple[Trade, str], ...]
@@ -232,8 +280,10 @@ def build_bars(
     latency: FeedLatency,
     rights: IngestRights,
     extended: ExtendedHours | None = None,
+    markers: Iterable[Marker] | None = None,
 ) -> BarBuild:
-    """Bars of one instrument on `rights.feed_id`, as known at `rights.received_at`."""
+    """Bars of one instrument on `rights.feed_id`, as known at `rights.received_at`;
+    with `markers`, only bins that a known marker confirms complete."""
     if type(rights) is not IngestRights:
         raise TypeError("bar construction needs IngestRights")
     items = list(trades)
@@ -241,6 +291,10 @@ def build_bars(
         t.instrument_id != instrument_id or t.feed_id != rights.feed_id for t in items
     ):
         raise BarError("every trade must be of this instrument and feed")
+    marks = None if markers is None else list(markers)
+    if marks and any((m.feed_id, m.instrument_id) != (rights.feed_id, instrument_id)
+                     for m in marks):  # fmt: skip
+        raise BarError("every marker must be of this instrument and feed")
     require_ingest(rights)
     as_of, grid = rights.received_at, session_grid(calendar, day, interval, extended)
     rejected: list[tuple[Trade, str]] = []
@@ -261,6 +315,9 @@ def build_bars(
         for a, b in pairwise(sorted(first.values(), key=lambda t: t.sequence))
         if b.sequence > a.sequence + 1
     )
+    if marks is not None:
+        since = grid[0].start if grid else as_of
+        gaps += tuple(_marker_gaps(first, marks, as_of, since))
     bins: dict[Slot, list[Trade]] = {}
     for t in first.values():
         slot = _locate(grid, t.event_at)

@@ -17,11 +17,17 @@ streams) is exposed, never hidden behind rotation that masquerades as continuity
   meet its need.
 - Every demand is either served or reported uncovered with each feed's reason; the
   uncovered instruments are the scheduled-discovery set.
+- `discovery_jobs` turns the uncovered set into scheduled-research job requests for
+  T025 (`adapters.jobs.enqueue`): sorted batches within a per-job quota, an
+  idempotency key over (calendar, session date, batch) so re-planning the same day
+  does not duplicate work, and the session close as deadline.
 LIMITATION: the stream cap, entitled instruments and latency class are a
 caller-supplied trust boundary (`StreamFeed`): T021 records no quotas yet.
 Stdlib only.
 """
 
+import hashlib
+import json
 from collections import deque
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
@@ -29,10 +35,12 @@ from datetime import datetime, timedelta
 from enum import StrEnum
 from types import MappingProxyType
 
+from qw_domain.calendars import Session
 from qw_domain.decimals import safe_repr
 from qw_domain.identity import InstrumentId
 from qw_domain.ingest import IngestDenied, IngestRights, require_ingest
 from qw_domain.instants import ensure_aware_utc
+from qw_domain.jobs import Priority
 from qw_domain.rights import DenyReason, Registry, UseScope
 from qw_domain.sources import ID_PATTERN
 
@@ -55,6 +63,10 @@ class FeedLatency(StrEnum):
 
     def satisfies(self, needed: "FeedLatency") -> bool:
         return self.rank <= needed.rank
+
+    @property
+    def real_time(self) -> bool:
+        return self.rank <= FeedLatency.REALTIME_EXCHANGE_LIMITED.rank
 
 
 class DemandClass(StrEnum):
@@ -278,3 +290,37 @@ def plan_streams(
     return StreamPlan(
         at, subs, tuple(uncovered), MappingProxyType(denied), MappingProxyType(hashes)
     )
+
+
+@dataclass(frozen=True, slots=True)
+class DiscoveryJob:
+    """A request for `adapters.jobs.enqueue` (kind, input_revision, priority,
+    payload, deadline_at)."""
+
+    kind: str
+    input_revision: str
+    priority: Priority
+    payload: dict[str, str | list[str]]
+    deadline_at: datetime
+
+
+def discovery_jobs(
+    plan: StreamPlan, session: Session, batch_size: int
+) -> tuple[DiscoveryJob, ...]:
+    """Scheduled-discovery jobs for the instruments the plan could not stream."""
+    if type(batch_size) is not int or batch_size < 1:
+        raise StreamError("batch_size must be a positive int")
+    wire = [i.to_wire() for i in plan.scheduled_discovery]
+    jobs = []
+    for n in range(0, len(wire), batch_size):
+        payload: dict[str, str | list[str]] = {
+            "calendar_id": session.calendar_id.code,
+            "session_date": session.session_date.isoformat(),
+            "instruments": wire[n : n + batch_size],
+            "reason": "not_streamed",
+        }
+        text = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+        key = hashlib.sha256(text.encode()).hexdigest()
+        kind, prio = "scheduled_discovery", Priority.SCHEDULED_RESEARCH
+        jobs.append(DiscoveryJob(kind, key, prio, payload, session.close_at))
+    return tuple(jobs)
