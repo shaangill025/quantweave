@@ -35,6 +35,7 @@ from test_research_data import AS_OF, EVENTS, ORIGINAL, event, freeze, iid, righ
 TENANT = "tenant-synth-a"
 MAT, CFG = "a" * 64, "b" * 64
 CAND = Candidate("fam-momentum", MAT, CFG)
+PROTO_HASH = "e" * 64  # SYNTHETIC evaluation protocol hash frozen with the plan
 TRAIN = Window(datetime(2020, 1, 1, tzinfo=UTC), datetime(2022, 1, 1, tzinfo=UTC))
 DEV = Window(datetime(2022, 2, 1, tzinfo=UTC), datetime(2023, 6, 1, tzinfo=UTC))
 PROMO = Window(datetime(2023, 7, 1, tzinfo=UTC), datetime(2025, 12, 31, tzinfo=UTC))
@@ -60,6 +61,7 @@ def plan(**kw: object) -> SplitPlan:
         "train": TRAIN, "development": DEV, "promotion": PROMO,
         "embargo": timedelta(days=30), "holdout_instruments": frozenset({iid(3)}),
         "max_promotion_accesses": 1, "approved_by": "owner-synth", "registered_at": T0,
+        "protocol_hash": PROTO_HASH,
     } | kw  # fmt: skip
     return SplitPlan(**args)  # type: ignore[arg-type]
 
@@ -86,7 +88,7 @@ def trial(
         "trial_id": f"trial-{n}", "plan_id": "plan-synth-1", "family": "fam-momentum",
         "hypothesis": "SYNTHETIC: 12-1 momentum ranks predict next-month returns",
         "material_hash": MAT, "config_hash": CFG, "split": split, "outcome": outcome,
-        "dataset_hash": DS.manifest.content_hash,
+        "dataset_hash": DS.manifest.content_hash, "protocol_hash": PROTO_HASH,
         "metrics": {"net_return": Decimal("0.0125")},
         "access_id": f"acc-{n}", "recorded_at": T0 + timedelta(hours=n, minutes=30),
     } | kw  # fmt: skip
@@ -231,6 +233,10 @@ def test_trial_binding_rules() -> None:
         lg.record(trial(1, Split.DEVELOPMENT))
     with pytest.raises(ResearchError, match="dataset_mismatch"):
         lg.record(trial(1, Split.TRAIN, dataset_hash="c" * 64))
+    with pytest.raises(ResearchError, match="protocol_changed"):
+        lg.record(trial(1, Split.TRAIN, protocol_hash="c" * 64))
+    with pytest.raises(ResearchError, match="protocol_hash"):
+        plan(protocol_hash="not-a-hash")
     with pytest.raises(ResearchError, match="metrics"):
         trial(1, Split.TRAIN, metrics={"sharpe": 1})
     lg = lg.record(trial(1, Split.TRAIN))
