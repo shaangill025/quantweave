@@ -35,6 +35,7 @@ from qw_domain.backtest import (
     trial_report,
     walk_forward,
 )
+from qw_domain.decimal_math import CTX
 from qw_domain.eval_stats import Z95, summarize
 from qw_domain.research_data import EvidenceClass, ResearchError
 from qw_domain.strategy_registry import EvidenceState
@@ -210,6 +211,8 @@ def test_claims_are_structured_and_costs_bounded() -> None:
     with pytest.raises(ResearchError, match="claim"):
         protocol(claim=DeclaredClaim(ClaimMetric.EXCESS_MEAN, Direction.POSITIVE,
                                      "bl-unknown"))  # fmt: skip
+    with pytest.raises(ResearchError, match="96"):  # metric keys stay valid ids
+        protocol(baselines=(replace(CASH, baseline_id="b" * 97),))
     for bad in ((D(1), D(0), D(0)), (D("0.5"), D("0.25"), D("0.25"))):
         with pytest.raises(ResearchError, match="cost"):
             CostModel(*bad)  # total rate must stay below 1
@@ -261,6 +264,41 @@ def test_synthetic_evaluation_is_capped_at_limited_and_claims_are_scoped() -> No
     redone = replace(bent, summary=summarize(nets, 1, Z95))  # consistent, not recorded
     with pytest.raises(ResearchError, match="metrics_mismatch"):
         claim_for(redone, lg)
+    # Part B follow-up: the recorded buy-and-hold excess mean is -0.004/3 (see the
+    # hand-computed test); a forged +0.05 excess, alone or with periods and summaries
+    # rebuilt to agree with it, is not the recorded figure.
+    hold, cash = ev.baselines
+    assert lg.trials()[0].metrics["baseline.bl-hold.excess_mean"] == hold.excess.mean
+    fake = replace(hold, excess=replace(hold.excess, mean=D("0.05")))
+    with pytest.raises(ResearchError, match="metrics_mismatch"):
+        claim_for(replace(ev, baselines=(fake, cash)), lg)
+    worse = tuple(replace(p, net=CTX.subtract(p.net, D("0.06"))) for p in hold.periods)
+    pairs = zip(ev.periods, worse, strict=True)
+    excess = [CTX.subtract(p.net, q.net) for p, q in pairs]
+    rebuilt = replace(hold, periods=worse, summary=summarize([p.net for p in worse], 1,
+                      Z95), excess=summarize(excess, 1, Z95))  # fmt: skip
+    with pytest.raises(ResearchError, match="metrics_mismatch"):
+        claim_for(replace(ev, baselines=(rebuilt, cash)), lg)
+    vol = replace(hold, excess=replace(hold.excess, volatility=D(9)))  # not recorded
+    with pytest.raises(ResearchError, match="metrics_mismatch"):
+        claim_for(replace(ev, baselines=(vol, cash)), lg)  # but not from the periods
+    # Review round 1: truncated baseline periods; a baseline whose first period
+    # claims no turnover or cost (gross set to the net -0.102); a strategy period
+    # with turnover 0 but cost 0.002; a strategy gross that is not net + cost.
+    short = replace(hold, periods=hold.periods[:-1])
+    p0 = replace(hold.periods[0], turnover=D(0), cost=D(0), gross=D("-0.102"))
+    free = replace(hold, periods=(p0, *hold.periods[1:]))
+    q0, q1 = replace(ev.periods[0], turnover=D(0)), replace(ev.periods[0], gross=D(0))
+    g0, g1, *rest = ev.periods  # gross +-0.1: same gross mean, net != gross - cost
+    swapped = (replace(g0, gross=g0.gross + D("0.1")),
+               replace(g1, gross=g1.gross - D("0.1")), *rest)  # fmt: skip
+    for bad in (replace(ev, baselines=(short, cash)),
+                replace(ev, baselines=(free, cash)),
+                replace(ev, periods=(q0, *ev.periods[1:])),
+                replace(ev, periods=(q1, *ev.periods[1:])),
+                replace(ev, periods=swapped)):  # fmt: skip
+        with pytest.raises(ResearchError, match="metrics_mismatch"):
+            claim_for(bad, lg)
 
 
 def test_failed_and_abandoned_trials_are_reported() -> None:
@@ -310,3 +348,17 @@ def test_claims_carry_every_ledger_trial_in_any_order(
     assert wire["significance_claimed"] is False
     assert {"ci_lower", "ci_upper", "ci_method"} <= set(wire)
     assert "edge" not in json.dumps(receipt).lower()
+
+
+def test_long_cash_rate_is_rounded_once_and_still_claims() -> None:
+    # a 47-digit cash rate is rounded to the 40-digit context when the periods are
+    # built, so the period arithmetic check agrees with it (review N1)
+    long_rate = D("0.00001234567890123456789012345678901234567890123")
+    cash = replace(CASH, cash_rate=long_rate)
+    pr = protocol(baselines=(cash,))
+    lg = ask(ledger(plan(protocol_hash=pr.content_hash)), 1, Split.TRAIN, TRAIN)[0]
+    lg, out = run_trial(lg, "trial-1", "SYNTHETIC", T0 + timedelta(hours=2), DS,
+                        rights(), "acc-1", pr, PX, scripted(["1", "0", "1", "0", "0"]),
+                        {"px-synth-1": PX})  # fmt: skip
+    assert out.evaluation is not None
+    assert claim_for(out.evaluation, lg).trial_count == 1

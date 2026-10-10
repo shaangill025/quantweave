@@ -218,6 +218,8 @@ class EvaluationProtocol:
         ids = [b.baseline_id for b in self.baselines if type(b) is Baseline]
         if not ids or len(set(ids)) != len(self.baselines):
             raise ResearchError("baselines", "distinct declared baselines required")
+        if any(len(i) > 96 for i in ids):  # keeps the recorded metric keys valid ids
+            raise ResearchError("baselines", "baseline ids of at most 96 characters")
         object.__setattr__(self, "declared_at", ensure_aware_utc(self.declared_at))
         c = self.claim
         if (
@@ -394,8 +396,9 @@ def walk_forward(
                 held[b.series_id], lag, [Decimal(1)] * len(weights), costs.rate
             )
         else:
-            bp = tuple(Period(p.start, p.end, Decimal(0), Decimal(0), Decimal(0),
-                              b.cash_rate, b.cash_rate) for p in periods)  # fmt: skip
+            r = CTX.plus(b.cash_rate)  # rounded once, as every other period figure
+            bp = tuple(Period(p.start, p.end, Decimal(0), Decimal(0), Decimal(0), r, r)
+                       for p in periods)  # fmt: skip
         excess = [CTX.subtract(p.net, q.net) for p, q in zip(periods, bp, strict=True)]
         results.append(BaselineResult(b, bp, summarize([p.net for p in bp], lags, z),
                                       summarize(excess, lags, z)))  # fmt: skip
@@ -404,7 +407,7 @@ def walk_forward(
         a, plan.dataset_hash, dataset.manifest.evidence_class, protocol,
         series.content_hash, hashes, series.instrument, periods,
         summarize([p.net for p in periods], lags, z), mean([p.gross for p in periods]),
-        CTX.plus(sum((p.cost for p in periods), Decimal(0))), tuple(results),
+        _total_cost(periods), tuple(results),
     )  # fmt: skip
 
 
@@ -417,7 +420,50 @@ def _metrics(ev: Evaluation) -> dict[str, Decimal]:
             m[k] = v
     if s.interval is not None:
         m["ci_lower"], m["ci_upper"] = s.interval.lower, s.interval.upper
+    for b in ev.baselines:  # recorded so a forged baseline comparison is caught
+        k = f"baseline.{b.baseline.baseline_id}."
+        m[k + "net_mean"], m[k + "excess_mean"] = b.summary.mean, b.excess.mean
+        m[k + "total_cost"] = _total_cost(b.periods)
+        if (i := b.excess.interval) is not None:
+            m[k + "excess_ci_lower"], m[k + "excess_ci_upper"] = i.lower, i.upper
     return m
+
+
+def _total_cost(periods: Iterable[Period]) -> Decimal:
+    return CTX.plus(sum((p.cost for p in periods), Decimal(0)))
+
+
+def _arithmetic(periods: tuple[Period, ...], rate: Decimal) -> bool:
+    """net = gross - cost and cost = turnover * rate in every period."""
+    return all(
+        p.net == CTX.subtract(p.gross, p.cost)
+        and p.cost == CTX.multiply(p.turnover, rate)
+        for p in periods
+    )
+
+
+def _consistent(ev: Evaluation) -> bool:
+    """The summaries follow from the periods (strategy and every baseline)."""
+    lags, z, rate = ev.protocol.hac_lags, ev.protocol.z, ev.protocol.costs.rate
+    if summarize([p.net for p in ev.periods], lags, z) != ev.summary:
+        return False
+    if not _arithmetic(ev.periods, rate) or (ev.gross_mean, ev.total_cost) != (
+        mean([p.gross for p in ev.periods]),
+        _total_cost(ev.periods),
+    ):
+        return False
+    if [b.baseline for b in ev.baselines] != list(ev.protocol.baselines):
+        return False
+    for b in ev.baselines:
+        if len(b.periods) != len(ev.periods) or not _arithmetic(b.periods, rate):
+            return False
+        pairs = zip(ev.periods, b.periods, strict=True)
+        ex = [CTX.subtract(p.net, q.net) for p, q in pairs]
+        if summarize([q.net for q in b.periods], lags, z) != b.summary:
+            return False
+        if summarize(ex, lags, z) != b.excess:
+            return False
+    return True
 
 
 @dataclass(frozen=True, slots=True)
@@ -544,11 +590,8 @@ def claim_for(ev: Evaluation, ledger: TrialLedger) -> ScopedClaim:
             and t.protocol_hash == ev.protocol.content_hash]  # fmt: skip
     if not done:
         raise ResearchError("trial_not_recorded", a.access_id)
-    nets, pr = [p.net for p in ev.periods], ev.protocol
-    if (
-        dict(done[0].metrics) != _metrics(ev)  # the numbers must be the recorded ones
-        or summarize(nets, pr.hac_lags, pr.z) != ev.summary  # and follow the periods
-    ):
+    # the numbers must be the recorded ones and follow from the periods
+    if dict(done[0].metrics) != _metrics(ev) or not _consistent(ev):
         raise ResearchError("metrics_mismatch", done[0].trial_id)
     report = ledger_report(ledger, a.candidate.family)
     limits = ["development_window_not_promotion", "no_multiple_testing_adjustment"]
