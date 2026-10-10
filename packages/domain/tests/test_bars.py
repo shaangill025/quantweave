@@ -20,6 +20,7 @@ from qw_domain.bars import (
     BarError,
     ExtendedHours,
     Gap,
+    Marker,
     SessionLabel,
     Trade,
     build_bars,
@@ -72,9 +73,10 @@ def build(
     as_of: datetime,
     day: date = DAY,
     extended: ExtendedHours | None = None,
+    markers: list[Marker] | None = None,
 ) -> BarBuild:
     rights = qualified_rights(IEX, as_of)
-    return build_bars(trades, CAL, day, X, MIN, RT, rights, extended)
+    return build_bars(trades, CAL, day, X, MIN, RT, rights, extended, markers)
 
 
 def reasons(result: BarBuild) -> list[str]:
