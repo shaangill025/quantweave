@@ -1,6 +1,5 @@
-"""Virtual portfolios, virtual orders and fills (T041 increment 1; spec 14, R063,
-R098). Lifecycle events (dividends, splits, option expiry and assignment) follow in
-increment 2. A simulator ledger only: nothing here reaches a broker or the real
+"""Virtual portfolios, virtual orders and fills, and lifecycle events (T041; spec 14,
+R063, R098). A simulator ledger only: nothing here reaches a broker or the real
 journal.
 
 Segregation: `VirtualEntry` and `VirtualPortfolio` are separate types; the real
@@ -23,29 +22,66 @@ latency. Only bars of the model's feed known at `as_of` (latest version) are use
 - One-cancels-other group: if several trigger in one bar the worse price for the
   side fills first, labelled ambiguous; any fill cancels the rest of the group.
 - Quantity per bar: participation x volume in whole lots (zero volume, no fill),
-  then capped by the units and cash held as of the fill stamp (entries effective
-  at or before it), so nothing is sold or spent before it exists. No short sales.
+  then capped by the free units (held less short-call cover) and free cash (cash
+  less put collateral) as of the fill stamp (entries effective at or before it),
+  so nothing is sold or spent before it exists. No short sales. Orders on a
+  virtual option contract are unsupported (options are written by `write_option`).
 - Expiry: no fill is stamped at or after `expires_at` (`expired_in_bar`).
 Time order: `record` refuses an entry earlier than the ledger's latest effective
 time (`time_order`), so a ledger is append-only in time; fills in a bar are recorded
 in stamp order. Orders are evaluated together, bar by bar, from the portfolio before
 them: never re-simulate orders already recorded in that portfolio.
+
+Lifecycle events (each returns a new portfolio or a typed `Unavailable`; a replay of
+identical inputs returns the same portfolio and a conflicting replay of the same
+event raises; every entry goes through `record`, so back-dated events raise):
+- Cash dividend: once known, its pay date known and both pay and ex dates reached,
+  units held before the ex-date's exchange-local midnight (the holder of record
+  under T+1) earn amount x units as income, stamped at the later of the two local
+  midnights (a due-bill special dividend goes ex after it pays).
+- Split: units held before the effective date's local midnight scale exactly by the
+  ratio; cost is unchanged. A fractional result would be cash in lieu, whose amount
+  the corporate-action model leaves unknown (`CashInLieu`), so it is refused.
+- A split, or a special dividend (which adjusts deliverables), on an underlying with
+  open virtual options is refused (`option_adjustment_required`).
+- Options: `write_option` sells to open a fully covered call or cash-secured put on
+  verified physical terms (`contract_terms`) at a fresh positive bid mark; the
+  write's own premium is not counted as its collateral (afterwards it is free cash)
+  and the fee may not leave free cash negative. `settle_expiry` settles all open
+  contracts of one contract id at the expiry session close, from a last or reference
+  settlement mark observed between that close and the next session open, through
+  the T034 lifecycle and `expiry_expectation`: worthless, or assignment delivering
+  units at the strike; an uncertain or unavailable outcome changes nothing. Premium
+  is a liability (negative cost) until expiry or assignment realizes it. Early
+  assignment is not modelled.
 """
 
 from collections.abc import Sequence
 from dataclasses import dataclass, field, replace
-from datetime import datetime, timedelta
+from datetime import UTC, date, datetime, time, timedelta
 from decimal import Decimal, localcontext
 from enum import StrEnum
 from fractions import Fraction
 from typing import Literal
 
 from qw_domain.bars import Bar, BarBook
-from qw_domain.decimals import DOMAIN_CONTEXT, Money, PositiveQuantity, Price
+from qw_domain.calendars import CalendarCoverageError, ExchangeCalendar
+from qw_domain.corporate_actions import CashDividend, Split
+from qw_domain.decimals import DOMAIN_CONTEXT, Money, PositiveQuantity, Price, Quantity
 from qw_domain.identity import InstrumentId
 from qw_domain.instants import ensure_aware_utc
 from qw_domain.journal import Positions
+from qw_domain.option_lifecycle import (
+    Event,
+    Expectation,
+    LifecycleEvent,
+    Position,
+    expiry_expectation,
+)
+from qw_domain.option_risk import check_mark, contract_terms
+from qw_domain.options import OptionContract, OptionRight, Settlement
 from qw_domain.risk import Side
+from qw_domain.valuation import Mark, MarkKind, Unavailable
 
 _Z = Decimal(0)
 
@@ -58,6 +94,11 @@ class EntryKind(StrEnum):
     CAPITAL = "capital"
     SEED = "seed"
     FILL = "fill"
+    DIVIDEND = "dividend"
+    SPLIT = "split"
+    OPTION_OPEN = "option_open"
+    OPTION_CLOSE = "option_close"
+    DELIVERY = "delivery"
 
 
 @dataclass(frozen=True, slots=True)
@@ -109,6 +150,11 @@ def _round12(v: Fraction) -> Decimal:
         return Decimal(round(v * 10**12)).scaleb(-12)
 
 
+def _ceil12(v: Fraction) -> Decimal:
+    with localcontext(DOMAIN_CONTEXT):
+        return Decimal(-((-v * 10**12) // 1)).scaleb(-12)
+
+
 def _share(total: Decimal, part: Decimal, whole: Decimal) -> Decimal:
     """`total * part / whole` to 1e-12 (exact when everything is removed)."""
     if part == whole:
@@ -128,6 +174,7 @@ class VirtualPortfolio:
     account_id: str
     currency: str
     entries: tuple[VirtualEntry, ...] = ()
+    options: tuple[Position, ...] = ()  # written (short) options, T034 lifecycle
     virtual: Literal[True] = True
 
     @classmethod
@@ -186,14 +233,17 @@ class VirtualPortfolio:
         return replace(self, entries=(*self.entries, entry))
 
     def _sum(
-        self, attr: str, iid: InstrumentId | None = None, at: datetime | None = None
-    ) -> Decimal:
-        """Total of `attr` over entries effective at or before `at` (default all)."""
+        self, attr: str, iid: InstrumentId | None = None, at: datetime | None = None,
+        before: datetime | None = None,
+    ) -> Decimal:  # fmt: skip
+        """Total of `attr` over entries effective at or before `at` and strictly
+        before `before` (default all)."""
         with localcontext(DOMAIN_CONTEXT):
             return sum(
                 (getattr(e, attr) for e in self.entries
                  if (iid is None or e.instrument_id == iid)
-                 and (at is None or e.effective_at <= at)),
+                 and (at is None or e.effective_at <= at)
+                 and (before is None or e.effective_at < before)),
                 _Z,
             )  # fmt: skip
 
@@ -215,12 +265,56 @@ class VirtualPortfolio:
     def cost(self, iid: InstrumentId) -> Decimal:
         return self._sum("cost", iid)
 
-    def units(self, iid: InstrumentId, at: datetime | None = None) -> Decimal:
-        return self._sum("units", iid, at)
+    def units(
+        self, iid: InstrumentId, at: datetime | None = None,
+        before: datetime | None = None,
+    ) -> Decimal:  # fmt: skip
+        return self._sum("units", iid, at, before)
 
     def instruments(self) -> tuple[InstrumentId, ...]:
         found = {e.instrument_id for e in self.entries if e.instrument_id is not None}
         return tuple(sorted(found, key=lambda i: i.to_wire()))
+
+    def option(self, contract_id: InstrumentId) -> Position:
+        for p in self.options:
+            if p.contract.contract_id == contract_id:
+                return p
+        raise SimError("no virtual option position for that contract")
+
+    def _cover(
+        self, right: OptionRight, iid: InstrumentId | None, at: datetime | None
+    ) -> Decimal:
+        """Put collateral (strike cash) or units covering short calls on `iid`, for
+        contracts open as of `at` (from the ledger), rounded up."""
+        total = Fraction()
+        for p in self.options:
+            c = p.contract
+            n = -Fraction(self.units(c.contract_id, at))
+            other = right is OptionRight.CALL and c.underlying_id != iid
+            if c.right is not right or n <= 0 or other:
+                continue
+            terms = contract_terms(c)
+            if isinstance(terms, Unavailable):  # fail closed, never count zero
+                raise SimError(f"open option without usable terms: {terms.code}")
+            put = right is OptionRight.PUT
+            total += (terms.strike_cash if put else terms.units) * n
+        return _ceil12(total)
+
+    def reserved(self, at: datetime | None = None) -> Decimal:
+        return self._cover(OptionRight.PUT, None, at)
+
+    def free_units(self, iid: InstrumentId, at: datetime | None = None) -> Decimal:
+        with localcontext(DOMAIN_CONTEXT):
+            return self.units(iid, at) - self._cover(OptionRight.CALL, iid, at)
+
+    def _has(self, entry_id: str) -> bool:
+        return any(e.entry_id == entry_id for e in self.entries)
+
+    def _optioned(self, iid: InstrumentId) -> bool:
+        return any(
+            p.contract.underlying_id == iid and self.units(p.contract.contract_id)
+            for p in self.options
+        )
 
 
 # ---- orders and fills
@@ -412,8 +506,9 @@ def simulate(
     if len({o.order_id for o in orders}) != len(orders):
         raise SimError("duplicate order id")
     live = [_Live(o, o.quantity.value) for o in orders]
+    contracts = {pos.contract.contract_id for pos in portfolio.options}
     for lv in live:
-        if lv.order.unsupported():
+        if lv.order.unsupported() or lv.order.instrument_id in contracts:
             lv.note("order_terms_unsupported")
     p = portfolio
     ids = {o.instrument_id for o in orders}
@@ -484,9 +579,11 @@ def _fill(
         if qty < lv.remaining:
             lv.note("participation_cap")
         if o.side is Side.SELL:
-            room, short = _lots(p.units(iid, filled_at), Decimal(1), m.lot), "units"
+            free = p.free_units(iid, filled_at)
+            room, short = _lots(free, Decimal(1), m.lot), "units"
         else:
-            room = _lots(p.cash(filled_at) - fixed, px + per, m.lot)
+            free = p.cash(filled_at) - p.reserved(filled_at)
+            room = _lots(free - fixed, px + per, m.lot)
             short = "cash"
         if room < qty:
             lv.note(f"insufficient_virtual_{short}")
@@ -524,3 +621,210 @@ def _fill(
             if other is not lv and other.order.oco_group == o.oco_group:
                 other.cancelled = True
     return p.record(e)
+
+
+# ---- lifecycle events
+
+
+def _local_midnight(cal: ExchangeCalendar, d: date) -> datetime:
+    return datetime.combine(d, time(), tzinfo=cal.tz).astimezone(UTC)
+
+
+def apply_dividend(
+    p: VirtualPortfolio, action: CashDividend, cal: ExchangeCalendar, as_of: datetime
+) -> VirtualPortfolio | Unavailable:
+    as_of, iid, eid = ensure_aware_utc(as_of), action.instrument_id, action.event_id
+    if action.known_at > as_of:
+        return Unavailable("action_not_known", eid)
+    if action.pay_date is None:
+        return Unavailable("pay_date_unknown", eid)
+    if action.currency != p.currency:
+        return Unavailable("currency_mismatch", action.currency)
+    pay = _local_midnight(cal, action.pay_date)
+    if pay > as_of:
+        return Unavailable("pay_date_not_reached", action.pay_date.isoformat())
+    ex = _local_midnight(cal, action.ex_date)
+    if ex > as_of:  # a due-bill special dividend goes ex after it pays
+        return Unavailable("ex_date_not_reached", action.ex_date.isoformat())
+    units = p.units(iid, before=ex)
+    if units <= 0:
+        return Unavailable("no_entitlement", eid)
+    with localcontext(DOMAIN_CONTEXT):
+        amt = units * action.amount_per_share.amount.value
+    e = VirtualEntry(f"div:{eid}", EntryKind.DIVIDEND, max(pay, ex), iid,
+                     p.account_id, cash=amt, income=amt,
+                     ref=f"{eid}:v{action.version}")  # fmt: skip
+    if action.special and p._optioned(iid) and not p._has(e.entry_id):
+        return Unavailable("option_adjustment_required", eid)
+    return p.record(e)
+
+
+def apply_split(
+    p: VirtualPortfolio, action: Split, cal: ExchangeCalendar, as_of: datetime
+) -> VirtualPortfolio | Unavailable:
+    as_of, iid, eid = ensure_aware_utc(as_of), action.instrument_id, action.event_id
+    cut = _local_midnight(cal, action.effective)
+    if action.known_at > as_of or cut > as_of:
+        return Unavailable("action_not_effective", eid)
+    held = p.units(iid, before=cut)
+    if held <= 0:
+        return Unavailable("no_entitlement", eid)
+    new = Fraction(held) * action.ratio.fraction()
+    if new.denominator != 1:
+        return Unavailable("cash_in_lieu_terms_unknown", eid)
+    with localcontext(DOMAIN_CONTEXT):
+        delta = Decimal(new.numerator) - held
+    e = VirtualEntry(f"split:{eid}", EntryKind.SPLIT, cut, iid, p.account_id,
+                     units=delta, ref=f"{eid}:v{action.version}")  # fmt: skip
+    if p._optioned(iid) and not p._has(e.entry_id):
+        return Unavailable("option_adjustment_required", eid)
+    return p.record(e)
+
+
+def _expiry_close(cal: ExchangeCalendar, c: OptionContract) -> datetime | Unavailable:
+    day = c.expiry.session_date
+    if c.expiry.calendar_id != cal.calendar_id:
+        return Unavailable("calendar_mismatch", c.expiry.calendar_id.code)
+    try:
+        session = cal.session_for(day)
+    except CalendarCoverageError:
+        session = None
+    if session is None:
+        return Unavailable("expiry_session_unknown", day.isoformat())
+    return session.close_at
+
+
+def write_option(
+    p: VirtualPortfolio, contract: OptionContract, contracts: int, premium: Mark,
+    fee: Money, cal: ExchangeCalendar, at: datetime, entry_id: str,
+    max_age: timedelta,
+) -> VirtualPortfolio | Unavailable:  # fmt: skip
+    """Sell to open `contracts` fully covered calls or cash-secured puts."""
+    at, cid = ensure_aware_utc(at), contract.contract_id
+    if type(contracts) is not int or contracts < 1:
+        raise SimError("contracts must be a positive int")
+    terms = contract_terms(contract)
+    if isinstance(terms, Unavailable):
+        return terms
+    if contract.settlement is not Settlement.PHYSICAL:
+        return Unavailable("settlement_unsupported", contract.settlement.value)
+    if terms.currency != p.currency or fee.currency != p.currency:
+        return Unavailable("currency_mismatch", terms.currency)
+    if premium.kind is not MarkKind.BID or premium.price.value <= 0:
+        return Unavailable("premium_not_bid", "a sold option is marked at the bid")
+    if stale := check_mark(premium, cid, p.currency, at, max_age, "premium"):
+        return stale
+    close = _expiry_close(cal, contract)
+    if isinstance(close, Unavailable):
+        return close
+    if at >= close:
+        return Unavailable("expiry_passed", contract.expiry.session_date.isoformat())
+    assert contract.multiplier is not None  # implied by contract_terms
+    with localcontext(DOMAIN_CONTEXT):
+        credit = premium.price.value * contract.multiplier.value * contracts
+        f = fee.amount.value
+    ref = f"{premium.source}@{premium.observed_at.isoformat()}"
+    e = VirtualEntry(entry_id, EntryKind.OPTION_OPEN, at, cid, p.account_id,
+                     cash=credit - f, units=Decimal(-contracts), cost=-credit,
+                     fees=f, ref=ref)  # fmt: skip
+    if p._has(entry_id):
+        return p.record(e)  # identical replay is a no-op, a conflict raises
+    if any(o.contract.contract_id == cid for o in p.options):
+        return Unavailable("position_exists", "one virtual position per contract")
+    n, free = Fraction(contracts), Fraction(p.cash(at) - p.reserved(at))
+    if contract.right is OptionRight.CALL:
+        need = terms.units * n
+        if Fraction(p.free_units(contract.underlying_id, at)) < need:
+            return Unavailable("cover_insufficient", f"call needs {need} free units")
+    else:
+        free -= terms.strike_cash * n  # this write's premium is not collateral
+        if free < 0:
+            return Unavailable("cover_insufficient", "put needs free strike cash")
+    if free + Fraction(credit - f) < 0:
+        return Unavailable(
+            "fee_exceeds_premium", "the write would leave free cash negative"
+        )
+    pos = Position(contract, long=False, open_quantity=n)
+    return replace(p.record(e), options=(*p.options, pos))
+
+
+def settle_expiry(
+    p: VirtualPortfolio, contract_id: InstrumentId, settlement: Mark,
+    auto_exercise_min: Price | None, cal: ExchangeCalendar, as_of: datetime,
+    max_age: timedelta,
+) -> VirtualPortfolio | Unavailable:  # fmt: skip
+    """Settle the open contracts of one contract id at the expiry close."""
+    as_of = ensure_aware_utc(as_of)
+    pos = p.option(contract_id)
+    c, key = pos.contract, contract_id.to_wire()
+    ref = f"{settlement.source}:{settlement.price.value}@{settlement.observed_at}"
+    for e in p.entries:
+        if e.entry_id == f"{key}:settle":
+            if e.ref != ref:
+                raise SimError("expiry already settled with a different settlement")
+            return p
+    close = _expiry_close(cal, c)
+    if isinstance(close, Unavailable):
+        return close
+    if as_of < close:
+        return Unavailable("expiry_not_reached", c.expiry.session_date.isoformat())
+    if settlement.kind not in (MarkKind.LAST, MarkKind.REFERENCE):
+        return Unavailable(
+            "settlement_kind_invalid", "settlement must be a last or reference price"
+        )
+    if settlement.observed_at < close:
+        return Unavailable(
+            "settlement_before_expiry", "settlement observed before the expiry close"
+        )
+    try:
+        reopen = cal.next_open(close)
+    except CalendarCoverageError:
+        return Unavailable("expiry_session_unknown", "no session after the expiry")
+    if settlement.observed_at >= reopen:  # no post-expiry quote decides assignment
+        return Unavailable(
+            "settlement_outside_window",
+            "settlement observed after the next session open",
+        )
+    open_n = pos.open_quantity
+    view = expiry_expectation(c, Quantity(-open_n.numerator), settlement,
+                              auto_exercise_min, as_of, max_age)  # fmt: skip
+    if isinstance(view, Unavailable):
+        return view
+    if view.expectation is Expectation.UNCERTAIN:
+        return Unavailable(
+            "assignment_uncertain", "in the money below the auto-exercise threshold"
+        )
+    assigned = view.expectation is Expectation.ASSIGNMENT
+    if not assigned and view.expectation is not Expectation.WORTHLESS:
+        return Unavailable("unsupported_expectation", view.expectation.value)
+    pos = pos.apply(LifecycleEvent(f"{key}:expiry", Event.EXPIRY_REACHED, close,
+                                   "simulation"))  # fmt: skip
+    kind = Event.ASSIGNMENT_REPORTED if assigned else Event.EXPIRED_WORTHLESS_REPORTED
+    qty = Quantity(open_n.numerator) if assigned else None
+    pos = pos.apply(LifecycleEvent(f"{key}:{kind.value}", kind, close, "simulation",
+                                   qty))  # fmt: skip
+    liability = p.cost(contract_id)  # negative: premium received
+    q = p.record(VirtualEntry(f"{key}:settle", EntryKind.OPTION_CLOSE, close,
+                              contract_id, p.account_id, units=_round12(open_n),
+                              cost=-liability, realized=-liability,
+                              ref=ref))  # fmt: skip
+    q = replace(q, options=tuple(pos if o.contract.contract_id == contract_id else o
+                                 for o in q.options))  # fmt: skip
+    if not assigned:
+        return q
+    du, dc, und = _round12(view.units), _round12(view.cash), c.underlying_id
+    with localcontext(DOMAIN_CONTEXT):
+        if du < 0:  # deliver the covering units at the strike
+            if q.units(und) < -du:
+                raise SimError("covering units are missing")
+            out = _share(q.cost(und), -du, q.units(und))
+            e = VirtualEntry(f"{key}:delivery", EntryKind.DELIVERY, close, und,
+                             q.account_id, cash=dc, units=du, cost=-out,
+                             realized=dc - out, ref=ref)  # fmt: skip
+        else:  # receive the units and pay the strike from the collateral
+            if q.cash() < -dc:
+                raise SimError("put collateral is missing")
+            e = VirtualEntry(f"{key}:delivery", EntryKind.DELIVERY, close, und,
+                             q.account_id, cash=dc, units=du, cost=-dc,
+                             ref=ref)  # fmt: skip
+    return q.record(e)

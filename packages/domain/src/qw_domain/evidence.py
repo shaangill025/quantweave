@@ -449,6 +449,16 @@ class EvidenceStore:
                 self._content.pop((tenant, sid), None)
         self._clock[tenant_id] = at
 
+    def passage(self, tenant_id: str, passage_id: str) -> Passage:
+        return self._get(self._passages, tenant_id, passage_id)
+
+    def source(self, tenant_id: str, source_id: str) -> Source:
+        return self._get(self._sources, tenant_id, source_id)
+
+    def unusable(self, src: Source, at: datetime) -> Invalid | None:
+        """Why `src` cannot be used as known at `at`, or None (rights excluded)."""
+        return self._unusable(src, ensure_aware_utc(at))
+
     def passage_text(self, tenant_id: str, passage_id: str) -> str | None:
         p = self._get(self._passages, tenant_id, passage_id)
         content = self._content.get((tenant_id, p.source_id))
