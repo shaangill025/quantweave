@@ -431,7 +431,7 @@ def simulate(
             got = _trigger(o, b, t0, model.slippage)
             if isinstance(got, str):
                 lv.note(got)
-            elif got is not None and o.expires_at is not None and got[1] >= o.expires_at:
+            elif got is not None and o.expires_at and got[1] >= o.expires_at:
                 lv.note("expired_in_bar")
             elif got is not None:
                 hits.append((i, *got))
