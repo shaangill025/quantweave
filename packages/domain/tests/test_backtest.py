@@ -353,7 +353,8 @@ def test_claims_carry_every_ledger_trial_in_any_order(
 def test_long_cash_rate_is_rounded_once_and_still_claims() -> None:
     # a 47-digit cash rate is rounded to the 40-digit context when the periods are
     # built, so the period arithmetic check agrees with it (review N1)
-    cash = replace(CASH, cash_rate=D("0.00001234567890123456789012345678901234567890123"))
+    long_rate = D("0.00001234567890123456789012345678901234567890123")
+    cash = replace(CASH, cash_rate=long_rate)
     pr = protocol(baselines=(cash,))
     lg = ask(ledger(plan(protocol_hash=pr.content_hash)), 1, Split.TRAIN, TRAIN)[0]
     lg, out = run_trial(lg, "trial-1", "SYNTHETIC", T0 + timedelta(hours=2), DS,
