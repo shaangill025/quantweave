@@ -15,10 +15,11 @@ access recorded), R029, R065, R084.
   research rights and serves data only inside the access window, hiding holdout (and
   unresolved) instruments from train/development.
 - Every trial, including failed and abandoned ones, is appended and must match the
-  candidate its access was granted for. `trial_count` (for later multiple-testing
-  adjustment) also counts granted accesses never bound to a trial. Only a completed
-  promotion trial on the first holdout access yields a T027 `EvidenceRecord`; later
-  ones are `holdout_reused`. Construction replays every entry (forged grants fail).
+  candidate its access was granted for and the plan's evaluation protocol hash.
+  `trial_count` (for later multiple-testing adjustment) also counts granted
+  accesses never bound to a trial. Only a completed promotion trial on the first
+  holdout access yields a T027 `EvidenceRecord`; later ones are `holdout_reused`.
+  Construction replays every entry (forged grants fail).
 LIMITATIONS: no persistence; roles are caller-asserted; times must come from the
 server clock; no multiple-testing adjustment is computed yet.
 Stdlib only.
@@ -102,9 +103,11 @@ class SplitPlan:
     max_promotion_accesses: int
     approved_by: str
     registered_at: datetime
+    protocol_hash: str  # the evaluation protocol frozen with the plan (T033)
 
     def __post_init__(self) -> None:
         check_id(self.plan_id, "plan")
+        _sha(self.protocol_hash, "protocol_hash")
         check_id(self.approved_by, "approver")
         if type(self.dataset) is not DatasetManifest:
             raise ResearchError("dataset", "a DatasetManifest is required")
@@ -175,6 +178,7 @@ class Trial:
     material_hash: str
     config_hash: str
     dataset_hash: str
+    protocol_hash: str
     split: Split
     outcome: Outcome
     metrics: Mapping[str, Decimal]
@@ -184,7 +188,7 @@ class Trial:
     def __post_init__(self) -> None:
         for name in ("trial_id", "plan_id", "family"):
             check_id(getattr(self, name), name)
-        for name in ("material_hash", "config_hash", "dataset_hash"):
+        for name in ("material_hash", "config_hash", "dataset_hash", "protocol_hash"):
             _sha(getattr(self, name), name)
         if self.access_id is not None:
             check_id(self.access_id, "access")
@@ -266,6 +270,8 @@ def _apply(s: _State, e: Entry) -> None:
             raise ResearchError("unknown_plan", e.plan_id)
         if e.dataset_hash != p.dataset_hash:
             raise ResearchError("dataset_mismatch", e.trial_id)
+        if e.protocol_hash != p.protocol_hash:
+            raise ResearchError("protocol_changed", e.trial_id)
         if e.access_id is None:
             if e.outcome is Outcome.COMPLETED:
                 raise ResearchError("access_required", e.trial_id)
