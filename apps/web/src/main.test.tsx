@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 import { afterEach, describe, expect, it } from "vitest";
-import { cleanup, render, screen, within } from "@testing-library/react";
+import { cleanup, render, screen, waitFor, within } from "@testing-library/react";
 import { App } from "./main";
 import indexHtml from "../index.html?raw";
 
@@ -21,6 +21,7 @@ describe("app shell landmarks", () => {
 
   it("has exactly one banner, primary navigation and main", () => {
     render(<App />);
+    expect(screen.getByRole("note").textContent).toMatch(/never places, changes or cancels broker orders/);
     expect(screen.getAllByRole("banner")).toHaveLength(1);
     expect(screen.getAllByRole("navigation")).toHaveLength(1);
     expect(screen.getAllByRole("main")).toHaveLength(1);
@@ -46,9 +47,14 @@ describe("app shell landmarks", () => {
     ]);
   });
 
-  it("says plainly that no API is connected instead of showing data", () => {
-    render(<App />);
-    expect(screen.getByRole("main").textContent).toContain("not connected");
+  it("says plainly that the API is unreachable instead of showing data", async () => {
+    render(<App fetcher={() => Promise.reject(new TypeError("offline"))} />);
+    const main = screen.getByRole("main");
+    await waitFor(() => {
+      expect(main.textContent).toContain("Proposals: Unavailable (api_unreachable)");
+    });
+    expect(main.textContent).toContain("Accounts: Unavailable (api_unreachable)");
+    expect(main.textContent).not.toContain("Nothing in the loaded records needs attention");
     expect(screen.queryByRole("table")).toBeNull();
   });
 
