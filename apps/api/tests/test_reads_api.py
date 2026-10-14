@@ -28,6 +28,7 @@ from jsonschema import (  # type: ignore[import-untyped]
     FormatChecker,
 )
 from qw_adapters import journal_store as js
+from qw_adapters import pause_store
 from qw_adapters import simulation_store as ss
 from qw_adapters import tenancy as tn
 from qw_api import reads
@@ -236,7 +237,7 @@ def test_proposals_resolve_state_at_read_time_without_writing(
     login(world.client, "bob")
     page = world.client.get("/api/v1/proposals?limit=1").json()
     items, reasons = list(page["items"]), list(page["coverage"]["reasons"])
-    assert "not_rechecked:risk_evaluation_and_pauses" in reasons  # the live one
+    assert "not_rechecked:risk_evaluation" in reasons  # the live one
     while page["next_cursor"]:
         page = world.client.get(f"/api/v1/proposals?cursor={page['next_cursor']}")
         page = page.json()
@@ -251,7 +252,7 @@ def test_proposals_resolve_state_at_read_time_without_writing(
     assert live["binding"]["account_revision"] == 1
     assert live["binding"]["policy_version_id"].endswith(":1")
     assert events(world) == before  # a read records no expiry
-    assert "not_rechecked:risk_evaluation_and_pauses" not in page["coverage"]["reasons"]
+    assert "not_rechecked:risk_evaluation" not in page["coverage"]["reasons"]
     page_conforms("proposal", page)
     for item in items:
         found = strict("proposal", item, reasons)
@@ -303,7 +304,7 @@ def test_read_proposal_matches_the_list_and_is_tenant_scoped(
             "review_id", "final_check_receipt_id", "qualification", "joint_set_id",
         )] + [f"none:{pid}/sleeve_id"]  # fmt: skip
         assert set(named) <= set(reasons)
-        rechecked = "not_rechecked:risk_evaluation_and_pauses" in reasons
+        rechecked = "not_rechecked:risk_evaluation" in reasons
         assert rechecked is (state == "candidate")
     live = world.client.get("/api/v1/proposals/prop-syn-live").json()
     assert live["legs"][0]["estimated_cash_effect"] == {
@@ -508,3 +509,37 @@ def test_an_unmapped_journal_kind_fails_closed(
     for leak in ("deposit", "KeyError", ACCT, *ids.values()):
         assert leak not in text, leak
     assert body["field_errors"] == [] and body["reasons"] == []
+
+
+@pytest.mark.db
+def test_a_stored_pause_invalidates_new_risk_until_resumed(
+    world: Any, app_conn: Any
+) -> None:
+    c, _ = seed_proposals(world, app_conn)
+    with tn.tenant_transaction(app_conn, world.tenant_a) as tx:
+        pause_store.pause(tx, c.policy, principal=world.users["bob"], reason="",
+                          text="SYNTHETIC pause")  # fmt: skip
+    login(world.client, "bob")
+    page = world.client.get("/api/v1/proposals").json()
+    live = next(i for i in page["items"] if i["id"] == "prop-syn-live")
+    assert (live["state"], live["reason_codes"]) == ("invalidated", ["RISK_PAUSED"])
+    assert "not_rechecked:risk_evaluation" not in page["coverage"]["reasons"]
+    with tn.tenant_transaction(app_conn, world.tenant_a) as tx:
+        etag = pause_store.tag(1, pause_store.load(tx).active_for(c.policy))
+        pause_store.resume(tx, c.policy, etag, principal=c.owner, session_id=c.session,
+                           window=timedelta(minutes=10), reason="SYNTHETIC ok",
+                           text="SYNTHETIC resume")  # fmt: skip
+    page = world.client.get("/api/v1/proposals").json()
+    live = next(i for i in page["items"] if i["id"] == "prop-syn-live")
+    assert (live["state"], live["reason_codes"]) == (
+        "candidate",
+        ["RISK_NOT_RECHECKED"],
+    )
+    assert "not_rechecked:risk_evaluation" in page["coverage"]["reasons"]
+    with tn.tenant_transaction(app_conn, world.tenant_a) as tx:  # N1: both reasons
+        pause_store.pause(
+            tx, c.policy, principal=world.users["bob"], reason="", text="t"
+        )
+    post(world, world.tenant_a, deposit(hdr("acct-1", "D9"), Money.of("1", "CAD")))
+    live = world.client.get("/api/v1/proposals/prop-syn-live").json()
+    assert live["reason_codes"] == ["ACCOUNT_CHANGED", "RISK_PAUSED"]
