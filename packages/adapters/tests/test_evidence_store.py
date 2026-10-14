@@ -19,7 +19,7 @@ from decimal import Decimal
 
 import psycopg
 import pytest
-from ingest_rights_helper import KEEP, REGION, qualified_registry
+from ingest_rights_helper import KEEP, REGION, UNTIL, qualified_registry
 from psycopg import errors
 from psycopg.rows import TupleRow
 from qw_adapters import evidence_store as es
@@ -40,7 +40,7 @@ from qw_domain.ingest import IngestRights
 from qw_domain.rights import Registry, Use, UseScope
 
 Conn = psycopg.Connection[TupleRow]
-T0 = datetime(2026, 9, 1, 12, tzinfo=UTC)  # before the database clock
+T0 = datetime(2026, 9, 1, 12, tzinfo=UTC)  # receipt; db tests: clock_relative
 E1 = InstrumentId(uuid.UUID("00000000-0000-4000-8000-00000000e001"))
 FY25 = Period(date(2025, 1, 1), date(2025, 12, 31))
 REV = "us-gaap:Revenues"
@@ -49,6 +49,23 @@ WIRE = "SYNTHETIC   RELEASE:  revenues were 100 usd for fy2025."  # same origin
 NOTE = "SYNTHETIC filing note: total revenue 100 USD in fiscal 2025."
 MEMO = "SYNTHETIC memo: revenue 100 USD."  # kept one day only
 BLOG = "SYNTHETIC independent estimate: revenue 120 USD."
+
+
+@pytest.fixture(autouse=True)
+def clock_relative(
+    request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """For db tests, receipt (T0) is 30 days before the database clock and grants end
+    ten years after it, since the triggers compare retention with now(): the memo
+    (kept one day) has expired and the KEEP (365 days) sources are retained on any
+    date. Pure tests keep the fixed T0."""
+    if request.node.get_closest_marker("db") is None:
+        return
+    row = request.getfixturevalue("conn").execute("SELECT clock_timestamp()").fetchone()
+    assert row is not None
+    now: datetime = row[0].astimezone(UTC).replace(microsecond=0)
+    monkeypatch.setitem(globals(), "T0", now - timedelta(days=30))
+    monkeypatch.setitem(globals(), "UNTIL", now + timedelta(days=3650))
 
 
 def h(hours: float) -> datetime:
@@ -60,7 +77,7 @@ def reading(value: str) -> Reading:
 
 
 def registry(tenant: str, missing: Use | None = None) -> Registry:
-    return qualified_registry(("feed-a", "feed-b"), missing, tenant)
+    return qualified_registry(("feed-a", "feed-b"), missing, tenant, UNTIL)
 
 
 def scenario(tenant: str) -> EvidenceStore:
@@ -212,8 +229,8 @@ def test_rows_are_append_only(app_conn: Conn) -> None:
         "UPDATE app.evidence_record SET start_offset = 1 WHERE id = 'p-release'",
         "UPDATE app.claim SET stated = jsonb_set(stated, '{value}', '\"120\"') "
         "WHERE id = 'c-1'",
-        "UPDATE app.claim_evidence SET linked_at = '2026-09-01T11:00Z'",
-        "UPDATE app.claim_evidence SET linked_at = '2026-09-01T16:30Z' "
+        "UPDATE app.claim_evidence SET linked_at = %(t0)s - interval '1 hour'",
+        "UPDATE app.claim_evidence SET linked_at = %(t0)s + interval '4.5 hours' "
         "WHERE evidence_id = 'p-wire'",  # cited after its deletion at hour 4
         "UPDATE app.evidence_source SET origin = repeat('a', 64) "
         "WHERE id = 's-release'",
@@ -225,7 +242,7 @@ def test_tampered_rows_fail_load(app_conn: Conn, conn: Conn, forge: str) -> None
     a = tenant(app_conn)
     stored(app_conn, a)
     conn.execute("SET session_replication_role = replica")  # a tampering owner
-    conn.execute(forge)
+    conn.execute(forge, {"t0": T0} if "%(t0)s" in forge else None)
     with pytest.raises(es.EvidenceStoreError, match="integrity"):
         get(app_conn, a)
 
