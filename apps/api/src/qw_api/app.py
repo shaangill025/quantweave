@@ -20,6 +20,7 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from qw_adapters.tenancy import MAX_SESSION_TTL, Conn, ThrottlePolicy
+from qw_domain.rights import Registry
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
@@ -28,6 +29,9 @@ if TYPE_CHECKING:
 
 log = logging.getLogger("qw_api")
 ConnectionProvider = Callable[[], AbstractContextManager[Conn]]
+# The T021 rights registry in force now. No store holds it yet, so the default is
+# an empty registry: every use is denied (fail closed).
+RightsProvider = Callable[[], Registry]
 SAFE_METHODS = frozenset({"GET", "HEAD"})
 _ORIGIN = re.compile(r"(https://[a-z0-9.-]+|http://(localhost|127\.0\.0\.1))(:\d+)?")
 _REFERER = re.compile(_ORIGIN.pattern + r"(?=/|$)")
@@ -235,7 +239,10 @@ class Envelope:
 
 
 def create_app(
-    settings: Settings, connections: ConnectionProvider, authenticator: Authenticator
+    settings: Settings,
+    connections: ConnectionProvider,
+    authenticator: Authenticator,
+    rights: RightsProvider = Registry,
 ) -> FastAPI:
     from qw_api.policies import router as policies
     from qw_api.reads import router as reads
@@ -252,6 +259,7 @@ def create_app(
     app.state.settings = settings
     app.state.connections = connections
     app.state.authenticator = authenticator
+    app.state.rights = rights
     app.include_router(router)
     app.include_router(policies)
     app.include_router(reads)

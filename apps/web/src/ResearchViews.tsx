@@ -2,13 +2,19 @@
 // differentiated scorecards) views, spec 13. Read-only: no order, exercise or trade control.
 // Uncertainty is always text (a [Tag], an interval or a reason), never colour or a model score.
 import { useEffect, useId, useState, type ReactNode } from "react";
-import type { Loaded } from "./api";
+import { reasonFor, type Loaded } from "./api";
 import { Completeness, MoneyText, Resource, Retrieved, Tag, Unavailable, humanize, utc } from "./labels";
 import {
   isRecordId, percent, quoteBlockers, termBlockers, type Calculation, type Claim, type Evidence, type Origin,
   type RecordKind, type ResearchSource, type ScenarioGrid, type ScoreRow, type SimulationSummary,
 } from "./sources";
 import type { Env } from "./views";
+
+/** A null `material` shows the reason coverage names for it, or plain "Unavailable". */
+const materialReason = (reasons: string[], id: string) => {
+  const why = reasonFor(reasons, id, "material");
+  return why === undefined ? "Unavailable" : `Unavailable (${why})`;
+};
 import { formatDecimal, type DecimalString } from "./wire";
 
 export interface SimMode { current: SimulationSummary | null; set: (s: SimulationSummary | null) => void }
@@ -106,7 +112,8 @@ function ClaimPanel({ id, research }: { id: string; research: ResearchSource }) 
             <Retrieved at={at} />
             <p>
               <Tag>{KIND[c.kind]}</Tag> <Tag>{VERIFY[c.verification]}</Tag>{" "}
-              <Tag>{c.material ? "Material to the decision" : "Not material"}</Tag>
+              <Tag>{c.material !== null ? (c.material ? "Material to the decision" : "Not material")
+                : materialReason(c.coverage.reasons, c.id)}</Tag>
             </p>
             <p>Evidence support says how well sources back this claim; it is not a forecast of investment outcome.</p>
             <blockquote>{c.text}</blockquote>

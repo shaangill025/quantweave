@@ -7,7 +7,7 @@ import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-li
 import { App } from "./main";
 import type { Fetcher } from "./api";
 import {
-  checked, httpSource, isScenarioGrid, isScorecard, isSimulationPage, percent, quoteBlockers, termBlockers,
+  checked, httpSource, isClaim, isScenarioGrid, isScorecard, isSimulationPage, percent, quoteBlockers, termBlockers,
   type OptionTerms, type ResearchSource,
 } from "./sources";
 
@@ -39,6 +39,18 @@ const ROUTES: Record<string, unknown> = {
     id: "clm-1", kind: "forecast", text: "SYNTHETIC: revenue grows next year", instrument_ids: ["inst-SYNTHETIC"],
     evidence_ids: ["ev-1", "ev-gone"], calculation_ids: ["calc-1"], material: true, verification: "contested",
     counterevidence_ids: ["ev-contra"], valid_at: "2026-10-10T00:00:00Z",
+    coverage: { status: "complete", reasons: [] },
+  },
+  "/api/v1/claims/clm-null": {
+    id: "clm-null", kind: "reported_fact", text: "SYNTHETIC: revenue 100 USD", instrument_ids: [],
+    evidence_ids: [], calculation_ids: [], material: null, verification: "unavailable",
+    counterevidence_ids: [], valid_at: "2026-10-10T00:00:00Z",
+    coverage: { status: "partial", reasons: ["unknown:material"] },
+  },
+  "/api/v1/claims/clm-unnamed": {
+    id: "clm-unnamed", kind: "reported_fact", text: "SYNTHETIC: revenue 100 USD", instrument_ids: [],
+    evidence_ids: [], calculation_ids: [], material: null, verification: "unavailable",
+    counterevidence_ids: [], valid_at: "2026-10-10T00:00:00Z", coverage: { status: "partial", reasons: [] },
   },
   "/api/v1/evidence/ev-1": evidence("ev-1"),
   "/api/v1/evidence/ev-gone": evidence("ev-gone", { passage: null, availability: "deleted", published_at: null }),
@@ -187,6 +199,26 @@ describe("evidence drilldown (AT019, AT085)", () => {
     await waitFor(() => { expect(panel.textContent).toContain("Result: Unavailable (insufficient_inputs)"); });
     expect(panel.textContent).toContain("1,200.50 USD");
     expect(panel.textContent).not.toMatch(/confidence|\d%/i);
+  });
+
+  it("shows an unknown materiality as unavailable, never as not material", async () => {
+    setHash("#/research");
+    render(<App fetcher={fakeFetch} now={now} research={source()} />);
+    open("Claim id", "clm-null");
+    const panel = await screen.findByRole("region", { name: /Claim clm-null/ });
+    await waitFor(() => { expect(panel.textContent).toContain("Unavailable (unknown:material)"); });
+    expect(panel.textContent).not.toMatch(/Not material|Material to the decision/);
+    open("Claim id", "clm-unnamed");  // a null whose reason is not named: plain Unavailable
+    const bare = await screen.findByRole("region", { name: /Claim clm-unnamed/ });
+    await waitFor(() => { expect(bare.textContent).toContain("Unavailable"); });
+    expect(bare.textContent).not.toMatch(/unknown:material|Not material|Material to the decision/);
+  });
+
+  it("requires claim coverage", () => {
+    const claim = ROUTES["/api/v1/claims/clm-null"] as Record<string, unknown>;
+    expect(isClaim(claim)).toBe(true);
+    expect(isClaim({ ...claim, coverage: undefined })).toBe(false);
+    expect(isClaim({ ...claim, coverage: { status: "partial" } })).toBe(false);
   });
 
   it("rejects an id that is not a contract id before any request", () => {

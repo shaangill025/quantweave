@@ -1,9 +1,13 @@
 {
-  "version": "0.2.0",
+  "version": "0.3.0",
   "base": "docs/spec/contracts 0.1.0",
-  "decision": "Owner decision 2026-10-14 (T008 A-01; docs/receipts/T053-api.md)",
+  "versions": {
+    "0.2.0": {"decision": "Owner decision 2026-10-14 (T008 A-01; docs/receipts/T053-api.md)"},
+    "0.3.0": {"status": "proposed, pending owner confirmation",
+              "receipt": "docs/receipts/T036.md (increment 4)"}
+  },
   "about": "Project-owned contract (T008 A-01). docs/spec/contracts stays unchanged; tools/project_contract.py applies these amendments to its schemas. Unnamed schemas are the spec's. Consumers (apps/api tests, apps/web/src/api.ts guards) enforce the rule below; a null receipt or qualification never makes a proposal actionable.",
-  "changes": "0.2.0: fields no store holds yet become nullable (account, account_snapshot, proposal); snapshot gains ledger_cash (trade-date journal cash, not available cash) and coverage; pages gain the C-02 coverage; the active-proposal rule accepts a null final-check receipt or qualification.",
+  "changes": "0.2.0: fields no store holds yet become nullable (account, account_snapshot, proposal); snapshot gains ledger_cash (trade-date journal cash, not available cash) and coverage; pages gain the C-02 coverage; the active-proposal rule accepts a null final-check receipt or qualification. 0.3.0: claim and evidence gain coverage (withheld text, invalid citations and limitations are named there); claim material becomes nullable (no store records materiality).",
   "rule": "A null in an amended field must be named in the response coverage.reasons as unavailable:<field>, unavailable:<id>/<field>, unknown:<field> or none:<id>/<field>.",
   "schemas": {
     "account": {
@@ -29,6 +33,13 @@
                    "invalidation_conditions", "claim_ids", "evidence_ids",
                    "calculation_ids", "qualification"],
       "active_nullable": ["final_check_receipt_id", "qualification"]
+    },
+    "claim": {
+      "nullable": ["material"],
+      "add": {"coverage": {"$ref": "#/$defs/Coverage"}}
+    },
+    "evidence": {
+      "add": {"coverage": {"$ref": "#/$defs/Coverage"}}
     }
   },
   "page": {

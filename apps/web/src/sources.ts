@@ -1,11 +1,12 @@
 // Read-only sources for the Research and Simulation views (T054).
 // Contract routes used (openapi.yaml 1.0.0): GET /claims/{id}, /evidence/{id},
-// /calculations/{id}, /instruments/{id}/option-terms and /simulations. apps/api serves none of
-// them yet, so against the real API they fail as `not_found` and the views say so.
+// /calculations/{id}, /instruments/{id}/option-terms and /simulations. apps/api serves claims,
+// evidence and calculations (project contract 0.3.0: claim `material` may be null, its reason
+// named in `coverage.reasons`); the others fail as `not_found` and the views say so.
 // The option scenario grid and the differentiated scorecard have NO contract route or schema.
 // Their shapes below follow qw_domain.option_scenarios / option_greeks and qw_domain.scorecard,
 // and the HTTP source answers `no_contract_route` for them without sending a request.
-import { checks as c, getJson, type Fetcher, type Guard, type Loaded, type Money, type Page } from "./api";
+import { checks as c, getJson, type Coverage, type Fetcher, type Guard, type Loaded, type Money, type Page } from "./api";
 import { parseDecimalString, type DecimalString as Dec } from "./wire";
 
 type Instant = string;
@@ -13,8 +14,8 @@ export type Verification =
   | "pending" | "supported" | "calculation_checked" | "assumption_dependent" | "contested" | "unsupported" | "unavailable";
 export interface Claim {
   id: string; kind: "reported_fact" | "calculation" | "assumption" | "forecast" | "interpretation"; text: string;
-  instrument_ids: string[]; evidence_ids: string[]; calculation_ids: string[]; material: boolean;
-  verification: Verification; counterevidence_ids: string[]; valid_at: Instant;
+  instrument_ids: string[]; evidence_ids: string[]; calculation_ids: string[]; material: boolean | null;
+  verification: Verification; counterevidence_ids: string[]; valid_at: Instant; coverage: Coverage;
 }
 export type Availability = "available" | "restricted" | "redacted" | "deleted" | "unavailable";
 export interface Evidence {
@@ -67,9 +68,10 @@ const date = (v: unknown) => typeof v === "string" && /^\d{4}-\d{2}-\d{2}$/.test
 const gap = obj({ code: str, reason: str });
 export const isClaim = obj({
   id, kind: oneOf("reported_fact", "calculation", "assumption", "forecast", "interpretation"), text: str,
-  instrument_ids: arr(id), evidence_ids: arr(id), calculation_ids: arr(id), material: bool,
+  instrument_ids: arr(id), evidence_ids: arr(id), calculation_ids: arr(id), material: n(bool),
   verification: oneOf("pending", "supported", "calculation_checked", "assumption_dependent", "contested", "unsupported", "unavailable"),
   counterevidence_ids: arr(id), valid_at: instant,
+  coverage: (v) => v !== undefined && coverage(v),  // project contract 0.3.0: required
 }) as Guard<Claim>;
 export const isEvidence = obj({
   id, source_id: id, locator: str, passage: n(str), published_at: n(instant), retrieved_at: instant,
