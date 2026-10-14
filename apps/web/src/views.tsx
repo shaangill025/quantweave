@@ -1,12 +1,13 @@
 // Overview, Accounts and Decisions views (spec 13). Read-only: there is no control that
 // places, amends or cancels a broker order anywhere in the app.
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useId, useRef, useState } from "react";
 import {
-  accountPage, actionable, getJson, isPolicy, isSnapshot, pageOf, proposalPage, reasonFor,
+  accountPage, actionable, checks, getJson, isPolicy, isSnapshot, pageOf, proposalPage, reasonFor,
   type Account, type Fetcher, type Guard, type Loaded, type Proposal,
 } from "./api";
 import { LimitDraft } from "./LimitDraft";
-import { Completeness, MoneyText, complete, Resource, Retrieved, Tag, Unavailable, humanize, utc } from "./labels";
+import { Completeness, CoverageReasons, MoneyText, More, complete, Resource, Retrieved, Tag, Unavailable, humanize, lookup, utc } from "./labels";
+import { isLedgerPage, isProposalDetail, type LedgerEvent } from "./reads";
 import { formatDecimal } from "./wire";
 
 export interface Env {
@@ -22,7 +23,7 @@ const Na = ({ reasons, id, field }: { reasons: string[] | undefined; id: string;
 const label = (a: Account) => a.name ?? a.id;
 const NOT_ACTIONABLE = "Not actionable: final check or qualification unavailable";
 
-function useLoad<T>(env: Env, path: string, guard: Guard<T>) {
+export function useLoad<T>(env: Env, path: string, guard: Guard<T>) {
   const [state, setState] = useState<Loaded<T>>();
   useEffect(() => {
     let live = true;
@@ -63,12 +64,12 @@ const PROPOSAL_STATE: Record<string, string> = {
   superseded: "Superseded by a newer version",
 };
 const LIVE = ["candidate", "verifying", "awaiting_review", "ready_for_final_check", "active"];
-const stateLabel = (s: string) => PROPOSAL_STATE[s] ?? `Unknown state (${s})`;
+const stateLabel = (s: string) => lookup(PROPOSAL_STATE, s) ?? `Unknown state (${s})`;
 /** A live proposal whose expiry has passed on this clock: shown, never treated as actionable. */
 const pastExpiry = (p: Proposal, now: Date) =>
   LIVE.includes(p.state) && new Date(p.expires_at).getTime() <= now.getTime();
 
-const Head = ({ cols }: { cols: string[] }) => (
+export const Head = ({ cols }: { cols: string[] }) => (
   <thead><tr>{cols.map((c) => <th key={c} scope="col">{c}</th>)}</tr></thead>
 );
 
@@ -118,14 +119,14 @@ export function Overview({ env }: { env: Env }) {
   );
 }
 
-function AccountTable({ title, rows, onOpen, reasons }: {
-  title: string; rows: Account[]; onOpen: (a: Account) => void; reasons: string[] | undefined;
+function AccountTable({ title, rows, onOpen, onLedger, reasons }: {
+  title: string; rows: Account[]; onOpen: (a: Account) => void; onLedger: (a: Account) => void; reasons: string[] | undefined;
 }) {
   if (rows.length === 0) return null;
   return (
     <table>
       <caption>{title}</caption>
-      <Head cols={["Account", "Scope", "Status", "Cash basis", "Sources", "Snapshot"]} />
+      <Head cols={["Account", "Scope", "Status", "Cash basis", "Sources", "Snapshot", "Ledger"]} />
       <tbody>
         {rows.map((a) => (
           <tr key={a.id}>
@@ -144,6 +145,7 @@ function AccountTable({ title, rows, onOpen, reasons }: {
             <td>
               <button type="button" onClick={() => { onOpen(a); }}>Show snapshot for {label(a)}</button>
             </td>
+            <td><button type="button" onClick={() => { onLedger(a); }}>Show ledger for {label(a)}</button></td>
           </tr>
         ))}
       </tbody>
@@ -239,6 +241,7 @@ function SnapshotPanel({ env, account }: { env: Env; account: Account }) {
 export function Accounts({ env }: { env: Env }) {
   const accounts = useLoad(env, "/accounts?limit=200", accountPage);
   const [open, setOpen] = useState<Account | null>(null);
+  const [ledger, setLedger] = useState<Account | null>(null);
   return (
     <Resource label="Accounts" state={accounts}>
       {(page, at) => (
@@ -246,19 +249,22 @@ export function Accounts({ env }: { env: Env }) {
           <Retrieved at={at} />
           {page.items.length === 0 && <p>No accounts are declared yet.</p>}
           {(["Real accounts", "Hypothetical accounts (not real holdings)", "Accounts with undeclared scope (real or hypothetical unknown)"] as const).map((title, i) => (
-            <AccountTable key={title} title={title} onOpen={setOpen} reasons={page.coverage?.reasons}
+            <AccountTable key={title} title={title} onOpen={setOpen} onLedger={setLedger} reasons={page.coverage?.reasons}
               rows={page.items.filter((a) => [a.analysis_scope !== null && a.analysis_scope !== "hypothetical", a.analysis_scope === "hypothetical", a.analysis_scope === null][i])} />
           ))}
           <Completeness page={page} />
           {open && <SnapshotPanel key={open.id} env={env} account={open} />}
+          {ledger && <LedgerPanel key={ledger.id} env={env} account={ledger} />}
         </>
       )}
     </Resource>
   );
 }
 
-function ProposalCard({ p, now, reasons }: { p: Proposal; now: Date; reasons: string[] | undefined }) {
-  const id = `proposal-${p.id}-${String(p.version)}`;
+function ProposalCard({ p, now, reasons, onOpen }: {
+  p: Proposal; now: Date; reasons: string[] | undefined; onOpen?: (id: string) => void;
+}) {
+  const id = useId();
   const q = p.qualification;
   const na = (field: string) => <Na reasons={reasons} id={p.id} field={field} />;
   return (
@@ -268,6 +274,9 @@ function ProposalCard({ p, now, reasons }: { p: Proposal; now: Date; reasons: st
         {p.horizon === null ? <>horizon {na("horizon")}</> : humanize(p.horizon)}
       </h3>
       <p>
+        {onOpen && checks.id(p.id) && (
+          <button type="button" onClick={() => { onOpen(p.id); }}>Show detail for proposal {p.id}</button>
+        )}{" "}
         <Tag>{stateLabel(p.state)}</Tag> {pastExpiry(p, now) && <Tag>Past expiry, not actionable</Tag>}{" "}
         {p.state === "active" && !actionable(p) && <Tag>{NOT_ACTIONABLE}</Tag>} Expires{" "}
         {utc(p.expires_at)}. Version {p.version}.
@@ -307,6 +316,7 @@ function ProposalCard({ p, now, reasons }: { p: Proposal; now: Date; reasons: st
 export function Decisions({ env }: { env: Env }) {
   const policies = useLoad(env, "/policies?limit=100", policyPage);
   const proposals = useLoad(env, "/proposals?limit=200", proposalPage);
+  const [open, setOpen] = useState<string>();
   return (
     <>
       <h2>Policy versions</h2>
@@ -346,11 +356,98 @@ export function Decisions({ env }: { env: Env }) {
           <>
             <Retrieved at={at} />
             {page.items.length === 0 && <p>No proposals.</p>}
-            {page.items.map((p) => <ProposalCard key={`${p.id}:${String(p.version)}`} p={p} now={env.now()} reasons={page.coverage?.reasons} />)}
+            {page.items.map((p) => <ProposalCard key={`${p.id}:${String(p.version)}`} p={p} now={env.now()} reasons={page.coverage?.reasons} onOpen={setOpen} />)}
             <Completeness page={page} />
           </>
         )}
       </Resource>
+      {open && <ProposalDetail key={open} env={env} id={open} />}
     </>
+  );
+}
+
+function useFocus(key: string) {
+  const heading = useRef<HTMLHeadingElement>(null);
+  useEffect(() => { heading.current?.focus(); }, [key]); // keyboard users land on the panel
+  return heading;
+}
+
+function ProposalDetail({ env, id }: { env: Env; id: string }) {
+  const state = useLoad(env, `/proposals/${encodeURIComponent(id)}`, isProposalDetail);
+  return (
+    <section aria-labelledby="proposal-detail-title">
+      <h2 id="proposal-detail-title" tabIndex={-1} ref={useFocus(id)}>Proposal detail: {id}</h2>
+      <Resource label="Proposal" state={state}>
+        {(p, at) => p.id !== id ? <p role="alert"><Unavailable reason="record_id_mismatch" /></p> : (
+          <>
+            <Retrieved at={at} />
+            <ProposalCard p={p} now={env.now()} reasons={p.coverage.reasons} />
+            <CoverageReasons coverage={p.coverage} label="Proposal coverage" />
+          </>
+        )}
+      </Resource>
+    </section>
+  );
+}
+
+const LEDGER_STATUS: Record<string, string> = {
+  observed: "Observed: not accepted into the journal", conflicted: "Conflicted: sources disagree",
+  reversed: "Reversed by a correction",
+};
+/** `accepted` is journal acceptance, never reconciliation: the caveat always goes with it. */
+function LedgerState({ e, reasons }: { e: LedgerEvent; reasons: string[] }) {
+  if (e.status !== "accepted") return <Tag>{lookup(LEDGER_STATUS, e.status) ?? `Unknown status (${e.status})`}</Tag>;
+  const why = reasons.filter((r) => r.startsWith("unreconciled:"));
+  return <><Tag>Accepted by the journal: not reconciled</Tag> {why.map((r) => <code key={r}>{r} </code>)}</>;
+}
+
+function LedgerPanel({ env, account }: { env: Env; account: Account }) {
+  const state = useLoad(env, `/accounts/${encodeURIComponent(account.id)}/ledger?limit=200`, isLedgerPage);
+  return (
+    <section aria-labelledby="ledger-title">
+      <h2 id="ledger-title" tabIndex={-1} ref={useFocus(account.id)}>Ledger: {label(account)}</h2>
+      <Resource label="Ledger" state={state}>
+        {(page, at) => page.items.some((e) => e.account_id !== account.id)
+          ? <p role="alert"><Unavailable reason="ledger_account_mismatch" /></p> : (
+          <>
+            <Retrieved at={at} />
+            <CoverageReasons coverage={page.coverage} label="Ledger coverage" />
+            <table>
+              <caption>
+                Journal events for {label(account)} in account revision order. Amounts are exactly as recorded and
+                never summed across commodities.
+              </caption>
+              <Head cols={["Effective", "Kind", "Status", "Postings", "Units moved", "Source", "Notes"]} />
+              <tbody>
+                {page.items.length === 0 && <tr><td colSpan={7}>No journal events.</td></tr>}
+                {page.items.map((e) => (
+                  <tr key={e.id}>
+                    <th scope="row">{utc(e.effective_at)} ({e.id})</th>
+                    <td>
+                      {e.kind === "correction"
+                        ? <><Tag>Correction</Tag> of {e.reverses_event_id ?? <Unavailable reason="corrected_event_not_named" />}</>
+                        : humanize(e.kind)}
+                    </td>
+                    <td><LedgerState e={e} reasons={page.coverage.reasons} /></td>
+                    <td>
+                      <ul aria-label={`Postings of ${e.id}`}>
+                        {e.postings.map((p, i) => <li key={i}>{p.book_account}: {p.amount} {p.commodity}</li>)}
+                      </ul>
+                    </td>
+                    <td>{e.instrument_movements.map((m) => `${m.quantity} ${m.instrument_id}`).join("; ") || "none"}</td>
+                    <td>{e.source_id} / {e.source_record_id}; recorded {utc(e.recorded_at)}</td>
+                    <td>
+                      Lot policy: {e.lot_policy_id ?? <Na reasons={page.coverage.reasons} id={e.id} field="lot_policy_id" />}.{" "}
+                      {e.economic_annotations.join("; ")}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+            <More page={page} />
+          </>
+        )}
+      </Resource>
+    </section>
   );
 }

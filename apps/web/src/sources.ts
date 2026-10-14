@@ -1,11 +1,11 @@
 // Read-only sources for the Research and Simulation views (T054).
-// Contract routes used (openapi.yaml 1.0.0): GET /claims/{id}, /evidence/{id},
-// /calculations/{id}, /instruments/{id}/option-terms and /simulations. apps/api serves claims,
-// evidence, calculations (project contract 0.3.0: claim `material` may be null, its reason
-// named in `coverage.reasons`) and /simulations (T041); option terms fail as `not_found`.
-// The option scenario grid and the differentiated scorecard have NO contract route or schema.
-// Their shapes below follow qw_domain.option_scenarios / option_greeks and qw_domain.scorecard,
-// and the HTTP source answers `no_contract_route` for them without sending a request.
+// Contract routes (openapi.yaml 1.0.0, project contract 0.3.0): GET /claims/{id}, /evidence/{id},
+// /calculations/{id}, /instruments/{id}/option-terms, /simulations and, under simulation mode,
+// /simulations/{id}/fills and /simulations/{id}/results. apps/api serves all of them except
+// option terms, which fail as `not_found`. The option scenario grid and the differentiated
+// scorecard have NO contract route or schema: their shapes below follow
+// qw_domain.option_scenarios / option_greeks and qw_domain.scorecard, and the HTTP source
+// answers `no_contract_route` for them without sending a request.
 import { checks as c, getJson, type Coverage, type Fetcher, type Guard, type Loaded, type Money, type Page } from "./api";
 import { parseDecimalString, type DecimalString as Dec } from "./wire";
 
@@ -36,6 +36,11 @@ export interface OptionTerms {
 export interface SimulationSummary {
   id: string; name: string; execution_model_id: string; benchmark_policy_id: string;
   mode: "manual" | "approved_policy_shadow"; separate_from_actual: true;
+}
+/** A modelled fill (simulated_fill schema); never an actual execution. */
+export interface Fill {
+  id: string; simulated_order_id: string; filled_at: Instant; quantity: Dec; price: Money; fees: Money;
+  data_record_ids: string[]; assumption_ids: string[]; execution_model_id: string; actual_execution: false;
 }
 export interface Gap { code: string; reason: string }
 interface Shock { spot_shock: Dec; vol_shift: Dec; elapsed_days: number }
@@ -96,6 +101,24 @@ const isSimulation = obj({
 export const isSimulationPage = ((v: unknown) =>
   obj({ items: arr(isSimulation), next_cursor: n(str) })(v) && coverage((v as { coverage?: unknown }).coverage)
 ) as Guard<Page<SimulationSummary>>;
+export const SIMULATED = "simulated:separate_from_actual";
+/** A simulation page must say it is simulated; each item must pass `ok` as well. */
+const simulatedPage = <T>(item: (v: unknown) => boolean, ok: (i: T) => boolean) => ((v: unknown) =>
+  obj({ items: arr(item), next_cursor: n(str), coverage: (x) => x !== undefined && coverage(x) })(v) &&
+  (v as Page<T>).coverage?.reasons.includes(SIMULATED) === true && (v as Page<T>).items.every(ok)
+) as Guard<Page<T>>;
+export const isFillPage = simulatedPage<Fill>(obj({
+  id, simulated_order_id: id, filled_at: instant, quantity: (v) => dec(v) && !(v as string).startsWith("-"),
+  price: money, fees: money, data_record_ids: arr(id), assumption_ids: arr(id), execution_model_id: id,
+  actual_execution: (v) => v === false,
+}), () => true);
+/** Ledger results of one simulation (calculation records): each is marked simulated, names that
+ * simulation as `ref:simulation=<id>` and no other, and an `ok` record carries a value. */
+export const resultPageFor = (simulationId: string) => simulatedPage<Calculation>(isCalculation, (k) => {
+  const named = k.warnings.filter((w) => w.startsWith("ref:simulation="));
+  return k.warnings.includes(SIMULATED) && (k.status !== "ok" || k.result !== null) &&
+    named.length > 0 && named.every((w) => w === `ref:simulation=${simulationId}`);
+});
 const shock = { spot_shock: dec, vol_shift: dec, elapsed_days: int };
 const point = obj({ ...shock, spot: dec, at_expiry: bool, premium_value: dec, delta_units: dec, pnl: dec });
 export const isScenarioGrid = obj({
@@ -135,6 +158,8 @@ export interface ResearchSource {
   scenarios(instrumentId: string): Promise<Loaded<ScenarioGrid>>;
   simulations(): Promise<Loaded<Page<SimulationSummary>>>;
   scorecard(simulationId: string): Promise<Loaded<Scorecard>>;
+  fills(simulationId: string): Promise<Loaded<Page<Fill>>>;
+  results(simulationId: string): Promise<Loaded<Page<Calculation>>>;
 }
 const fail = <T>(code: string, detail: string): Promise<Loaded<T>> =>
   Promise.resolve({ status: "failed", code, detail, correlationId: null });
@@ -157,6 +182,8 @@ export function httpSource(fetcher: Fetcher, now: () => Date): ResearchSource {
     calculation: one("/calculations", "", isCalculation),
     optionTerms: one("/instruments", "/option-terms", isOptionTerms),
     simulations: () => getJson(fetcher, "/simulations?limit=200", isSimulationPage, now),
+    fills: one("/simulations", "/fills?limit=200", isFillPage),
+    results: (sim) => one("/simulations", "/results?limit=200", resultPageFor(sim))(sim),
     scenarios: unserved("option scenario grids"),
     scorecard: unserved("differentiated scorecards"),
   };
