@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { beforeAll, describe, expect, it } from "vitest";
 import { ESLint } from "eslint";
 import {
   DecimalStringError,
@@ -212,6 +212,9 @@ describe("money guard lint rule (project eslint.config.js)", () => {
     const [result] = await eslint.lintText(code, { filePath: "src/wire.ts" });
     return (result?.messages ?? []).filter((m) => m.ruleId === "no-restricted-syntax").length;
   };
+  // The first type-aware lint builds the program for all of src (several seconds when test
+  // files run in parallel); do it once here so no single case carries that cost.
+  beforeAll(() => lint("export {};"), 30_000);
 
   // SYNTHETIC samples.
   it.each([
