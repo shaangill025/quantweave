@@ -1,10 +1,11 @@
-# Virtual uv workspace root: no package of its own. Members: packages/* and apps/api.
+# Virtual uv workspace root: no package of its own. Members: packages/*, apps/api and
+# apps/worker.
 [tool.uv]
 # Transitive pins held back to releases at least two weeks old (T010 review).
 constraint-dependencies = ["pycparser<3.1"]
 
 [tool.uv.workspace]
-members = ["packages/*", "apps/api"]
+members = ["packages/*", "apps/api", "apps/worker"]
 
 [dependency-groups]
 dev = [
@@ -38,11 +39,11 @@ select = ["E", "W", "F", "I", "B", "SIM", "UP", "TID", "DTZ", "RUF"]
 [tool.mypy]
 python_version = "3.13"
 strict = true
-files = ["packages", "apps/api", "tools", "tests"]
+files = ["packages", "apps/api", "apps/worker", "tools", "tests"]
 exclude = ["^docs/"]
 
 [tool.pytest.ini_options]
-testpaths = ["packages", "apps/api", "tests"]
+testpaths = ["packages", "apps/api", "apps/worker", "tests"]
 addopts = ["--import-mode=importlib", "-ra", "--strict-markers", "--strict-config"]
 pythonpath = ["packages/domain/tests"]  # shared SYNTHETIC test helpers (no conftest)
 markers = [
