@@ -22,9 +22,13 @@ or feed binding store yet.
   available cash (no settlement terms or open orders are persisted, T017), so
   `available_cash` is null. A cost the journal does not know stays null.
 - A proposal's state is resolved at read time from stored records
-  (`qw_domain.proposals.resolve_recorded`); risk inputs and pauses are not
-  persisted, so a live state carries `RISK_NOT_RECHECKED`. Each proposal carries
-  its own coverage (project contract 0.4.0), as readProposal returns one item.
+  (`qw_domain.proposals.resolve_recorded`) and the stored pauses (pause_store, the
+  domain's `pause_reasons`): an active pause covering a buy or call-cover sale of
+  a live proposal adds `RISK_PAUSED` and reads `invalidated` until it is resumed (a
+  read projection; no transition is recorded). Risk inputs are not persisted, so
+  the evaluation is not re-run: a live state carries `RISK_NOT_RECHECKED`. Each
+  proposal carries its own coverage (project contract 0.4.0), as readProposal
+  returns one item.
 - The ledger pages the verified journal by account revision (`ledger_item`; the
   wire mapping is in docs/receipts/T053-api.md, reads increment 2). A simulation
   id is never a journal account (0014 guard), so it is the unknown-account 404.
@@ -42,7 +46,7 @@ from typing import Annotated, Any
 
 from fastapi import APIRouter, Path, Query, Request, Response
 from qw_adapters import journal_store as js
-from qw_adapters import policy_store
+from qw_adapters import pause_store, policy_store
 from qw_adapters import proposal_store as pst
 from qw_domain import proposals as dp
 from qw_domain.decimals import Money
@@ -51,6 +55,7 @@ from qw_domain.journal import Entry, Journal, materialize
 from qw_domain.policy import PolicyHistory
 from qw_domain.postings import EventKind, Holding, UnitAccount
 from qw_domain.risk import Side
+from qw_domain.risk_pauses import PauseBook
 
 from qw_api import routes
 from qw_api import security as sec
@@ -70,7 +75,7 @@ PROPOSAL_UNAVAILABLE = (
     "invalidation_conditions", "claim_ids", "evidence_ids", "calculation_ids",
     "review_id", "final_check_receipt_id", "qualification", "joint_set_id",
 )  # fmt: skip
-NOT_RECHECKED = "not_rechecked:risk_evaluation_and_pauses"
+NOT_RECHECKED = "not_rechecked:risk_evaluation"
 SNAPSHOT_REASONS = ["unknown:freshness_status", "unavailable:reconciliation",
                     "unavailable:available_cash", "unknown:cash_basis",
                     "unavailable:unresolved_ids"]  # fmt: skip
@@ -190,13 +195,15 @@ def horizon(pid: str, value: str) -> tuple[str | None, list[str]]:
 
 def proposal(
     p: dp.Proposal, history: PolicyHistory | None, revisions: dict[str, int],
-    at: datetime,
+    at: datetime, pauses: PauseBook,
 ) -> tuple[dict[str, Any], list[str]]:  # fmt: skip
     """The latest version with its read-time state, and per-item reasons."""
     v, a = p.latest, p.latest.action
     adopted = history.adopted if history else None
     current = adopted[0].content_hash if adopted else None
     state, why = dp.resolve_recorded(p, at, revisions, current)
+    if p.live and (paused := dp.pause_reasons(a, pauses)):  # with other reasons too
+        state, why = dp.ProposalState.INVALIDATED, (*why, *paused)
     codes = [r.code.value for r in why]
     if state not in dp.TERMINAL:
         codes.append("RISK_NOT_RECHECKED")
@@ -237,8 +244,9 @@ def proposal(
 
 
 def _proposal(
-    tx: Any, store: pst.ProposalPublisher, now: datetime, pid: str, policy: uuid.UUID
-) -> tuple[dict[str, Any], list[str]]:
+    tx: Any, store: pst.ProposalPublisher, now: datetime, pid: str,
+    policy: uuid.UUID, held: pause_store.Pauses,
+) -> tuple[dict[str, Any], list[str]]:  # fmt: skip
     """The proposal at the database clock with its own coverage (0.4.0), and the
     item reasons for a page."""
     p = store.load(pid)
@@ -246,7 +254,8 @@ def _proposal(
     history = policy_store.load(tx, policy)
     accounts = {k for k, _ in p.latest.binding.account_revisions}
     revisions = {k: js.revision(tx, k) for k in sorted(accounts)}
-    view, why = proposal(p, history, revisions, max(now, p.events[-1].at))
+    book = held.covering(policy, p.latest.action.account_id)  # every policy account
+    view, why = proposal(p, history, revisions, max(now, p.events[-1].at), book)
     own = [f"unavailable:{f}" for f in PROPOSAL_UNAVAILABLE] + why
     if "RISK_NOT_RECHECKED" in view["reason_codes"]:
         own.append(NOT_RECHECKED)
@@ -269,8 +278,10 @@ def list_proposals(
     with principal.tx() as tx:
         rows = pst.list_proposals(tx, limit + 1, after)
         now, store = _now(tx), pst.ProposalPublisher(tx)
+        held = pause_store.load(tx)
         for pid, policy_id in rows[:limit]:
-            view, why = _proposal(tx, store, now, pid, uuid.UUID(str(policy_id)))
+            pol = uuid.UUID(str(policy_id))
+            view, why = _proposal(tx, store, now, pid, pol, held)
             items.append(view)
             reasons += why
     if any("RISK_NOT_RECHECKED" in i["reason_codes"] for i in items):
@@ -288,7 +299,7 @@ def read_proposal(
         if policy is None:  # unknown, or another tenant's under RLS
             raise ApiError(404, "not_found", "No such proposal.")
         view, _ = _proposal(tx, pst.ProposalPublisher(tx), _now(tx), proposal_id,
-                            policy)  # fmt: skip
+                            policy, pause_store.load(tx))  # fmt: skip
     return Response(json.dumps(view).encode(), 200, media_type="application/json")
 
 

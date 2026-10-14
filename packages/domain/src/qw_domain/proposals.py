@@ -293,6 +293,16 @@ class Reason:
     detail: str = ""
 
 
+def pause_reasons(a: ProposedAction, pauses: PauseBook) -> tuple[Reason, ...]:
+    """`RISK_PAUSED` per active pause covering an action that adds risk (buys and
+    sales of call cover, the reduction rule of risk.py); reductions continue."""
+    if not (a.side is Side.BUY or a.covers_short_call):
+        return ()
+    on = pauses.blocking(a.tenant_id, a.account_id, a.sleeve_id, a.strategy_id)
+    return tuple(Reason(Code.RISK_PAUSED, f"{p.scope.kind}:{p.scope.scope_id}")
+                 for p in on)  # fmt: skip
+
+
 def final_check(v: ProposalVersion, cur: Current) -> tuple[Reason, ...]:
     """Why the bound snapshot no longer holds; empty when it still holds."""
     a, b, now = v.action, v.binding, cur.as_of
@@ -305,11 +315,7 @@ def final_check(v: ProposalVersion, cur: Current) -> tuple[Reason, ...]:
     for account, revision in b.account_revisions:
         if cur.account_revisions.get(account) != revision:
             out.append(Reason(Code.ACCOUNT_CHANGED, account))
-    if a.side is Side.BUY or a.covers_short_call:  # the reduction rule of risk.py
-        on = cur.pauses.blocking(a.tenant_id, a.account_id, a.sleeve_id, a.strategy_id)
-        out += [
-            Reason(Code.RISK_PAUSED, f"{p.scope.kind}:{p.scope.scope_id}") for p in on
-        ]
+    out += pause_reasons(a, cur.pauses)
     if risk_digest(ev) != b.risk_digest:
         out.append(Reason(Code.RISK_CHANGED, ev.outcome))
     return tuple(out)

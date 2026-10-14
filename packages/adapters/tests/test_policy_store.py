@@ -39,22 +39,23 @@ UNKNOWN = ConflictCode.OPTION_PERMISSION_UNKNOWN
 WINDOW = timedelta(minutes=10)
 
 
-def draft(tenant: uuid.UUID, objectives: tuple[str, ...] = ("growth",)) -> DraftPolicy:
+def draft(tenant: uuid.UUID, objectives: tuple[str, ...] = ("growth",),
+          acct: str = "acct-syn-1") -> DraftPolicy:  # fmt: skip
     """SYNTHETIC answers. Options with no account facts raise the acknowledgeable
     unknown-permission conflict and an exclusion, so receipts carry both."""
     limits = [
         {"metric": m, "value": "0.05", "unit": "ratio", "window": "rolling_30d",
-         "denominator": "account_nav", "account_id": "acct-syn-1", "currency": "CAD"}
+         "denominator": "account_nav", "account_id": acct, "currency": "CAD"}
         for m in sorted(REQUIRED_METRICS)
     ] + [{"metric": "drawdown", "value": "2500.5", "unit": "amount", "sleeve_id": "s1",
           "window": "rolling_30d", "denominator": "sleeve_nav",
-          "account_id": "acct-syn-1", "currency": "CAD"}]  # fmt: skip
+          "account_id": acct, "currency": "CAD"}]  # fmt: skip
     answers: dict[str, Any] = {
         "ONB01": "selected_accounts", "ONB03": "CAD", "ONB04": list(objectives),
         "ONB05": "gt_7y", "ONB06": "none_known", "ONB07": "financially_manageable",
         "ONB10": "regular_session", "ONB11": ["stocks", "options"],
         "ONB12": ["long_term", "same_day"], "ONB14": limits, "ONB16": "rules_only",
-        "ONB13": [{"account_id": "acct-syn-1", "currency": "CAD", "amount": "5000"}],
+        "ONB13": [{"account_id": acct, "currency": "CAD", "amount": "5000"}],
     }  # fmt: skip
     responses = CATALOGUE.validate(answers)
     return build_draft(str(tenant), responses, (), as_of=date(2026, 10, 9),
