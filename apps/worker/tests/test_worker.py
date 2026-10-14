@@ -144,27 +144,72 @@ def test_tick_runs_a_registered_handler_and_marks_the_job_succeeded(
 
 
 @pytest.mark.db
-def test_unknown_kind_and_crashing_handler_are_never_marked_succeeded(
-    app_conn: Conn, worker_conn: Conn
+def test_unknown_kind_is_never_claimed_and_a_crashing_handler_never_succeeds(
+    app_conn: Conn, worker_conn: Conn, conn: Conn
 ) -> None:
     assert dict(HANDLERS) == {}  # no domain handler exists yet: the default is empty
     tenant, _ = make_tenant(app_conn)
     unknown = enqueue(app_conn, tenant, "synthetic.unknown", "r1", max_attempts=2)
-    tick = Worker(worker_conn, SETTINGS).tick()  # default (empty) registry
-    # Fails closed: retried with backoff, then dead-lettered (operator requeue).
-    assert tick.jobs == [(unknown, S.QUEUED), (unknown, S.DEAD_LETTER)]
-    assert job_row(app_conn, tenant, unknown) == (S.DEAD_LETTER, 2, "no_handler")
+    snapshot = ("SELECT state::text, attempts, available_at, next_available_at, "
+                "claimed_at, updated_at FROM app.job WHERE id = %s")  # fmt: skip
+    before = conn.execute(snapshot, (unknown,)).fetchone()
+    assert Worker(worker_conn, SETTINGS).tick().jobs == []  # empty registry
+    boom = enqueue(app_conn, tenant, "synthetic.boom", "r1", max_attempts=3)
 
     def crash(tx: TenantTx, job: ClaimedJob) -> None:
         handled(tx, job)
         raise RuntimeError("SYNTHETIC crash text that is never stored")
 
-    boom = enqueue(app_conn, tenant, "synthetic.boom", "r1", max_attempts=3)
     one = WorkerSettings("synthetic-w1", jobs_per_tick=1, job_backoff=NOW)
     worker = Worker(worker_conn, one, handlers={"synthetic.boom": crash})
-    assert worker.tick().jobs == [(boom, S.QUEUED)]
+    assert worker.tick().jobs == [(boom, S.QUEUED)]  # past the unknown head job
     assert job_row(app_conn, tenant, boom) == (S.QUEUED, 1, "handler_failed")
     assert audits(app_conn, tenant, "synthetic.handled") == 0
+    assert job_row(app_conn, tenant, unknown) == (S.QUEUED, 0, None)
+    assert conn.execute(snapshot, (unknown,)).fetchone() == before
+
+
+@pytest.mark.db
+def test_workers_with_disjoint_registries_claim_only_their_own_kinds(
+    app_conn: Conn, worker_conn: Conn
+) -> None:
+    a, _ = make_tenant(app_conn)
+    b, _ = make_tenant(app_conn)
+    left = [enqueue(app_conn, t, "synthetic.left", f"r{t}") for t in (a, b)]
+    right = [enqueue(app_conn, t, "synthetic.right", f"r{t}") for t in (a, b)]
+    ran: dict[str, list[uuid.UUID]] = {"left": [], "right": []}
+
+    def worker(side: str) -> Worker:
+        return Worker(worker_conn, SETTINGS, handlers={
+            f"synthetic.{side}": lambda tx, job: ran[side].append(job.id)})  # fmt: skip
+
+    lefty, righty = worker("left"), worker("right")
+    assert sorted(lefty.tick().jobs) == sorted((j, S.SUCCEEDED) for j in left)
+    assert [job_row(app_conn, t, j) for t, j in zip((a, b), right, strict=True)] == [
+        (S.QUEUED, 0, None)] * 2  # fmt: skip
+    assert lefty.tick().jobs == []
+    assert sorted(righty.tick().jobs) == sorted((j, S.SUCCEEDED) for j in right)
+    assert sorted(ran["left"]) == sorted(left)
+    assert sorted(ran["right"]) == sorted(right)
+
+
+@pytest.mark.db
+def test_a_claimed_kind_without_a_handler_still_fails_closed(
+    app_conn: Conn, worker_conn: Conn, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    tenant, _ = make_tenant(app_conn)
+    stray = enqueue(app_conn, tenant, "synthetic.stray", "r1", max_attempts=2)
+    real_claim = qj.claim
+
+    def leaky(c: Conn, worker: str, pool: Any, lease: timedelta,
+              kinds: tuple[str, ...]) -> ClaimedJob | None:  # fmt: skip
+        return real_claim(c, worker, pool, lease, (*kinds, "synthetic.stray"))
+
+    monkeypatch.setattr(qj, "claim", leaky)  # as if the kind filter were lost
+    worker = Worker(worker_conn, SETTINGS, handlers={"synthetic.echo": handled})
+    # Never succeeded: retried with backoff, then dead-lettered (operator requeue).
+    assert worker.tick().jobs == [(stray, S.QUEUED), (stray, S.DEAD_LETTER)]
+    assert job_row(app_conn, tenant, stray) == (S.DEAD_LETTER, 2, "no_handler")
 
 
 @pytest.mark.db

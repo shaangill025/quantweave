@@ -12,10 +12,13 @@
    email, broker) needs explicit owner authorisation;
 5. the retention purges, when `purge_every` has passed on the database clock.
 
-A job kind with no handler fails closed: the attempt is recorded as the retryable
-error `no_handler` (backoff, then `dead_letter` at max_attempts, where an operator
-requeue can redrive it once a handler exists); it is never marked succeeded. No
-handler is registered yet: no job-producing domain code exists.
+A worker claims only the kinds in its handler registry (`0021_job_pick_kinds.sql`):
+any other kind stays queued, untouched, for a worker that handles it, and an empty
+registry claims nothing. As a fail-closed fallback, a claimed job whose kind has no
+handler is recorded as the retryable error `no_handler` (backoff, then
+`dead_letter` at max_attempts, where an operator requeue can redrive it); it is
+never marked succeeded. No handler is registered yet: no job-producing domain code
+exists.
 
 Stopping (`request_stop`, SIGTERM via `install_signal_handlers`) lets the current
 job or event finish and claims nothing more. Delivery stays at-least-once.
@@ -44,7 +47,7 @@ Handler = Callable[[TenantTx, ClaimedJob], None]
 Publisher = Callable[[OutboxEvent], None]
 Clock = Callable[[], datetime]
 Sleep = Callable[[timedelta], None]
-# Job kind -> handler. Empty: no domain handler exists yet (fail closed above).
+# Job kind -> handler. Empty: no domain handler exists yet (claims nothing).
 HANDLERS: Mapping[str, Handler] = MappingProxyType({})
 
 
@@ -145,7 +148,7 @@ class Worker:
 
     def _run_one(self) -> tuple[uuid.UUID, JobState | None] | None:
         s = self.settings
-        job = qj.claim(self.conn, s.worker_name, s.pool, s.lease)
+        job = qj.claim(self.conn, s.worker_name, s.pool, s.lease, tuple(self.handlers))
         if job is None:
             return None
         handler = self.handlers.get(job.kind)
