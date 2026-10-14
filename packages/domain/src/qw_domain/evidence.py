@@ -15,17 +15,20 @@ Supported claims with one key (entity, attribute, period, unit) and different va
 form a contradiction and read `contested` until an append-only resolution, naming a
 preferred member, an actor and a time, binds that exact member set (claim, revision);
 a new member, a lost member or a revision reopens it. No mutation may be backdated
-within a tenant.
-LIMITATIONS: in-memory; non-fact claim kinds refused; no T027 binding. Stdlib only.
+within a tenant. `snapshot` and `restore` carry one tenant's records to and from
+storage (qw_adapters.evidence_store); `restore` re-checks every rule that does not
+need the rights in force at ingest or resolution time.
+LIMITATIONS: non-fact claim kinds refused; no T027 binding. Stdlib only.
 """
 
 import hashlib
 import json
 import re
+from collections import Counter
 from collections.abc import Mapping
 from dataclasses import dataclass
-from datetime import datetime
-from decimal import Decimal
+from datetime import date, datetime
+from decimal import Decimal, InvalidOperation
 from enum import StrEnum
 from types import MappingProxyType
 
@@ -208,6 +211,40 @@ class Contradiction:
     resolution: Resolution | None
 
 
+@dataclass(frozen=True, slots=True)
+class Snapshot:
+    """One tenant's records in a canonical order, for persistence."""
+
+    tenant_id: str
+    sources: tuple[Source, ...]  # by id
+    content: Mapping[str, str]  # source id -> text still held
+    passages: tuple[Passage, ...]  # by id
+    revisions: tuple[ClaimRevision, ...]  # by (claim id, revision)
+    citations: tuple[Citation, ...]  # by id
+    withdrawn: Mapping[str, datetime]  # origin group -> withdrawal time
+    deleted: Mapping[str, datetime]  # source id -> tombstone time
+    purged: Mapping[str, datetime]  # source id -> text purged after retention
+    resolutions: tuple[Resolution, ...]  # in recording order
+
+
+def _fact_passage(src: Source, text: str, p: Passage) -> bool:
+    """A whole-record passage built by `add_fact`: its source id is the hash of
+    (feed, content) and its reading is the content's concept, unit, value, period."""
+    if p.passage_id != f"p-{src.source_id}" or (p.start, p.end) != (0, len(text)):
+        return False
+    if src.source_id != f"fact-{_sha(json.dumps([src.feed_id, text]))[:32]}":
+        return False
+    try:
+        b = json.loads(text)
+        start = None if b[9] is None else date.fromisoformat(b[9])
+        period = Period(start, date.fromisoformat(b[8]))
+        stated = (f"{b[1]}:{b[2]}", b[3], Decimal(b[4]), period)
+    except (ValueError, TypeError, IndexError, KeyError, InvalidOperation):
+        return False
+    r = p.reading
+    return stated == (r.attribute, r.unit, r.value, r.period)
+
+
 class EvidenceStore:
     """Append-only, tenant-scoped; every lookup is keyed by (tenant, id)."""
 
@@ -219,6 +256,7 @@ class EvidenceStore:
         self._citations: dict[tuple[str, str], dict[str, Citation]] = {}
         self._withdrawn: dict[tuple[str, str], datetime] = {}  # (tenant, origin)
         self._deleted: dict[tuple[str, str], datetime] = {}
+        self._purged: dict[tuple[str, str], datetime] = {}
         self._resolutions: dict[str, list[Resolution]] = {}
         self._clock: dict[str, datetime] = {}
 
@@ -445,8 +483,9 @@ class EvidenceStore:
     def purge_expired(self, tenant_id: str, at: datetime) -> None:
         at = self._time(tenant_id, at)
         for (tenant, sid), src in self._sources.items():
-            if tenant == tenant_id and src.retain_until <= at:
-                self._content.pop((tenant, sid), None)
+            expired = tenant == tenant_id and src.retain_until <= at
+            if expired and self._content.pop((tenant, sid), None) is not None:
+                self._purged[(tenant, sid)] = at
         self._clock[tenant_id] = at
 
     def passage(self, tenant_id: str, passage_id: str) -> Passage:
@@ -588,3 +627,130 @@ class EvidenceStore:
 
     def resolutions(self, tenant_id: str) -> tuple[Resolution, ...]:
         return tuple(self._resolutions.get(tenant_id, ()))
+
+    def snapshot(self, tenant_id: str) -> Snapshot:
+        def mine[V](table: Mapping[tuple[str, str], V]) -> dict[str, V]:
+            return {k: v for (t, k), v in sorted(table.items()) if t == tenant_id}
+
+        revs = [r for (t, _), rs in sorted(self._claims.items()) if t == tenant_id
+                for r in rs]  # fmt: skip
+        cites = [c for (t, _), cs in self._citations.items() if t == tenant_id
+                 for c in cs.values()]  # fmt: skip
+        return Snapshot(
+            tenant_id,
+            tuple(mine(self._sources).values()),
+            mine(self._content),
+            tuple(mine(self._passages).values()),
+            tuple(revs),
+            tuple(sorted(cites, key=lambda c: c.citation_id)),
+            mine(self._withdrawn),
+            mine(self._deleted),
+            mine(self._purged),
+            tuple(self._resolutions.get(tenant_id, ())),
+        )
+
+    @classmethod
+    def restore(cls, snap: Snapshot) -> "EvidenceStore":
+        """Rebuild one tenant from stored records, re-checking content and passage
+        hashes, spans, quote values (or the `add_fact` derivation), origin groups,
+        revision order, citation ids, matching, link-time revision and usability,
+        resolution members, and the live store's chronology: events after receipt,
+        withdrawals of known groups, passages known before their citations and
+        before their text was removed, resolutions while their members were
+        current. Ingest and resolution rights are not replayed.
+        Any failure raises EvidenceError("integrity")."""
+
+        def need(ok: bool, what: str) -> None:
+            if not ok:
+                raise EvidenceError("integrity", what)
+
+        s, t = cls(), _id(snap.tenant_id, "tenant")
+        times: list[datetime] = []
+        group = Counter(src.origin for src in snap.sources)
+        for src in snap.sources:
+            need(type(src) is Source and src.tenant_id == t, "source")
+            text = snap.content.get(_id(src.source_id, "source"))
+            norm = None if text is None else _sha(" ".join(text.casefold().split()))
+            need(text is None or _sha(text) == src.content_hash, src.source_id)
+            need(norm in (None, src.origin) or group[src.origin] > 1, "origin")
+            need(src.received_at <= src.retain_until, src.source_id)
+            s._sources[(t, src.source_id)] = src
+            times.append(src.received_at)
+        # Each source's text is held, tombstoned or purged after retention.
+        held, gone, purged = set(snap.content), set(snap.deleted), set(snap.purged)
+        need(held | gone | purged == {k for _, k in s._sources}, "missing text")
+        need(not held & (gone | purged), "removed text held")
+        for k, at in snap.purged.items():
+            need(s._sources[(t, k)].retain_until <= at, "purged before expiry")
+        first: dict[str, datetime] = {}  # origin group -> earliest receipt
+        for src in snap.sources:
+            first[src.origin] = min(first.get(src.origin, src.received_at),
+                                    src.received_at)  # fmt: skip
+        for o, at in snap.withdrawn.items():
+            need(o in first, "withdrawn group unknown")
+            need(first[o] <= at, "event before receipt")
+        for k, at in (*snap.deleted.items(), *snap.purged.items()):
+            need(s._sources[(t, k)].received_at <= at, "event before receipt")
+        s._content = {(t, k): v for k, v in snap.content.items()}
+        times += [ensure_aware_utc(at) for at in (*snap.withdrawn.values(),
+                  *snap.deleted.values(), *snap.purged.values())]  # fmt: skip
+        s._withdrawn = {(t, k): v for k, v in snap.withdrawn.items()}
+        s._deleted = {(t, k): v for k, v in snap.deleted.items()}
+        s._purged = {(t, k): v for k, v in snap.purged.items()}
+        for p in snap.passages:
+            need(type(p) is Passage and p.tenant_id == t, "passage")
+            src = s._get(s._sources, t, p.source_id)
+            need(0 <= p.start < p.end and src.received_at <= p.known_at, p.passage_id)
+            removed = [m[k] for m in (snap.deleted, snap.purged)
+                       if (k := p.source_id) in m]  # fmt: skip
+            need(all(p.known_at <= at for at in removed), "passage after removal")
+            text = snap.content.get(p.source_id)
+            if text is not None:
+                quote = text[p.start : p.end]
+                need(p.end <= len(text) and _sha(quote) == p.text_hash, p.passage_id)
+                fact = _fact_passage(src, text, p)
+                need(fact or p.reading.value in _numbers(quote), p.passage_id)
+            s._passages[(t, _id(p.passage_id, "passage"))] = p
+            times.append(p.known_at)
+        for r in snap.revisions:
+            need(type(r) is ClaimRevision and r.tenant_id == t, "claim")
+            revs = s._claims.setdefault((t, _id(r.claim_id, "claim")), [])
+            last = revs[-1] if revs else None
+            need(r.kind is ClaimKind.REPORTED_FACT and r.revision == len(revs) + 1,
+                 r.claim_id)  # fmt: skip
+            need(last is None or (last.known_at <= r.known_at
+                                  and last.stated != r.stated), r.claim_id)  # fmt: skip
+            revs.append(r)
+            times.append(r.known_at)
+        for c in snap.citations:
+            need(type(c) is Citation and c.tenant_id == t, "citation")
+            revs = s._get(s._claims, t, c.claim_id)
+            need(1 <= c.revision <= len(revs), c.citation_id)
+            rev, later = revs[c.revision - 1], revs[c.revision :]
+            p = s._get(s._passages, t, c.passage_id)
+            src = s._sources[(t, p.source_id)]
+            body = [t, c.claim_id, c.revision, c.passage_id]
+            need(c.citation_id == f"cit-{_sha(json.dumps(body))[:32]}", "citation id")
+            need(p.known_at <= c.linked_at, "passage after citation")
+            need(rev.stated == p.reading and src.kind is not SourceKind.SOCIAL
+                 and rev.known_at <= c.linked_at
+                 and (not later or c.linked_at < later[0].known_at)
+                 and s._unusable(src, c.linked_at) is None, c.citation_id)  # fmt: skip
+            s._citations.setdefault((t, c.claim_id), {})[c.citation_id] = c
+            times.append(c.linked_at)
+        for res in snap.resolutions:
+            need(type(res) is Resolution and res.tenant_id == t, "resolution")
+            ids = {cid for cid, _ in res.members}
+            need(len(res.members) >= 2 and res.preferred in ids, "resolution")
+            for cid, n in res.members:
+                revs = s._get(s._claims, t, cid)
+                need(1 <= n <= len(revs), "resolution member")
+                current = revs[n - 1].known_at <= res.at
+                need(current and (n == len(revs) or res.at < revs[n].known_at),
+                     "resolution before members")  # fmt: skip
+            _id(res.actor_id, "actor")
+            s._resolutions.setdefault(t, []).append(res)
+            times.append(res.at)
+        if times:
+            s._clock[t] = max(times)
+        return s
