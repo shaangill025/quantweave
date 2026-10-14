@@ -1,8 +1,8 @@
 // Read-only sources for the Research and Simulation views (T054).
 // Contract routes used (openapi.yaml 1.0.0): GET /claims/{id}, /evidence/{id},
 // /calculations/{id}, /instruments/{id}/option-terms and /simulations. apps/api serves claims,
-// evidence and calculations (project contract 0.3.0: claim `material` may be null, its reason
-// named in `coverage.reasons`); the others fail as `not_found` and the views say so.
+// evidence, calculations (project contract 0.3.0: claim `material` may be null, its reason
+// named in `coverage.reasons`) and /simulations (T041); option terms fail as `not_found`.
 // The option scenario grid and the differentiated scorecard have NO contract route or schema.
 // Their shapes below follow qw_domain.option_scenarios / option_greeks and qw_domain.scorecard,
 // and the HTTP source answers `no_contract_route` for them without sending a request.

@@ -22,8 +22,8 @@ or restricted, and the reason is in coverage. A claim's `verification` is the
 domain support status (`unavailable` when nothing counts and rights are a
 reason); evidence and counterevidence ids are the passages that count for it and
 for disagreeing members of its contradiction; invalid citations are in coverage.
-Option terms and simulations have contract routes but no store yet, so they are
-not served here (docs/receipts/T054-api.md).
+Option terms have a contract route but no store yet, so they are not served here
+(docs/receipts/T054-api.md); simulations are read in qw_api.simulations (T041).
 """
 
 from __future__ import annotations
