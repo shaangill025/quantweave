@@ -33,6 +33,7 @@ from dataclasses import dataclass, replace
 from datetime import datetime, timedelta
 from decimal import Decimal, localcontext
 from enum import StrEnum
+from fractions import Fraction
 from types import MappingProxyType
 
 from qw_domain.budget import BudgetBook, BudgetError, Category, Status, check_id
@@ -146,9 +147,8 @@ class Mandate:
     def __post_init__(self) -> None:
         check_id(self.mandate_id, "mandate_id")
         check_id(self.tenant_id, "tenant")
-        w = self.workflow
-        if type(w) is not StrategyManifest or w.family is not Family.AI_THESIS:
-            raise ResearchError("workflow", "an ai_thesis StrategyManifest")
+        if type(self.workflow) is not StrategyManifest:  # ai_thesis: `research`
+            raise ResearchError("workflow", "a StrategyManifest")
         if (type(self.instrument), type(self.max_cost)) != (InstrumentId, UsdBudget):
             raise TypeError("instrument is an InstrumentId, max_cost a UsdBudget")
         if not isinstance(self.question, str) or not self.question.strip():
@@ -274,6 +274,7 @@ class Claim:
     evidence_ids: tuple[str, ...]
     value: Decimal | None
     verification: str  # supported, assumption_dependent or lead
+    formula: str | None = None  # calculation: FORMULAS key over evidence_ids, in order
 
 
 @dataclass(frozen=True, slots=True)
@@ -319,12 +320,50 @@ def _claim(d: object) -> Claim:
     return Claim(cid, ClaimKind(kind), text, _texts(c["evidence_ids"], "ids"), dec, "")
 
 
+def _ratio_minus_one(xs: tuple[Fraction, ...]) -> Fraction | None:
+    return None if len(xs) != 2 or xs[1] == 0 else Fraction(xs[0], xs[1]) - 1
+
+
+def _mean(xs: tuple[Fraction, ...]) -> Fraction | None:
+    return Fraction(sum(xs, Fraction(0)), len(xs)) if xs else None
+
+
+# Registered deterministic formulas (exact arithmetic; inputs are the cited
+# passages' values in citation order). None: the inputs do not fit the formula.
+FORMULAS: Mapping[str, Callable[[tuple[Fraction, ...]], Fraction | None]] = (
+    MappingProxyType({"ratio_minus_one/1": _ratio_minus_one, "mean/1": _mean})
+)
+
+
+def _calc_problem(c: Claim, m: Mandate, by_id: dict[str, Item]) -> str:
+    """A calculation claim is recomputed from its typed input records; the claimed
+    value must equal the exact result, half-even at 1e-18."""
+    if (f := FORMULAS.get(c.formula or "")) is None:
+        return "formula_unknown"
+    if len(set(c.evidence_ids)) != len(c.evidence_ids):
+        return "repeated_input"
+    items = [by_id[e] for e in c.evidence_ids]
+    if any(i.kind is SourceKind.SOCIAL for i in items):
+        return "social_input"
+    if any(i.reading.entity != m.instrument for i in items):
+        return "entity_mismatch"
+    if len({(i.reading.attribute, i.reading.unit) for i in items}) > 1:
+        return "input_mismatch"  # registered formulas take one attribute and unit
+    got = f(tuple(Fraction(i.reading.value) for i in items))
+    if got is None or c.value is None:
+        return "calc_inputs" if got is None else "value_required"
+    units = round(got * 10**18)  # exact half-even integer count of 1e-18 units
+    return "" if Fraction(c.value) * 10**18 == units else "calc_mismatch"
+
+
 def _problem(c: Claim, m: Mandate, by_id: dict[str, Item], read: set[str]) -> str:
     """'' when supported, 'lead' when social-only, else why it is unsupported."""
-    if c.kind is ClaimKind.CALCULATION:
-        return "kind_unsupported"  # formula and input records: not modelled yet
+    if c.kind is ClaimKind.CALCULATION and c.formula is None:
+        return "kind_unsupported"  # formula and input records required
     if any(e not in read for e in c.evidence_ids):
         return "not_read"
+    if c.kind is ClaimKind.CALCULATION:
+        return _calc_problem(c, m, by_id)
     if c.kind is ClaimKind.ASSUMPTION:
         return ""
     firm = [by_id[e] for e in c.evidence_ids if by_id[e].kind is not SourceKind.SOCIAL]
@@ -463,6 +502,8 @@ def research(
     m: Mandate, store: EvidenceStore, eng: Engine, book: BudgetBook, at: datetime
 ) -> Result:
     """Run the bounded research loop; every outcome is a thesis or an abstention."""
+    if m.workflow.family is not Family.AI_THESIS:
+        raise ResearchError("workflow", "an ai_thesis StrategyManifest")
     at, ctx = ensure_aware_utc(at), eng.ctx
     rec = Record(m.mandate_id, m.workflow.material_hash, tuple(sorted(m.tools)),
                  None, (), ())  # fmt: skip

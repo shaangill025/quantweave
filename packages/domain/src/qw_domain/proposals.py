@@ -90,6 +90,12 @@ class Code(StrEnum):
     ALTERNATIVE_SELECTED = "ALTERNATIVE_SELECTED"
     CAPITAL_CONFLICT = "CAPITAL_CONFLICT"  # commitment admission
     CASH_UNCONFIRMED = "CASH_UNCONFIRMED"  # commitment admission
+    MATERIAL_CLAIM_UNSUPPORTED = "MATERIAL_CLAIM_UNSUPPORTED"  # T040 routing
+    REVIEW_UNAVAILABLE = "REVIEW_UNAVAILABLE"
+    REVIEW_REVISE = "REVIEW_REVISE"
+    REVIEW_RESEARCH_ONLY = "REVIEW_RESEARCH_ONLY"
+    REVIEW_REJECTED = "REVIEW_REJECTED"
+    REVIEW_DEADLINE_MISSED = "REVIEW_DEADLINE_MISSED"
 
 
 P = ProposalState
@@ -440,8 +446,12 @@ def _no(p: Proposal, *why: Reason) -> Decision:
     return Decision(False, p, why)
 
 
-def step(p: Proposal, dst: ProposalState, cur: Current) -> Decision:
-    """A pipeline move: verifying, review, final check, research-only, rejected."""
+def step(
+    p: Proposal, dst: ProposalState, cur: Current, code: Code | None = None,
+    why: str = "",
+) -> Decision:  # fmt: skip
+    """A pipeline move: verifying, review, final check, research-only, rejected;
+    `code` and `why` record the structured reason on the event."""
     if dst not in _STEPS:
         raise ProposalError("illegal", f"{dst} is not a pipeline step")
     p, closed = settle(p, cur)
@@ -453,7 +463,7 @@ def step(p: Proposal, dst: ProposalState, cur: Current) -> Decision:
         return _no(p, Reason(Code.REVIEW_REQUIRED))
     if dst is P.AWAITING_REVIEW and not ai:
         return _no(p, Reason(Code.NOT_AI_MODE))
-    return Decision(True, p._record(dst, cur.as_of))
+    return Decision(True, p._record(dst, cur.as_of, code, why))
 
 
 def revise(p: Proposal, v: ProposalVersion, cur: Current) -> Decision:

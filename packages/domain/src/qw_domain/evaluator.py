@@ -24,6 +24,10 @@ provider SDK or persistence.
   for the one permitted revision (`MAX_REVISIONS`, spec §7), then rejects.
   Interpretation, forecast and assumption differences are disclosed only. The
   model can make the outcome stricter, never looser.
+- Rule-origin candidates (T040, R023): a mandate whose workflow is not ai_thesis
+  frames a rule thesis built by code, with no proposer model run. It takes the
+  same two passes; isolation is `rules_origin` and `model_family_distinct` is
+  false, because there is no proposer model to be distinct from.
 - The hand-off is a `review.schema.json` record. `approve_for_final_checks` moves a
   proposal to `ready_for_final_check`, where the deterministic final validator
   (T026) still decides; a review carries no order, size, approval or adoption.
@@ -74,6 +78,7 @@ from qw_domain.researcher import (  # the researcher's claim rules, reused as is
     _texts,
 )
 from qw_domain.sources import ID_PATTERN
+from qw_domain.strategy_registry import Family
 
 BLIND_T, COMPARE_T = "evaluator-blind-v1", "evaluator-compare-v1"
 BLIND = OutputSchema(BLIND_T, (("assessment", Kind.TEXT), ("claims", Kind.TEXT),
@@ -209,9 +214,11 @@ class Evaluation:
 
 def thesis_wire(t: Thesis) -> dict[str, object]:
     def c(x: Claim) -> dict[str, object]:
-        return {"id": x.claim_id, "kind": x.kind.value, "text": x.text,
+        body: dict[str, object] = {
+                "id": x.claim_id, "kind": x.kind.value, "text": x.text,
                 "evidence_ids": list(x.evidence_ids),
                 "value": None if x.value is None else str(x.value)}  # fmt: skip
+        return body if x.formula is None else body | {"formula": x.formula}
 
     return {"instrument_id": t.instrument.to_wire(), "summary": t.summary,
             "claims": [c(x) for x in t.claims], "leads": [c(x) for x in t.leads],
@@ -297,8 +304,15 @@ def evaluate(
         m.mandate_id, m.mandate_id, m.instrument,
     ):  # fmt: skip
         raise EvaluatorError("mandate", "thesis, record and mandate differ")
-    if not record.runs or any(r.route_id != cfg.proposer.route_id
-                              for r in record.runs):  # fmt: skip
+    rules = m.workflow.family is not Family.AI_THESIS  # rule origin (T040, R023)
+    if rules and record.runs:
+        raise EvaluatorError("proposer", "a rule-origin record has no model runs")
+    if rules and (t.leads or t.alternatives != ("no action",) or any(
+        x.kind not in MATERIAL_KINDS or (x.kind is ClaimKind.CALCULATION) is (
+            x.formula is None) for x in t.claims)):  # fmt: skip
+        raise EvaluatorError("rules_thesis", "facts and formula calculations only")
+    if not rules and (not record.runs or any(r.route_id != cfg.proposer.route_id
+                                             for r in record.runs)):  # fmt: skip
         raise EvaluatorError("proposer", "the record was not produced on proposer")
     revision = 0 if prior is None else prior.revision_number + 1
     if revision > cfg.max_revisions:
@@ -318,10 +332,12 @@ def evaluate(
 
     def done(outcome: Review | Abstention) -> Evaluation:
         iso = isolation_label(cfg.proposer, tuple(seen_route))
+        iso = "rules_origin" if rules and iso else iso
         return Evaluation(outcome, tuple(receipts), tuple(runs), book, iso)
 
     fam = cfg.proposer.family_id
-    if cfg.require_distinct_family and any(r.family_id == fam for r in eng.chain):
+    same = any(r.family_id == fam for r in eng.chain)
+    if not rules and cfg.require_distinct_family and same:
         return done(Abstention(Why.POLICY_VIOLATION, ("same_family",)))
     snap = rs.snapshot(m, store, ctx.registry, ctx.scope, ctx.jurisdiction, at)
     if isinstance(snap, Abstention):
@@ -460,11 +476,12 @@ def evaluate(
                 if f.claim_id in rechecks else f for f in findings]  # fmt: skip
     with localcontext(DOMAIN_CONTEXT):
         cost = sum((r.cost.value for r in runs if r.cost is not None), Decimal(0))
-    completed = ensure_aware_utc(eng.clock())
+    completed, seen = ensure_aware_utc(eng.clock()), tuple(seen_route)
     return done(Review(
         f"{pid}-ev-r{revision}", pid, revision + 1, _sha(_json(proposal)),
-        runs[-1].run_id, record.runs[-1].run_id,
-        isolation_label(cfg.proposer, tuple(seen_route)) == "cross_model",
+        runs[-1].run_id,
+        record.runs[-1].run_id if record.runs else f"rules:{record.mandate_id}",
+        not rules and isolation_label(cfg.proposer, seen) == "cross_model",
         assessment, final, tuple(findings), tuple(x.claim_id for x in accepted),
         revision, completed, completed + cfg.ttl, UsdBudget(cost),
         str(c["rationale"]), alternatives, tuple(material), tuple(disclosures),
