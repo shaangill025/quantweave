@@ -13,15 +13,33 @@ proposals with readProposal's state (`reads.proposal`: recorded resolution plus
 covering stored pauses; live states name NOT_RECHECKED),
 risk pauses as `paused`/`resumed`; alerts, jobs (no store qw_app may read), missing
 objects and resolver errors read `unavailable`, named in coverage.
+With the user's `in_app` preference off, only safety categories (risk pauses) keep
+their in-app row; preferences failing verification list as if it were off and
+name `unavailable:notification_preferences/integrity` (never more than allowed).
+
+`PATCH /notifications/preferences` (setNotificationPreferences, increment 4): any
+member's own preferences (the session user; no id names another user), CSRF,
+Idempotency-Key (C-03) and If-Match `"N"` (T010 form; 428 absent, 412 otherwise
+stale or malformed; the openapi text says 409, as recorded for T019). There is no
+read operation: nothing recorded is revision `"0"` (the domain defaults), and each
+response, replays too, carries the ETag of the revision its request recorded.
+Enabling email or browser push is refused (422 `external_channel_unavailable`,
+a neutral detail): step-up for it is an open owner decision, no transport exists.
+Detail exposure is refused (422). Stored preferences failing checks, the replay
+ETag lookup included, are 409 `integrity`; a purged-key replay writes no audit.
 """
 
 from __future__ import annotations
 
 import json
+import re
 from datetime import datetime
+from typing import Annotated
 
-from fastapi import APIRouter, Request, Response
+from fastapi import APIRouter, Header, Request, Response
+from pydantic import Field
 from qw_adapters import journal_store as js
+from qw_adapters import notification_preference_store as prefs_store
 from qw_adapters import notification_store as ns
 from qw_adapters import pause_store, policy_store
 from qw_adapters import proposal_store as pst
@@ -30,9 +48,9 @@ from qw_domain import notifications as dn
 from qw_domain.notifications import Category, Channel
 from qw_domain.proposals import TERMINAL, ProposalState
 
-from qw_api import reads
+from qw_api import reads, routes
 from qw_api import security as sec
-from qw_api.app import ApiError, Settings
+from qw_api.app import ApiError, FieldError, Settings
 from qw_api.policies import Reader
 from qw_api.reads import NOT_RECHECKED, Cursor, Limit, _after, _cursor, _now
 
@@ -41,6 +59,9 @@ SORT = "seq_channel"
 
 
 INTEGRITY = "unavailable:notification_record/integrity"
+PREFERENCES_INTEGRITY = "unavailable:notification_preferences/integrity"
+_IF_MATCH = re.compile(r'"(0|[1-9][0-9]{0,8})"')
+_ZONE = r"^[A-Za-z][A-Za-z0-9_+/-]{0,63}$"  # as 0020's CHECK
 
 
 def keyring(settings: Settings) -> ns.Keyring:
@@ -96,15 +117,25 @@ def list_notifications(
     except ValueError:  # the MAC held, so only a key we never issue lands here
         raise ApiError(400, "invalid_cursor", "The cursor is not valid here.") from None
     keys, user = keyring(sec.settings_of(request)), str(principal.session.user_id)
+    reasons = list[str]()
     with principal.tx() as tx:
         try:
-            rows = ns.page(tx, keys, user, limit + 1,
-                           None if seq is None else (seq, rank))  # fmt: skip
-            now, views = _now(tx), dict[str, dn.CurrentView | None]()
-            try:
+            try:  # lock order: pause, then preference
                 held: pause_store.Pauses | None = pause_store.load(tx)  # once
             except pause_store.PauseStoreError:
                 held = None
+            try:
+                in_app = prefs_store.load(
+                    tx, principal.session.user_id
+                ).preferences.in_app
+            except prefs_store.PreferenceStoreError as exc:
+                if exc.code != "integrity":
+                    raise
+                in_app = False  # unverifiable: never list more than allowed
+                reasons.append(PREFERENCES_INTEGRITY)
+            rows = ns.page(tx, keys, user, limit + 1,
+                           None if seq is None else (seq, rank), in_app)  # fmt: skip
+            now, views = _now(tx), dict[str, dn.CurrentView | None]()
             for r in rows[:limit]:
                 if r.item is None:
                     continue
@@ -115,10 +146,10 @@ def list_notifications(
                     except (dn.NotificationError, pst.ProposalStoreError,
                             pause_store.PauseStoreError):  # fmt: skip
                         views[n.id] = None  # never the stored, stale version
-        except ns.NotificationStoreError as exc:
+        except (ns.NotificationStoreError, prefs_store.PreferenceStoreError) as exc:
             raise ApiError(500, "internal_error", "Notifications could not be "
                            "read.") from exc  # fmt: skip
-    items, reasons = [], list[str]()
+    items = []
     for r in rows[:limit]:
         if r.item is None:  # never the failing record's id, object or state
             reasons.append(INTEGRITY)
@@ -142,3 +173,94 @@ def list_notifications(
     coverage = {"status": "partial" if reasons else "complete", "reasons": reasons}
     body = {"items": items, "next_cursor": nxt, "coverage": coverage}
     return Response(json.dumps(body).encode(), 200, media_type="application/json")
+
+
+class PreferencesBody(routes.Body):
+    """Contract `NotificationPreferences`; windows are checked by the domain."""
+
+    in_app: bool
+    email: bool
+    browser_push: bool
+    quiet_hours_timezone: str = Field(min_length=1, max_length=64, pattern=_ZONE)
+    quiet_hours: list[Annotated[str, Field(max_length=11)]] = Field(max_length=8)
+    redact_financial_values: bool
+
+
+_REFUSED = {
+    "external_channel_unavailable": (422, "External notification channels are not "
+        "available."),
+    "detail_exposure_unsupported": (422, "Financial values are always redacted."),
+    "stale": (412, "The preferences have changed."),
+    "idempotency_key_reused": (409, "Key used elsewhere."),
+    "integrity": (409, "Stored notification preferences failed checks."),
+}  # fmt: skip
+
+
+def _refuse(code: str) -> ApiError:
+    status, detail = _REFUSED[code]
+    return ApiError(status, "version_mismatch" if status == 412 else code, detail)
+
+
+def _preferences(body: PreferencesBody) -> dn.Preferences:
+    def field(pointer: str) -> ApiError:
+        error = FieldError(pointer, "invalid", "Not accepted.")
+        return ApiError(400, "invalid_request", "Invalid preferences.", False, (error,))
+
+    try:
+        dn.Preferences(quiet_hours_timezone=body.quiet_hours_timezone)
+    except dn.NotificationError:
+        raise field("/quiet_hours_timezone") from None
+    try:
+        return dn.Preferences(body.in_app, body.email, body.browser_push,
+                              body.quiet_hours_timezone, tuple(body.quiet_hours),
+                              body.redact_financial_values)  # fmt: skip
+    except dn.NotificationError as exc:
+        if exc.code in _REFUSED:
+            raise _refuse(exc.code) from None
+        raise field("/quiet_hours") from None
+
+
+@router.patch("/notifications/preferences")
+def set_notification_preferences(
+    body: PreferencesBody, request: Request, principal: Reader, key: routes.IdemKey,
+    if_match: Annotated[str | None, Header(alias="If-Match")] = None,
+) -> Response:  # fmt: skip
+    session = principal.session
+
+    def run(tx: TenantTx) -> tuple[int, bytes]:
+        if if_match is None:
+            raise ApiError(428, "if_match_required", "Send If-Match with the revision.")
+        if (m := _IF_MATCH.fullmatch(if_match)) is None:
+            raise _refuse("stale")
+        p = _preferences(body)
+        try:
+            cur, wrote = prefs_store.set_preferences(
+                tx, session.user_id, session.session_id, key, int(m[1]), p)  # fmt: skip
+        except prefs_store.PreferenceStoreError as exc:
+            if exc.code not in _REFUSED:
+                raise  # database: a crash (500), never a client answer
+            raise _refuse(exc.code) from None
+        if wrote:  # a replay after the idempotency purge changed nothing
+            routes._audit(tx, request, "notification.preferences_set",
+                          session.user_id, session.user_id)  # fmt: skip
+        return 200, json.dumps(_wire(cur.preferences)).encode()
+
+    payload = {"if_match": if_match, "body": body.model_dump(mode="json")}
+    response = sec.idempotent(principal, request, key, payload, run)
+    try:
+        with principal.tx() as tx:
+            recorded = prefs_store.by_key(tx, session.user_id, key)
+    except prefs_store.PreferenceStoreError as exc:
+        if exc.code not in _REFUSED:
+            raise
+        raise _refuse(exc.code) from None
+    if recorded is not None:
+        response.headers["ETag"] = f'"{recorded.revision}"'
+    return response
+
+
+def _wire(p: dn.Preferences) -> dict[str, object]:
+    return {"in_app": p.in_app, "email": p.email, "browser_push": p.browser_push,
+            "quiet_hours_timezone": p.quiet_hours_timezone,
+            "quiet_hours": list(p.quiet_hours),
+            "redact_financial_values": p.redact_financial_values}  # fmt: skip
