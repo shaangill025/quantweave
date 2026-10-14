@@ -1,27 +1,33 @@
-"""Persisted notifications (T056 increment 2; 0017_notifications.sql) on a migrated
-PostgreSQL 16 database: the worker records and appends, the API role reads and
-records an open. SYNTHETIC tenants, users, objects and addresses only; every time
-is taken from the database clock."""
+"""Persisted notifications (T056 increments 2-3; 0017_notifications.sql,
+0018_notification_seal_kid.sql) on a migrated PostgreSQL 16 database: the worker
+records and appends, the API role reads and records an open. SYNTHETIC tenants,
+users, objects, addresses and keys only; every time is taken from the database
+clock."""
 
 from __future__ import annotations
 
+import shutil
 import uuid
 from collections.abc import Callable
 from dataclasses import replace
 from datetime import datetime, timedelta
+from pathlib import Path
 from typing import Any
 
 import psycopg
 import pytest
 from qw_adapters import notification_store as ns
 from qw_adapters import tenancy as tn
+from qw_adapters.migrations import MIGRATIONS_DIR, migrate
 from qw_domain import notifications as N
 from qw_domain.instants import ensure_aware_utc
 from qw_domain.notifications import Category, Channel, DeliveryStatus, SendOutcome
 
 pytestmark = pytest.mark.db
 Conn = psycopg.Connection[Any]
-KEY = b"SYNTHETIC-notification-key-0001"
+A, B = b"SYNTHETIC-seal-key-A-000000000000", b"SYNTHETIC-seal-key-B-000000000000"
+ID_KEY = b"SYNTHETIC-notification-id-key-0001"
+KEY = ns.Keyring("syn-a", {"syn-a": A}, ID_KEY)
 ON = N.Preferences(email=True, browser_push=True)
 PUSH = N.PushSubscription("https://push.example.invalid", "granted", True, None, False)
 
@@ -65,24 +71,42 @@ def submit(
     at = now(conn)
     s = N.Signal(str(tenant), Category.JOB_OUTCOME, obj, "succeeded",
                  at - timedelta(seconds=5))  # fmt: skip
-    c = c or N.Center(str(tenant), timedelta(0), 3, KEY)
+    c = c or N.Center(str(tenant), timedelta(0), 3, ID_KEY)
     return c.submit(s, me(tenant, user, prefs), at)
 
 
-def write(conn: Conn, tenant: uuid.UUID, fn: Callable[..., Any], *args: Any) -> Any:
+def write(conn: Conn, tenant: uuid.UUID, fn: Callable[..., Any], *args: Any,
+          keys: ns.Keyring = KEY) -> Any:  # fmt: skip
     with tn.tenant_transaction(conn, tenant) as tx:
-        return fn(tx, KEY, *args)
+        return fn(tx, keys, *args)
 
 
-def code_of(conn: Conn, t: uuid.UUID, fn: Callable[..., Any], *args: Any) -> str:
+def code_of(conn: Conn, t: uuid.UUID, fn: Callable[..., Any], *args: Any,
+            keys: ns.Keyring = KEY) -> str:  # fmt: skip
     with pytest.raises(ns.NotificationStoreError) as err:
-        write(conn, t, fn, *args)
+        write(conn, t, fn, *args, keys=keys)
     return err.value.code
+
+
+def kids(conn: Conn, nid: str) -> list[str | None]:
+    """Every seal kid of one record, record row first (owner view)."""
+    rows = conn.execute(
+        "SELECT 0, '', seal_kid FROM app.notification WHERE id = %(n)s UNION ALL "
+        "SELECT 1, channel, seal_kid FROM app.notification_delivery WHERE "
+        "notification_id = %(n)s UNION ALL SELECT 2, channel || position, seal_kid "
+        "FROM app.notification_delivery_event WHERE notification_id = %(n)s UNION "
+        "ALL SELECT 3, '', seal_kid FROM app.notification_seen WHERE "
+        "notification_id = %(n)s ORDER BY 1, 2", {"n": nid}).fetchall()  # fmt: skip
+    return [r[2] for r in rows]
+
+
+def unavailable(rows: list[ns.Row]) -> bool:
+    return bool(rows) and all(r.item is None for r in rows)
 
 
 def test_round_trip_events_repeat_and_seen(worker_conn: Conn, app_conn: Conn) -> None:
     t, u1, *_ = people(app_conn)
-    c = N.Center(str(t), timedelta(0), 3, KEY)
+    c = N.Center(str(t), timedelta(0), 3, ID_KEY)
     sub = submit(worker_conn, t, u1, c=c)
     stored = write(worker_conn, t, ns.record, sub)
     assert (stored.notification, stored.deliveries) == (sub.notification,
@@ -231,7 +255,7 @@ def test_tampered_rows_fail_closed(
         tamper(conn, f"UPDATE app.{table} SET {change} {cond}")
         user = str(u2) if "user_id" in change else str(u1)
         assert code_of(app_conn, t, ns.load, user, nid) == "integrity"
-        assert code_of(app_conn, t, ns.page, user, 10, None) == "integrity"
+        assert unavailable(write(app_conn, t, ns.page, user, 10, None))
         tamper(conn, f"DELETE FROM app.{table} {cond}")
         tamper(
             conn, f"INSERT INTO app.{table} OVERRIDING SYSTEM VALUE SELECT * FROM keep"
@@ -240,9 +264,10 @@ def test_tampered_rows_fail_closed(
         assert write(app_conn, t, ns.load, str(u1), nid) == good
     # a forged event row with a valid-looking seal under another key
     other = N.DeliveryEvent(DeliveryStatus.ATTEMPTED, now(worker_conn))
+    forger = ns.Keyring("syn-a", {"syn-a": b"SYNTHETIC-another-key-00000000000"},
+                        ID_KEY)  # fmt: skip
     with tn.tenant_transaction(worker_conn, t) as tx:
-        ns._insert_event(tx, b"SYNTHETIC-another-key-000000000", nid, Channel.EMAIL, 1,
-                         other)  # fmt: skip
+        ns._insert_event(tx, forger, nid, Channel.EMAIL, 1, other)
     assert code_of(app_conn, t, ns.load, str(u1), nid) == "integrity"
 
 
@@ -287,3 +312,114 @@ def test_page_is_newest_first_per_channel_with_keyset(
     else:
         pytest.fail("the keyset did not advance")
     assert [(r.seq, r.channel) for r in walked] == [(r.seq, r.channel) for r in rows]
+
+
+def test_rotation_seals_with_the_active_kid_and_verifies_old_ones(
+    worker_conn: Conn, app_conn: Conn, conn: Conn
+) -> None:
+    t, u1, *_ = people(app_conn)
+    c = N.Center(str(t), timedelta(0), 3, ID_KEY)
+    sub = submit(worker_conn, t, u1, c=c)
+    old = write(worker_conn, t, ns.record, sub)
+    nid = sub.notification.id
+    assert kids(conn, nid) == ["syn-a"] * 5  # record, 2 deliveries, 2 events
+    rotated = ns.Keyring("syn-b", {"syn-a": A, "syn-b": B}, ID_KEY)
+    assert write(app_conn, t, ns.load, str(u1), nid, keys=rotated) == old
+    done = c.attempt(nid, Channel.EMAIL, Tx(), me(t, u1), now(worker_conn))
+    write(worker_conn, t, ns.append, done, keys=rotated)
+    got = write(app_conn, t, ns.record_seen, str(u1), nid, now(app_conn),
+                keys=rotated)  # fmt: skip
+    # the id does not depend on the seal keys: a redelivery finds the same record
+    again = submit(worker_conn, t, u1)
+    assert write(worker_conn, t, ns.record, again, keys=rotated) == got
+    assert kids(conn, nid) == ["syn-a"] * 5 + ["syn-b"] * 3  # 2 events, the open
+    page = write(app_conn, t, ns.page, str(u1), 10, None, keys=rotated)
+    assert [r.item.notification.seen_at is not None for r in page if r.item] == [
+        True] * 3  # fmt: skip
+    # retiring A leaves its rows unverifiable: unknown kid, fail closed
+    only_b = ns.Keyring("syn-b", {"syn-b": B}, ID_KEY)
+    assert code_of(app_conn, t, ns.load, str(u1), nid, keys=only_b) == "integrity"
+    assert unavailable(write(app_conn, t, ns.page, str(u1), 10, None, keys=only_b))
+    # a kid relabelled to another known kid, or to an unknown one, fails closed
+    for kid in ("syn-b", "syn-z"):
+        tamper(conn, f"UPDATE app.notification SET seal_kid = '{kid}' "
+                     f"WHERE id = '{nid}'")  # fmt: skip
+        assert code_of(app_conn, t, ns.load, str(u1), nid, keys=rotated) == (
+            "integrity")  # fmt: skip
+    tamper(conn, f"UPDATE app.notification SET seal_kid = 'syn-a' WHERE id = '{nid}'")
+    assert write(app_conn, t, ns.load, str(u1), nid, keys=rotated) is not None
+
+
+def test_keyring_is_validated() -> None:
+    short = b"SYNTHETIC-31-bytes-000000000000"
+    assert len(short) == 31
+    bad: list[tuple[str, Any, Any]] = [
+        ("syn-a", {"syn-a": short}, ID_KEY),  # a seal key under 32 bytes
+        ("syn-a", {"syn-a": A}, short),  # an id key under 32 bytes
+        ("syn-b", {"syn-a": A}, ID_KEY),  # the active kid has no key
+        ("syn-a", {}, ID_KEY),
+        ("Syn A", {"Syn A": A}, ID_KEY),  # not a kid
+        ("syn-a", {"syn-a": A.decode()}, ID_KEY),  # not bytes
+        ("syn-a", {"syn-a": A}, A),  # the id key is a seal key
+        ("syn-a", {"syn-a": A, "syn-b": A}, ID_KEY),  # one key under two kids
+        ("syn-a", [("syn-a", A)], ID_KEY),
+    ]
+    for args in bad:
+        with pytest.raises(ValueError):
+            ns.Keyring(*args)
+    k = ns.Keyring("syn-a", {"syn-a": A}, ID_KEY)
+    assert A.decode() not in repr(k) and ID_KEY.decode() not in repr(k)
+    with pytest.raises(TypeError):
+        k.seal_keys["syn-b"] = B  # type: ignore[index]
+
+
+def test_one_bad_record_does_not_hide_the_others(
+    worker_conn: Conn, app_conn: Conn, conn: Conn
+) -> None:
+    t, u1, *_ = people(app_conn)
+    a = write(worker_conn, t, ns.record, submit(worker_conn, t, u1, "job-a"))
+    b = write(worker_conn, t, ns.record, submit(worker_conn, t, u1, "job-b"))
+    tamper(conn, "UPDATE app.notification SET version = 'failed' WHERE id = "
+                 f"'{a.notification.id}'")  # fmt: skip
+    rows = write(app_conn, t, ns.page, str(u1), 10, None)
+    assert [(r.channel.value, r.item) for r in rows] == [
+        ("in_app", b), ("email", b), ("browser_push", b),
+        ("in_app", None), ("email", None), ("browser_push", None)]  # fmt: skip
+    assert code_of(app_conn, t, ns.load, str(u1), a.notification.id) == "integrity"
+
+
+def test_rows_from_0017_fail_closed(
+    database_url: str, conn: Conn, tmp_path: Path
+) -> None:
+    """A record written before 0018 (no kid) is never verified; new rows need one."""
+    for f in sorted(MIGRATIONS_DIR.glob("*.sql")):
+        if f.name < "0018":
+            shutil.copy(f, tmp_path / f.name)
+    assert migrate(conn, tmp_path)[-1] == 17
+    with tn.provision_tenant(conn) as tx:
+        user = tn.create_user(tx, "SYNTHETIC legacy")
+    t, nid = tx.tenant_id, "ntf-" + "3" * 32
+    with tn.tenant_transaction(conn, t):
+        conn.execute(
+            "INSERT INTO app.notification (tenant_id, id, user_id, category, object_id,"
+            " version, trigger_at, created_at, listed, seal) VALUES (%s, %s, %s, "
+            "'job_outcome', 'job-legacy', 'succeeded', now(), now(), true, %s)",
+            (t, nid, user, "0" * 64),
+        )  # fmt: skip
+    assert migrate(conn) == [18]
+    assert kids(conn, nid) == [None]
+    assert code_of(conn, t, ns.load, str(user), nid) == "integrity"
+    assert unavailable(write(conn, t, ns.page, str(user), 10, None))
+    with pytest.raises(psycopg.errors.CheckViolation), tn.tenant_transaction(conn, t):
+        conn.execute(
+            "INSERT INTO app.notification (tenant_id, id, user_id, category, object_id,"
+            " version, trigger_at, created_at, listed, seal) VALUES (%s, %s, %s, "
+            "'job_outcome', 'job-new', 'succeeded', now(), now(), true, %s)",
+            (t, "ntf-" + "4" * 32, user, "0" * 64),
+        )  # fmt: skip
+    # a correctly sealed row stripped of its kid (constraint dropped) fails too
+    nid = write(conn, t, ns.record, submit(conn, t, user)).notification.id
+    conn.execute("ALTER TABLE app.notification DROP CONSTRAINT "
+                 "notification_seal_kid_set")  # fmt: skip
+    tamper(conn, f"UPDATE app.notification SET seal_kid = NULL WHERE id = '{nid}'")
+    assert code_of(conn, t, ns.load, str(user), nid) == "integrity"
