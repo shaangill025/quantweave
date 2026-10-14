@@ -1,7 +1,7 @@
 // Shared display pieces. Every state is text (no colour-only cue) and every figure names its
 // scope; an unavailable value is shown with its reason, never as 0 or blank.
 import type { ReactNode } from "react";
-import type { Loaded, Money, Page } from "./api";
+import type { Coverage, Loaded, Money, Page } from "./api";
 import { formatDecimal, isDecimalString } from "./wire";
 
 /** An offset timestamp normalised to UTC for display, e.g. "2026-10-10 14:05 UTC". */
@@ -66,10 +66,27 @@ export function Completeness({ page, label = "" }: { page: Page<unknown>; label?
   );
 }
 
+/** Coverage reasons exactly as sent: codes such as `none:family/ai_thesis` are not reworded. */
+export function CoverageReasons({ coverage, label }: { coverage: Coverage; label: string }) {
+  const reasons = [...new Set(coverage.reasons)];
+  return (
+    <div>
+      <p>{label}: <Tag>{coverage.status === "complete" ? "Complete" : "Partial"}</Tag>{reasons.length === 0 && " No reason given."}</p>
+      {reasons.length > 0 && <ul aria-label={`${label} reasons`}>{reasons.map((r) => <li key={r}><code>{r}</code></li>)}</ul>}
+    </div>
+  );
+}
+export const More = ({ page }: { page: Page<unknown> }) =>
+  page.next_cursor === null ? null : <p>Only the first page is shown; more records exist.</p>;
+
 /** Focuses an in-page target without changing the URL hash (the hash belongs to the router). */
 export function focusTarget(e: { preventDefault: () => void; currentTarget: HTMLAnchorElement }) {
   e.preventDefault();
   document.getElementById(e.currentTarget.hash.slice(1))?.focus();
 }
+
+/** A label for a payload string; inherited names such as `__proto__` or `constructor` never match. */
+export const lookup = (labels: Record<string, string>, key: string): string | undefined =>
+  Object.hasOwn(labels, key) ? labels[key] : undefined;
 
 export const humanize = (code: string): string => code.replaceAll("_", " ");

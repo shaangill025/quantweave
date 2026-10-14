@@ -4,6 +4,7 @@ import type { Fetcher } from "./api";
 import { focusTarget } from "./labels";
 import { Research, Simulation, type ViewProps } from "./ResearchViews";
 import { httpSource, type ResearchSource, type SimulationSummary } from "./sources";
+import { Settings, Strategies } from "./StrategyViews";
 import { Accounts, Decisions, Overview, type Env } from "./views";
 
 // Spec 13 primary navigation. Each screen is delivered by its own task.
@@ -21,7 +22,7 @@ const SECTIONS = [
 
 type Section = (typeof SECTIONS)[number];
 const VIEWS: Partial<Record<Section, (props: ViewProps) => ReactNode>> = {
-  Overview, Accounts, Decisions, Research, Simulation,
+  Overview, Accounts, Decisions, Research, Strategies, Simulation, Settings,
 };
 
 function sectionOf(hash: string): Section {

@@ -3,9 +3,9 @@
 // Uncertainty is always text (a [Tag], an interval or a reason), never colour or a model score.
 import { useEffect, useId, useState, type ReactNode } from "react";
 import { reasonFor, type Loaded } from "./api";
-import { Completeness, MoneyText, Resource, Retrieved, Tag, Unavailable, humanize, utc } from "./labels";
+import { Completeness, CoverageReasons, MoneyText, More, Resource, Retrieved, Tag, Unavailable, humanize, lookup, utc } from "./labels";
 import {
-  isRecordId, percent, quoteBlockers, termBlockers, type Calculation, type Claim, type Evidence, type Origin,
+  SIMULATED, isRecordId, percent, quoteBlockers, termBlockers, type Calculation, type Claim, type Evidence, type Origin,
   type RecordKind, type ResearchSource, type ScenarioGrid, type ScoreRow, type SimulationSummary,
 } from "./sources";
 import type { Env } from "./views";
@@ -324,8 +324,92 @@ export function Simulation({ research, sim }: ViewProps) {
           </>
         )}
       </Resource>
-      {sim.current && <ScorecardPanel key={sim.current.id} id={sim.current.id} research={research} />}
+      {sim.current && <>
+        <FillsPanel key={`f:${sim.current.id}`} id={sim.current.id} research={research} />
+        <ResultsPanel key={`r:${sim.current.id}`} sim={sim.current} research={research} />
+        <ScorecardPanel key={sim.current.id} id={sim.current.id} research={research} />
+      </>}
     </>
+  );
+}
+
+function FillsPanel({ id, research }: { id: string; research: ResearchSource }) {
+  const state = useSourced(`fills:${id}`, () => research.fills(id));
+  return (
+    <section aria-labelledby="fills-title">
+      <h2 id="fills-title">[SIMULATED] Modelled fills</h2>
+      <Resource label="Simulated fills" state={state}>
+        {(page, at) => (
+          <>
+            <Retrieved at={at} />
+            {page.coverage && <CoverageReasons coverage={page.coverage} label="Fill coverage" />}
+            <table>
+              <caption>[SIMULATED] Modelled fills under the named execution model; not actual executions, nothing reached a broker</caption>
+              <Head cols={["Fill", "Simulated order", "Filled at", "Quantity", "Price", "Fees", "Execution model", "Assumptions", "Data records"]} />
+              <tbody>
+                {page.items.length === 0 && <tr><td colSpan={9}>No modelled fill is recorded.</td></tr>}
+                {page.items.map((f) => (
+                  <tr key={f.id}>
+                    <th scope="row">{f.id}</th><td>{f.simulated_order_id}</td><td>{utc(f.filled_at)}</td><td>{fmt(f.quantity)}</td>
+                    <td><MoneyText money={f.price} /></td><td><MoneyText money={f.fees} /></td><td>{f.execution_model_id}</td>
+                    <td>{f.assumption_ids.join(", ") || "none named"}</td>
+                    <td>
+                      {f.data_record_ids.join(", ") ||
+                        <Unavailable reason={reasonFor(page.coverage?.reasons, f.id, "data_record_ids") ?? "none_named"} />}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+            <More page={page} />
+          </>
+        )}
+      </Resource>
+    </section>
+  );
+}
+
+const RESULT: Record<string, string> = {
+  virtual_realized_net: "Realized net P&L (fees in cost and deducted from proceeds)",
+  virtual_realized_gain_before_fees: "Realized gain before fees (fees not deducted)",
+};
+const GAP = "unavailable:";
+function ResultsPanel({ sim, research }: { sim: SimulationSummary; research: ResearchSource }) {
+  const state = useSourced(`results:${sim.id}`, () => research.results(sim.id));
+  return (
+    <section aria-labelledby="results-title">
+      <h2 id="results-title">[SIMULATED] Ledger results</h2>
+      <Resource label="Simulation results" state={state}>
+        {(page, at) => (
+          <>
+            <Retrieved at={at} />
+            {page.coverage && <CoverageReasons coverage={page.coverage} label="Result coverage" />}
+            <table>
+              <caption>[SIMULATED] Ledger results for {sim.name}: hypothetical, not actual returns; each figure stands alone</caption>
+              <Head cols={["Calculation", "Status", "Result", "Notes"]} />
+              <tbody>
+                {page.items.length === 0 && <tr><td colSpan={4}>No result is recorded.</td></tr>}
+                {page.items.map((k) => {
+                  const gaps = k.warnings.filter((w) => w.startsWith(GAP)).map((w) => w.slice(GAP.length));
+                  return (
+                    <tr key={k.id}>
+                      <th scope="row">{lookup(RESULT, k.formula_id) ?? k.formula_id} ({k.formula_id} v{k.formula_version})</th>
+                      <td><Tag>{lookup(CALC_STATUS, k.status) ?? "Unrecognised status"}</Tag> ({k.status})</td>
+                      <td>
+                        {k.status === "ok" && k.result !== null ? `${fmt(k.result)} ${k.unit}`
+                          : (gaps.length ? gaps : [k.status]).map((g) => <Unavailable key={g} reason={g} />)}
+                      </td>
+                      <td>{k.warnings.filter((w) => w !== SIMULATED && !w.startsWith(GAP)).join("; ")}</td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+            <More page={page} />
+          </>
+        )}
+      </Resource>
+    </section>
   );
 }
 
