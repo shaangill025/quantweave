@@ -2,6 +2,8 @@ import { StrictMode, useEffect, useMemo, useRef, useState, type ReactNode } from
 import { createRoot } from "react-dom/client";
 import type { Fetcher } from "./api";
 import { focusTarget } from "./labels";
+import { Research, Simulation, type ViewProps } from "./ResearchViews";
+import { httpSource, type ResearchSource, type SimulationSummary } from "./sources";
 import { Accounts, Decisions, Overview, type Env } from "./views";
 
 // Spec 13 primary navigation. Each screen is delivered by its own task.
@@ -18,8 +20,8 @@ const SECTIONS = [
 ] as const;
 
 type Section = (typeof SECTIONS)[number];
-const VIEWS: Partial<Record<Section, (props: { env: Env }) => ReactNode>> = {
-  Overview, Accounts, Decisions,
+const VIEWS: Partial<Record<Section, (props: ViewProps) => ReactNode>> = {
+  Overview, Accounts, Decisions, Research, Simulation,
 };
 
 function sectionOf(hash: string): Section {
@@ -33,8 +35,16 @@ const clock = () => new Date();
 export function App({
   fetcher = browserFetch,
   now = clock,
-}: { fetcher?: Fetcher; now?: () => Date }) {
+  research: injected,
+}: { fetcher?: Fetcher; now?: () => Date; research?: ResearchSource }) {
   const env = useMemo<Env>(() => ({ fetcher, now }), [fetcher, now]);
+  const research = useMemo(() => injected ?? httpSource(fetcher, now), [injected, fetcher, now]);
+  // Simulation mode lives in the shell, so its label survives navigation between views.
+  const [virtual, setVirtual] = useState<SimulationSummary | null>(null);
+  const sim = useMemo(() => ({ current: virtual, set: setVirtual }), [virtual]);
+  useEffect(() => {
+    document.title = virtual ? "[SIMULATED] quantweave" : "quantweave";
+  }, [virtual]);
   const [section, setSection] = useState(() => sectionOf(window.location.hash));
   const [moved, setMoved] = useState(0);
   const heading = useRef<HTMLHeadingElement>(null);
@@ -58,7 +68,16 @@ export function App({
       <a className="skip-link" href="#main" onClick={focusTarget}>Skip to main content</a>
       <header>
         <p>quantweave</p>
-        <p role="note">Real-account analysis only. This app never places, changes or cancels broker orders.</p>
+        <p role="note">Analysis only. This app never places, changes or cancels broker orders.</p>
+        <p role="status" aria-label="Mode">
+          {virtual ? (
+            <>
+              <strong>[SIMULATED]</strong> Simulation mode: {virtual.name}. Its figures are hypothetical, kept apart
+              from real accounts and never added to them. Real-account screens still show real accounts only.{" "}
+              <button type="button" onClick={() => { setVirtual(null); }}>Leave simulation mode</button>
+            </>
+          ) : "Mode: real-account analysis."}
+        </p>
       </header>
       <nav aria-label="Primary">
         <ul>
@@ -71,7 +90,7 @@ export function App({
       </nav>
       <main id="main" tabIndex={-1}>
         <h1 ref={heading} tabIndex={-1}>{section}</h1>
-        {View ? <View env={env} /> : <p>This screen is not connected yet; it is delivered by its own task.</p>}
+        {View ? <View env={env} research={research} sim={sim} /> : <p>This screen is not connected yet; it is delivered by its own task.</p>}
       </main>
     </>
   );
