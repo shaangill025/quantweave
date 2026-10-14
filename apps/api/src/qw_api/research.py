@@ -13,7 +13,9 @@ record that fails its hash or domain checks is a 500, never an answer.
 
 Claims and evidence (project contract 0.3.0: both gain `coverage`; claim
 `material` is null, named `unknown:material`) are evaluated now, by the database
-clock, under the `app.state.rights` registry. Evidence text is served only when
+clock, under the `app.state.rights` registry, loaded in the request's tenant
+transaction (qw_adapters.rights_store by default; a tampered registry is a 500).
+Evidence text is served only when
 the source is usable and display is granted; otherwise `passage` is null,
 `availability` is deleted, unavailable (withdrawn, expired, purged, unpublished)
 or restricted, and the reason is in coverage. A claim's `verification` is the
@@ -66,10 +68,11 @@ def _json(body: dict[str, Any]) -> Response:
 def _open(principal: Reader, request: Request) -> Opened:
     with principal.tx() as tx:
         es = evidence_store.load(tx, for_write=False)  # read-only: shared lock
-        # "now" is read once the lock is held, in the same transaction.
+        rights = request.app.state.rights(tx)  # this tenant's, re-verified
+        # "now" is read once the locks are held, in the same transaction.
         row = tx.conn.execute("SELECT clock_timestamp()").fetchone()
     assert row is not None
-    return es, row[0], request.app.state.rights()
+    return es, row[0], rights
 
 
 def _coverage(reasons: list[str]) -> dict[str, object]:
