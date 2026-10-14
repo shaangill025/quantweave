@@ -13,6 +13,18 @@ with the run's as-of (`Outcome`). Callers build them with qw_domain.simulation.
   state and counts with the latest digest: one changed, deleted or appended row is
   `integrity`. Rows rewritten with a matching digest are not detected.
 - Another tenant's simulation is unknown (None), also on an RLS-bypassing role.
+Results (increment 4): `save` also records the state's ledger results
+(qw_domain.simulation_results: cash, realized gain, fees, income and units; the
+price-dependent figures as unavailable) through calculation_store, in the same
+transaction, computed at the database clock `now()`. The results are written at
+save, not on a read, so a GET never writes. A simulation whose as-of (its latest
+entry or evaluation) is after that clock is refused (`clock`): no result could be
+computed before the state it describes. `results` loads the simulation first (so
+the replay and digest checks run before anything else), recomputes the expected
+records and returns the stored ones under those content-addressed ids, each
+re-verified by calculation_store; an altered record, or one missing while others
+exist, is `integrity`. None recorded at all (a simulation saved before increment
+4) is `[]`; an identical re-save records them.
 Locks: the tenant's simulation lock, shared to read and exclusive to `save` (then
 the account lock inside the insert); evidence and rights locks come first. Do not
 `load` before `save` in one transaction (two callers would deadlock upgrading);
@@ -33,7 +45,9 @@ from typing import Any
 
 import psycopg
 from psycopg.types.json import Jsonb
+from qw_domain import calculation as dc
 from qw_domain import simulation as sim
+from qw_domain import simulation_results as sr
 from qw_domain.decimals import (
     DOMAIN_CONTEXT,
     BoundedDecimal,
@@ -46,10 +60,11 @@ from qw_domain.instants import ensure_aware_utc, format_instant
 from qw_domain.risk import Side
 from qw_domain.simulation import EntryKind, OrderStatus, VirtualEntry
 
+from qw_adapters import calculation_store as cs
 from qw_adapters.tenancy import TenantTx
 
-__all__ = ["Mode", "Outcome", "Simulation", "SimulationStoreError", "load", "page",
-           "save"]  # fmt: skip
+__all__ = ["Mode", "Outcome", "Simulation", "SimulationStoreError", "as_of", "load",
+           "page", "results", "save"]  # fmt: skip
 TABLES = ("simulation", "simulation_entry", "simulation_order", "simulation_fill",
           "simulation_digest")  # fmt: skip
 KINDS = frozenset({EntryKind.CAPITAL, EntryKind.SEED, EntryKind.FILL,
@@ -196,6 +211,19 @@ def digest(s: Simulation) -> str:
     return hashlib.sha256(body.encode()).hexdigest()
 
 
+def as_of(s: Simulation) -> datetime:
+    """The state's as-of: its latest ledger entry or order evaluation."""
+    times = [e.effective_at for e in s.portfolio.entries]
+    return max(times + [o.as_of for o in s.outcomes])
+
+
+def _figures(s: Simulation, computed_at: datetime) -> tuple[dc.CalculationRecord, ...]:
+    return sr.ledger_results(
+        s.simulation_id, digest(s), s.portfolio, as_of=as_of(s),
+        computed_at=computed_at, warnings=("unverified:execution_model_id",),
+    )  # fmt: skip
+
+
 def _lock(tx: TenantTx, shared: bool) -> None:
     fn = "pg_advisory_xact_lock_shared" if shared else "pg_advisory_xact_lock"
     key = "hashtextextended('simulation:' || %s, 0)"
@@ -314,6 +342,25 @@ def page(tx: TenantTx, limit: int, after: str | None) -> list[Simulation]:
     return [s for s in found if s is not None]
 
 
+def results(tx: TenantTx, simulation_id: str) -> list[dc.CalculationRecord] | None:
+    """The stored results of this tenant's simulation; None when unknown, [] when
+    none was recorded."""
+    s = load(tx, simulation_id)  # replay and digest first
+    if s is None:
+        return None
+    try:
+        wanted = _figures(s, as_of(s))  # computed_at is outside the id
+        got = [cs.load(tx, cs.PREFIX + w.content_hash) for w in wanted]
+    except cs.CalculationStoreError as exc:
+        raise _bad(f"result record: {exc}") from None
+    except psycopg.Error as exc:
+        raise SimulationStoreError("database", type(exc).__name__) from None
+    found = [r for r in got if r is not None]
+    if found and len(found) != len(wanted):
+        raise _bad("a result record is missing")
+    return found  # [] only when none was recorded
+
+
 def _definition(s: Simulation) -> tuple[object, ...]:
     p = s.portfolio
     return (s.name, s.execution_model_id, s.benchmark_policy_id, s.mode,
@@ -330,6 +377,8 @@ def save(tx: TenantTx, s: Simulation) -> None:
         raise _bad(str(exc)) from None
     try:
         _save(tx, s)
+    except cs.CalculationStoreError as exc:
+        raise _bad(f"result record: {exc}") from None
     except psycopg.Error as exc:  # the 0014 guard: a real journal account id
         code = "account_conflict" if "virtual account" in str(exc) else "database"
         raise SimulationStoreError(code, type(exc).__name__) from None
@@ -346,6 +395,11 @@ def _insert(
 
 def _save(tx: TenantTx, s: Simulation) -> None:
     sid, p = s.simulation_id, s.portfolio
+    row = tx.conn.execute("SELECT now()").fetchone()
+    assert row is not None
+    now = ensure_aware_utc(row[0])
+    if as_of(s) > now:
+        raise SimulationStoreError("clock", "the simulation ends after the clock")
     _lock(tx, shared=False)
     old = _read(tx, sid)
     if old is None:
@@ -397,3 +451,5 @@ def _save(tx: TenantTx, s: Simulation) -> None:
         )  # fmt: skip
     if _read(tx, sid) != s:
         raise _bad("the stored simulation differs")
+    for rec in _figures(s, now):
+        cs.record(tx, rec)
