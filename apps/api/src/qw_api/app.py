@@ -21,6 +21,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from qw_adapters import rights_store
 from qw_adapters.tenancy import MAX_SESSION_TTL, Conn, TenantTx, ThrottlePolicy
+from qw_domain.release import Edition
 from qw_domain.rights import Registry
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
@@ -37,6 +38,7 @@ RightsProvider = Callable[[TenantTx], Registry]
 SAFE_METHODS = frozenset({"GET", "HEAD"})
 _ORIGIN = re.compile(r"(https://[a-z0-9.-]+|http://(localhost|127\.0\.0\.1))(:\d+)?")
 _REFERER = re.compile(_ORIGIN.pattern + r"(?=/|$)")
+_REGION = re.compile(r"[A-Z]{2}(-[A-Z0-9]{1,3})?", re.ASCII)  # as qw_domain.rights
 
 
 _ACCOUNT = ThrottlePolicy(
@@ -54,7 +56,10 @@ class Settings:
     HMACs. `trusted_proxies`: IP addresses or CIDR networks whose X-Forwarded-For
     is believed. It MUST be set per deployment behind a reverse proxy; when empty,
     the socket peer is the client, so every user behind a proxy shares one address
-    throttle bucket (a startup warning says so)."""
+    throttle bucket (a startup warning says so).
+    `deployment` is reported by `GET /capabilities`; the default is hosted, the
+    stricter edition. `jurisdiction` (ISO 3166, e.g. `CA-ON`) is a self-hosted
+    operator's, the place rights are checked for; unset, no rights gate passes."""
 
     allowed_origins: frozenset[str]
     secret_key: bytes
@@ -65,8 +70,17 @@ class Settings:
     account_throttle: ThrottlePolicy = _ACCOUNT
     address_throttle: ThrottlePolicy = _ADDRESS
     trusted_proxies: frozenset[str] = frozenset()
+    deployment: Edition = Edition.HOSTED
+    jurisdiction: str | None = None
 
     def __post_init__(self) -> None:
+        if not isinstance(self.deployment, Edition):
+            raise ValueError("deployment must be an Edition")
+        if self.jurisdiction is not None and (
+            self.deployment is Edition.HOSTED
+            or not _REGION.fullmatch(self.jurisdiction)
+        ):
+            raise ValueError("jurisdiction is a self-hosted ISO 3166 code")
         for proxy in self.trusted_proxies:
             ipaddress.ip_network(proxy)  # ValueError for a malformed entry
         if not self.allowed_origins or not all(
@@ -246,6 +260,7 @@ def create_app(
     authenticator: Authenticator,
     rights: RightsProvider = rights_store.load,
 ) -> FastAPI:
+    from qw_api.capabilities import router as capabilities
     from qw_api.policies import router as policies
     from qw_api.reads import router as reads
     from qw_api.research import router as research
@@ -264,6 +279,7 @@ def create_app(
     app.state.authenticator = authenticator
     app.state.rights = rights
     app.include_router(router)
+    app.include_router(capabilities)
     app.include_router(policies)
     app.include_router(reads)
     app.include_router(research)
