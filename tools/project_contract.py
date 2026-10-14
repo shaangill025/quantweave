@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
-"""Project contract 0.2.0 (T008 A-01): the docs/spec/contracts 0.1.0 schemas with the
-owner-approved amendments of contracts/amendments.json applied. docs/spec is never
+"""Project contract 0.3.0 (T008 A-01): the docs/spec/contracts 0.1.0 schemas with the
+amendments of contracts/amendments.json applied (0.2.0 owner-approved; 0.3.0
+proposed, pending owner confirmation: see `versions` there). docs/spec is never
 edited; this derives the amended schemas in memory.
 
 - `nullable`: the property (or `parent/property`; a `$ref` parent is inlined from

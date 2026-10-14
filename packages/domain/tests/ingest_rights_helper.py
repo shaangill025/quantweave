@@ -23,24 +23,29 @@ from qw_domain.rights import (
     UseScope,
 )
 
-T = datetime(2025, 1, 2, tzinfo=UTC)  # feed qualified; grants expire 2028
+T = datetime(2025, 1, 2, tzinfo=UTC)  # feed qualified; grants expire UNTIL
+UNTIL = datetime(2028, 1, 1, tzinfo=UTC)
 TENANT, REGION, KEEP = "tenant-synth-a", "CA-ON", timedelta(365)
 PERMIT = Evidence(EvidenceKind.PERMISSION, "synthetic-permit", T, "counsel-synth")
 
 
-def _profile(missing: Use | None = None) -> RightsProfile:
+def _profile(missing: Use | None = None, until: datetime = UNTIL) -> RightsProfile:
     def grant(use: Use | None = None) -> Grant:
         keep = KEEP if use is Use.RETENTION else None
-        return Grant(RightState.GRANTED, PERMIT, datetime(2028, 1, 1, tzinfo=UTC), keep)
+        return Grant(RightState.GRANTED, PERMIT, until, keep)
 
     uses = {u: grant(u) for u in Use if u is not missing}
     return RightsProfile(uses, {UseScope.PERSONAL: grant()}, {REGION: grant()})
 
 
 def qualified_registry(
-    feed_ids: tuple[str, ...], missing: Use | None = None, tenant: str = TENANT
+    feed_ids: tuple[str, ...],
+    missing: Use | None = None,
+    tenant: str = TENANT,
+    until: datetime = UNTIL,
 ) -> Registry:
-    """A registry with every feed qualified and entitled to `tenant`."""
+    """A registry with every feed qualified and entitled to `tenant`; every grant
+    expires at `until`."""
     auth = Evidence(EvidenceKind.AUTH, "synthetic-auth", T)
     work = Evidence(EvidenceKind.WORKLOAD, "synthetic-workload", T)
     registry = Registry().with_provider(
@@ -49,12 +54,16 @@ def qualified_registry(
     for feed_id in feed_ids:
         feed = (
             FeedHistory.new(feed_id, "provider-synth")
-            .revise("synthetic_feed", frozenset(Use), _profile(), T)
+            .revise("synthetic_feed", frozenset(Use), _profile(None, until), T)
             .transition(FeedStatus.CONNECTED, "operator-synth", (auth,), T)
             .transition(FeedStatus.QUALIFIED, "operator-synth", (work, PERMIT), T)
         )
         ent = EntitlementHistory.new(tenant, feed_id).revise(
-            EntitlementSource.INSTALLATION_LICENSE, True, _profile(missing), None, T
+            EntitlementSource.INSTALLATION_LICENSE,
+            True,
+            _profile(missing, until),
+            None,
+            T,
         )
         registry = registry.with_feed(feed).with_entitlement(ent)
     return registry
