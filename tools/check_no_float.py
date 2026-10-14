@@ -35,6 +35,7 @@ MONEY_PATHS: dict[str, tuple[str, ...]] = {
     "domain": ("src",),
     "portfolio": ("src",),
     "strategies": ("src/qw_strategies/sizing", "src/qw_strategies/valuation"),
+    "worker": ("src",),  # apps/worker: relays payloads that carry decimal strings
 }
 # Packages reviewed as float-tolerant, with the reason.
 NOT_MONEY: dict[str, str] = {

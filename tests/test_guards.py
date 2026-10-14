@@ -47,6 +47,7 @@ APP_ALLOWED_THIRD_PARTY: dict[str, frozenset[str]] = {
         {"fastapi", "starlette", "pydantic", "argon2", "qw_adapters", "qw_domain"}
     ),
     "web": frozenset(),
+    "worker": frozenset({"qw_adapters", "qw_domain"}),
 }
 # Standard-library modules denied in a package's non-test code (I/O, processes, code
 # loading). Matched by dotted prefix like DENIED.
@@ -58,6 +59,12 @@ DENIED_STDLIB: dict[str, tuple[str, ...]] = {
         "marshal", "runpy", "importlib.util", "zipimport", "os", "asyncio",
         "threading", "concurrent", "shutil", "select", "selectors", "tempfile",
         "wsgiref",
+    ),
+    # The worker ships no transport: network modules stay out of its code (T025).
+    "worker": (
+        "socket", "socketserver", "ssl", "http", "urllib", "ftplib", "smtplib",
+        "poplib", "imaplib", "xmlrpc", "webbrowser", "asyncio", "subprocess",
+        "multiprocessing", "ctypes",
     ),
 }  # fmt: skip
 DYNAMIC = "<non-literal>"
@@ -145,11 +152,17 @@ def test_app_boundaries_on_the_tree_and_an_injected_sample(tmp_path: Path) -> No
     assert boundary_violations(APPS, APP_ALLOWED_THIRD_PARTY, PROVIDERS) == []
     (src := tmp_path / "api" / "src" / "qw_api").mkdir(parents=True)  # SYNTHETIC
     (src / "bad.py").write_text("import fastapi, qw_adapters, psycopg, openai\n")
-    (tmp_path / "worker").mkdir()
+    (tmp_path / "newapp").mkdir()
+    (wsrc := tmp_path / "worker" / "src" / "qw_worker").mkdir(parents=True)
+    (wsrc / "send.py").write_text("import smtplib\nfrom http import client\n")
     assert boundary_violations(tmp_path, APP_ALLOWED_THIRD_PARTY, PROVIDERS) == [
         "api/src/qw_api/bad.py:1 imports openai (denied in core)",
         "api/src/qw_api/bad.py:1 imports psycopg (not allowed for api)",
-        "worker: no entry in ALLOWED_THIRD_PARTY",
+        "newapp: no entry in ALLOWED_THIRD_PARTY",
+        "worker/src/qw_worker/send.py:1 imports smtplib (stdlib module denied for "
+        "worker)",
+        "worker/src/qw_worker/send.py:2 imports http.client (stdlib module denied for "
+        "worker)",
     ]
 
 
