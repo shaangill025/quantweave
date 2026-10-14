@@ -1,7 +1,10 @@
-"""`GET /notifications` (listNotifications; T056 increment 2) over
+"""`GET /notifications` (listNotifications; T056 increments 2-3) over
 qw_adapters.notification_store, like the T053 reads: membership, session tenant
 (RLS) and session user, C-02 keyset pages with the qw_api.reads HMAC cursor, and
-nothing written (listing is not opening). A record failing verification is a 500.
+nothing written (listing is not opening). Keys are `Settings.notification_keys`
+(503 when unset). A record failing verification is left out whole, none of its
+content served, and coverage names `unavailable:notification_record/integrity`;
+the other records are still served. A database error is a 500.
 Rows are the contract `Notification`, one per channel: the in-app row (id = record
 id; `delivered` = listed, never a read) when listed, then each external channel
 (`<id>:<channel>`) at its latest event. No transport exists, so nothing is sent.
@@ -37,8 +40,14 @@ router = APIRouter(prefix="/api/v1")
 SORT = "seq_channel"
 
 
-def id_key(settings: Settings) -> bytes:
-    return sec.mac(settings, "notification-id")
+INTEGRITY = "unavailable:notification_record/integrity"
+
+
+def keyring(settings: Settings) -> ns.Keyring:
+    if settings.notification_keys is None:
+        raise ApiError(503, "notifications_unconfigured",
+                       "Notification keys are not configured.")  # fmt: skip
+    return settings.notification_keys
 
 
 def _resolve(
@@ -86,10 +95,10 @@ def list_notifications(
         seq, rank = (int(x) for x in raw.split(":")) if raw else (None, 0)
     except ValueError:  # the MAC held, so only a key we never issue lands here
         raise ApiError(400, "invalid_cursor", "The cursor is not valid here.") from None
-    key, user = id_key(sec.settings_of(request)), str(principal.session.user_id)
+    keys, user = keyring(sec.settings_of(request)), str(principal.session.user_id)
     with principal.tx() as tx:
         try:
-            rows = ns.page(tx, key, user, limit + 1,
+            rows = ns.page(tx, keys, user, limit + 1,
                            None if seq is None else (seq, rank))  # fmt: skip
             now, views = _now(tx), dict[str, dn.CurrentView | None]()
             try:
@@ -97,6 +106,8 @@ def list_notifications(
             except pause_store.PauseStoreError:
                 held = None
             for r in rows[:limit]:
+                if r.item is None:
+                    continue
                 n = r.item.notification
                 if n.id not in views:
                     try:
@@ -105,10 +116,13 @@ def list_notifications(
                             pause_store.PauseStoreError):  # fmt: skip
                         views[n.id] = None  # never the stored, stale version
         except ns.NotificationStoreError as exc:
-            raise ApiError(500, "integrity", "A stored notification failed its "
-                           "checks.") from exc  # fmt: skip
+            raise ApiError(500, "internal_error", "Notifications could not be "
+                           "read.") from exc  # fmt: skip
     items, reasons = [], list[str]()
     for r in rows[:limit]:
+        if r.item is None:  # never the failing record's id, object or state
+            reasons.append(INTEGRITY)
+            continue
         n = r.item.notification
         rid = n.id if r.channel is Channel.IN_APP else f"{n.id}:{r.channel.value}"
         view = views[n.id]

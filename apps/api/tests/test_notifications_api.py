@@ -1,4 +1,4 @@
-"""`GET /api/v1/notifications` (T056 increment 2) through TestClient on a migrated
+"""`GET /api/v1/notifications` (T056 increments 2-3) through TestClient on a migrated
 PostgreSQL 16 database as the non-superuser qw_app login. Records are written by
 the qw_worker login through qw_adapters.notification_store, as a producer job
 would. SYNTHETIC tenants, users, proposals, pauses and jobs only (the T026 store
@@ -28,7 +28,6 @@ from qw_adapters import pause_store as pz
 from qw_adapters import policy_store
 from qw_adapters import tenancy as tn
 from qw_api.app import Settings
-from qw_api.notifications import id_key
 from qw_domain import notifications as N
 
 ROOT = Path(__file__).parents[3]
@@ -49,7 +48,9 @@ pg_admin_url, database_url, conn = api.pg_admin_url, api.database_url, api.conn
 runtime_urls, app_conn, world = api.runtime_urls, api.app_conn, api.world
 login, assert_problem = api.login, api.assert_problem
 OPENAPI = yaml.safe_load((ROOT / "docs/spec/contracts/openapi.yaml").read_text())
-KEY = id_key(Settings(frozenset({api.ORIGIN}), api.KEY))
+A, B = b"SYNTHETIC-api-seal-key-A-00000000", b"SYNTHETIC-api-seal-key-B-00000000"
+KEY = ns.Keyring("syn-a", {"syn-a": A}, b"SYNTHETIC-api-notification-id-key")
+ROTATED = ns.Keyring("syn-b", {"syn-a": A, "syn-b": B}, KEY.id_key)
 URL = "/api/v1/notifications"
 
 
@@ -63,8 +64,10 @@ def conforms(body: dict[str, Any]) -> None:
 
 def seed(w: Any, app_conn: Any, runtime_urls: dict[str, str]) -> tuple[Any, ...]:
     """For bob: a proposal notified at version 1 then revised, an active pause and
-    a job outcome, each with an email delivery. Returns object id -> record id,
+    a job outcome, each with an email delivery, after giving the app the SYNTHETIC
+    notification keyring. Returns object id -> record id,
     the store context and a function recording another signal for bob."""
+    keys(w, KEY)
     alice, bob = w.users["alice"], w.users["bob"]
     with tn.tenant_transaction(app_conn, w.tenant_a) as tx:
         session, _ = tn.create_session(tx, alice, timedelta(hours=1))
@@ -81,7 +84,7 @@ def seed(w: Any, app_conn: Any, runtime_urls: dict[str, str]) -> tuple[Any, ...]
     tenant = str(w.tenant_a)
     prefs = N.Preferences(email=True)
     me = N.Recipient(tenant, str(bob), prefs, "bob@example.invalid", True, None)
-    center, ids = N.Center(tenant, timedelta(0), 3, KEY), {}
+    center, ids = N.Center(tenant, timedelta(0), 3, KEY.id_key), {}
 
     def notify(sig: N.Signal) -> str:
         sub = center.submit(sig, me, ps.db_now(w.db))
@@ -96,6 +99,11 @@ def seed(w: Any, app_conn: Any, runtime_urls: dict[str, str]) -> tuple[Any, ...]
     two = replace(ps.ver(app_conn, c, s, "prop-syn-n", 70), version=2)
     assert ps.run(app_conn, c, "revise", "prop-syn-n", two, s).accepted
     return ids, c, notify
+
+
+def keys(w: Any, ring: ns.Keyring | None) -> None:
+    state = w.client.app.state
+    state.settings = replace(state.settings, notification_keys=ring)
 
 
 def walk(client: Any, limit: int) -> tuple[list[dict[str, Any]], list[str]]:
@@ -127,6 +135,8 @@ def test_rows_resolve_current_state_page_and_write_nothing(
     before = api_rows(world)
     items, reasons = walk(world.client, 1)
     assert walk(world.client, 2)[0] == walk(world.client, 50)[0] == items
+    keys(world, ROTATED)  # B seals from now on; rows sealed under A still verify
+    assert walk(world.client, 50)[0] == items
     got = [(i["id"], i["object_id"], i["channel"], i["status"],
             i["current_object_state"]) for i in items]  # fmt: skip
     assert got == [
@@ -204,9 +214,40 @@ def test_foreign_cursors_and_tampered_records_fail_closed(
     for bad in ("0", "201"):
         assert_problem(world.client.get(f"{URL}?limit={bad}"), 400, "invalid_request")
     login(world.client, "bob")
-    with world.db.transaction():
-        world.db.execute("SET LOCAL session_replication_role = replica")
-        world.db.execute("UPDATE app.notification SET version = '3:candidate' "
-                         "WHERE id = %s", (ids["prop-syn-n"],))  # fmt: skip
-    crash = assert_problem(world.client.get(URL), 500, "integrity")
-    assert "prop-syn-n" not in json.dumps(crash)
+    tamper(world, "UPDATE app.notification SET version = '3:candidate' WHERE id = "
+                  f"'{ids['prop-syn-n']}'")  # fmt: skip
+    body = world.client.get(URL).json()  # one bad record hides nothing else
+    conforms(body)
+    served = {i["id"]: i["current_object_state"] for i in body["items"]}
+    assert served == {k: v for k, v in states.items() if k.split(":")[0]
+                      != ids["prop-syn-n"]}  # fmt: skip
+    assert served[ids[pause]] == "resumed" and len(served) == len(states) - 2
+    assert body["coverage"]["status"] == "partial"
+    assert "unavailable:notification_record/integrity" in body["coverage"]["reasons"]
+    assert ids["prop-syn-n"] not in json.dumps(body)
+    # a tampered pause store: every item is unavailable, never a permissive state
+    tamper(world, "UPDATE app.risk_pause SET reason = 'SYNTHETIC forged'")
+    body = world.client.get(URL).json()
+    conforms(body)
+    assert {i["current_object_state"] for i in body["items"]} == {"unavailable"}
+    assert len(body["items"]) == len(served) and body["coverage"]["status"] == (
+        "partial")  # fmt: skip
+    assert {f"unavailable:{i}/current_object_state" for i in served} <= set(
+        body["coverage"]["reasons"])  # fmt: skip
+
+
+def tamper(w: Any, sql: str) -> None:
+    with w.db.transaction():
+        w.db.execute("SET LOCAL session_replication_role = replica")
+        w.db.execute(sql)
+
+
+@pytest.mark.db
+def test_without_a_keyring_the_feed_is_unavailable(world: Any) -> None:
+    login(world.client, "bob")
+    assert_problem(world.client.get(URL), 503, "notifications_unconfigured")
+    base = Settings(frozenset({api.ORIGIN}), api.KEY)
+    for bad in (ns.Keyring("syn-a", {"syn-a": api.KEY}, KEY.id_key),
+                ns.Keyring("syn-a", {"syn-a": A}, api.KEY), KEY.id_key):  # fmt: skip
+        with pytest.raises(ValueError, match="notification_keys"):
+            replace(base, notification_keys=bad)  # type: ignore[arg-type]

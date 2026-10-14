@@ -20,6 +20,7 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from qw_adapters import rights_store
+from qw_adapters.notification_store import Keyring
 from qw_adapters.tenancy import MAX_SESSION_TTL, Conn, TenantTx, ThrottlePolicy
 from qw_domain.release import Edition
 from qw_domain.rights import Registry
@@ -59,7 +60,10 @@ class Settings:
     throttle bucket (a startup warning says so).
     `deployment` is reported by `GET /capabilities`; the default is hosted, the
     stricter edition. `jurisdiction` (ISO 3166, e.g. `CA-ON`) is a self-hosted
-    operator's, the place rights are checked for; unset, no rights gate passes."""
+    operator's, the place rights are checked for; unset, no rights gate passes.
+    `notification_keys` (operator-held, shared with the qw_worker producer) seals
+    and identifies notifications; it shares no key with `secret_key`, so rotating
+    `secret_key` leaves stored notifications valid. Unset, the feed is 503."""
 
     allowed_origins: frozenset[str]
     secret_key: bytes
@@ -72,6 +76,7 @@ class Settings:
     trusted_proxies: frozenset[str] = frozenset()
     deployment: Edition = Edition.HOSTED
     jurisdiction: str | None = None
+    notification_keys: Keyring | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.deployment, Edition):
@@ -89,6 +94,11 @@ class Settings:
             raise ValueError("allowed_origins must be exact https origins")
         if len(self.secret_key) < 32:
             raise ValueError("secret_key must be at least 32 bytes")
+        if (k := self.notification_keys) is not None and (
+            not isinstance(k, Keyring)
+            or self.secret_key in (k.id_key, *k.seal_keys.values())
+        ):
+            raise ValueError("notification_keys: a Keyring sharing no secret_key")
         if not timedelta(0) < self.session_ttl <= MAX_SESSION_TTL:
             raise ValueError("session_ttl must be in (0, 30 days]")
         if not timedelta(0) < self.idle_timeout <= self.session_ttl:
