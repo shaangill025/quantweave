@@ -591,6 +591,26 @@ class ImprovementEvidence:
     def uses(self, tenant_id: str) -> tuple[Use, ...]:
         return tuple(u for u in self._uses if u.tenant_id == tenant_id)
 
+    def export_view(
+        self, tenant_id: str
+    ) -> tuple[tuple[AnyRecord, ...], tuple[str, ...]]:
+        """Owner export read (T052): the tenant's live records, and only the ids of
+        final-holdout cases, whose content stays behind `select`'s read-once rule."""
+        mine = [r for (t, _), r in self._records.items() if t == tenant_id]
+        held = {r.record_id for r in mine if isinstance(r, EvaluationCase)
+                and r.split is Split.FINAL_HOLDOUT}  # fmt: skip
+        return tuple(r for r in mine if r.record_id not in held), tuple(sorted(held))
+
+    def tombstones(self, tenant_id: str) -> tuple[Tombstone, ...]:
+        return tuple(s for (t, _), s in self._deleted.items() if t == tenant_id)
+
+    def consents(
+        self, tenant_id: str
+    ) -> tuple[tuple[ConsentGrant, datetime | None], ...]:
+        """The tenant's grants, each with its revocation time or None."""
+        return tuple((g, self._revoked.get(k)) for k, g in self._grants.items()
+                     if k[0] == tenant_id)  # fmt: skip
+
     def affected_uses(self, tenant_id: str, at: datetime) -> tuple[AffectedUse, ...]:
         """Earlier uses that relied on consent revoked, or a record deleted, by
         `at`: derived state to invalidate or rebuild (spec §12)."""
