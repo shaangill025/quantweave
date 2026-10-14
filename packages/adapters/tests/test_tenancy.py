@@ -57,6 +57,8 @@ SIMULATION_TABLES = ("simulation", "simulation_entry", "simulation_order",
                      "simulation_fill", "simulation_digest")  # fmt: skip
 STRATEGY_TABLES = ("strategy_manifest", "strategy_adoption")
 PAUSE_TABLES = ("risk_pause", "risk_pause_resume")  # 0016, test_pause_store
+NOTIFICATION_TABLES = ("notification", "notification_delivery",
+                       "notification_delivery_event", "notification_seen")  # fmt: skip
 
 
 def make_tenant(conn: Conn, name: str) -> tuple[uuid.UUID, uuid.UUID]:
@@ -152,6 +154,7 @@ def test_tables_have_forced_rls_and_no_public_grants(conn: Conn) -> None:
         + SIMULATION_TABLES  # 0014, test_simulation_store
         + STRATEGY_TABLES  # 0015, test_strategy_store (manifest: open read policy)
         + PAUSE_TABLES
+        + NOTIFICATION_TABLES  # 0017, test_notification_store
     )
     for name, rls, forced, owner, acl in rows:
         assert (rls, forced, owner) == (True, True, "qw_migrate"), name
