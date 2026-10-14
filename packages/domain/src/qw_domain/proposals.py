@@ -389,6 +389,29 @@ def resolve(p: Proposal, cur: Current) -> ProposalState:
     return P.EXPIRED if reasons[0].code is Code.EXPIRED else P.INVALIDATED
 
 
+def resolve_recorded(
+    p: Proposal, as_of: datetime, revisions: Mapping[str, int], policy_hash: str | None
+) -> tuple[ProposalState, tuple[Reason, ...]]:
+    """Read-time status from stored records only, recording nothing: `resolve`'s
+    expiry and the `final_check` parts that need no risk inputs or pauses (input
+    freshness, the adopted policy hash, account revisions). The risk evaluation and
+    pauses are NOT re-checked here; the caller must say so."""
+    as_of, v = ensure_aware_utc(as_of), p.latest
+    state = p.state(v.version)
+    if state in TERMINAL:
+        return state, ()
+    if as_of >= v.expires_at:
+        return P.EXPIRED, (Reason(Code.EXPIRED, format_instant(v.expires_at)),)
+    b = v.binding
+    out = [Reason(Code.INPUT_STALE, o.key) for o in b.observations if o.stale(as_of)]
+    if policy_hash is None or policy_hash != b.policy_hash:
+        out.append(Reason(Code.POLICY_CHANGED))
+    for account, n in b.account_revisions:
+        if revisions.get(account) != n:
+            out.append(Reason(Code.ACCOUNT_CHANGED, account))
+    return (P.INVALIDATED if out else state), tuple(out)
+
+
 def settle(p: Proposal, cur: Current) -> tuple[Proposal, tuple[Reason, ...]]:
     """Record expiry or invalidation of the latest version. Reasons are returned
     only when the state changed."""

@@ -46,6 +46,7 @@ from qw_domain.proposals import (
     policy_mode,
     publish,
     resolve,
+    resolve_recorded,
     revise,
     risk_digest,
     step,
@@ -411,3 +412,29 @@ def test_no_recorded_transition_is_outside_the_table(
         for src, dst in pairwise(states):
             assert dst in TRANSITIONS[src] or (src is dst is S.ACTIVE)
     assert [e.at for e in p.events] == sorted(e.at for e in p.events)
+
+
+def test_resolve_recorded_reads_stored_records_only() -> None:
+    """Read-time status without risk inputs or pauses (the API list): it agrees with
+    `resolve` on expiry, input freshness, policy and account revisions."""
+    adopted = H.adopted
+    assert adopted is not None
+    digest, p = adopted[0].content_hash, ready(ver())
+    assert resolve_recorded(p, AT, REVS, digest) == (S.READY_FOR_FINAL_CHECK, ())
+    assert resolve(p, cur()) is S.READY_FOR_FINAL_CHECK
+    late = AT + T(minutes=30)  # == expires_at
+    expired = resolve_recorded(p, late, REVS, digest)
+    assert expired == (S.EXPIRED, (Reason(Code.EXPIRED, "2026-10-09T15:30:00Z"),))
+    assert resolve(p, cur(late)) is S.EXPIRED
+    stale = resolve_recorded(p, AT + T(minutes=5), REVS, digest)  # account obs 300s
+    assert stale == (S.INVALIDATED, (Reason(Code.INPUT_STALE, "account:acct-1"),))
+    assert resolve(p, cur(AT + T(minutes=5))) is S.INVALIDATED
+    for policy in ("f" * 64, None):
+        changed = resolve_recorded(p, AT, REVS, policy)
+        assert changed == (S.INVALIDATED, (Reason(Code.POLICY_CHANGED),))
+    for revs in ({"acct-1": 8}, {}):
+        moved = resolve_recorded(p, AT, revs, digest)
+        assert moved == (S.INVALIDATED, (Reason(Code.ACCOUNT_CHANGED, "acct-1"),))
+    gone = expire(p, late)  # a recorded terminal state is returned as recorded
+    assert resolve_recorded(gone, AT, {}, None) == (S.EXPIRED, ())
+    assert gone.state(1) is S.EXPIRED and p.state(1) is S.READY_FOR_FINAL_CHECK

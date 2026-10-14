@@ -1,0 +1,46 @@
+{
+  "version": "0.2.0",
+  "base": "docs/spec/contracts 0.1.0",
+  "decision": "Owner decision 2026-10-14 (T008 A-01; docs/receipts/T053-api.md)",
+  "about": "Project-owned contract (T008 A-01). docs/spec/contracts stays unchanged; tools/project_contract.py applies these amendments to its schemas. Unnamed schemas are the spec's. Consumers (apps/api tests, apps/web/src/api.ts guards) enforce the rule below; a null receipt or qualification never makes a proposal actionable.",
+  "changes": "0.2.0: fields no store holds yet become nullable (account, account_snapshot, proposal); snapshot gains ledger_cash (trade-date journal cash, not available cash) and coverage; pages gain the C-02 coverage; the active-proposal rule accepts a null final-check receipt or qualification.",
+  "rule": "A null in an amended field must be named in the response coverage.reasons as unavailable:<field>, unavailable:<id>/<field>, unknown:<field> or none:<id>/<field>.",
+  "schemas": {
+    "account": {
+      "nullable": ["name", "broker", "account_type", "reporting_currency",
+                   "analysis_scope", "status"]
+    },
+    "account_snapshot": {
+      "nullable": ["reconciliation", "available_cash", "unresolved_ids"],
+      "add": {
+        "ledger_cash": {
+          "description": "Trade-date journal cash per currency; not available cash.",
+          "type": "array",
+          "items": {"$ref": "common.schema.json#/$defs/Money"}
+        },
+        "coverage": {"$ref": "#/$defs/Coverage"}
+      }
+    },
+    "proposal": {
+      "nullable": ["sleeve_id", "origin", "horizon", "binding/account_revision",
+                   "binding/policy_version_id", "binding/strategy_version_id",
+                   "binding/feed_spec_id", "binding/entitlement_revision",
+                   "binding/portfolio_snapshot_id", "conditions",
+                   "invalidation_conditions", "claim_ids", "evidence_ids",
+                   "calculation_ids", "qualification"],
+      "active_nullable": ["final_check_receipt_id", "qualification"]
+    }
+  },
+  "page": {
+    "add": {"coverage": {"$ref": "#/$defs/Coverage"}}
+  },
+  "Coverage": {
+    "type": "object",
+    "properties": {
+      "status": {"type": "string", "enum": ["complete", "partial"]},
+      "reasons": {"type": "array", "items": {"type": "string", "maxLength": 300}}
+    },
+    "required": ["status", "reasons"],
+    "additionalProperties": false
+  }
+}
