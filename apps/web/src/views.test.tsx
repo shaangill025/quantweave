@@ -101,7 +101,7 @@ describe("navigation and focus", () => {
     const h1 = await screen.findByRole("heading", { level: 1, name: "Decisions" });
     expect(document.activeElement).toBe(h1);
     expect(link.getAttribute("aria-current")).toBe("page");
-    go("#/strategies");
+    go("#/watchlists");
     expect(await screen.findByText(/not connected yet/)).toBeTruthy();
   });
 
@@ -242,7 +242,7 @@ describe("Decisions", () => {
     expect(within(card(/inst-p-review/)).getByText("-1,234.5 CAD")).toBeTruthy();
     expect(screen.getByText("Only the first page is shown; more records exist.")).toBeTruthy();
     const names = screen.getAllByRole("button").map((b) => b.textContent);
-    expect(names).toEqual(["Check draft"]);
+    expect(names.filter((n) => !n.startsWith("Show detail for proposal "))).toEqual(["Check draft"]);
     expect(names.join(" ")).not.toMatch(/buy|sell|submit|order|place|trade/i);
   });
 
