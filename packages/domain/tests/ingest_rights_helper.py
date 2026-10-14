@@ -38,9 +38,9 @@ def _profile(missing: Use | None = None) -> RightsProfile:
 
 
 def qualified_registry(
-    feed_ids: tuple[str, ...], missing: Use | None = None
+    feed_ids: tuple[str, ...], missing: Use | None = None, tenant: str = TENANT
 ) -> Registry:
-    """A registry with every feed qualified and entitled to TENANT."""
+    """A registry with every feed qualified and entitled to `tenant`."""
     auth = Evidence(EvidenceKind.AUTH, "synthetic-auth", T)
     work = Evidence(EvidenceKind.WORKLOAD, "synthetic-workload", T)
     registry = Registry().with_provider(
@@ -53,7 +53,7 @@ def qualified_registry(
             .transition(FeedStatus.CONNECTED, "operator-synth", (auth,), T)
             .transition(FeedStatus.QUALIFIED, "operator-synth", (work, PERMIT), T)
         )
-        ent = EntitlementHistory.new(TENANT, feed_id).revise(
+        ent = EntitlementHistory.new(tenant, feed_id).revise(
             EntitlementSource.INSTALLATION_LICENSE, True, _profile(missing), None, T
         )
         registry = registry.with_feed(feed).with_entitlement(ent)
