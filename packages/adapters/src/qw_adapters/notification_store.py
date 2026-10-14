@@ -230,7 +230,8 @@ _PAGE = """SELECT n.seq, c.rank, n.id, n.user_id, n.category, n.object_id, n.ver
     n.trigger_at, n.created_at, n.listed, n.seal, n.seal_kid FROM app.notification n
 CROSS JOIN (VALUES (0, 'in_app'), (1, 'email'), (2, 'browser_push')) AS c (rank, ch)
 WHERE n.tenant_id = %(t)s AND n.user_id = %(u)s
-  AND CASE WHEN c.rank = 0 THEN n.listed ELSE EXISTS (SELECT 1 FROM
+  AND CASE WHEN c.rank = 0 THEN n.listed AND (%(i)s OR n.category = ANY(%(safe)s))
+      ELSE EXISTS (SELECT 1 FROM
       app.notification_delivery d WHERE d.tenant_id = n.tenant_id
       AND d.notification_id = n.id AND d.channel = c.ch) END
   AND (%(s)s::bigint IS NULL OR n.seq < %(s)s OR (n.seq = %(s)s AND c.rank > %(r)s))
@@ -239,13 +240,15 @@ ORDER BY n.seq DESC, c.rank LIMIT %(n)s"""
 
 def page(
     tx: TenantTx, keys: Keyring, user_id: str, limit: int,
-    after: tuple[int, int] | None,
+    after: tuple[int, int] | None, in_app: bool = True,
 ) -> list[Row]:  # fmt: skip
-    """Up to `limit` channel rows, newest record first, after `(seq, rank)`. A
-    record failing verification yields rows without an item; a database error
-    still fails the page."""
+    """Up to `limit` channel rows, newest record first, after `(seq, rank)`. With
+    `in_app` False (the user's preference) only safety categories keep an in-app
+    row. A record failing verification yields rows without an item; a database
+    error still fails the page."""
     s, r = after or (None, 0)
-    args = {"t": tx.tenant_id, "u": user_id, "s": s, "r": r, "n": limit}
+    args = {"t": tx.tenant_id, "u": user_id, "s": s, "r": r, "n": limit,
+            "i": in_app, "safe": sorted(c.value for c in N.SAFETY)}  # fmt: skip
     try:
         rows = [tuple(x) for x in tx.conn.execute(_PAGE, args).fetchall()]
     except psycopg.Error as exc:
