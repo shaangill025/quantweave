@@ -425,3 +425,18 @@ class ProposalPublisher:
         for (account, currency), pids in sorted(books.items()):
             out += self._expire(account, currency, pids, at)
         return sorted(out)
+
+
+def list_proposals(
+    tx: TenantTx, limit: int, after: str | None = None
+) -> list[tuple[str, uuid.UUID]]:
+    """Proposal ids in byte order after `after` (keyset), each with the policy id of
+    its latest version. Read-only; RLS keeps it inside the transaction's tenant."""
+    rows = tx.conn.execute(
+        'SELECT DISTINCT ON (proposal_id COLLATE "C") proposal_id, policy_id FROM '
+        "app.proposal_version WHERE tenant_id = %s AND (%s::text IS NULL OR "
+        'proposal_id COLLATE "C" > %s) ORDER BY proposal_id COLLATE "C", version DESC '
+        "LIMIT %s",
+        (tx.tenant_id, after, after, limit),
+    ).fetchall()
+    return [(pid, policy) for pid, policy in rows]
