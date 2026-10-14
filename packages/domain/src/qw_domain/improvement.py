@@ -6,7 +6,8 @@ R030, R032, R033, R035, R037, R084, R092, R099). Domain only, stdlib only.
   threshold (it cannot drop or loosen one) plus at least one goal threshold.
 - A `Protocol` is registered before any candidate and frozen into `content_hash`:
   scorecard, test access (T032 plan id and `plan_digest`), evidence purpose, risk
-  policy hash, required runtime approval classes, budget terms, assessor identity.
+  policy hash, required runtime approval classes, budget terms, assessor identity
+  and, for strategies, the permitted mutations (`mutation_space_hash`, T047).
   Registering the id again with any change is `protocol_frozen`, naming the fields.
 - A `Candidate` is data: an artifact hash, a payload of strings and the logged T043
   `select` uses it was built from. Nothing here reads the payload, and keys naming
@@ -224,6 +225,7 @@ class Protocol:
     sandbox_profile_id: str | None
     authorized_by: str
     registered_at: datetime
+    mutation_space_hash: str | None = None  # permitted mutations (T047 search space)
 
     def __post_init__(self) -> None:
         ids = ("experiment_id", "scope_id", "baseline_version", "plan_id",
@@ -264,6 +266,8 @@ class Protocol:
             raise ImprovementError("sandbox_profile", "code targets name a profile")
         if self.sandbox_profile_id is not None:
             _id(self.sandbox_profile_id, "sandbox_profile_id")
+        if self.mutation_space_hash is not None:
+            _sha(self.mutation_space_hash, "mutation_space_hash")
         object.__setattr__(self, "registered_at", ensure_aware_utc(self.registered_at))
 
     def wire(self) -> dict[str, object]:
