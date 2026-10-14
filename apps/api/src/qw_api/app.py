@@ -251,6 +251,7 @@ def create_app(
     from qw_api.research import router as research
     from qw_api.routes import router
     from qw_api.simulations import router as simulations
+    from qw_api.strategies import router as strategies
 
     app = FastAPI(
         title="Portfolio Intelligence API", version="0.1.0", docs_url=None,
@@ -268,6 +269,7 @@ def create_app(
     app.include_router(reads)
     app.include_router(research)
     app.include_router(simulations)
+    app.include_router(strategies)
     app.add_exception_handler(ApiError, problem)
     app.add_exception_handler(RequestValidationError, _on_validation)
     app.add_exception_handler(StarletteHTTPException, _on_http)
