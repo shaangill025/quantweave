@@ -269,3 +269,25 @@ def revision(tx: TenantTx, account_id: str) -> int:
     ).fetchone()
     assert row is not None
     return int(row[0])
+
+
+def list_accounts(
+    tx: TenantTx, limit: int, after: str | None = None
+) -> list[tuple[str, int, tuple[str, ...]]]:
+    """The tenant's journal accounts in byte order of id after `after` (keyset), each
+    with its `revision` and the sorted ids of the sources that fed it (journal events
+    and stored source records). An account with source records but no journal event
+    is not listed: nothing has been committed to it. Reads the whole tenant journal
+    index per page (O(events)); there is no account registry table yet."""
+    rows = tx.conn.execute(
+        "SELECT e.account_id, max(e.account_rev) + 1, (SELECT array_agg(DISTINCT s) "
+        "FROM (SELECT x.source_id FROM app.ledger_event x "
+        "WHERE x.tenant_id = e.tenant_id AND x.account_id = e.account_id UNION "
+        "SELECT r.source_id FROM app.source_record r WHERE r.tenant_id = e.tenant_id "
+        "AND r.account_id = e.account_id) AS u (s)) FROM app.ledger_event e "
+        'WHERE e.tenant_id = %s AND (%s::text IS NULL OR e.account_id COLLATE "C" > '
+        '%s) GROUP BY e.tenant_id, e.account_id ORDER BY e.account_id COLLATE "C" '
+        "LIMIT %s",
+        (tx.tenant_id, after, after, limit),
+    ).fetchall()
+    return [(a, int(n), tuple(sorted(s))) for a, n, s in rows]

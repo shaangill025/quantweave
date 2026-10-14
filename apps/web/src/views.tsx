@@ -2,7 +2,7 @@
 // places, amends or cancels a broker order anywhere in the app.
 import { useEffect, useRef, useState } from "react";
 import {
-  getJson, isAccount, isPolicy, isProposal, isSnapshot, pageOf,
+  accountPage, actionable, getJson, isPolicy, isSnapshot, pageOf, proposalPage, reasonFor,
   type Account, type Fetcher, type Guard, type Loaded, type Proposal,
 } from "./api";
 import { LimitDraft } from "./LimitDraft";
@@ -13,9 +13,14 @@ export interface Env {
   fetcher: Fetcher;
   now: () => Date;
 }
-const accountPage = pageOf(isAccount);
 const policyPage = pageOf(isPolicy);
-const proposalPage = pageOf(isProposal);
+/** A null contract field with the coverage reason naming it (the guards refuse a response
+ * whose null has none, so "unexplained" is never expected on screen). */
+const Na = ({ reasons, id, field }: { reasons: string[] | undefined; id: string; field: string }) => (
+  <Unavailable reason={reasonFor(reasons, id, field) ?? "unexplained"} />
+);
+const label = (a: Account) => a.name ?? a.id;
+const NOT_ACTIONABLE = "Not actionable: final check or qualification unavailable";
 
 function useLoad<T>(env: Env, path: string, guard: Guard<T>) {
   const [state, setState] = useState<Loaded<T>>();
@@ -75,8 +80,9 @@ export function Overview({ env }: { env: Env }) {
   const now = env.now();
   if (accounts?.status === "ok") {
     for (const a of accounts.data.items) {
-      if (a.status === "conflicted") items.push(`${a.name}: reconciliation conflict between sources.`);
-      if (a.analysis_scope === "partial_declared") items.push(`${a.name}: partial portfolio; outside holdings are unknown, not zero.`);
+      if (a.status === "conflicted") items.push(`${label(a)}: reconciliation conflict between sources.`);
+      if (a.analysis_scope === "partial_declared") items.push(`${label(a)}: partial portfolio; outside holdings are unknown, not zero.`);
+      if (a.analysis_scope === null) items.push(`${label(a)}: portfolio scope not declared; completeness unknown.`);
     }
   }
   if (policies?.status === "ok") {
@@ -90,6 +96,7 @@ export function Overview({ env }: { env: Env }) {
       const what = `${humanize(p.action)} proposal for ${p.account_id}`;
       if (pastExpiry(p, now)) items.push(`${what}: past expiry, awaiting server expiry.`);
       else if (LIVE.includes(p.state) && p.state !== "active") items.push(`${what}: ${stateLabel(p.state)}.`);
+      else if (p.state === "active" && !actionable(p)) items.push(`${what}: ${NOT_ACTIONABLE}.`);
     }
   }
   const sources = [accounts, policies, proposals];
@@ -111,7 +118,9 @@ export function Overview({ env }: { env: Env }) {
   );
 }
 
-function AccountTable({ title, rows, onOpen }: { title: string; rows: Account[]; onOpen: (a: Account) => void }) {
+function AccountTable({ title, rows, onOpen, reasons }: {
+  title: string; rows: Account[]; onOpen: (a: Account) => void; reasons: string[] | undefined;
+}) {
   if (rows.length === 0) return null;
   return (
     <table>
@@ -120,13 +129,20 @@ function AccountTable({ title, rows, onOpen }: { title: string; rows: Account[];
       <tbody>
         {rows.map((a) => (
           <tr key={a.id}>
-            <th scope="row">{a.name} ({a.broker}, {a.account_type})</th>
-            <td>{SCOPE[a.analysis_scope]}</td>
-            <td>{a.status === "conflicted" ? <Tag>{ACCOUNT_STATUS.conflicted}</Tag> : ACCOUNT_STATUS[a.status]}</td>
+            <th scope="row">
+              {a.name ?? <>{a.id} <Na reasons={reasons} id={a.id} field="name" /></>} (
+              {a.broker ?? <Na reasons={reasons} id={a.id} field="broker" />},{" "}
+              {a.account_type ?? <Na reasons={reasons} id={a.id} field="account_type" />})
+            </th>
+            <td>{a.analysis_scope ? SCOPE[a.analysis_scope] : <Na reasons={reasons} id={a.id} field="analysis_scope" />}</td>
+            <td>
+              {a.status === null ? <Na reasons={reasons} id={a.id} field="status" />
+                : a.status === "conflicted" ? <Tag>{ACCOUNT_STATUS.conflicted}</Tag> : ACCOUNT_STATUS[a.status]}
+            </td>
             <td>{BASIS[a.cash_basis]}</td>
             <td>{a.source_ids.length ? a.source_ids.join(", ") : <Unavailable reason="no_sources" />}</td>
             <td>
-              <button type="button" onClick={() => { onOpen(a); }}>Show snapshot for {a.name}</button>
+              <button type="button" onClick={() => { onOpen(a); }}>Show snapshot for {label(a)}</button>
             </td>
           </tr>
         ))}
@@ -143,29 +159,36 @@ function SnapshotPanel({ env, account }: { env: Env; account: Account }) {
   const mismatch = state?.status === "ok" && state.data.account_id !== account.id;
   return (
     <section aria-labelledby="snapshot-title">
-      <h2 id="snapshot-title" tabIndex={-1} ref={heading}>Snapshot: {account.name}</h2>
+      <h2 id="snapshot-title" tabIndex={-1} ref={heading}>Snapshot: {label(account)}</h2>
       {mismatch ? (
         <p role="alert"><Unavailable reason="snapshot_account_mismatch" /></p>
       ) : (
         <Resource label="Snapshot" state={state}>
-          {(s, at) => (
+          {(s, at) => {
+            const why = s.coverage?.reasons;
+            const na = (field: string) => <Na reasons={why} id={s.account_id} field={field} />;
+            return (
             <>
               <Retrieved at={at} />
               <p>
-                <Tag>{FRESHNESS[s.freshness_status]}</Tag> <Tag>{RECONCILIATION[s.reconciliation]}</Tag>
+                <Tag>{FRESHNESS[s.freshness_status]}</Tag>{" "}
+                <Tag>{s.reconciliation ? RECONCILIATION[s.reconciliation] : <>Reconciliation: {na("reconciliation")}</>}</Tag>
               </p>
               <p>As of {utc(s.effective_at)}; received {utc(s.received_at)}; account revision {s.revision}.</p>
               <p>
-                Unresolved items: {s.unresolved_ids.length ? s.unresolved_ids.join(", ") : "none reported"}
+                Unresolved items:{" "}
+                {s.unresolved_ids === null ? na("unresolved_ids") : s.unresolved_ids.join(", ") || "none reported"}
               </p>
               <table>
                 <caption>
-                  Available cash in {account.name} only, per currency ({BASIS[s.cash_basis]}
+                  Available cash in {label(account)} only, per currency ({BASIS[s.cash_basis]}
                   {s.freshness_status === "stale" ? "; stale" : ""}). Not usable by other accounts.
                 </caption>
                 <Head cols={["Currency", "Available"]} />
                 <tbody>
-                  {s.available_cash.length === 0 ? (
+                  {s.available_cash === null ? (
+                    <tr><td colSpan={2}>{na("available_cash")}</td></tr>
+                  ) : s.available_cash.length === 0 ? (
                     <tr><td colSpan={2}><Unavailable reason="no_cash_observation" /></td></tr>
                   ) : (
                     s.available_cash.map((m) => (
@@ -174,8 +197,23 @@ function SnapshotPanel({ env, account }: { env: Env; account: Account }) {
                   )}
                 </tbody>
               </table>
+              {s.ledger_cash && (
+                <table>
+                  <caption>
+                    Ledger cash (trade-date, not available cash) in {label(account)} only, per currency.
+                    Includes unsettled amounts; not usable for sizing.
+                  </caption>
+                  <Head cols={["Currency", "Ledger cash"]} />
+                  <tbody>
+                    {s.ledger_cash.length === 0 && <tr><td colSpan={2}>No ledger cash balance.</td></tr>}
+                    {s.ledger_cash.map((m) => (
+                      <tr key={m.currency}><th scope="row">{m.currency}</th><td><MoneyText money={m} /></td></tr>
+                    ))}
+                  </tbody>
+                </table>
+              )}
               <table>
-                <caption>Positions in {account.name} as of {utc(s.effective_at)}</caption>
+                <caption>Positions in {label(account)} as of {utc(s.effective_at)}</caption>
                 <Head cols={["Instrument", "Quantity", "Economic cost", "Lot coverage"]} />
                 <tbody>
                   {s.positions.length === 0 && <tr><td colSpan={4}>No positions reported in this snapshot.</td></tr>}
@@ -190,7 +228,8 @@ function SnapshotPanel({ env, account }: { env: Env; account: Account }) {
                 </tbody>
               </table>
             </>
-          )}
+            );
+          }}
         </Resource>
       )}
     </section>
@@ -206,8 +245,10 @@ export function Accounts({ env }: { env: Env }) {
         <>
           <Retrieved at={at} />
           {page.items.length === 0 && <p>No accounts are declared yet.</p>}
-          <AccountTable title="Real accounts" rows={page.items.filter((a) => a.analysis_scope !== "hypothetical")} onOpen={setOpen} />
-          <AccountTable title="Hypothetical accounts (not real holdings)" rows={page.items.filter((a) => a.analysis_scope === "hypothetical")} onOpen={setOpen} />
+          {(["Real accounts", "Hypothetical accounts (not real holdings)", "Accounts with undeclared scope (real or hypothetical unknown)"] as const).map((title, i) => (
+            <AccountTable key={title} title={title} onOpen={setOpen} reasons={page.coverage?.reasons}
+              rows={page.items.filter((a) => [a.analysis_scope !== null && a.analysis_scope !== "hypothetical", a.analysis_scope === "hypothetical", a.analysis_scope === null][i])} />
+          ))}
           <Completeness page={page} />
           {open && <SnapshotPanel key={open.id} env={env} account={open} />}
         </>
@@ -216,27 +257,35 @@ export function Accounts({ env }: { env: Env }) {
   );
 }
 
-function ProposalCard({ p, now }: { p: Proposal; now: Date }) {
+function ProposalCard({ p, now, reasons }: { p: Proposal; now: Date; reasons: string[] | undefined }) {
   const id = `proposal-${p.id}-${String(p.version)}`;
   const q = p.qualification;
+  const na = (field: string) => <Na reasons={reasons} id={p.id} field={field} />;
   return (
     <article aria-labelledby={id}>
       <h3 id={id}>
-        {humanize(p.action)} · {p.legs.map((l) => l.instrument_id).join(", ") || "no instrument"} · {humanize(p.horizon)}
+        {humanize(p.action)} · {p.legs.map((l) => l.instrument_id).join(", ") || "no instrument"} ·{" "}
+        {p.horizon === null ? <>horizon {na("horizon")}</> : humanize(p.horizon)}
       </h3>
       <p>
-        <Tag>{stateLabel(p.state)}</Tag> {pastExpiry(p, now) && <Tag>Past expiry, not actionable</Tag>} Expires{" "}
+        <Tag>{stateLabel(p.state)}</Tag> {pastExpiry(p, now) && <Tag>Past expiry, not actionable</Tag>}{" "}
+        {p.state === "active" && !actionable(p) && <Tag>{NOT_ACTIONABLE}</Tag>} Expires{" "}
         {utc(p.expires_at)}. Version {p.version}.
       </p>
       <p>
-        Account {p.account_id}, sleeve {p.sleeve_id}. Origin {humanize(p.origin)};{" "}
+        Account {p.account_id}, sleeve {p.sleeve_id ?? na("sleeve_id")}. Origin{" "}
+        {p.origin === null ? na("origin") : humanize(p.origin)};{" "}
         {p.mode === "ai_enabled" ? "AI-enabled" : "rules-only"} mode. Execution: {humanize(p.execution_state)}.
       </p>
-      <p>
-        Qualification: operational {humanize(q.operational)}; investment evidence{" "}
-        {humanize(q.investment_evidence)}; eligibility {humanize(q.user_eligibility)}.
-      </p>
-      <p>Reasons: {[...p.reason_codes, ...q.reason_codes].join(", ") || "none given"}</p>
+      {q === null ? (
+        <p>Qualification: {na("qualification")}</p>
+      ) : (
+        <p>
+          Qualification: operational {humanize(q.operational)}; investment evidence{" "}
+          {humanize(q.investment_evidence)}; eligibility {humanize(q.user_eligibility)}.
+        </p>
+      )}
+      <p>Reasons: {[...p.reason_codes, ...(q?.reason_codes ?? [])].join(", ") || "none given"}</p>
       <table>
         <caption>Legs (estimated cash effect is for account {p.account_id} only)</caption>
         <Head cols={["Instrument", "Side", "Quantity", "Estimated cash effect"]} />
@@ -297,7 +346,7 @@ export function Decisions({ env }: { env: Env }) {
           <>
             <Retrieved at={at} />
             {page.items.length === 0 && <p>No proposals.</p>}
-            {page.items.map((p) => <ProposalCard key={`${p.id}:${String(p.version)}`} p={p} now={env.now()} />)}
+            {page.items.map((p) => <ProposalCard key={`${p.id}:${String(p.version)}`} p={p} now={env.now()} reasons={page.coverage?.reasons} />)}
             <Completeness page={page} />
           </>
         )}

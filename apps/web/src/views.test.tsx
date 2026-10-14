@@ -78,6 +78,7 @@ const ROUTES: Record<string, [number, unknown]> = {
     proposal("p-expired", "expired", "2026-10-09T00:00:00Z"),
     proposal("p-super", "superseded", "2026-10-11T00:00:00Z"),
     proposal("p-late", "active", "2026-10-10T11:00:00Z", {
+      final_check_receipt_id: "fc-SYNTHETIC-1",
       legs: [{ instrument_id: "inst-p-late", side: "buy", quantity: null, quantity_basis: "unsized", estimated_cash_effect: null }],
     }),
   ] }],
@@ -280,6 +281,62 @@ describe("Decisions", () => {
     );
     fireEvent.change(value, { target: { value: "-1" } }); // review N2: an edit clears the verdict
     expect(live?.textContent).toBe("");
+  });
+});
+
+describe("project contract 0.2.0 nulls (SYNTHETIC, shaped like the journal-backed API)", () => {
+  const NULLS = ["name", "broker", "account_type", "reporting_currency", "analysis_scope", "status"];
+  const journal = account("acct-j", "x", Object.fromEntries(NULLS.map((f) => [f, null])));
+  const snapshot = {
+    id: "snap:SYNTHETIC", account_id: "acct-j", revision: 4, effective_at: "2026-10-01T14:02:00Z",
+    received_at: "2026-10-01T14:03:00Z", freshness_status: "unknown", reconciliation: null,
+    available_cash: null, cash_basis: "unknown", unresolved_ids: null, positions: [],
+    ledger_cash: [{ amount: "9492.55", currency: "CAD" }],
+    coverage: { status: "partial", reasons: ["unavailable:reconciliation", "unavailable:available_cash", "unavailable:unresolved_ids"] },
+  };
+  const routes = (reasons: string[]): Record<string, [number, unknown]> => ({
+    "/api/v1/accounts?limit=200": [200, { items: [journal], next_cursor: null, coverage: { status: "partial", reasons } }],
+    "/api/v1/accounts/acct-j/snapshot": [200, snapshot],
+  });
+
+  it("renders each null with its coverage reason, never blank or 0, and labels ledger cash", async () => {
+    setHash("#/accounts");
+    render(<App fetcher={fakeFetch(routes(NULLS.map((f) => `unavailable:${f}`)))} now={now} />);
+    const undeclared = await screen.findByRole("table", { name: /undeclared scope/ });
+    expect(screen.queryByRole("table", { name: "Real accounts" })).toBeNull();
+    for (const f of ["name", "broker", "account_type", "analysis_scope", "status"]) {
+      expect(within(undeclared).getByText(`Unavailable (unavailable:${f})`)).toBeTruthy();
+    }
+    fireEvent.click(screen.getByRole("button", { name: "Show snapshot for acct-j" }));
+    await screen.findByText("Unavailable (unavailable:reconciliation)");
+    const cash = screen.getByRole("table", { name: /Available cash in acct-j only/ });
+    expect(within(cash).getByText("Unavailable (unavailable:available_cash)")).toBeTruthy();
+    expect(cash.textContent).not.toMatch(/\b0(\.0+)?\b/);
+    const ledger = screen.getByRole("table", { name: /Ledger cash \(trade-date, not available cash\)/ });
+    expect(within(ledger).getByText("9,492.55 CAD")).toBeTruthy();
+    expect(screen.getByText("Unavailable (unavailable:unresolved_ids)")).toBeTruthy();
+  });
+
+  it("refuses a page with an unexplained null", async () => {
+    setHash("#/accounts");
+    render(<App fetcher={fakeFetch(routes(["unavailable:name"]))} now={now} />);
+    expect(await screen.findByText(/Unavailable \(invalid_response\)/)).toBeTruthy();
+  });
+
+  it("never shows an active proposal without receipt or qualification as actionable", async () => {
+    setHash("#/decisions");
+    const p = proposal("p-null", "active", "2026-10-11T00:00:00Z", {
+      qualification: null, sleeve_id: null, origin: null, horizon: null,
+    });
+    const reasons = ["unavailable:qualification", "unavailable:final_check_receipt_id", "unavailable:origin",
+      "none:p-null/sleeve_id", "unknown:p-null/horizon"];
+    const page = { items: [p], next_cursor: null, coverage: { status: "partial", reasons } };
+    render(<App fetcher={fakeFetch({ "/api/v1/proposals?limit=200": [200, page] })} now={now} />);
+    const card = await screen.findByRole("article", { name: /inst-p-null/ });
+    expect(within(card).getByText("[Not actionable: final check or qualification unavailable]")).toBeTruthy();
+    for (const r of ["unavailable:qualification", "unavailable:origin", "none:p-null/sleeve_id", "unknown:p-null/horizon"]) {
+      expect(within(card).getByText(`Unavailable (${r})`)).toBeTruthy();
+    }
   });
 });
 
