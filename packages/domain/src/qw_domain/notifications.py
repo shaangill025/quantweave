@@ -18,7 +18,7 @@ current-state resolution (T056; R020, R047, R067, R069, R083, R085; spec §13
   original. External sends per (user, category, object) coalesce inside
   `dedupe_window`; quiet hours defer them. Safety categories bypass both (D1).
 - Push needs a qualified subscription, email a verified single-line address.
-In-memory; persistence and routes are remaining work. Stdlib only.
+In-memory; qw_adapters.notification_store persists it. Stdlib only.
 """
 
 import hashlib
@@ -38,7 +38,12 @@ from qw_domain.jobs import TRANSITIONS as JOB_TRANSITIONS
 from qw_domain.jobs import JobState
 from qw_domain.monitoring import Alert
 from qw_domain.proposals import Current as ProposalCurrent
-from qw_domain.proposals import ExecutionState, Proposal, ProposalState, resolve
+from qw_domain.proposals import (
+    ExecutionState,
+    Proposal,
+    ProposalState,
+    resolve,
+)
 from qw_domain.risk_pauses import Pause
 from qw_domain.sources import ID_PATTERN
 
@@ -385,6 +390,21 @@ def proposal_resolver(p: Proposal, cur: ProposalCurrent) -> Resolver:
     `superseded`. Only the notified, active, unplanned latest version is
     actionable. Tenant, category and proposal id must match."""
 
+    return _proposal_view(p, lambda at: resolve(p, replace(cur, as_of=at)), True)
+
+
+def recorded_proposal_resolver(
+    p: Proposal, state_at: Callable[[datetime], ProposalState]
+) -> Resolver:
+    """As `proposal_resolver`, with the latest version's read-time state from stored
+    records supplied by the caller (the API's readProposal state); risk is not
+    re-evaluated, so nothing is actionable."""
+    return _proposal_view(p, state_at, False)
+
+
+def _proposal_view(
+    p: Proposal, now_at: Callable[[datetime], ProposalState], live: bool
+) -> Resolver:
     def view(note: "Notification", at: datetime) -> CurrentView:
         s, a = note.subject, p.latest.action
         if (note.tenant_id, s.category, s.object_id) != (
@@ -395,12 +415,13 @@ def proposal_resolver(p: Proposal, cur: ProposalCurrent) -> Resolver:
         n = int(head) if head.isascii() and head.isdigit() else 0
         if not 1 <= n <= latest:
             raise NotificationError("subject_mismatch", "unknown version")
-        now = resolve(p, replace(cur, as_of=at))
+        now = now_at(at)
         current = f"{latest}:{now}"
         if n != latest:
             return CurrentView(p.state(n), False, current)
         planned = p.execution(latest) is not ExecutionState.NONE
-        return CurrentView(now, now is ProposalState.ACTIVE and not planned, current)
+        ok = live and now is ProposalState.ACTIVE and not planned
+        return CurrentView(now, ok, current)
 
     return view
 
@@ -436,6 +457,13 @@ class FeedEntry:
 _UNAVAILABLE = CurrentView("unavailable", False, "")
 
 
+def notification_id(key: bytes, tenant: str, user: str, *subject: str) -> str:
+    """The record id: HMAC-SHA256 under the server key of tenant, user, category,
+    object and version (the dedupe key)."""
+    body = json.dumps([tenant, user, *subject]).encode()
+    return "ntf-" + hmac.new(key, body, hashlib.sha256).hexdigest()[:32]
+
+
 @dataclass
 class Center:
     """One tenant's notification records, deliveries and decision reasons."""
@@ -465,9 +493,8 @@ class Center:
         if at < s.trigger_at:
             raise NotificationError("time_order", "generated before its trigger")
         user, cat = r.user_id, s.category
-        body = json.dumps([self.tenant_id, user, cat, s.object_id, s.version])
-        mac = hmac.new(self.id_key, body.encode(), hashlib.sha256).hexdigest()
-        nid = "ntf-" + mac[:32]
+        nid = notification_id(self.id_key, self.tenant_id, user, cat, s.object_id,
+                              s.version)  # fmt: skip
         if (old := self._items.get(nid)) is not None:
             return Submitted(old, False, (), ())
         prefs, reasons = r.preferences, list[str]()
