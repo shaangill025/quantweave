@@ -51,6 +51,8 @@ PROPOSAL_TABLES = ("proposal_version", "proposal_event", "proposal_commitment")
 CALCULATION_TABLES = ("calculation_record",)  # 0011, test_calculation_store
 EVIDENCE_TABLES = ("evidence_source", "evidence_content", "evidence_record", "claim",
                    "claim_evidence", "claim_resolution", "evidence_event")  # fmt: skip
+RIGHTS_TABLES = ("rights_provider", "rights_feed", "rights_feed_revision",
+                 "rights_feed_transition", "rights_entitlement")  # fmt: skip
 
 
 def make_tenant(conn: Conn, name: str) -> tuple[uuid.UUID, uuid.UUID]:
@@ -142,6 +144,7 @@ def test_tables_have_forced_rls_and_no_public_grants(conn: Conn) -> None:
         + PROPOSAL_TABLES
         + CALCULATION_TABLES
         + EVIDENCE_TABLES  # 0012, test_evidence_store
+        + RIGHTS_TABLES  # 0013, test_rights_store (global ones: open read policy)
     )
     for name, rls, forced, owner, acl in rows:
         assert (rls, forced, owner) == (True, True, "qw_migrate"), name

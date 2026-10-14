@@ -19,7 +19,8 @@ from typing import TYPE_CHECKING, Any
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
-from qw_adapters.tenancy import MAX_SESSION_TTL, Conn, ThrottlePolicy
+from qw_adapters import rights_store
+from qw_adapters.tenancy import MAX_SESSION_TTL, Conn, TenantTx, ThrottlePolicy
 from qw_domain.rights import Registry
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
@@ -29,9 +30,10 @@ if TYPE_CHECKING:
 
 log = logging.getLogger("qw_api")
 ConnectionProvider = Callable[[], AbstractContextManager[Conn]]
-# The T021 rights registry in force now. No store holds it yet, so the default is
-# an empty registry: every use is denied (fail closed).
-RightsProvider = Callable[[], Registry]
+# The T021 rights registry in force for a request, loaded inside its tenant
+# transaction (default: qw_adapters.rights_store, re-verified on every load). With
+# nothing recorded it is the empty registry: every use is denied (fail closed).
+RightsProvider = Callable[[TenantTx], Registry]
 SAFE_METHODS = frozenset({"GET", "HEAD"})
 _ORIGIN = re.compile(r"(https://[a-z0-9.-]+|http://(localhost|127\.0\.0\.1))(:\d+)?")
 _REFERER = re.compile(_ORIGIN.pattern + r"(?=/|$)")
@@ -242,7 +244,7 @@ def create_app(
     settings: Settings,
     connections: ConnectionProvider,
     authenticator: Authenticator,
-    rights: RightsProvider = Registry,
+    rights: RightsProvider = rights_store.load,
 ) -> FastAPI:
     from qw_api.policies import router as policies
     from qw_api.reads import router as reads

@@ -41,11 +41,14 @@ def _module(name: str, path: Path) -> Any:
 api = _module("qw_api_tests", ROOT / "apps/api/tests/test_api.py")
 ev = _module("qw_estore_tests",
              ROOT / "packages/adapters/tests/test_evidence_store.py")  # fmt: skip
+rs_tests = _module("qw_rstore_tests",
+                   ROOT / "packages/adapters/tests/test_rights_store.py")  # fmt: skip
 research = importlib.import_module("qw_api.research")
 PC = _module("qw_project_contract", ROOT / "tools/project_contract.py")
 pg_admin_url, database_url, conn = api.pg_admin_url, api.database_url, api.conn
 runtime_urls, app_conn, world = api.runtime_urls, api.app_conn, api.world
 login, assert_problem = api.login, api.assert_problem
+owner = rs_tests.owner
 COUNTED = ("evidence_source", "evidence_content", "claim", "claim_evidence")
 
 
@@ -90,7 +93,7 @@ def test_claims_and_evidence_are_served_tenant_scoped(
     a, b = world.tenant_a, tenant_of(world, "carol")
     ev.stored(app_conn, a)
     ev.stored(app_conn, b)  # the same ids in tenant B
-    world.client.app.state.rights = lambda: ev.registry(str(a))
+    world.client.app.state.rights = lambda tx: ev.registry(str(a))
     before = rows(world)
     login(world.client, "bob")  # a member may read
     got = world.client.get("/api/v1/claims/c-1")
@@ -169,7 +172,7 @@ def test_display_rights_are_enforced(world: Any, app_conn: Any) -> None:
     assert (claim["verification"], claim["evidence_ids"]) == ("unavailable", [])
     assert "invalid:p-release=rights_revoked" in claim["coverage"]["reasons"]
     # A registry granting every use but display: still withheld.
-    world.client.app.state.rights = lambda: ev.registry(str(a), Use.DISPLAY)
+    world.client.app.state.rights = lambda tx: ev.registry(str(a), Use.DISPLAY)
     got = world.client.get("/api/v1/evidence/p-release")
     assert (got.json()["availability"], got.json()["passage"]) == ("restricted", None)
     assert got.json()["coverage"]["reasons"] == ["restricted:right_unknown"]
@@ -188,7 +191,7 @@ def test_display_rights_are_enforced(world: Any, app_conn: Any) -> None:
 @pytest.mark.db
 def test_a_tampered_store_is_a_crash_not_an_answer(world: Any, app_conn: Any) -> None:
     ev.stored(app_conn, world.tenant_a)
-    world.client.app.state.rights = lambda: ev.registry(str(world.tenant_a))
+    world.client.app.state.rights = lambda tx: ev.registry(str(world.tenant_a))
     world.db.execute("SET session_replication_role = replica")  # a tampering owner
     world.db.execute("UPDATE app.evidence_content SET content = "
                      "replace(content, '100', '999')")  # fmt: skip
@@ -207,7 +210,7 @@ def test_now_is_read_after_the_lock(
     the same transaction: never before a state the claim was evaluated on."""
     a = world.tenant_a
     ev.stored(app_conn, a)
-    world.client.app.state.rights = lambda: ev.registry(str(a))
+    world.client.app.state.rights = lambda tx: ev.registry(str(a))
     real, locked = research.evidence_store.load, []
 
     def load(tx: Any, **kw: Any) -> Any:
@@ -219,3 +222,43 @@ def test_now_is_read_after_the_lock(
     login(world.client, "alice")
     body = world.client.get("/api/v1/claims/c-1").json()
     assert parse_instant(body["valid_at"]) >= locked[0]
+
+
+@pytest.mark.db
+def test_stored_rights_are_loaded_per_request(
+    world: Any, app_conn: Any, owner: Any
+) -> None:
+    """The server default reads the registry store in the request's tenant
+    transaction: a SYNTHETIC qualified feed and entitlement recorded by the owner
+    serve the text; another tenant without an entitlement is still restricted;
+    a later revocation row takes effect on the next request; a tampered registry
+    is a 500, never an answer."""
+    a, b = world.tenant_a, tenant_of(world, "carol")
+    ev.stored(app_conn, a)
+    ev.stored(app_conn, b)
+    rs_tests.grant_all(owner, a, ("feed-a", "feed-b"))
+    login(world.client, "alice")
+    got = world.client.get("/api/v1/evidence/p-release")
+    assert (got.json()["availability"], got.json()["passage"]) == (
+        "available", ev.RELEASE)  # fmt: skip
+    assert world.client.get("/api/v1/claims/c-1").json()["verification"] == (
+        "supported")  # fmt: skip
+    login(world.client, "carol")
+    body = world.client.get("/api/v1/evidence/p-release").json()
+    assert (body["availability"], body["coverage"]["reasons"]) == (
+        "restricted", ["restricted:not_entitled"])  # fmt: skip
+    login(world.client, "alice")
+    with api.tenancy.tenant_transaction(owner, a) as tx:
+        held = rs_tests.rs.load(tx).entitlements[(str(a), "feed-a")]
+        last = held.current
+        assert last is not None
+        rs_tests.rs.record_entitlement(tx, held.revise(
+            last.source, False, last.rights, None, rs_tests.clock(owner)))  # fmt: skip
+    got = world.client.get("/api/v1/evidence/p-release")
+    assert (got.json()["availability"], got.json()["passage"]) == ("restricted", None)
+    assert ev.RELEASE not in got.text
+    world.db.execute("SET session_replication_role = replica")  # a tampering owner
+    world.db.execute("UPDATE app.rights_entitlement SET active = true")
+    got = world.client.get("/api/v1/evidence/p-release")
+    assert_problem(got, 500, "internal_error")
+    assert ev.RELEASE not in got.text
