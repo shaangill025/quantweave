@@ -29,6 +29,7 @@ P = Priority
 S = JobState
 LEASE = timedelta(minutes=5)
 NOW = Backoff(timedelta(0), timedelta(0))  # retry immediately (tests only)
+KINDS = ("synthetic.refresh", "synthetic.x")  # the kinds these tests enqueue
 
 
 def make_tenant(conn: Conn, name: str) -> tuple[uuid.UUID, uuid.UUID]:
@@ -46,8 +47,9 @@ def add(conn: Conn, tenant: uuid.UUID, rev: str, prio: P = P.MONITORING,
 
 
 def must_claim(conn: Conn, pool: Pool = Pool.STANDARD,
-               lease: timedelta = LEASE) -> ClaimedJob:  # fmt: skip
-    job = qj.claim(conn, "w1", pool, lease)
+               lease: timedelta = LEASE,
+               kinds: tuple[str, ...] = KINDS) -> ClaimedJob:  # fmt: skip
+    job = qj.claim(conn, "w1", pool, lease, kinds)
     assert job is not None
     return job
 
@@ -225,7 +227,7 @@ def test_concurrent_claimers_never_share_a_valid_lease(
     claimed: list[uuid.UUID] = []
 
     def work(c: Conn) -> None:
-        while (job := qj.claim(c, "w", Pool.STANDARD, LEASE)) is not None:
+        while (job := qj.claim(c, "w", Pool.STANDARD, LEASE, KINDS)) is not None:
             claimed.append(job.id)
 
     in_threads(8, runtime_urls["qw_worker"], work)
@@ -239,7 +241,9 @@ def test_expired_lease_is_reclaimed_and_the_old_holder_is_fenced(
     tenant, _ = make_tenant(app_conn, "A")
     job_id = add(app_conn, tenant, "r1")
     old = must_claim(worker_conn, lease=timedelta(microseconds=1))
-    assert qj.claim(worker_conn, "w2", Pool.STANDARD, LEASE) is None  # not yet reaped
+    assert (
+        qj.claim(worker_conn, "w2", Pool.STANDARD, LEASE, KINDS) is None
+    )  # not yet reaped
     with pytest.raises(LeaseLost):
         qj.heartbeat(worker_conn, old, LEASE)  # an expired lease is not extended
     with pytest.raises(LeaseLost), tenant_transaction(worker_conn, tenant) as tx:
@@ -254,12 +258,12 @@ def test_expired_lease_is_reclaimed_and_the_old_holder_is_fenced(
     assert qj.heartbeat(worker_conn, new, timedelta(seconds=1)) == long  # no shrink
     for bad in (timedelta(0), timedelta(seconds=-1)):
         with pytest.raises(ValueError):
-            qj.claim(worker_conn, "w", Pool.STANDARD, bad)
+            qj.claim(worker_conn, "w", Pool.STANDARD, bad, KINDS)
         with pytest.raises(ValueError):
             qj.heartbeat(worker_conn, new, bad)
     for name in ("", "w" * 161):
         with pytest.raises(ValueError):
-            qj.claim(worker_conn, name, Pool.STANDARD, LEASE)
+            qj.claim(worker_conn, name, Pool.STANDARD, LEASE, KINDS)
     assert qj.reap_expired(worker_conn, NOW) == []  # a valid lease is not reaped
 
 
@@ -275,7 +279,7 @@ def test_max_attempts_dead_letters_and_operator_requeues(
         with tenant_transaction(worker_conn, tenant) as tx:
             assert qj.fail(tx, job, "upstream_timeout", retryable=True,
                         backoff=NOW) is expected  # fmt: skip
-    assert qj.claim(worker_conn, "w", Pool.STANDARD, LEASE) is None
+    assert qj.claim(worker_conn, "w", Pool.STANDARD, LEASE, KINDS) is None
     assert state(app_conn, tenant, job_id) == (S.DEAD_LETTER, 2)
     with tenant_transaction(worker_conn, tenant) as tx:
         assert qj.requeue(tx, job_id) and not qj.requeue(tx, job_id)
@@ -349,7 +353,7 @@ def test_backoff_delays_the_retry(app_conn: Conn, worker_conn: Conn) -> None:
             "interval '1 hour', last_error FROM app.job"
         ).fetchone()
     assert row == (True, "rate_limited")
-    assert qj.claim(worker_conn, "w", Pool.STANDARD, LEASE) is None
+    assert qj.claim(worker_conn, "w", Pool.STANDARD, LEASE, KINDS) is None
 
 
 @pytest.mark.db
@@ -386,10 +390,10 @@ def test_tenant_fairness_round_robin(app_conn: Conn, worker_conn: Conn) -> None:
 def test_experiment_pool_is_separate(app_conn: Conn, worker_conn: Conn) -> None:
     tenant, _ = make_tenant(app_conn, "A")
     job_id = add(app_conn, tenant, "exp", P.EXPERIMENT)
-    assert qj.claim(worker_conn, "std", Pool.STANDARD, LEASE) is None
+    assert qj.claim(worker_conn, "std", Pool.STANDARD, LEASE, KINDS) is None
     assert must_claim(worker_conn, Pool.EXPERIMENT).id == job_id
     add(app_conn, tenant, "std", P.SAFETY)
-    assert qj.claim(worker_conn, "exp", Pool.EXPERIMENT, LEASE) is None
+    assert qj.claim(worker_conn, "exp", Pool.EXPERIMENT, LEASE, KINDS) is None
     with (
         pytest.raises(errors.CheckViolation),
         tenant_transaction(app_conn, tenant) as tx,
@@ -399,6 +403,72 @@ def test_experiment_pool_is_separate(app_conn: Conn, worker_conn: Conn) -> None:
             "pool, payload, max_attempts) VALUES (gen_random_uuid(), %s, 'x', 'r', "
             "'experiment', 'standard', '{}', 1)", (tenant,),
         )  # fmt: skip
+
+
+def job_times(conn: Conn, job_id: uuid.UUID) -> tuple[object, ...]:
+    """Superuser read of the fields a claim writes (0021: untouched if not taken)."""
+    row = conn.execute(
+        "SELECT state::text, attempts, total_attempts, available_at, "
+        "next_available_at, claimed_at, heartbeat_at, lease_owner, updated_at "
+        "FROM app.job WHERE id = %s", (job_id,),
+    ).fetchone()  # fmt: skip
+    assert row is not None
+    return tuple(row)
+
+
+@pytest.mark.db
+def test_claim_takes_only_the_given_kinds_and_skips_the_rest_in_place(
+    app_conn: Conn, worker_conn: Conn, conn: Conn
+) -> None:
+    a, _ = make_tenant(app_conn, "A")
+    b, _ = make_tenant(app_conn, "B")
+    with tenant_transaction(app_conn, a) as tx:  # the unknown kind is at the head
+        unknown = qj.enqueue(tx, "synthetic.unknown", "r0", P.MONITORING, {})[0]
+    behind = add(app_conn, a, "r1")  # same tenant and priority, enqueued after it
+    other = add(app_conn, b, "r1")  # another tenant
+    before = job_times(conn, unknown)
+    assert before[:3] == ("queued", 0, 0) and before[5] is None
+    got = {must_claim(worker_conn).id for _ in range(2)}
+    assert got == {behind, other}
+    assert qj.claim(worker_conn, "w", Pool.STANDARD, LEASE, KINDS) is None
+    assert job_times(conn, unknown) == before  # never claimed, never touched
+    empty: tuple[tuple[str, ...], list[str]] = ((), [])
+    for kinds in empty:
+        # No database call: the stand-in connection fails on any use.
+        assert qj.claim(object(), "w", Pool.STANDARD, LEASE, kinds) is None  # type: ignore[arg-type]
+    with pytest.raises(TypeError):
+        qj.claim(worker_conn, "w", Pool.STANDARD, LEASE, "synthetic.unknown")
+    assert job_times(conn, unknown) == before
+    job = must_claim(worker_conn, kinds=("synthetic.unknown", "synthetic.other"))
+    assert (job.id, job.kind, job.attempt) == (unknown, "synthetic.unknown", 1)
+
+
+@pytest.mark.db
+def test_kind_filter_is_exact_not_a_pattern(app_conn: Conn, worker_conn: Conn) -> None:
+    a, _ = make_tenant(app_conn, "A")
+    add(app_conn, a, "r1")  # kind "synthetic.refresh"
+    for kinds in (("SYNTHETIC.REFRESH",), ("synthetic_refresh",), ("synthetic%",)):
+        # Case and LIKE wildcards never widen what a worker claims.
+        assert qj.claim(worker_conn, "w", Pool.STANDARD, LEASE, kinds) is None
+    assert must_claim(worker_conn).kind == "synthetic.refresh"
+
+
+@pytest.mark.db
+def test_fairness_with_kind_filters(app_conn: Conn, worker_conn: Conn) -> None:
+    big, _ = make_tenant(app_conn, "big")
+    small, _ = make_tenant(app_conn, "small")
+    with tenant_transaction(app_conn, big) as tx:
+        for i in range(20):
+            qj.enqueue(tx, "synthetic.unknown", f"u{i}", P.MONITORING, {})
+            qj.enqueue(tx, "synthetic.refresh", f"r{i}", P.MONITORING, {})
+    add(app_conn, small, "only")
+    add(app_conn, small, "later")
+    served = [must_claim(worker_conn).tenant_id for _ in range(4)]
+    assert served[:2] in ([big, small], [small, big])  # rotation, not big's backlog
+    assert served[2:] == served[:2]
+    with tenant_transaction(app_conn, small) as tx:  # priority still beats fairness
+        qj.enqueue(tx, "synthetic.refresh", "urgent", P.SAFETY, {})
+    assert must_claim(worker_conn).tenant_id == small
 
 
 @pytest.mark.db
@@ -425,7 +495,10 @@ def test_cross_tenant_reads_and_writes_are_impossible(
                 assert row == (0,), table
         row = c.execute("SELECT count(*) FROM app.job").fetchone()  # no context
         assert row == (0,)
-    for fn in ("app.job_pick('standard')", "app.job_expired_leases(1)"):
+    for fn in (
+        "app.job_pick('standard', ARRAY['synthetic.refresh'])",
+        "app.job_expired_leases(1)",
+    ):
         with pytest.raises(errors.InsufficientPrivilege):
             app_conn.execute(f"SELECT * FROM {fn}")
     with pytest.raises(errors.InsufficientPrivilege):
@@ -508,6 +581,11 @@ def test_security_definer_functions_are_hardened(conn: Conn) -> None:
     assert [r[0] for r in jobs] == [
         "idempotency_purge", "inbox_purge", "job_expired_leases", "job_overdue",
         "job_pick", "outbox_pick", "outbox_purge"]  # fmt: skip
+    pick = conn.execute(
+        "SELECT array_agg(p.oid::regprocedure::text) FROM pg_proc p "
+        "WHERE p.proname = 'job_pick'"
+    ).fetchone()
+    assert pick == (["app.job_pick(app.job_pool,text[])"],)  # 0021 dropped the old one
     for _, owner, secdef, config, grantees in jobs:
         assert (owner, secdef, config) == (
             "qw_migrate",
@@ -543,7 +621,7 @@ def test_deadline_expires_queued_jobs_and_is_never_claimed(
     assert qj.expire_overdue(worker_conn) == []  # not overdue yet
     time.sleep(max(0.0, (soon - datetime.now(UTC)).total_seconds()) + 0.1)
     assert must_claim(worker_conn).id == open_  # never the overdue safety jobs
-    assert qj.claim(worker_conn, "w", Pool.STANDARD, LEASE) is None
+    assert qj.claim(worker_conn, "w", Pool.STANDARD, LEASE, KINDS) is None
     assert sorted(qj.expire_overdue(worker_conn)) == sorted([late, retried])
     for job_id in (late, retried):  # one was claimed and retried, one never ran
         expected = (S.EXPIRED, 1 if job_id == job.id else 0)

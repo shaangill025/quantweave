@@ -6,12 +6,13 @@ lease expires, even if the worker committed its effect first. `consume` makes
 effects idempotent: the (consumer, event id) inbox row and the handler's writes
 commit in one transaction, so a redelivery finds the row and is skipped.
 
-Claims pick the highest priority class with ready work, then the least recently
-served tenant in it (`app.job_pick`). Heartbeat, complete and fail need the current
-lease token and an unexpired lease, else `LeaseLost`; complete and fail run in the
-caller's `TenantTx`, so the outcome commits with the business writes and any
-`write_outbox` rows. A job may carry a start-by `deadline_at`: no attempt starts
-after it and `expire_overdue` moves overdue queued jobs to `expired`.
+Claims pick, among the kinds the claimer can handle, the highest priority class
+with ready work, then the least recently served tenant in it (`app.job_pick`).
+Heartbeat, complete and fail need the current lease token and an unexpired lease,
+else `LeaseLost`; complete and fail run in the caller's `TenantTx`, so the outcome
+commits with the business writes and any `write_outbox` rows. A job may carry a
+start-by `deadline_at`: no attempt starts after it and `expire_overdue` moves
+overdue queued jobs to `expired`.
 
 `relay_outbox` publishes due events (oldest first) and marks them published in the
 transaction that locked them, after the publish call returned: a crash in between
@@ -23,7 +24,7 @@ from __future__ import annotations
 
 import random
 import uuid
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Collection, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from enum import StrEnum
@@ -148,16 +149,26 @@ def _check_lease(lease: timedelta, worker: str | None = None) -> None:
         raise ValueError(f"worker name must be 1..{MAX_WORKER_NAME} characters")
 
 
-def claim(conn: Conn, worker: str, pool: Pool, lease: timedelta) -> ClaimedJob | None:
-    """Claim the next ready job of `pool` for `lease`, or None."""
+def claim(
+    conn: Conn, worker: str, pool: Pool, lease: timedelta, kinds: Collection[str]
+) -> ClaimedJob | None:
+    """Claim the next ready job of `pool` whose kind is in `kinds` (the kinds the
+    caller can handle) for `lease`, or None. Other kinds stay queued, untouched
+    (`0021_job_pick_kinds.sql`). No kinds: None without a database call."""
+    if isinstance(kinds, str):
+        raise TypeError("kinds is a collection of kinds, not one string")
     _check_lease(lease, worker)
+    wanted = sorted(set(kinds))
+    if not wanted:
+        return None
     _idle(conn)
     token = f"{worker}:{uuid.uuid4().hex}"
     with conn.transaction():
         conn.execute("SELECT set_config('app.tenant_id', '', true)")
         picked = conn.execute(
-            "SELECT tenant_id, id FROM app.job_pick(%s) WHERE id IS NOT NULL",
-            (Pool(pool).value,),
+            "SELECT tenant_id, id FROM app.job_pick(%s, %s::text[]) "
+            "WHERE id IS NOT NULL",
+            (Pool(pool).value, wanted),
         ).fetchone()
         if picked is None:
             return None
@@ -169,11 +180,12 @@ def claim(conn: Conn, worker: str, pool: Pool, lease: timedelta) -> ClaimedJob |
             "lease_owner = %s, lease_expires_at = now() + %s, heartbeat_at = now(), "
             "claimed_at = now(), updated_at = now() "
             "WHERE tenant_id = %s AND id = %s AND pool = %s AND state = 'queued' "
+            "AND kind = ANY(%s::text[]) "
             "RETURNING kind, input_revision, priority::text, payload, attempts, "
             "max_attempts, lease_expires_at",
-            (token, lease, tenant_id, job_id, Pool(pool).value),
+            (token, lease, tenant_id, job_id, Pool(pool).value, wanted),
         ).fetchone()
-        assert row is not None  # locked by job_pick, still queued
+        assert row is not None  # locked by job_pick, still queued, a wanted kind
     kind, revision, priority, payload, attempt, max_attempts, expires = row
     return ClaimedJob(
         job_id, tenant_id, kind, revision, Priority(priority), payload, attempt,
