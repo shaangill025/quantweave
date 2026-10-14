@@ -218,7 +218,7 @@
       "requirements": "R012,R043,R049,R058,R071,R080,R081,R082,R083",
       "deliverable": "Implement observation conflict handling, settled/unsettled/reported cash, open-order commitments and provenance.",
       "verification": "Newer user transactions not erased by stale broker snapshots; material conflict blocks sizing.",
-      "status": "Not started",
+      "status": "In progress",
       "size": "M",
       "release_required": "Yes"
     },
@@ -257,7 +257,7 @@
       "requirements": "R010,R012,R026,R044,R049,R060,R068,R069,R082,R083,R086",
       "deliverable": "Implement eligibility, cash/concentration/planned-loss/stress constraints and scoped risk pauses/resumption.",
       "verification": "Portfolio-feasible alternatives, stop-gap scenarios, deposits/withdrawals and explicit resume tests.",
-      "status": "Not started",
+      "status": "In progress",
       "size": "M",
       "release_required": "Yes"
     },
@@ -270,7 +270,7 @@
       "requirements": "R003,R011,R014,R021,R066,R073,R083,R091,R094,R095",
       "deliverable": "Implement explicit provider/feed/rights/entitlement records, revisions, transition policies and no-cross-tenant pooling default.",
       "verification": "Unsupported display/model-processing/retention prevents affected use; connected is not qualified.",
-      "status": "Not started",
+      "status": "In progress",
       "size": "M",
       "release_required": "Yes"
     },
@@ -283,7 +283,7 @@
       "requirements": "R004,R008,R009,R014,R050,R054,R066,R067,R083,R091",
       "deliverable": "Implement prioritized streams, EOD/delayed history, coverage accounting, normalized bars and recovery.",
       "verification": "30-symbol planning obeys actual entitlements; missing coverage and retrospective recovery labelled.",
-      "status": "Not started",
+      "status": "In progress",
       "size": "M",
       "release_required": "Yes"
     },
@@ -296,7 +296,7 @@
       "requirements": "R004,R045,R059,R064,R071,R080,R081,R090,R098",
       "deliverable": "Implement SEC submissions/XBRL publication-aware normalized facts and reference FX ingestion.",
       "verification": "Units/restatements/currencies/publication-date and reference-not-executable FX tests.",
-      "status": "Not started",
+      "status": "In progress",
       "size": "M",
       "release_required": "Yes"
     },
@@ -309,7 +309,7 @@
       "requirements": "R009,R014,R020,R047,R056,R057,R085,R093",
       "deliverable": "Implement watchlist CRUD, thesis/conditions/review date, custom deterministic events and priority allocation.",
       "verification": "Deletion doesn't alter holdings; dedupe/cooldown/snooze and stale-source tests.",
-      "status": "Not started",
+      "status": "In progress",
       "size": "M",
       "release_required": "Yes"
     },
@@ -335,7 +335,7 @@
       "requirements": "R012,R020,R026,R049,R067,R069,R074,R082,R083,R085,R086",
       "deliverable": "Implement proposal versions, alternative sets, expiry/invalidation, final revision checks and atomic commitments.",
       "verification": "Concurrency test prevents two individually valid proposals overspending; late review cannot activate.",
-      "status": "Not started",
+      "status": "In progress",
       "size": "M",
       "release_required": "Yes"
     },
@@ -348,7 +348,7 @@
       "requirements": "R024,R034,R059,R061,R065,R066,R072,R083,R084,R091,R099",
       "deliverable": "Implement manifests, bounded configuration, three qualification axes, family policies and user adoption.",
       "verification": "Research-only and actionable eligibility are distinct; materially changed strategies need adoption.",
-      "status": "Not started",
+      "status": "In progress",
       "size": "L",
       "release_required": "Yes"
     },
@@ -361,7 +361,7 @@
       "requirements": "R010,R043,R049,R059,R062,R068,R072,R082",
       "deliverable": "Implement deterministic cash-first underweight allocation with explicit targets, costs and account feasibility.",
       "verification": "Free synthetic positive/abstention oracles and conflicting-cash cases pass.",
-      "status": "Not started",
+      "status": "In progress",
       "size": "M",
       "release_required": "Yes"
     },
@@ -374,7 +374,7 @@
       "requirements": "R045,R059,R060,R065,R072,R084,R099",
       "deliverable": "Implement sector-aware factor policies and distribution sustainability analysis with known missingness.",
       "verification": "Negative earnings, incompatible sectors, stale filings and unsustainable headline yield cases handled.",
-      "status": "Not started",
+      "status": "In progress",
       "size": "M",
       "release_required": "Yes"
     },
@@ -387,7 +387,7 @@
       "requirements": "R008,R009,R059,R060,R062,R065,R072,R084,R099",
       "deliverable": "Implement 126-session momentum/200-session trend candidate, next-session timing, exit and sizing contract.",
       "verification": "No look-ahead, split adjustment mismatch, insufficient history or same-close fill advantage.",
-      "status": "Not started",
+      "status": "In progress",
       "size": "M",
       "release_required": "Yes"
     },
@@ -400,7 +400,7 @@
       "requirements": "R008,R009,R050,R059,R065,R066,R067,R072,R083,R084,R091,R099",
       "deliverable": "Implement 15-minute range candidate, completion buffer, qualified feed and regular-session deadlines.",
       "verification": "Partial ranges, provider switches, halts, half-days and expired review block proposals.",
-      "status": "Not started",
+      "status": "In progress",
       "size": "M",
       "release_required": "Yes"
     },
@@ -413,7 +413,7 @@
       "requirements": "R024,R029,R040,R059,R065,R071,R080,R081,R084,R099",
       "deliverable": "Implement permitted PIT datasets, universe snapshots, full trial ledger and train/development/promotion access separation.",
       "verification": "Survivorship, future filings, revision leakage and repeated test access controls demonstrated.",
-      "status": "Not started",
+      "status": "In progress",
       "size": "M",
       "release_required": "Yes"
     },
@@ -426,7 +426,7 @@
       "requirements": "R024,R029,R040,R059,R062,R065,R084,R099",
       "deliverable": "Implement chronological cost-sensitive evaluation, dependence-aware statistics, frozen baselines and prospective shadow capture.",
       "verification": "Report unsuccessful trials, confidence intervals and limited evidence honestly; no universal edge badge.",
-      "status": "Not started",
+      "status": "In progress",
       "size": "M",
       "release_required": "Yes"
     },
@@ -439,7 +439,7 @@
       "requirements": "R017,R043,R044,R068,R082,R089",
       "deliverable": "Implement explicit deliverables/multipliers, Greeks/model assumptions, collateral and expiry/assignment event states.",
       "verification": "Standard and adjusted contract fixtures, spread legging and collateral release tests.",
-      "status": "Not started",
+      "status": "In progress",
       "size": "L",
       "release_required": "Yes"
     },
@@ -452,7 +452,7 @@
       "requirements": "R017,R059,R065,R084,R089,R099",
       "deliverable": "Implement long call/put, covered call, cash-secured put and four directional debit/credit vertical variants.",
       "verification": "Whole-package expiry payoffs and pre-expiry scenario risk checked; indicative feed blocks live trade pricing.",
-      "status": "Not started",
+      "status": "In progress",
       "size": "M",
       "release_required": "Yes"
     },
@@ -465,7 +465,7 @@
       "requirements": "R019,R020,R024,R045,R052,R071,R080,R081,R084,R085,R087",
       "deliverable": "Implement source passages/rights, atomic claim support, citation IDs, revisions, contradiction and retention propagation.",
       "verification": "Bad citation, wrong entity/date/unit, syndicated-source duplication and withdrawn evidence cases.",
-      "status": "Not started",
+      "status": "In progress",
       "size": "M",
       "release_required": "Yes"
     },
@@ -478,7 +478,7 @@
       "requirements": "R018,R025,R027,R032,R035,R074,R085,R095",
       "deliverable": "Implement API/native adapters, secrets separation, request bounds, metering and explicit fallbacks.",
       "verification": "No authorization/financial-policy/limit bypass; concurrent USD100/USD20 reservations and timeout reconciliation.",
-      "status": "Not started",
+      "status": "In progress",
       "size": "M",
       "release_required": "Yes"
     },
@@ -491,7 +491,7 @@
       "requirements": "R015,R024,R045,R059,R074,R084,R085",
       "deliverable": "Implement independent research thesis generation via allowlisted read tools and structured output.",
       "verification": "AI-only thesis path plus unsupported-claim/injection/insufficient-input abstention controls.",
-      "status": "Not started",
+      "status": "In progress",
       "size": "M",
       "release_required": "Yes"
     },
@@ -504,7 +504,7 @@
       "requirements": "R015,R019,R023,R025,R026,R065,R074,R084,R085,R086,R099",
       "deliverable": "Implement blind-first evidence review, alternatives, bounded revision and final validator handoff.",
       "verification": "Separate context receipts, material disagreements block, reviewer-added claims reverified.",
-      "status": "Not started",
+      "status": "In progress",
       "size": "M",
       "release_required": "Yes"
     },
@@ -517,7 +517,7 @@
       "requirements": "R015,R019,R023,R056,R067,R074,R083,R085,R093",
       "deliverable": "Route rule-origin actions through evaluator in AI mode and chat through same proposal graph.",
       "verification": "No backdoor chat recommendation, no silent mode switch, timeout misses remain visible.",
-      "status": "Not started",
+      "status": "In progress",
       "size": "M",
       "release_required": "Yes"
     },
@@ -530,7 +530,7 @@
       "requirements": "R017,R049,R063,R064,R082,R089,R090,R098",
       "deliverable": "Implement virtual capital, virtual order/fill policy, partial/no fills, slippage/fees and lifecycle events.",
       "verification": "Same-bar ambiguity, dividend/split/assignment, real/sim segregation and no broker calls.",
-      "status": "Not started",
+      "status": "In progress",
       "size": "M",
       "release_required": "Yes"
     },
@@ -543,7 +543,7 @@
       "requirements": "R042,R043,R064,R065,R084,R090,R098,R099",
       "deliverable": "Implement preselected baseline versions and cash-flow-matched actual/sim scorecards.",
       "verification": "Deposits not returns; no reconstructed historical trades from holdings snapshots.",
-      "status": "Not started",
+      "status": "In progress",
       "size": "M",
       "release_required": "Yes"
     },
@@ -556,7 +556,7 @@
       "requirements": "R028,R029,R031,R040,R052,R084,R087",
       "deliverable": "Capture errors, user feedback, private evaluation cases and permitted outcome categories.",
       "verification": "Dismissal not assumed losing trade; private feedback not global training consent.",
-      "status": "Not started",
+      "status": "In progress",
       "size": "M",
       "release_required": "Yes"
     },
@@ -569,7 +569,7 @@
       "requirements": "R028,R029,R030,R032,R033,R035,R037,R084,R092,R099",
       "deliverable": "Implement candidate lineage, task-specific scorecards, independent assessor and experiment budget scheduling.",
       "verification": "Candidates cannot change test access, risk constraints, acceptance thresholds or approval records.",
-      "status": "Not started",
+      "status": "In progress",
       "size": "M",
       "release_required": "Yes"
     },
@@ -582,7 +582,7 @@
       "requirements": "R028,R031,R033,R039,R040,R084",
       "deliverable": "Implement candidate changes to alert/explanation preference configuration with reversible private state.",
       "verification": "Helpful fixture improvement plus deliberate regression rejection; no widening investment policy.",
-      "status": "Not started",
+      "status": "In progress",
       "size": "L",
       "release_required": "Yes"
     },
@@ -595,7 +595,7 @@
       "requirements": "R028,R029,R033,R040,R084",
       "deliverable": "Implement extraction/query/prompt candidate generation and controlled evaluation/promotion.",
       "verification": "Publication-date fixture improves while a false fact/reference regression is rejected.",
-      "status": "Not started",
+      "status": "In progress",
       "size": "L",
       "release_required": "Yes"
     },
@@ -608,7 +608,7 @@
       "requirements": "R028,R029,R033,R034,R059,R065,R084,R099",
       "deliverable": "Implement bounded strategy/ranking candidates, trial accounting, prospective review and adoption artifacts.",
       "verification": "Overfit higher-P&L candidate with violations rejected; user adoption required for semantics.",
-      "status": "Not started",
+      "status": "In progress",
       "size": "L",
       "release_required": "Yes"
     },
@@ -621,7 +621,7 @@
       "requirements": "R028,R029,R030,R033,R039,R084,R092,R099",
       "deliverable": "Implement candidate evaluator policies assessed by separate fixed evaluation control.",
       "verification": "False-approval/overrejection/latency/cost metrics and protected answer-key tamper rejection.",
-      "status": "Not started",
+      "status": "In progress",
       "size": "L",
       "release_required": "Yes"
     },
@@ -660,7 +660,7 @@
       "requirements": "R030,R034,R039,R051,R076,R087,R092,R096,R099",
       "deliverable": "Implement candidate-to-release signing, operator install, user strategy adoption and compatible rollback.",
       "verification": "Maintainer signature not user adoption; unsupported rollback pauses without rewriting records.",
-      "status": "Not started",
+      "status": "In progress",
       "size": "M",
       "release_required": "Yes"
     },
@@ -673,7 +673,7 @@
       "requirements": "R031,R039,R051,R052,R087,R096",
       "deliverable": "Implement learned-state classification, consent revocation, data lineage invalidation and safe export/import.",
       "verification": "No executable activation/credential export; deleted evidence no longer marked reproducible.",
-      "status": "Not started",
+      "status": "In progress",
       "size": "M",
       "release_required": "Yes"
     },
@@ -686,7 +686,7 @@
       "requirements": "R002,R016,R042,R043,R047,R056,R068,R082,R093",
       "deliverable": "Build account/portfolio/decision views with scope/freshness/qualification and accessible numerical controls.",
       "verification": "Keyboard-only essential journeys and contradictory/stale/pending states visible.",
-      "status": "Not started",
+      "status": "In progress",
       "size": "M",
       "release_required": "Yes"
     },
@@ -699,7 +699,7 @@
       "requirements": "R017,R019,R020,R056,R063,R064,R065,R084,R085,R089,R090,R093,R098,R099",
       "deliverable": "Build evidence drilldown, options scenarios, virtual mode and differentiated scorecards.",
       "verification": "No uncertainty hidden behind color or model confidence; sim labels persist across navigation.",
-      "status": "Not started",
+      "status": "In progress",
       "size": "M",
       "release_required": "Yes"
     },
@@ -725,7 +725,7 @@
       "requirements": "R020,R047,R067,R069,R083,R085,R093",
       "deliverable": "Implement in-app feed, email/provider-neutral SMTP, browser push qualification, preferences and dedupe.",
       "verification": "Financial details minimal; late notification opens expired state; sending is not read receipt.",
-      "status": "Not started",
+      "status": "In progress",
       "size": "M",
       "release_required": "Yes"
     },
@@ -751,7 +751,7 @@
       "requirements": "R031,R052,R075,R077,R086,R087,R088",
       "deliverable": "Implement retention classes, deletion jobs, legal holds, backup expiry and restore-time tombstone application.",
       "verification": "Deletion/reproducibility UX and no reappearance after restoring old backup.",
-      "status": "Not started",
+      "status": "In progress",
       "size": "M",
       "release_required": "Yes"
     },

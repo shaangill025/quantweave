@@ -411,6 +411,7 @@ def test_cross_tenant_reads_and_writes_are_impossible(
     with tenant_transaction(app_conn, a) as tx:
         qj.write_outbox(tx, "synthetic.changed", {})
     job = must_claim(worker_conn)
+    assert job.lease_token not in repr(job)  # a bearer token stays out of logs
     forged = ClaimedJob(**{**{f: getattr(job, f) for f in job.__slots__},
                            "tenant_id": b})  # fmt: skip
     with pytest.raises(LeaseLost), tenant_transaction(worker_conn, b) as tx:
