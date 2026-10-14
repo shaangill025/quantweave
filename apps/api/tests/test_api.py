@@ -14,7 +14,7 @@ import threading
 import time
 import uuid
 from collections.abc import Iterator
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, fields, replace
 from datetime import timedelta
 from pathlib import Path
 from typing import Any, cast
@@ -24,11 +24,13 @@ from argon2 import PasswordHasher
 from fastapi.testclient import TestClient
 from httpx import Response
 from qw_adapters import tenancy
+from qw_adapters.notification_store import Keyring
 from qw_adapters.tenancy import Conn, MembershipRole
 from qw_api import Settings, create_app
 from qw_api.security import (
     SESSION_COOKIE,
     LocalPasswordAuthenticator,
+    Principal,
     client_address,
     csrf_token,
 )
@@ -194,6 +196,21 @@ def test_settings_and_hasher_defaults() -> None:
         tenancy.ThrottlePolicy(0, timedelta(1), timedelta(1), timedelta(1))
     verifier = LocalPasswordAuthenticator().hasher.hash("SYNTHETIC")  # RFC 9106
     assert verifier.startswith("$argon2id$v=19$m=65536,t=3,p=4$")
+
+
+def test_settings_repr_and_str_omit_every_secret() -> None:
+    seal = b"SYNTHETIC-seal-key-0123456789abcdef"
+    ident = b"SYNTHETIC-id-key-0123456789abcdefgh"
+    keys = Keyring("syn-a", {"syn-a": seal}, ident)
+    settings = Settings(frozenset({ORIGIN}), KEY, notification_keys=keys)
+    for text in (repr(settings), str(settings), f"{settings}", f"{settings!r}"):
+        assert ORIGIN in text and "syn-a" in text  # the non-secret fields remain
+        for secret in (KEY, seal, ident):
+            for form in (repr(secret), secret.decode(), secret.hex()):
+                assert form not in text
+        assert "secret_key" not in text
+    token = next(f for f in fields(Principal) if f.name == "token")
+    assert token.repr is False  # the session bearer token stays out of logs
 
 
 @pytest.mark.db
