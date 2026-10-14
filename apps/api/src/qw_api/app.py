@@ -239,6 +239,7 @@ def create_app(
 ) -> FastAPI:
     from qw_api.policies import router as policies
     from qw_api.reads import router as reads
+    from qw_api.research import router as research
     from qw_api.routes import router
 
     app = FastAPI(
@@ -254,6 +255,7 @@ def create_app(
     app.include_router(router)
     app.include_router(policies)
     app.include_router(reads)
+    app.include_router(research)
     app.add_exception_handler(ApiError, problem)
     app.add_exception_handler(RequestValidationError, _on_validation)
     app.add_exception_handler(StarletteHTTPException, _on_http)
