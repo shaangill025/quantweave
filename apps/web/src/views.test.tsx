@@ -101,7 +101,7 @@ describe("navigation and focus", () => {
     const h1 = await screen.findByRole("heading", { level: 1, name: "Decisions" });
     expect(document.activeElement).toBe(h1);
     expect(link.getAttribute("aria-current")).toBe("page");
-    go("#/research");
+    go("#/strategies");
     expect(await screen.findByText(/not connected yet/)).toBeTruthy();
   });
 
