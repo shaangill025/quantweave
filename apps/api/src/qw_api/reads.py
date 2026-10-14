@@ -1,6 +1,8 @@
 """Read-only routes for the T053 web UI: `GET /accounts` (listAccounts),
-`GET /accounts/{account_id}/snapshot` (readSnapshot) and `GET /proposals`
-(listProposals), over qw_adapters.journal_store and proposal_store.
+`GET /accounts/{account_id}/snapshot` (readSnapshot),
+`GET /accounts/{account_id}/ledger` (listLedger), `GET /proposals` (listProposals)
+and `GET /proposals/{proposal_id}` (readProposal), over qw_adapters.journal_store
+and proposal_store.
 
 Like `/policies`: membership reads, the session tenant under RLS (another tenant's
 account is the same 404 as an unknown one), C-02 keyset pages with an HMAC cursor
@@ -21,7 +23,11 @@ or feed binding store yet.
   `available_cash` is null. A cost the journal does not know stays null.
 - A proposal's state is resolved at read time from stored records
   (`qw_domain.proposals.resolve_recorded`); risk inputs and pauses are not
-  persisted, so a live state carries `RISK_NOT_RECHECKED`.
+  persisted, so a live state carries `RISK_NOT_RECHECKED`. Each proposal carries
+  its own coverage (project contract 0.4.0), as readProposal returns one item.
+- The ledger pages the verified journal by account revision (`ledger_item`; the
+  wire mapping is in docs/receipts/T053-api.md, reads increment 2). A simulation
+  id is never a journal account (0014 guard), so it is the unknown-account 404.
 """
 
 from __future__ import annotations
@@ -41,9 +47,9 @@ from qw_adapters import proposal_store as pst
 from qw_domain import proposals as dp
 from qw_domain.decimals import Money
 from qw_domain.instants import ensure_aware_utc, format_instant
-from qw_domain.journal import Journal, materialize
+from qw_domain.journal import Entry, Journal, materialize
 from qw_domain.policy import PolicyHistory
-from qw_domain.postings import Holding
+from qw_domain.postings import EventKind, Holding, UnitAccount
 from qw_domain.risk import Side
 
 from qw_api import routes
@@ -64,6 +70,7 @@ PROPOSAL_UNAVAILABLE = (
     "invalidation_conditions", "claim_ids", "evidence_ids", "calculation_ids",
     "review_id", "final_check_receipt_id", "qualification", "joint_set_id",
 )  # fmt: skip
+NOT_RECHECKED = "not_rechecked:risk_evaluation_and_pauses"
 SNAPSHOT_REASONS = ["unknown:freshness_status", "unavailable:reconciliation",
                     "unavailable:available_cash", "unknown:cash_basis",
                     "unavailable:unresolved_ids"]  # fmt: skip
@@ -102,9 +109,11 @@ def _after(request: Request, p: Principal, sort: str, raw: str | None) -> str | 
 
 def _page(
     request: Request, p: Principal, sort: str, items: list[dict[str, Any]],
-    more: bool, reasons: list[str],
+    more: bool, reasons: list[str], last: str | None = None,
 ) -> Response:  # fmt: skip
-    after = _cursor(request, p, sort, items[-1]["id"]) if more else None
+    """A C-02 page; the cursor carries `last` (default: the last item's id)."""
+    key = last if last is not None else items[-1]["id"] if more else ""
+    after = _cursor(request, p, sort, key) if more else None
     status = "partial" if reasons else "complete"
     page = {"items": items, "next_cursor": after,
             "coverage": {"status": status, "reasons": reasons}}  # fmt: skip
@@ -227,6 +236,30 @@ def proposal(
     return view, notes + [f"unavailable:{v.proposal_id}/{f}" for f in missing]
 
 
+def _proposal(
+    tx: Any, store: pst.ProposalPublisher, now: datetime, pid: str, policy: uuid.UUID
+) -> tuple[dict[str, Any], list[str]]:
+    """The proposal at the database clock with its own coverage (0.4.0), and the
+    item reasons for a page."""
+    p = store.load(pid)
+    assert p is not None
+    history = policy_store.load(tx, policy)
+    accounts = {k for k, _ in p.latest.binding.account_revisions}
+    revisions = {k: js.revision(tx, k) for k in sorted(accounts)}
+    view, why = proposal(p, history, revisions, max(now, p.events[-1].at))
+    own = [f"unavailable:{f}" for f in PROPOSAL_UNAVAILABLE] + why
+    if "RISK_NOT_RECHECKED" in view["reason_codes"]:
+        own.append(NOT_RECHECKED)
+    view["coverage"] = {"status": "partial", "reasons": own}
+    return view, why
+
+
+def _now(tx: Any) -> datetime:
+    row = tx.conn.execute("SELECT clock_timestamp()").fetchone()
+    assert row is not None
+    return ensure_aware_utc(row[0])
+
+
 @router.get("/proposals")
 def list_proposals(
     request: Request, principal: Reader, limit: Limit = 50, cursor: Cursor = None
@@ -235,19 +268,103 @@ def list_proposals(
     items, reasons = [], [f"unavailable:{f}" for f in PROPOSAL_UNAVAILABLE]
     with principal.tx() as tx:
         rows = pst.list_proposals(tx, limit + 1, after)
-        row = tx.conn.execute("SELECT clock_timestamp()").fetchone()
-        assert row is not None
-        now, store = ensure_aware_utc(row[0]), pst.ProposalPublisher(tx)
+        now, store = _now(tx), pst.ProposalPublisher(tx)
         for pid, policy_id in rows[:limit]:
-            p = store.load(pid)
-            assert p is not None
-            history = policy_store.load(tx, uuid.UUID(str(policy_id)))
-            accounts = {k for k, _ in p.latest.binding.account_revisions}
-            revisions = {k: js.revision(tx, k) for k in sorted(accounts)}
-            view, why = proposal(p, history, revisions, max(now, p.events[-1].at))
+            view, why = _proposal(tx, store, now, pid, uuid.UUID(str(policy_id)))
             items.append(view)
             reasons += why
     if any("RISK_NOT_RECHECKED" in i["reason_codes"] for i in items):
-        reasons.append("not_rechecked:risk_evaluation_and_pauses")
+        reasons.append(NOT_RECHECKED)
     more = len(rows) > limit
     return _page(request, principal, "proposal_id", items, more, reasons * bool(items))
+
+
+@router.get("/proposals/{proposal_id}")
+def read_proposal(
+    principal: Reader, proposal_id: Annotated[str, Path(pattern=ID)]
+) -> Response:
+    with principal.tx() as tx:
+        policy = pst.policy_of(tx, proposal_id)
+        if policy is None:  # unknown, or another tenant's under RLS
+            raise ApiError(404, "not_found", "No such proposal.")
+        view, _ = _proposal(tx, pst.ProposalPublisher(tx), _now(tx), proposal_id,
+                            policy)  # fmt: skip
+    return Response(json.dumps(view).encode(), 200, media_type="application/json")
+
+
+# Journal kinds on the ledger_event wire. A reversal is the spec's correction
+# (spec §4: corrections use reversals/superseding events); the mapping is named
+# per item in coverage. A kind missing here is a 500, never a dropped event.
+# Identity map on purpose: it exists so a new EventKind fails closed (500).
+KINDS = {k.value: k.value for k in EventKind if k is not EventKind.REVERSAL}
+MAPPED = {EventKind.REVERSAL.value: "correction"}
+LEDGER_REASONS = ["unavailable:lot_policy_id",
+                  "unreconciled:status_is_journal_acceptance"]  # fmt: skip
+
+
+def _line(account: str, commodity: str, amount: str) -> dict[str, str]:
+    return {"book_account": account, "commodity": commodity, "amount": amount}
+
+
+def ledger_item(
+    tenant: str, entry: Entry, reversed_ids: set[str]
+) -> tuple[dict[str, Any], list[str]]:
+    """One journal event on the wire. Money lines keep their currency as commodity
+    (an instrument sub-ledger is `<book_account>:<instrument>`); unit lines use the
+    instrument id as commodity; never summed across commodities."""
+    e, why = entry.event, []
+    kind = KINDS.get(e.kind.value)
+    if kind is None:
+        kind = MAPPED[e.kind.value]
+        why.append(f"mapped:{e.event_id}/kind={e.kind.value}->{kind}")
+    postings = [
+        _line(p.account.value if p.instrument_id is None
+              else f"{p.account.value}:{p.instrument_id.to_wire()}",
+              p.amount.currency, p.amount.amount.to_wire())
+        for p in e.money
+    ] + [_line(u.account.value, u.instrument_id.to_wire(), u.quantity.to_wire())
+         for u in e.units]  # fmt: skip
+    moves = [{"instrument_id": u.instrument_id.to_wire(),
+              "quantity": u.quantity.to_wire()}
+             for u in e.units if u.account is UnitAccount.POSITION]  # fmt: skip
+    notes = [] if e.fee is None else [f"fee:{e.fee.amount.to_wire()} {e.fee.currency}"]
+    notes.append(f"lot_policy:{e.lot_policy}")
+    if e.supersedes is not None:
+        notes.append(f"supersedes:{e.supersedes}")
+    key = (f"reversal/{e.reverses}" if e.reverses is not None
+           else f"record/{e.source.source_id}/{e.source.record_id}")  # fmt: skip
+    return {
+        "id": e.event_id, "account_id": e.account_id, "tenant_id": tenant,
+        "kind": kind, "effective_at": format_instant(e.effective_at),
+        "recorded_at": format_instant(entry.recorded_at),
+        "source_id": e.source.source_id, "source_record_id": e.source.record_id,
+        "idempotency_key": key,
+        "status": "reversed" if e.event_id in reversed_ids else "accepted",
+        "reverses_event_id": e.reverses, "postings": postings,
+        "instrument_movements": moves, "lot_policy_id": None,
+        "economic_annotations": notes,
+    }, why  # fmt: skip
+
+
+@router.get("/accounts/{account_id}/ledger")
+def list_ledger(
+    request: Request, principal: Reader, account_id: Annotated[str, Path(pattern=ID)],
+    limit: Limit = 50, cursor: Cursor = None,
+) -> Response:  # fmt: skip
+    after = _after(request, principal, "account_rev", cursor)
+    with principal.tx() as tx:
+        journal = js.load_journal(tx, account_id)
+    entries = journal.entries()  # in account_rev order; revisions are gapless from 1
+    if not entries:  # unknown, another tenant's, or a simulation (never a ledger)
+        raise ApiError(404, "not_found", "No such account.")
+    start = 0 if after is None else int(after)
+    reversed_ids = {x.event.reverses for x in entries if x.event.reverses}
+    tenant, items, reasons = str(principal.session.tenant_id), [], []
+    for entry in entries[start : start + limit]:
+        view, why = ledger_item(tenant, entry, reversed_ids)
+        items.append(view)
+        reasons += why
+    more = start + limit < len(entries)
+    last = str(start + len(items))
+    page_reasons = (LEDGER_REASONS + reasons) * bool(items)
+    return _page(request, principal, "account_rev", items, more, page_reasons, last)

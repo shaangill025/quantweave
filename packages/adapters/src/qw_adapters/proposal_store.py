@@ -440,3 +440,14 @@ def list_proposals(
         (tx.tenant_id, after, after, limit),
     ).fetchall()
     return [(pid, policy) for pid, policy in rows]
+
+
+def policy_of(tx: TenantTx, pid: str) -> uuid.UUID | None:
+    """The policy id of `pid`'s latest version, or None when the tenant has no such
+    proposal (RLS keeps another tenant's out). Read-only."""
+    row = tx.conn.execute(
+        "SELECT policy_id FROM app.proposal_version WHERE tenant_id = %s AND "
+        "proposal_id = %s ORDER BY version DESC LIMIT 1",
+        (tx.tenant_id, pid),
+    ).fetchone()
+    return None if row is None else uuid.UUID(str(row[0]))
