@@ -23,7 +23,7 @@ import time
 import uuid
 from collections.abc import Callable, Iterator
 from contextlib import AbstractContextManager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from typing import Annotated, Protocol
 
@@ -202,7 +202,7 @@ def connection(request: Request) -> Iterator[Conn]:
 @dataclass(frozen=True, slots=True)
 class Principal:
     session: SessionPrincipal
-    token: str
+    token: str = field(repr=False)
     conn: Conn
 
     def tx(self) -> AbstractContextManager[TenantTx]:

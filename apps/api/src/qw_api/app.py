@@ -11,7 +11,7 @@ import re
 import secrets
 from collections.abc import Callable, Iterable
 from contextlib import AbstractContextManager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import timedelta
 from http import HTTPStatus
 from typing import TYPE_CHECKING, Any
@@ -66,7 +66,7 @@ class Settings:
     `secret_key` leaves stored notifications valid. Unset, the feed is 503."""
 
     allowed_origins: frozenset[str]
-    secret_key: bytes
+    secret_key: bytes = field(repr=False)  # never in repr/str or logs
     session_ttl: timedelta = timedelta(hours=12)
     idle_timeout: timedelta = timedelta(minutes=30)
     step_up_window: timedelta = timedelta(minutes=10)

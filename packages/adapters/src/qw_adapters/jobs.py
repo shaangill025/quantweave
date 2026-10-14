@@ -24,7 +24,7 @@ from __future__ import annotations
 import random
 import uuid
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from enum import StrEnum
 
@@ -72,7 +72,7 @@ class ClaimedJob:
     payload: Json
     attempt: int
     max_attempts: int
-    lease_token: str
+    lease_token: str = field(repr=False)
     lease_expires_at: datetime
 
 
