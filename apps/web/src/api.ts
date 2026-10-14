@@ -196,3 +196,5 @@ export async function getJson<T>(
   if (!guard(body)) return fail("invalid_response", "The response did not match the contract.");
   return { status: "ok", data: body, retrievedAt: now() };
 }
+/** Shape checks reused by other read-only clients (sources.ts). */
+export const checks = { str, id, int, dec, instant, oneOf, nullable, arr, obj, money, coverage };
