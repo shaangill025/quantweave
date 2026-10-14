@@ -28,6 +28,10 @@ provider SDK or persistence.
   frames a rule thesis built by code, with no proposer model run. It takes the
   same two passes; isolation is `rules_origin` and `model_family_distinct` is
   false, because there is no proposer model to be distinct from.
+- Policy knobs (T048) are typed `Config` fields with bounds: material claim kinds
+  (never fewer than `MATERIAL_KINDS`), a relative conflict tolerance of at most
+  `MAX_CONFLICT_TOLERANCE`, and a minimum number of alternatives (a shortfall is
+  material). Defaults reproduce the T039 behaviour.
 - The hand-off is a `review.schema.json` record. `approve_for_final_checks` moves a
   proposal to `ready_for_final_check`, where the deterministic final validator
   (T026) still decides; a review carries no order, size, approval or adoption.
@@ -90,6 +94,8 @@ VERDICT = ("claim_id", "result", "reason")
 MATERIAL_KINDS = frozenset({ClaimKind.REPORTED_FACT, ClaimKind.CALCULATION})
 MAX_TEXT = 4000  # characters in a rationale, assessment or verdict reason
 CLOCK_TOLERANCE = timedelta(minutes=5)  # how far `at` may trail the engine clock
+MAX_CONFLICT_TOLERANCE = Decimal("0.01")  # relative; orchestrator decision (owner)
+MAX_ALTERNATIVES = 3  # the largest minimum a policy may require
 
 
 class EvaluatorError(ValueError):
@@ -128,6 +134,9 @@ class Config:
     max_revisions: int  # at most MAX_REVISIONS
     max_cost: UsdBudget  # committed cost limit for one evaluation (both passes)
     ttl: timedelta  # how long a review stays usable by the final validator
+    material_kinds: frozenset[ClaimKind] = MATERIAL_KINDS  # may add, never drop
+    conflict_tolerance: Decimal = Decimal(0)  # relative difference still agreeing
+    min_alternatives: int = 1
 
     def __post_init__(self) -> None:
         if type(self.proposer) is not Route or type(self.max_cost) is not UsdBudget:
@@ -139,6 +148,17 @@ class Config:
             raise EvaluatorError("max_cost", "positive")
         if type(self.ttl) is not timedelta or self.ttl <= timedelta(0):
             raise EvaluatorError("ttl", "a positive timedelta")
+        kinds, tol = self.material_kinds, self.conflict_tolerance
+        if not isinstance(kinds, frozenset) or not kinds >= MATERIAL_KINDS or not all(
+            type(k) is ClaimKind for k in kinds
+        ):  # fmt: skip
+            raise EvaluatorError("material_kinds", "a superset of MATERIAL_KINDS")
+        if type(tol) is not Decimal or type(self.min_alternatives) is not int:
+            raise TypeError("conflict_tolerance is a Decimal, min_alternatives an int")
+        if not (tol.is_finite() and 0 <= tol <= MAX_CONFLICT_TOLERANCE):
+            raise EvaluatorError("conflict_tolerance", f"0..{MAX_CONFLICT_TOLERANCE}")
+        if not 1 <= self.min_alternatives <= MAX_ALTERNATIVES:
+            raise EvaluatorError("min_alternatives", f"1..{MAX_ALTERNATIVES}")
 
 
 @dataclass(frozen=True, slots=True)
@@ -276,6 +296,14 @@ def _key(i: rs.Item) -> tuple[object, ...]:
 def _keys(c: Claim, by_id: dict[str, rs.Item]) -> set[tuple[object, ...]]:
     items = [by_id[e] for e in c.evidence_ids if e in by_id]
     return {_key(i) for i in items if i.kind is not SourceKind.SOCIAL}
+
+
+def _differs(a: Decimal | None, b: Decimal | None, tol: Decimal) -> bool:
+    """Values disagree unless within `tol` of the larger magnitude (no division)."""
+    if a is None or b is None:
+        return a is not b
+    with localcontext(DOMAIN_CONTEXT):
+        return abs(a - b) > tol * max(abs(a), abs(b))
 
 
 def isolation_label(proposer: Route, passes: tuple[Route, ...]) -> str | None:
@@ -436,12 +464,13 @@ def evaluate(
     shown = set(by_id)  # this context saw every passage in the re-frozen snapshot
     kinds = {x.claim_id: x.kind for x in t.claims}
     material, disclosures, rejected = [], [], []
+    tol = cfg.conflict_tolerance
     rechecks = {x.claim_id: w for x in t.claims if (w := _problem(x, m, by_id, shown))}
     material += [f"recheck:{k}:{w}" for k, w in rechecks.items()]
     for f in findings:
         if f.result is Result.SUPPORTED:
             continue
-        if kinds[f.claim_id] in MATERIAL_KINDS:
+        if kinds[f.claim_id] in cfg.material_kinds:
             material.append(f"verdict:{f.claim_id}:{f.result}")
         else:
             disclosures.append(f"{f.claim_id}:{f.result}")
@@ -451,17 +480,21 @@ def evaluate(
             rejected.append(f"{x.claim_id}:{why}")
         else:
             accepted.append(x)
+    if len({x.strip().lower() for x in alternatives}) < cfg.min_alternatives:
+        material.append("alternatives_short")
     facts = [x for x in t.claims if x.kind is ClaimKind.REPORTED_FACT]
     if not [x for x in facts if x.claim_id not in rechecks]:
         material.append("no_supported_fact")
     for th in facts:  # code-only scan: every usable passage, whatever the model said
         material += [f"conflict:{th.claim_id}:{i.passage_id}" for i in snap.items
-                     if i.kind is not SourceKind.SOCIAL and i.reading.value != th.value
-                     and _key(i) in _keys(th, by_id)]  # fmt: skip
+                     if i.kind is not SourceKind.SOCIAL and _key(i) in _keys(th, by_id)
+                     and _differs(i.reading.value, th.value, tol)]  # fmt: skip
     for th in facts:
         for x in accepted:
             fact = x.kind is ClaimKind.REPORTED_FACT
-            if fact and th.value != x.value and _keys(th, by_id) & _keys(x, by_id):
+            if fact and _differs(th.value, x.value, tol) and (
+                _keys(th, by_id) & _keys(x, by_id)
+            ):  # fmt: skip
                 material.append(f"conflict:{th.claim_id}:{x.claim_id}")
     asked, final = Decision(str(c["decision"])), Decision.APPROVE
     if asked is Decision.ABSTAIN:  # no review exists: the candidate stays pending
