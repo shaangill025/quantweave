@@ -420,6 +420,24 @@ def test_deletion_drops_content_and_flags_earlier_uses() -> None:
         s.delete(OTHER, "fb-2", AT + 4 * H)
 
 
+def test_restore_reapplies_tombstones_over_any_restored_content() -> None:
+    """R052: a tombstone restored with or without the record's content wins."""
+    s = fb.ImprovementEvidence()
+    s.record(feedback())  # content an older backup still held
+    s.reapply(fb.Tombstone(TENANT, "fb-1", AT + H))
+    s.reapply(fb.Tombstone(TENANT, "fb-gone", AT + H))  # content already removed
+    assert s.export_view(TENANT) == ((), ())
+    assert {t.record_id for t in s.tombstones(TENANT)} == {"fb-1", "fb-gone"}
+    for rid in ("fb-1", "fb-gone"):
+        with pytest.raises(fb.FeedbackError, match="deleted"):
+            s.record(feedback(rid, at=AT + 2 * H))
+    with pytest.raises(fb.FeedbackError, match="deleted"):  # one tombstone per id
+        s.reapply(fb.Tombstone(TENANT, "fb-1", AT + 2 * H))
+    with pytest.raises(fb.FeedbackError, match="time_order"):
+        s.reapply(fb.Tombstone(TENANT, "fb-3", AT))
+    assert "SYNTHETIC note" not in repr(feedback())  # never in logs (N8)
+
+
 # ---- evidence capture only: no path into live decisions --------------------------
 
 

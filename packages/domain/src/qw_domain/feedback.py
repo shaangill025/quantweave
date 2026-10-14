@@ -16,7 +16,7 @@ live decision, proposal, review or order.
 - `select` is the only way to take records for an improvement purpose; every call is
   logged (R084). Final-holdout cases never reach development and are read at most
   once per experiment. Cases hold only `CASE_FIELDS`: no account ids, amounts or
-  free text. Deletion tombstones drop content; restore is deferred to persistence.
+  free text. Deletion tombstones drop content; `reapply` restores them over content.
 Stdlib only; no persistence. Retention periods are not invented here (spec §12).
 """
 
@@ -142,7 +142,7 @@ class Feedback(Record):
     KIND = RecordKind.FEEDBACK
     principal_id: str
     category: FeedbackCategory
-    message: str  # private; never logged
+    message: str = field(repr=False)  # private; never logged
 
     def __post_init__(self) -> None:
         Record.__post_init__(self)
@@ -530,6 +530,17 @@ class ImprovementEvidence:
         del self._records[(tenant_id, record_id)]
         self._deleted[(tenant_id, record_id)] = stone
         return stone
+
+    def reapply(self, stone: Tombstone) -> None:
+        """Restore (R052): the tombstone wins over any restored content."""
+        if type(stone) is not Tombstone:
+            raise TypeError("a Tombstone")
+        key = (stone.tenant_id, _id(stone.record_id, "record_id"))
+        if key in self._deleted:
+            raise FeedbackError("deleted", safe_repr(stone.record_id))
+        at = self._tick(stone.tenant_id, stone.deleted_at)
+        self._records.pop(key, None)
+        self._deleted[key] = replace(stone, deleted_at=at)
 
     def _consents(self, tenant_id: str, recipient: str, terms: str,
                   at: datetime) -> list[ConsentGrant]:  # fmt: skip

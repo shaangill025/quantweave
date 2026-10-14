@@ -406,7 +406,7 @@ def test_rows_from_0017_fail_closed(
             "'job_outcome', 'job-legacy', 'succeeded', now(), now(), true, %s)",
             (t, nid, user, "0" * 64),
         )  # fmt: skip
-    assert migrate(conn) == [18]
+    assert migrate(conn)[0] == 18  # then any later migrations
     assert kids(conn, nid) == [None]
     assert code_of(conn, t, ns.load, str(user), nid) == "integrity"
     assert unavailable(write(conn, t, ns.page, str(user), 10, None))
