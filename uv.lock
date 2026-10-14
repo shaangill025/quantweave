@@ -7,6 +7,7 @@ members = [
     "qw-adapters",
     "qw-api",
     "qw-domain",
+    "qw-worker",
 ]
 constraints = [{ name = "pycparser", specifier = "<3.1" }]
 
@@ -562,6 +563,21 @@ requires-dist = [
 name = "qw-domain"
 version = "0.1.0"
 source = { editable = "packages/domain" }
+
+[[package]]
+name = "qw-worker"
+version = "0.1.0"
+source = { editable = "apps/worker" }
+dependencies = [
+    { name = "qw-adapters" },
+    { name = "qw-domain" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "qw-adapters", editable = "packages/adapters" },
+    { name = "qw-domain", editable = "packages/domain" },
+]
 
 [[package]]
 name = "referencing"

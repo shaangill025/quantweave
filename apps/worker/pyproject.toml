@@ -1,0 +1,21 @@
+[project]
+name = "qw-worker"
+version = "0.1.0"
+description = "Portfolio Intelligence background worker (T025): job claiming, outbox relay, retention purges, deadline expiry"
+license = "Apache-2.0"
+requires-python = ">=3.13,<3.14"
+dependencies = [
+    "qw-adapters",
+    "qw-domain",
+]
+
+[project.scripts]
+qw-worker = "qw_worker.__main__:main"
+
+[tool.uv.sources]
+qw-adapters = { workspace = true }
+qw-domain = { workspace = true }
+
+[build-system]
+requires = ["uv_build>=0.11,<0.13"]
+build-backend = "uv_build"
