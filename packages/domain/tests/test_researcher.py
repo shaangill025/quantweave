@@ -424,7 +424,6 @@ def test_budget_and_gateway_refusals_abstain_without_spend() -> None:
 
 def test_mandate_validation_and_import_boundary() -> None:
     for bad in (
-        {"workflow": replace(WORKFLOW, family=Family.ALLOCATION, model_ref=None)},
         {"max_steps": 0},
         {"tools": frozenset({"read_passage"})},
         {"needs": ()},
@@ -433,6 +432,9 @@ def test_mandate_validation_and_import_boundary() -> None:
     ):
         with pytest.raises((rs.ResearchError, TypeError)):
             mandate(**bad)
+    rules = replace(WORKFLOW, family=Family.ALLOCATION, model_ref=None)
+    with pytest.raises(rs.ResearchError, match="workflow"):  # T040: rules mandates
+        run(Fake(), mandate(workflow=rules))  # are evaluator frames, never researched
     # no transitive import of ledger, proposal, order or broker code
     src, seen, todo = Path(rs.__file__).parent, set(), ["qw_domain.researcher"]
     while todo:
