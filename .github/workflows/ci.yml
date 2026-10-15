@@ -20,9 +20,10 @@ jobs:
   # blocked CI before any test ran. When the copy is absent it is created from Docker
   # Hub (ECR Public as fallback), labelled with this repo as its source so the
   # package links to this repo (confirm once in its settings); this workflow never
-  # overwrites it. Anyone with package write
-  # could still replace the tag, and a transient inspect error is read as "absent",
-  # so pinning the digest in the service reference is a follow-up. Only same-repo
+  # overwrites it. The python job's service is pinned by the digest this job printed
+  # on its first run (owner decision 2026-10-15), so a replaced tag can no longer
+  # change what the tests run against; the tag is kept for this existence check,
+  # and repinning is a reviewed edit of the service image. Only same-repo
   # runs create the copy; a fork PR gets a read-only token that cannot read this
   # private package, so fork PRs cannot run the database tests.
   postgres-image:
@@ -65,7 +66,7 @@ jobs:
     # registry login uses this run's short-lived GITHUB_TOKEN (packages: read).
     services:
       postgres:
-        image: ghcr.io/${{ github.repository }}/postgres:16
+        image: ghcr.io/${{ github.repository }}/postgres@sha256:1efe4a7a46f0d15554100d14b6e9d455c74028fd64fd7173957f63be1f639c81
         credentials:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}

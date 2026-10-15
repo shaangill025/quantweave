@@ -22,6 +22,11 @@ or restricted, and the reason is in coverage. A claim's `verification` is the
 domain support status (`unavailable` when nothing counts and rights are a
 reason); evidence and counterevidence ids are the passages that count for it and
 for disagreeing members of its contradiction; invalid citations are in coverage.
+A claim restates what its evidence says, so its text is served only when display
+is granted for every source it cites for the current revision (counted or not;
+superseded citations excepted); otherwise `text` is "" (the contract's text is a
+required string) and coverage names `withheld:<claim_id>/text:rights` (owner
+decision 2026-10-15). Status, ids and support are unchanged.
 Option terms have a contract route but no store yet, so they are not served here
 (docs/receipts/T054-api.md); simulations are read in qw_api.simulations (T041).
 """
@@ -120,6 +125,19 @@ def read_evidence(
     })  # fmt: skip
 
 
+def _displayable(
+    es: EvidenceStore, tenant: str, now: datetime, rights: Registry, cited: list[str]
+) -> bool:
+    """True when display is granted for the source of every passage `cited`."""
+    for pid in cited:
+        src = es.source(tenant, es.passage(tenant, pid).source_id)
+        shown = check_use(rights, tenant, src.feed_id, Use.DISPLAY, now,
+                          scope=src.scope, jurisdiction=src.jurisdiction)  # fmt: skip
+        if not shown.allowed:
+            return False
+    return True
+
+
 @router.get("/claims/{claim_id}")
 def read_claim(
     principal: Reader, request: Request, claim_id: Annotated[str, Path(pattern=ID)]
@@ -156,10 +174,14 @@ def read_claim(
     period = s.period.end.isoformat()
     if start is not None:
         period = f"{start.isoformat()}/{period}"
+    text = f"{s.attribute} of {s.entity.to_wire()} for {period}: {s.value} {s.unit}"
+    if not _displayable(es, tenant, now, rights, [passage[c] for c in (
+            *sup.valid, *(c for c, why in sup.invalid.items()
+                          if why is not Invalid.REVISION_SUPERSEDED))]):  # fmt: skip
+        text = ""
+        reasons.append(f"withheld:{claim_id}/text:rights")
     return _json({
-        "id": claim_id, "kind": rev.kind.value,
-        "text": f"{s.attribute} of {s.entity.to_wire()} for {period}: "
-                f"{s.value} {s.unit}",
+        "id": claim_id, "kind": rev.kind.value, "text": text,
         "instrument_ids": [s.entity.to_wire()],
         "evidence_ids": sorted({passage[c] for c in sup.valid}),
         "calculation_ids": [], "material": None, "verification": verification,
