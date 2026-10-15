@@ -2,8 +2,8 @@
 CSRF and Idempotency-Key (C-03); a deleted record's key is 409 `deleted`. `object_id`
 binds, in the tenant, a proposal's latest version or a simulation (unknown or
 foreign: 404; both kinds: 409). The 202 `job` is `succeeded` (synchronous write);
-its id is the record id, not pollable (readJob is not served). Never logged or sent
-to a model or any external service."""
+its id is the record id, readable by its submitter through readJob (qw_api.jobs).
+Never logged or sent to a model or any external service."""
 
 from __future__ import annotations
 
@@ -18,11 +18,11 @@ from qw_adapters import simulation_store as ss
 from qw_adapters.proposal_store import ProposalPublisher
 from qw_adapters.tenancy import TenantTx
 from qw_domain import feedback as fb
-from qw_domain.instants import format_instant
 
 from qw_api import routes
 from qw_api import security as sec
 from qw_api.app import ApiError, FieldError
+from qw_api.jobs import synchronous
 from qw_api.policies import Reader
 from qw_api.reads import ID
 
@@ -83,10 +83,9 @@ def submit_feedback(
                 raise  # integrity: a crash (500), never a client answer
             raise ApiError(409, *_CONFLICT[exc.code]) from None
         routes._audit(tx, request, "feedback.recorded", user, uuid.UUID(f.record_id))
-        job = {"id": f.record_id, "kind": "feedback.record", "state": "succeeded",
-               "created_at": format_instant(f.recorded_at), "attempt": 1,
-               "idempotency_key": key, "deadline_at": None,
-               "result_reference": f.record_id, "reasons": []}  # fmt: skip
+        # readJob (qw_api.jobs) rebuilds this body from the record
+        rid = f.record_id
+        job = synchronous(rid, "feedback.record", f.recorded_at, key, rid)
         return 202, json.dumps(job).encode()
 
     payload = {"body": body.model_dump(mode="json")}

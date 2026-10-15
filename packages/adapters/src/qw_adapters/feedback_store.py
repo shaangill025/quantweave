@@ -2,7 +2,8 @@
 - `load` re-hashes every row and replays it in time order through
   `ImprovementEvidence` (consent per principal and prospective, tombstones win);
   any failure is `integrity`. Hash-only, no C-20 signing (as pause_store).
-- `record` is keyed by (principal, Idempotency-Key), surviving API record purges.
+- `record` is keyed by (principal, Idempotency-Key), surviving API record purges;
+  `issued` gives readJob that key and time back.
 - `delete` (own feedback only) tombstones and DELETEs the content row, its salt
   included; `restore` removes content a restored backup still held (R052).
 Times are the DB clock; lock `feedback:<tenant>` is taken last. No external call."""
@@ -162,6 +163,25 @@ def _read(tx: TenantTx) -> fb.ImprovementEvidence:
 def load(tx: TenantTx) -> fb.ImprovementEvidence:
     _lock(tx, shared=True)
     return _read(tx)
+
+
+def issued(
+    tx: TenantTx, principal: uuid.UUID, record_id: str
+) -> tuple[str, datetime] | None:
+    """(Idempotency-Key, recorded_at) of the principal's own record, tombstoned or
+    not; None for another principal's or an unknown id. Only an own record takes
+    the lock and verifies the tenant's history (append-only rows), so a forged row
+    fails that record's job alone, never other ids."""
+    row = tx.conn.execute(
+        "SELECT idempotency_key, recorded_at FROM app.feedback WHERE tenant_id = %s "
+        "AND record_id = %s AND principal_id = %s", (tx.tenant_id, record_id,
+                                                      principal),
+    ).fetchone()  # fmt: skip
+    if row is None:
+        return None
+    _lock(tx, shared=True)
+    _read(tx)
+    return row[0], ensure_aware_utc(row[1])
 
 
 def record(

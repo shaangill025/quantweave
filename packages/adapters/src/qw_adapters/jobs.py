@@ -341,6 +341,33 @@ def job_state(tx: TenantTx, job_id: uuid.UUID) -> tuple[JobState, int] | None:
     return None if row is None else (JobState(row[0]), int(row[1]))
 
 
+@dataclass(frozen=True, slots=True)
+class JobStatus:
+    """What readJob may show: never the payload, input revision or lease."""
+
+    id: uuid.UUID
+    kind: str
+    state: JobState
+    idempotency_key: str
+    total_attempts: int  # never falls, unlike the per-generation `attempts`
+    last_error: str | None  # a short code (database CHECK)
+    created_at: datetime
+    deadline_at: datetime | None
+
+
+def status(tx: TenantTx, job_id: uuid.UUID) -> JobStatus | None:
+    """The tenant's job, or None (unknown, or another tenant's: RLS)."""
+    row = tx.conn.execute(
+        "SELECT id, kind, state::text, idempotency_key, total_attempts, last_error, "
+        "created_at, deadline_at FROM app.job WHERE tenant_id = %s AND id = %s",
+        (tx.tenant_id, job_id),
+    ).fetchone()
+    if row is None:
+        return None
+    return JobStatus(row[0], row[1], JobState(row[2]), row[3], int(row[4]), row[5],
+                     row[6], row[7])  # fmt: skip
+
+
 def write_outbox(tx: TenantTx, event_type: str, payload: Json) -> uuid.UUID:
     """Record an event in the caller's transaction, beside the business state."""
     event_id = uuid.uuid4()
