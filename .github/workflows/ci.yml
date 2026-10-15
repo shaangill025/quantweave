@@ -14,17 +14,61 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
+  # Keeps a copy of the PostgreSQL 16 test image in this repository's own GitHub
+  # registry, so the database tests do not depend on anonymous pull limits:
+  # Docker Hub's limit forced #53 onto the ECR Public mirror, whose data limit then
+  # blocked CI before any test ran. When the copy is absent it is created from Docker
+  # Hub (ECR Public as fallback), labelled with this repo as its source so the
+  # package links to this repo (confirm once in its settings); this workflow never
+  # overwrites it. Anyone with package write
+  # could still replace the tag, and a transient inspect error is read as "absent",
+  # so pinning the digest in the service reference is a follow-up. Only same-repo
+  # runs create the copy; a fork PR gets a read-only token that cannot read this
+  # private package, so fork PRs cannot run the database tests.
+  postgres-image:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      packages: write
+    env:
+      MIRROR: ghcr.io/${{ github.repository }}/postgres:16
+      SOURCE_URL: https://github.com/${{ github.repository }}
+      ACTOR: ${{ github.actor }}
+      SAME_REPO: ${{ github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository }}
+    steps:
+      - name: Mirror postgres:16 into GHCR when absent
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "$GH_TOKEN" | docker login ghcr.io -u "$ACTOR" --password-stdin
+          if ! docker buildx imagetools inspect "$MIRROR" >/dev/null 2>&1; then
+            if [ "$SAME_REPO" != "true" ]; then
+              echo "::error::$MIRROR is absent and a fork PR cannot create it"; exit 1
+            fi
+            note="index:org.opencontainers.image.source=$SOURCE_URL"
+            docker buildx imagetools create --annotation "$note" -t "$MIRROR" docker.io/library/postgres:16 ||
+              docker buildx imagetools create --annotation "$note" -t "$MIRROR" public.ecr.aws/docker/library/postgres:16
+          fi
+          echo "mirror digest: $(docker buildx imagetools inspect "$MIRROR" --format '{{.Manifest.Digest}}')"
+          docker logout ghcr.io
+
   python:
+    needs: postgres-image
     runs-on: ubuntu-24.04
     timeout-minutes: 20
+    permissions:
+      contents: read
+      packages: read
     # Throwaway PostgreSQL 16 for the @pytest.mark.db tests (CHK-DB-INTEGRATION).
-    # Trust auth on the job-local service, so no credential exists. Digest pin open.
-    # The Docker official image is pulled through the AWS ECR Public mirror of the
-    # docker/library namespace: anonymous Docker Hub pulls from shared runners hit
-    # the unauthenticated rate limit and fail before any test runs.
+    # Trust auth on the job-local service, so the database has no credential. The
+    # registry login uses this run's short-lived GITHUB_TOKEN (packages: read).
     services:
       postgres:
-        image: public.ecr.aws/docker/library/postgres:16
+        image: ghcr.io/${{ github.repository }}/postgres:16
+        credentials:
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
         env:
           POSTGRES_HOST_AUTH_METHOD: trust
         ports:
