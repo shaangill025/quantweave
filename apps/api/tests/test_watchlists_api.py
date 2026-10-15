@@ -1,5 +1,6 @@
 """`/api/v1/watchlists` (listWatchlists, createWatchlist, readWatchlist,
-updateWatchlist, deleteWatchlist; T024 increment 2) through TestClient on a migrated
+updateWatchlist, deleteWatchlist; T024 increment 2; the three entry operations,
+increment 3) through TestClient on a migrated
 PostgreSQL 16 database as qw_app (T010 harness). SYNTHETIC tenants, users, names and
 journal (test_reads_api.seed_journal); watchlist times are the database clock.
 Responses are validated against the contract `watchlist`, `watchlistPage` (project
@@ -43,11 +44,12 @@ WATCHLIST = Draft202012Validator(rd.PC.schema("watchlist"), registry=rd.REGISTRY
 GROWTH = {"name": "SYNTHETIC growth", "description": "SYNTHETIC thesis list"}
 
 
-def ok(response: Any, status: int, revision: int) -> dict[str, Any]:
+def ok(response: Any, status: int, revision: int,
+       entries: list[dict[str, Any]] | None = None) -> dict[str, Any]:  # fmt: skip
     assert response.status_code == status, response.text
     body: dict[str, Any] = response.json()
     assert [e.message for e in WATCHLIST.iter_errors(body)] == []
-    assert body["revision"] == revision and body["entries"] == []
+    assert body["revision"] == revision and body["entries"] == (entries or [])
     assert response.headers["etag"] == f'"{revision}"'
     return body
 
@@ -202,3 +204,147 @@ def test_tampered_revisions_are_409_integrity(world: Any) -> None:
     ):
         body = assert_problem(response, 409, "integrity")
         assert "forged" not in json.dumps(body)
+
+
+IID = "00000000-0000-4000-8000-0000000000a1"
+MOVE = {"metric": "pct_move", "operator": "between", "values": ["1", "2.5"],
+        "data_spec_id": "SYNTHETIC-feed", "description": "SYNTHETIC move"}  # fmt: skip
+ENTRY: dict[str, Any] = {
+    "instrument_id": IID, "thesis": "SYNTHETIC thesis", "tags": ["SYNTHETIC"],
+    "monitoring_priority": 60, "invalidation_text": "SYNTHETIC invalidation",
+    "conditions": [MOVE]}  # fmt: skip
+SERVED = ENTRY | {"review_at": None}  # the contract response entry; never `needs`
+
+
+@pytest.mark.db
+def test_entries_follow_if_match_and_idempotency_and_never_touch_holdings(
+    world: Any,
+) -> None:
+    rd.seed_journal(world)
+    login(world.client, "bob")
+    snap = world.client.get("/api/v1/accounts/acct-syn-1/snapshot").json()
+    wid = ok(write(world, "POST", URL, GROWTH), 201, 1)["id"]
+    url, one = f"{URL}/{wid}/entries", f"{URL}/{wid}/entries/{IID}"
+    for stale in ('"2"', '"01"', 'W/"1"'):  # an If-Match sent is honoured
+        assert_problem(write(world, "POST", url, ENTRY, stale), 412,
+                       "version_mismatch")  # fmt: skip
+    k = "SYNTHETIC-wl-api-e-01"
+    added = ok(write(world, "POST", url, ENTRY, '"1"', k), 200, 2, [SERVED])
+    replay = write(world, "POST", url, ENTRY, '"1"', k)
+    assert ok(replay, 200, 2, [SERVED]) == added and "idempotent-replayed" in (
+        replay.headers)  # fmt: skip
+    purge(world)  # the store replays
+    assert ok(write(world, "POST", url, ENTRY, '"1"', k), 200, 2, [SERVED]) == added
+    assert_problem(write(world, "POST", url, ENTRY | {"thesis": "x"}, '"1"', k), 409,
+                   "idempotency_key_reused")  # fmt: skip
+    for match in ('"2"', None):  # add replays on the key and body alone
+        assert ok(write(world, "POST", url, ENTRY, match, k), 200, 2,
+                  [SERVED]) == added  # fmt: skip
+    assert ok(world.client.get(f"{URL}/{wid}"), 200, 2, [SERVED]) == added
+    assert_problem(write(world, "POST", url, ENTRY, '"2"'), 409, "entry_exists")
+    bad: list[tuple[dict[str, Any], int, str]] = [
+        (ENTRY | {"review_at": None}, 400, "invalid_request"),  # not in the contract
+        (ENTRY | {"needs": "delayed"}, 400, "invalid_request"),
+        (ENTRY | {"monitoring_priority": 101}, 400, "invalid_request"),
+        (ENTRY | {"monitoring_priority": True}, 400, "invalid_request"),
+        (ENTRY | {"thesis": "a\x00b"}, 400, "invalid_request"),
+        ({k: v for k, v in ENTRY.items() if k != "tags"}, 400, "invalid_request"),
+        (ENTRY | {"instrument_id": IID.upper()}, 422, "invalid_entry"),
+        (ENTRY | {"conditions": [MOVE | {"operator": "eq"}]}, 422,
+         "invalid_entry"),
+        (ENTRY | {"conditions": [MOVE | {"values": ["2", "1"]}]},
+         422, "invalid_entry"),
+        (ENTRY | {"conditions": [MOVE] * 17}, 400, "invalid_request"),  # bounds
+        (ENTRY | {"tags": ["SYNTHETIC"] * 33}, 400, "invalid_request"),
+        (ENTRY | {"conditions": [MOVE | {"values": ["1"] * 9}]}, 400,
+         "invalid_request"),
+        (ENTRY | {"conditions": [MOVE | {"values": ["1"] * 8}]}, 422,
+         "invalid_entry"),  # 8 passes the bound; the domain needs 1 or 2
+    ]  # fmt: skip
+    for body, status, code in bad:
+        other = body | {"instrument_id": body["instrument_id"].replace("a1", "b2")}
+        problem = assert_problem(write(world, "POST", url, other, '"2"'), status,
+                                 code)  # fmt: skip
+        assert status != 422 or problem["field_errors"] == []  # none for 422
+    new = ENTRY | {"thesis": "SYNTHETIC revised", "monitoring_priority": 0}
+    assert_problem(write(world, "PATCH", one, new), 428, "if_match_required")
+    assert_problem(write(world, "PATCH", one, new, '"1"'), 412, "version_mismatch")
+    elsewhere = f"{URL}/{wid}/entries/00000000-0000-4000-8000-0000000000c3"
+    assert_problem(write(world, "PATCH", elsewhere, new, '"2"'), 400,
+                   "instrument_mismatch")  # fmt: skip
+    assert_problem(write(world, "PATCH", elsewhere, new | {
+        "instrument_id": elsewhere[-36:]}, '"2"'), 404, "not_found")  # fmt: skip
+    k2 = "SYNTHETIC-wl-api-e-02"
+    served = new | {"review_at": None}
+    changed = ok(write(world, "PATCH", one, new, '"2"', k2), 200, 3, [served])
+    assert_problem(write(world, "PATCH", one, new, '"3"', k2), 409,
+                   "idempotency_key_reused")  # another If-Match  # fmt: skip
+    purge(world)
+    assert ok(write(world, "PATCH", one, new, '"2"', k2), 200, 3, [served]) == changed
+    assert_problem(write(world, "DELETE", one), 428, "if_match_required")
+    assert_problem(write(world, "DELETE", one, None, '"2"'), 412, "version_mismatch")
+    k3 = "SYNTHETIC-wl-api-e-03"
+    removed = ok(write(world, "DELETE", one, None, '"3"', k3), 200, 4)
+    assert_problem(write(world, "DELETE", one, None, '"4"', k3), 409,
+                   "idempotency_key_reused")  # another If-Match  # fmt: skip
+    purge(world)
+    assert ok(write(world, "DELETE", one, None, '"3"', k3), 200, 4) == removed
+    for response in (write(world, "DELETE", one, None, '"4"'),
+                     write(world, "PATCH", one, new, '"4"'),
+                     write(world, "DELETE", f"{URL}/{wid}/entries/{IID.upper()}",
+                           None, '"4"')):  # fmt: skip
+        assert_problem(response, 404, "not_found")
+    assert revisions(world) == 4
+    events = [api.audit(world, f"watchlist.entry_{a}")
+              for a in ("added", "updated", "removed")]  # fmt: skip
+    assert [len(e) for e in events] == [1, 1, 1]
+    assert {e[0][1:3] for e in events} == {(world.users["bob"], uuid.UUID(wid))}
+    assert world.client.get("/api/v1/accounts/acct-syn-1/snapshot").json() == snap
+    login(world.client, "carol")  # tenant B: the same 404 as an unknown list
+    for response in (write(world, "POST", url, ENTRY, '"4"'),
+                     write(world, "PATCH", one, ENTRY, '"4"'),
+                     write(world, "DELETE", one, None, '"4"'),
+                     write(world, "POST", f"{URL}/{uuid.uuid4()}/entries", ENTRY,
+                           '"1"')):  # fmt: skip
+        body = assert_problem(response, 404, "not_found")
+        assert body["detail"] == "No such watchlist."
+    assert revisions(world) == 4
+
+
+@pytest.mark.db
+def test_a_tampered_entry_is_409_integrity(world: Any) -> None:
+    login(world.client, "alice")
+    wid = ok(write(world, "POST", URL, GROWTH), 201, 1)["id"]
+    ok(write(world, "POST", f"{URL}/{wid}/entries", ENTRY, '"1"'), 200, 2, [SERVED])
+    with world.db.transaction():
+        world.db.execute("SET LOCAL session_replication_role = replica")
+        world.db.execute("UPDATE app.watchlist_revision SET entries = jsonb_set("
+                         "entries, '{0,thesis}', '\"SYNTHETIC forged\"')")  # fmt: skip
+    for response in (world.client.get(f"{URL}/{wid}"),
+                     write(world, "DELETE", f"{URL}/{wid}/entries/{IID}", None,
+                           '"2"')):  # fmt: skip
+        assert "forged" not in json.dumps(assert_problem(response, 409, "integrity"))
+
+
+@pytest.mark.db
+def test_add_entry_if_match_is_optional_as_in_the_contract(world: Any) -> None:
+    login(world.client, "alice")
+    wid = ok(write(world, "POST", URL, GROWTH), 201, 1)["id"]
+    url = f"{URL}/{wid}/entries"
+    k = "SYNTHETIC-wl-api-o-01"
+    first = ok(write(world, "POST", url, ENTRY, None, k), 200, 2, [SERVED])
+    b2 = ENTRY | {"instrument_id": IID.replace("a1", "b2")}
+    both = [SERVED, b2 | {"review_at": None}]
+    ok(write(world, "POST", url, b2), 200, 3, both)  # none: the latest revision
+    c3 = ENTRY | {
+        "instrument_id": IID.replace("a1", "c3"),
+        "conditions": [MOVE] * 16,
+        "tags": ["SYNTHETIC"] * 32,
+    }  # bounds
+    assert_problem(write(world, "POST", url, c3, '"2"'), 412, "version_mismatch")
+    ok(write(world, "POST", url, c3, '"3"'), 200, 4, [*both, c3 | {"review_at": None}])
+    for match in (None, '"1"'):  # a replay of the first add, by key and body
+        assert ok(write(world, "POST", url, ENTRY, match, k), 200, 2,
+                  [SERVED]) == first  # fmt: skip
+    assert revisions(world) == 4
+    assert len(api.audit(world, "watchlist.entry_added")) == 3
