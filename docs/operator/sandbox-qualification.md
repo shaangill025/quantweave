@@ -1,0 +1,59 @@
+# Sandbox qualification (QUAL17) — owner runbook
+
+QUAL17 ("gVisor and single-machine isolation") is qualified only by a run on the
+owner's reference Linux host. The script does not mark QUAL17: the owner pastes its
+evidence block back, it is recorded in `docs/receipts/T007.md`, and QUAL17 changes only
+by owner decision on that evidence. Until then the sandbox gate (`sandbox_unqualified`,
+G11) stays blocked. A development VM run is not a qualification.
+
+## Prerequisites
+- The reference host (x86_64 or aarch64) with sudo. Kernel, distro, CPU and RAM are
+  recorded, not checked against a list.
+- cgroup v2 with the `cpu`, `memory` and `pids` controllers, or cgroup v1 with the
+  `memory`, `pids`, `cpu` and `cpuacct` hierarchies (`stat -fc %T /sys/fs/cgroup`
+  prints `cgroup2fs` on v2). The adapter's v2 path is unit-tested only, so this run is
+  its first real exercise.
+- Swap off, or swap accounting on; otherwise every sandbox run fails closed.
+- A clean checkout of the commit to qualify, with no modified or untracked files, and
+  `uv sync` already run as your normal user.
+- runsc: the official gVisor release. Without `QW_SANDBOX_RUNSC`, the script prints the
+  manual steps (with `sha512sum -c`). Alternatively `--fetch-runsc` downloads release
+  `20261005.0` (`--runsc-release` overrides), verifies its sha512 and prints the
+  version. That flag is the only network access. runsc must be owned by root or you,
+  and must not be group- or world-writable.
+- The rootfs: the pinned `busybox:1.37.0@sha256:bdf57e52…5013f82e` exported to a
+  directory (the script prints the steps). Only its tree digest is **recorded**. Pass
+  `--expect-rootfs-digest <sha256_tree>` to require a known digest: a mismatch fails.
+
+## Commands
+```sh
+git status --short --untracked-files=all    # must print nothing
+sudo env "PATH=$PATH" \
+  QW_SANDBOX_RUNSC=/var/tmp/qw-sandbox/gvisor/runsc \
+  QW_SANDBOX_ROOTFS=/var/tmp/qw-sandbox/rootfs-busybox \
+  uv run --frozen --no-sync python tools/qualify_sandbox.py
+```
+The work dir (`/var/tmp/qw-sandbox`, or `--work-dir`) must be a real directory owned by
+root or you that is not group- or world-writable; otherwise the run is refused. Each
+run writes its logs and downloads to a fresh private `run-*` dir inside it. The run
+takes a few minutes: it runs the sandbox test files with `QW_REQUIRE_GVISOR=1`, first
+on systrap and then on ptrace. Keep any custom `--work-dir`, and the directory that holds runsc, under parents only you can write to, such as the default under the sticky `/var/tmp`. The script checks the directory itself, not its ancestors.
+
+## The result
+`"host_passes_sandbox_suite": true` only if all of these hold:
+- on at least one platform, pytest printed its summary with exit code 0 and zero
+  failed, errors or skipped, and every collected real-runtime (`gvisor`) test passed;
+- cgroup support is available;
+- the script ran as root, with a safe work dir and a usable runsc and rootfs (and the
+  expected rootfs digest, if one was given);
+- the tree was clean at a known commit.
+
+Otherwise it is false and `reasons` says why. The exit code is 0 or 1 to match.
+
+## What to paste back, and how it is recorded
+Paste everything from `----- BEGIN QW SANDBOX QUALIFICATION EVIDENCE -----` to
+`----- END … -----`, plus the summary lines after it. If a platform failed, also attach
+its `pytest-<platform>.log`. The block holds no secrets, but check the paths in it
+before sharing. The orchestrator appends it verbatim to the T007 receipt, and a
+cross-model reviewer checks it. A passing block is evidence, not authority: G11, hosted
+workers and the other open T007 items still need their own evidence.
