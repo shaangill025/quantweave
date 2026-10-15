@@ -171,14 +171,17 @@ def test_display_rights_are_enforced(world: Any, app_conn: Any) -> None:
     conforms("claim", claim)
     assert (claim["verification"], claim["evidence_ids"]) == ("unavailable", [])
     assert "invalid:p-release=rights_revoked" in claim["coverage"]["reasons"]
+    assert_withheld(world.client.get("/api/v1/claims/c-1"))
     # A registry granting every use but display: still withheld.
     world.client.app.state.rights = lambda tx: ev.registry(str(a), Use.DISPLAY)
     got = world.client.get("/api/v1/evidence/p-release")
     assert (got.json()["availability"], got.json()["passage"]) == ("restricted", None)
     assert got.json()["coverage"]["reasons"] == ["restricted:right_unknown"]
     assert ev.RELEASE not in got.text
-    assert world.client.get("/api/v1/claims/c-1").json()["verification"] == (
-        "supported")  # derived-data use is granted  # fmt: skip
+    got = world.client.get("/api/v1/claims/c-1")
+    assert got.json()["verification"] == "supported"  # derived-data use is granted
+    assert got.json()["evidence_ids"] == ["p-release"]
+    assert_withheld(got)  # owner decision 2026-10-15: its text is not displayable
     login(world.client, "carol")  # tenant B: A's ids are the same 404 as unknown
     for kind, known in (("claims", "c-1"), ("evidence", "p-release")):
         foreign = assert_problem(world.client.get(f"/api/v1/{kind}/{known}"), 404,
@@ -186,6 +189,47 @@ def test_display_rights_are_enforced(world: Any, app_conn: Any) -> None:
         unknown = assert_problem(world.client.get(f"/api/v1/{kind}/x-none"), 404,
                                  "not_found")  # fmt: skip
         assert {**foreign, "correlation_id": ""} == {**unknown, "correlation_id": ""}
+
+
+def assert_withheld(got: Any) -> None:
+    """A claim whose cited evidence may not be displayed: status, ids and support
+    stay; the text is empty and named in coverage (owner decision 2026-10-15)."""
+    assert got.status_code == 200, got.text
+    body = got.json()
+    conforms("claim", body)
+    assert body["text"] == ""
+    assert "100 USD" not in got.text and "us-gaap:Revenues" not in got.text
+    assert body["coverage"]["status"] == "partial"
+    assert f"withheld:{body['id']}/text:rights" in body["coverage"]["reasons"]
+    assert "unknown:material" in body["coverage"]["reasons"]
+
+
+@pytest.mark.db
+def test_claim_text_follows_display_rights_of_every_cited_source(
+    world: Any, app_conn: Any, clock_relative: datetime
+) -> None:
+    """Only feed-a is qualified. c-2 cites only feed-a evidence, so its text is
+    shown; c-1 also cites the (deleted) wire copy on feed-b, whose display is not
+    granted, so its text is withheld although the release still supports it."""
+    a = world.tenant_a
+    ev.stored(app_conn, a)
+    until = clock_relative + timedelta(days=3650)
+    world.client.app.state.rights = lambda tx: qualified_registry(
+        ("feed-a",), None, str(a), until)  # fmt: skip
+    login(world.client, "bob")  # a member may read
+    two = world.client.get("/api/v1/claims/c-2").json()
+    conforms("claim", two)
+    assert two["text"] == (f"us-gaap:Revenues of {ev.E1.uuid} for "
+                           "2025-01-01/2025-12-31: 120 USD")  # fmt: skip
+    assert not [r for r in two["coverage"]["reasons"] if r.startswith("withheld:")]
+    got = world.client.get("/api/v1/claims/c-1")
+    assert (got.json()["verification"], got.json()["evidence_ids"]) == (
+        "supported", ["p-release"])  # fmt: skip
+    assert_withheld(got)
+    world.client.app.state.rights = lambda tx: ev.registry(str(a))  # both feeds
+    shown = world.client.get("/api/v1/claims/c-1").json()
+    assert shown["text"].endswith(": 100 USD")
+    assert not [r for r in shown["coverage"]["reasons"] if r.startswith("withheld:")]
 
 
 @pytest.mark.db
