@@ -5,6 +5,7 @@ database clock."""
 from __future__ import annotations
 
 import ast
+import shutil
 import uuid
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
@@ -17,6 +18,7 @@ from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 from qw_adapters import tenancy as tn
 from qw_adapters import watchlist_store as ws
+from qw_adapters.migrations import MIGRATIONS_DIR, migrate
 from qw_domain.identity import InstrumentId
 from qw_domain.instants import format_instant
 from qw_domain.monitoring import Condition
@@ -53,7 +55,7 @@ def c(app_conn: Conn) -> Ctx:
 
 
 def run(conn: Conn, c: Ctx, fn: str, *args: Any, b: bool = False,
-        other: bool = False) -> Any:  # fmt: skip
+        other: bool = False, **kw: Any) -> Any:  # fmt: skip
     tenant = c.tenant_b if b else c.tenant
     who = (c.user_b, c.session_b) if b else (c.other, c.other_session) if other else (
         c.user, c.session)  # fmt: skip
@@ -61,7 +63,8 @@ def run(conn: Conn, c: Ctx, fn: str, *args: Any, b: bool = False,
         if fn in ("load", "page"):
             return getattr(ws, fn)(tx, *args)
         return getattr(ws, fn)(tx, *(args[:1] if fn != "create" else ()), *who,
-                               *(args[1:] if fn != "create" else args))  # fmt: skip
+                               *(args[1:] if fn != "create" else args),
+                               **kw)  # fmt: skip
 
 
 def count(conn: Conn) -> int:
@@ -461,7 +464,8 @@ def _rehash(row: dict[str, Any]) -> str:
     return ws.revision_hash(*(row[k] for k in (
         "tenant_id", "watchlist_id", "revision", "action", "principal_id",
         "session_id", "idempotency_key", "name", "description", "entries",
-        "recorded_at", "previous_hash")), instrument=row["instrument_id"])  # fmt: skip
+        "recorded_at", "previous_hash")), instrument=row["instrument_id"],
+        review_set=row["review_at_set"])  # fmt: skip
 
 
 def _forge(change: str, row: dict[str, Any]) -> None:
@@ -597,3 +601,194 @@ def test_0022_era_hashes_are_golden() -> None:
     h2 = ws.revision_hash(t, w, 2, "update", p, s, K2, "SYNTHETIC b", "d", [],
                           at + timedelta(seconds=1.5), h1)  # fmt: skip
     assert h2 == "ee7cdb7d31d7f8af7b4dbfc2a441eba5d7046f79153d84bf7e23ea72674de9c2"
+
+
+# --- review_at (0024, increment 4; project contract 0.5.0) ---
+
+T1 = datetime(2026, 11, 2, 14, tzinfo=UTC)
+GOLDEN_0023 = "00eca0ec42c8dab8ee4de77cf30075d0296f35176a9a6f70a020dc7b4a1a80db"
+GOLDEN_0024 = "26d5df554653b4dc50c28abb4628b617677982aba1123a9bb4b702effab5c587"
+T2 = datetime(2026, 12, 1, 9, 30, tzinfo=UTC)
+
+
+def reviewed(iid: str, at: datetime | None, thesis: str = "SYNTHETIC thesis") -> Entry:
+    return replace(entry(iid, thesis), review_at=at)
+
+
+def test_review_at_is_set_on_add_and_changed_only_by_an_update_that_sets_it(
+    app_conn: Conn, conn: Conn, c: Ctx
+) -> None:
+    wid = run(app_conn, c, "create", K1, "SYNTHETIC a", "")[0].watchlist.watchlist_id
+    run(app_conn, c, "add_entry", wid, K2, 1, reviewed(A, T1))
+    assert rows(conn)[-1]["entries"] == [
+        stored(A) | {"review_at": "2026-11-02T14:00:00Z"}
+    ]
+    assert rows(conn)[-1]["review_at_set"] is False
+    r, _ = run(
+        app_conn, c, "update_entry", wid, K3, 2, reviewed(A, None, "SYNTHETIC u")
+    )
+    assert r.watchlist.entry(iid_of(A)).review_at == T1  # omitted: kept
+    assert rows(conn)[-1]["review_at_set"] is False
+    r, _ = run(
+        app_conn, c, "update_entry", wid, K4, 3, reviewed(A, T2), review_set=True
+    )
+    assert rows(conn)[-1]["entries"] == [
+        stored(A) | {"review_at": "2026-12-01T09:30:00Z"}
+    ]
+    assert rows(conn)[-1]["review_at_set"] is True and r.review_set
+    k5 = "SYNTHETIC-wl-key-0005"
+    r, _ = run(
+        app_conn, c, "update_entry", wid, k5, 4, reviewed(A, None), review_set=True
+    )
+    assert rows(conn)[-1]["entries"] == [stored(A)]  # null clears it; needs kept
+    assert run(app_conn, c, "load", wid) == r and count(conn) == 5
+
+
+def test_review_at_keys_replay_the_same_request_only(app_conn: Conn, c: Ctx) -> None:
+    wid = run(app_conn, c, "create", K1, "SYNTHETIC a", "")[0].watchlist.watchlist_id
+    added, _ = run(app_conn, c, "add_entry", wid, K2, 1, reviewed(A, T1))
+    upd, _ = run(app_conn, c, "update_entry", wid, K3, 2, reviewed(A, T2),
+                 review_set=True)  # fmt: skip
+    kept, _ = run(app_conn, c, "update_entry", wid, K4, 3, reviewed(A, None))
+    assert run(app_conn, c, "add_entry", wid, K2, 1, reviewed(A, T1)) == (added, False)
+    assert run(app_conn, c, "update_entry", wid, K3, 2, reviewed(A, T2),
+               review_set=True) == (upd, False)  # fmt: skip
+    assert run(app_conn, c, "update_entry", wid, K4, 3, reviewed(A, None)) == (
+        kept, False)  # fmt: skip
+    for fn, args, kw in (("add_entry", (K2, 1, reviewed(A, T2)), {}),
+                         ("add_entry", (K2, 1, reviewed(A, None)), {}),
+                         ("update_entry", (K3, 2, reviewed(A, T1)),
+                          {"review_set": True}),
+                         ("update_entry", (K3, 2, reviewed(A, T2)), {}),  # omitted
+                         ("update_entry", (K4, 3, reviewed(A, T2)),
+                          {"review_set": True})):  # fmt: skip
+        with pytest.raises(ws.WatchlistStoreError) as err:
+            run(app_conn, c, fn, wid, *args, **kw)
+        assert err.value.code == "idempotency_key_reused", (fn, args, kw)
+
+
+def _review_chain(app_conn: Conn, conn: Conn, c: Ctx, review_set: bool) -> tuple[
+        str, dict[str, Any]]:  # fmt: skip
+    wid = run(app_conn, c, "create", K1, "SYNTHETIC a", "")[0].watchlist.watchlist_id
+    run(app_conn, c, "add_entry", wid, K2, 1, reviewed(A, T1))
+    run(app_conn, c, "update_entry", wid, K3, 2, reviewed(A, T1, "SYNTHETIC u"),
+        review_set=review_set)  # fmt: skip
+    return wid, rows(conn)[-1]
+
+
+def _replace_last(conn: Conn, row: dict[str, Any], rehash: bool = True) -> None:
+    if rehash:
+        row["event_hash"] = _rehash(row)
+    tamper(conn, "DELETE FROM app.watchlist_revision WHERE revision = %s",
+           (row["revision"],))  # fmt: skip
+    insert(conn, row, replica=True)
+
+
+REVIEW_FORGED = {
+    "review-not-set": (False, {"review_at": "2026-12-01T09:30:00Z"}, {}),
+    "needs-review-set": (True, {"needs": "delayed"}, {}),
+    "needs-and-review": (True, {"needs": "delayed",
+                                "review_at": "2026-12-01T09:30:00Z"}, {}),
+    "flag-unhashed": (False, {"review_at": "2026-12-01T09:30:00Z"},
+                      {"review_at_set": True, "rehash": False}),
+}  # fmt: skip
+
+
+@pytest.mark.parametrize("change", sorted(REVIEW_FORGED))
+def test_a_forged_update_review_or_needs_is_integrity(
+    app_conn: Conn, conn: Conn, c: Ctx, change: str
+) -> None:
+    review_set, edit, extra = REVIEW_FORGED[change]
+    wid, row = _review_chain(app_conn, conn, c, review_set)
+    row["entries"][0] |= edit
+    if "review_at_set" in extra:
+        row["review_at_set"] = extra["review_at_set"]
+    _replace_last(conn, row, rehash=extra.get("rehash", True))
+    for fn, args in (("load", (wid,)), ("page", (9, None))):
+        with pytest.raises(ws.WatchlistStoreError) as err:
+            run(app_conn, c, fn, *args)
+        assert err.value.code == "integrity", (change, fn)
+
+
+def test_a_rehashed_update_that_set_review_at_may_change_it(
+    app_conn: Conn, conn: Conn, c: Ctx
+) -> None:
+    """Control for `review-not-set`: the same edit on a row whose request set it."""
+    wid, row = _review_chain(app_conn, conn, c, True)
+    row["entries"][0]["review_at"] = "2026-12-01T09:30:00Z"
+    _replace_last(conn, row)
+    assert run(app_conn, c, "load", wid).watchlist.entries[0].review_at == T2
+
+
+def test_review_at_set_only_on_update_entry_rows(app_conn: Conn, conn: Conn,
+                                                 c: Ctx) -> None:  # fmt: skip
+    """0024 refuses the flag on any other action; with that CHECK dropped (this
+    test's own database), the adapter refuses a rehashed add that carries it."""
+    wid = run(app_conn, c, "create", K1, "SYNTHETIC a", "")[0].watchlist.watchlist_id
+    run(app_conn, c, "add_entry", wid, K2, 1, reviewed(A, T1))
+    row = rows(conn)[-1] | {"review_at_set": True}
+    row["event_hash"] = _rehash(row)
+    with pytest.raises(psycopg.errors.CheckViolation):
+        _replace_last(conn, dict(row), rehash=False)
+    conn.execute("ALTER TABLE app.watchlist_revision "
+                 "DROP CONSTRAINT watchlist_revision_review_at_set")  # fmt: skip
+    _replace_last(conn, row, rehash=False)
+    with pytest.raises(ws.WatchlistStoreError) as err:
+        run(app_conn, c, "load", wid)
+    assert err.value.code == "integrity"
+
+
+def test_entry_action_hashes_are_golden() -> None:
+    """Hard-coded: sha256 of the hand-written canonical JSON of a SYNTHETIC
+    update_entry, without the flag (0023 form) and with it (0024 appends
+    "review_at_set")."""
+    t, w, p, s = (uuid.UUID(f"{d * 8}-{d * 4}-4{d * 3}-8{d * 3}-{d * 12}")
+                  for d in "1234")  # fmt: skip
+    at = datetime(2026, 1, 1, tzinfo=UTC)
+    args: tuple[Any, ...] = (
+        t,
+        w,
+        3,
+        "update_entry",
+        p,
+        s,
+        K3,
+        "SYNTHETIC a",
+        "",
+        [],
+        at,
+        "f" * 64,
+    )
+    assert ws.revision_hash(*args, instrument=uuid.UUID(A)) == GOLDEN_0023
+    assert ws.revision_hash(*args, instrument=uuid.UUID(A),
+                            review_set=True) == GOLDEN_0024  # fmt: skip
+
+
+def test_rows_from_0023_read_as_review_not_set(conn: Conn, tmp_path: Path) -> None:
+    """A row written before 0024 gets `review_at_set` false from the default, and
+    its 0023-era hash still verifies."""
+    for f in sorted(MIGRATIONS_DIR.glob("*.sql")):
+        if f.name < "0024":
+            shutil.copy(f, tmp_path / f.name)
+    assert migrate(conn, tmp_path)[-1] == 23
+    with tn.provision_tenant(conn) as tx:
+        user = tn.create_user(tx, "SYNTHETIC legacy")
+        tn.add_membership(tx, user, tn.MembershipRole.TENANT_MEMBER)
+        session = tn.create_session(tx, user, timedelta(hours=1))[0]
+    t, wid = tx.tenant_id, uuid.uuid4()
+    with tn.tenant_transaction(conn, t):
+        stamp = conn.execute("SELECT clock_timestamp()").fetchone()
+        assert stamp is not None
+        at = stamp[0]
+        digest = ws.revision_hash(t, wid, 1, "create", user, session, K1,
+                                  "SYNTHETIC legacy", "", [], at, None)  # fmt: skip
+        insert(conn, {"tenant_id": t, "watchlist_id": wid, "revision": 1,
+                      "action": "create", "principal_id": user, "session_id": session,
+                      "idempotency_key": K1, "name": "SYNTHETIC legacy",
+                      "description": "", "entries": [], "recorded_at": at,
+                      "previous_hash": None, "event_hash": digest})  # fmt: skip
+    assert migrate(conn)[0] == 24
+    assert [r["review_at_set"] for r in rows(conn)] == [False]
+    with tn.tenant_transaction(conn, t) as tx:
+        got = ws.load(tx, str(wid))
+    assert got is not None and (got.digest, got.review_set) == (digest, False)

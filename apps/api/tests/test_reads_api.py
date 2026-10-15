@@ -208,6 +208,34 @@ def test_project_contract_amendments_are_strict() -> None:
     assert horizon("p-1", "decade") == (None, ["unknown:p-1/horizon"])
 
 
+def test_project_contract_request_amendment() -> None:
+    """0.5.0 (owner decision 2026-10-15): the request `WatchlistEntry` gains an
+    optional, nullable `review_at`; `needs` stays server-derived and refused."""
+    condition = {"metric": "price", "operator": "gt", "values": ["10"],
+                 "data_spec_id": "feed-syn", "description": "SYNTHETIC"}  # fmt: skip
+    entry = {"instrument_id": "inst-syn-1", "thesis": "SYNTHETIC", "tags": [],
+             "monitoring_priority": 5, "conditions": [condition],
+             "invalidation_text": ""}  # fmt: skip
+    request = PC.request("WatchlistEntry")
+    v = Draft202012Validator(request, registry=REGISTRY, format_checker=FormatChecker())
+
+    def errors(body: dict[str, Any]) -> list[str]:
+        return [e.message for e in v.iter_errors(body)]
+
+    assert errors(entry) == []  # optional: a 0.4.0 body stays valid
+    assert errors({**entry, "review_at": "2026-11-02T14:00:00Z"}) == []
+    assert errors({**entry, "review_at": "2026-11-02T09:00:00-05:00"}) == []
+    assert errors({**entry, "review_at": None}) == []
+    for bad in ("2026-11-02", "2026-11-02T14:00:00", "soon", 1, True):
+        assert errors({**entry, "review_at": bad}) != [], bad
+    assert errors({**entry, "needs": "delayed"}) != []  # still server-derived
+    assert errors({**entry, "conditions": [{"metric": "price"}]}) != []  # $ref resolves
+    assert "review_at" not in request["required"]
+    assert request["title"].endswith(f"(project contract {PC.AMENDMENTS['version']})")
+    with pytest.raises(KeyError):  # an amendment never invents a request schema
+        PC.request("NoSuchRequest")
+
+
 def seed_proposals(w: Any, app_conn: Any) -> tuple[Any, Any]:
     alice = w.users["alice"]
     with tn.tenant_transaction(app_conn, w.tenant_a) as tx:

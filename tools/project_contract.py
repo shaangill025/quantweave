@@ -1,22 +1,26 @@
 #!/usr/bin/env python3
-"""Project contract 0.4.0 (T008 A-01): the docs/spec/contracts 0.1.0 schemas with the
-amendments of contracts/amendments.json applied (0.2.0 owner-approved; 0.3.0 and 0.4.0
-proposed, pending owner confirmation: see `versions` there). docs/spec is never
-edited; this derives the amended schemas in memory.
+"""Project contract 0.5.0 (T008 A-01): the docs/spec/contracts 0.1.0 schemas with the
+amendments of contracts/amendments.json applied (all owner decisions: see `versions`
+there). docs/spec is never edited; this derives the amended schemas in memory.
 
 - `nullable`: the property (or `parent/property`; a `$ref` parent is inlined from
   common.schema.json first) also accepts null.
 - `add`: required properties appended to a closed schema.
 - `active_nullable`: the `state == active` if/then rules also accept null there.
 - `page(name)`: the C-02 page `{items, next_cursor, coverage}` of an item schema.
+- `request(name)`: an openapi.yaml request component; `requests.<name>.optional` adds
+  properties that are not required. Its `./schemas/` refs become the bare file names
+  the schema files use. Reading openapi.yaml needs PyYAML (dev group, as in
+  tools/check_contracts.py); everything else is standard library.
 The cross-field rule (every amended null is named in coverage.reasons) is not
 expressible in JSON Schema; consumers check it (`rule` in amendments.json).
-Run directly, it prints each amended schema's changes. Standard library only.
+Run directly, it prints each amended schema's changes.
 """
 
 from __future__ import annotations
 
 import copy
+import functools
 import json
 from pathlib import Path
 from typing import Any
@@ -59,6 +63,33 @@ def schema(name: str) -> dict[str, Any]:
     return s
 
 
+@functools.cache
+def _openapi() -> dict[str, Any]:
+    import yaml  # type: ignore[import-untyped]
+
+    data: dict[str, Any] = yaml.safe_load((SPEC.parent / "openapi.yaml").read_text())
+    return data
+
+
+def _local(node: Any) -> Any:
+    if isinstance(node, dict):
+        return {
+            k: v.removeprefix("./schemas/") if k == "$ref" else _local(v)
+            for k, v in node.items()
+        }
+    return [_local(v) for v in node] if isinstance(node, list) else node
+
+
+def request(name: str) -> dict[str, Any]:
+    s: dict[str, Any] = _local(_openapi()["components"]["schemas"][name])
+    for key, prop in AMENDMENTS["requests"].get(name, {}).get("optional", {}).items():
+        if key in s["properties"]:
+            raise ValueError(f"{name}.{key} is already in the request")
+        s["properties"][key] = prop
+    s["title"] = f"{name} (project contract {AMENDMENTS['version']})"
+    return s
+
+
 def page(name: str) -> dict[str, Any]:
     return {
         "type": "object",
@@ -77,4 +108,7 @@ if __name__ == "__main__":
     for name in AMENDMENTS["schemas"]:
         print(name, json.dumps(AMENDMENTS["schemas"][name], sort_keys=True))
         schema(name)  # raises on an amendment that names a missing property
+    for name in AMENDMENTS["requests"]:
+        print(name, json.dumps(AMENDMENTS["requests"][name], sort_keys=True))
+        request(name)  # raises on a missing request or an existing property
     print(f"project contract {AMENDMENTS['version']}: OK")
