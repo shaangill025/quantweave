@@ -3,7 +3,11 @@
 in the operator's environment (`__main__`), so no secret lives in code or config.
 
 Retention windows feed `qw_adapters.jobs.purge`, which also refuses windows below its
-minimums. Idempotency records (A-05: at least 24 h) default to 48 h for margin.
+minimums. Their defaults are the configured retention defaults
+(`qw_domain.retention_config`, owner decision 9): idempotency records 48 h (A-05: at
+least 24 h), outbox 7 days, inbox 30 days. QW_RETENTION_CONFIG names an operator
+JSON file (`retention_config.parse`) that sets the windows and purge holds; a held
+window is not purged.
 """
 
 from __future__ import annotations
@@ -17,15 +21,14 @@ from datetime import timedelta
 from qw_adapters.jobs import (
     DEFAULT_BACKOFF,
     IDEMPOTENCY_RETENTION,
-    INBOX_RETENTION,
     INBOX_RETENTION_MIN,
     MAX_WORKER_NAME,
-    OUTBOX_RETENTION,
     OUTBOX_RETENTION_MIN,
     RELAY_BACKOFF,
     RELAY_MAX_ATTEMPTS,
 )
 from qw_domain.jobs import Backoff, Pool
+from qw_domain.retention_config import DEFAULT_WINDOWS, Window, parse
 
 _NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
 
@@ -47,9 +50,10 @@ class WorkerSettings:
     job_backoff: Backoff = DEFAULT_BACKOFF
     relay_backoff: Backoff = RELAY_BACKOFF
     purge_every: timedelta = timedelta(hours=1)
-    outbox_retention: timedelta = OUTBOX_RETENTION
-    inbox_retention: timedelta = INBOX_RETENTION
-    idempotency_retention: timedelta = 2 * IDEMPOTENCY_RETENTION  # 48 h
+    outbox_retention: timedelta = DEFAULT_WINDOWS[Window.OUTBOX]
+    inbox_retention: timedelta = DEFAULT_WINDOWS[Window.INBOX]
+    idempotency_retention: timedelta = DEFAULT_WINDOWS[Window.IDEMPOTENCY]
+    purge_held: frozenset[Window] = frozenset()  # under a purge hold: not purged
 
     def __post_init__(self) -> None:
         if not isinstance(self.pool, Pool):
@@ -77,6 +81,9 @@ class WorkerSettings:
         ):  # fmt: skip
             if window < least:
                 raise ValueError(f"{name} must be at least {least}")
+        if type(self.purge_held) is not frozenset or not all(
+                type(w) is Window for w in self.purge_held):  # fmt: skip
+            raise ValueError("purge_held must be a frozenset of Window")
 
 
 # Optional integer overrides from the environment; anything else keeps its default.
@@ -105,6 +112,22 @@ def settings_from_env(environ: Mapping[str, str] = os.environ) -> WorkerSettings
             values[field] = int(raw) if unit is None else unit * int(raw)
         except OverflowError as exc:
             raise ValueError(f"{key} is out of range") from exc
+    if (path := environ.get("QW_RETENTION_CONFIG")) is not None:
+        if any(f.endswith("_retention") for f in values):
+            raise ValueError("set retention windows in QW_RETENTION_CONFIG or the "
+                             "QW_WORKER_*_RETENTION_* variables, not both")  # fmt: skip
+        try:
+            with open(path, encoding="utf-8") as fh:
+                text = fh.read(1 << 17)
+        except OSError as exc:
+            raise ValueError(
+                f"QW_RETENTION_CONFIG unreadable: {exc.strerror}"
+            ) from None
+        cfg = parse(text)  # RetentionError is a ValueError
+        values.update(outbox_retention=cfg.windows[Window.OUTBOX],
+                      inbox_retention=cfg.windows[Window.INBOX],
+                      idempotency_retention=cfg.windows[Window.IDEMPOTENCY],
+                      purge_held=cfg.held())  # fmt: skip
     pool = Pool(environ.get("QW_WORKER_POOL", Pool.STANDARD.value))
     name = environ.get("QW_WORKER_NAME", f"worker-{os.getpid()}")
     return WorkerSettings(name, pool, **values)  # type: ignore[arg-type]

@@ -8,6 +8,7 @@ and payloads are SYNTHETIC.
 from __future__ import annotations
 
 import importlib.util
+import json
 import logging
 import os
 import signal
@@ -24,6 +25,7 @@ from qw_adapters import tenancy as tn
 from qw_adapters.jobs import ClaimedJob, OutboxEvent, Purged, Relayed
 from qw_adapters.tenancy import Conn, TenantTx, append_audit_event, tenant_transaction
 from qw_domain.jobs import Backoff, JobState, Priority
+from qw_domain.retention_config import DEFAULT_WINDOWS, WINDOW_FLOORS, Window
 from qw_worker import (
     HANDLERS,
     HandlerFailed,
@@ -300,6 +302,70 @@ def test_purges_run_on_the_configured_schedule_with_48h_idempotency(
     short = Worker(worker_conn, WorkerSettings(
         "synthetic-w1", idempotency_retention=timedelta(hours=24)))  # fmt: skip
     assert short.tick().purged == Purged(outbox=0, inbox=0, idempotency=1)
+
+
+def retention_file(tmp_path: Path, **fields: object) -> dict[str, str]:
+    """A SYNTHETIC operator retention config (owner decision 9) and its env var."""
+    body: dict[str, object] = {"policy_id": "synthetic-ops-2", "version": 2}
+    body.update(fields)
+    path = tmp_path / "retention.json"
+    path.write_text(json.dumps(body))
+    return {"QW_WORKER_NAME": "synthetic-w3", "QW_RETENTION_CONFIG": str(path)}
+
+
+@pytest.mark.db
+def test_purge_hold_in_the_retention_config_beats_the_purge(
+    app_conn: Conn, worker_conn: Conn, conn: Conn, tmp_path: Path
+) -> None:
+    tenant, user = make_tenant(app_conn)
+    hold = {"hold_id": "ph-1", "windows": ["idempotency"], "reason": "litigation",
+            "authority_id": "counsel-1"}  # fmt: skip
+    cfg = settings_from_env(retention_file(tmp_path, purge_holds=[hold]))
+    assert cfg.purge_held == frozenset({Window.IDEMPOTENCY})
+    backdate(conn, tenant, user, 50)  # past the 48 h window, but held
+    got = Worker(worker_conn, cfg).tick().purged
+    assert got == Purged(outbox=1, inbox=0, idempotency=0, held=("idempotency",))
+    with tenant_transaction(app_conn, tenant) as tx:
+        left = tx.conn.execute("SELECT count(*) FROM app.idempotency_record").fetchone()
+    assert left == (1,)
+    free = settings_from_env(retention_file(tmp_path, windows={"idempotency": "49h"}))
+    assert Worker(worker_conn, free).tick().purged == Purged(0, 0, 1)
+
+
+def test_worker_reads_the_retention_config(tmp_path: Path) -> None:
+    got = settings_from_env(retention_file(
+        tmp_path, windows={"idempotency": "72h", "inbox": "45d"}))  # fmt: skip
+    assert (got.idempotency_retention, got.outbox_retention, got.inbox_retention,
+            got.purge_held) == (timedelta(hours=72), timedelta(days=7),
+                                timedelta(days=45), frozenset())  # fmt: skip
+    env = retention_file(tmp_path)
+    for extra in ({"QW_WORKER_IDEMPOTENCY_RETENTION_HOURS": "72"},
+                  {"QW_WORKER_OUTBOX_RETENTION_DAYS": "7"},
+                  {"QW_RETENTION_CONFIG": str(tmp_path / "missing.json")}):  # fmt: skip
+        with pytest.raises(ValueError):
+            settings_from_env({**env, **extra})
+    for bad in ({"windows": {"idempotency": "23h"}},
+                {"windows": {"idempotency": "-48h"}},
+                {"classes": {"journal": {"on_request": "delete"}}}):  # fmt: skip
+        with pytest.raises(ValueError):
+            settings_from_env(retention_file(tmp_path, **bad))
+    with pytest.raises(ValueError):
+        WorkerSettings("synthetic-w1", purge_held=frozenset({"idempotency"}))  # type: ignore[arg-type]
+
+
+def test_worker_defaults_are_the_configured_defaults() -> None:
+    s = WorkerSettings("synthetic-w1")
+    mine = {
+        Window.IDEMPOTENCY: s.idempotency_retention,
+        Window.OUTBOX: s.outbox_retention,
+        Window.INBOX: s.inbox_retention,
+    }
+    assert mine == dict(DEFAULT_WINDOWS) == {Window.IDEMPOTENCY: timedelta(hours=48),
+        Window.OUTBOX: timedelta(days=7), Window.INBOX: timedelta(days=30)}  # fmt: skip
+    assert s.purge_held == frozenset()
+    assert dict(WINDOW_FLOORS) == {Window.IDEMPOTENCY: qj.IDEMPOTENCY_RETENTION,
+                                   Window.OUTBOX: qj.OUTBOX_RETENTION_MIN,
+                                   Window.INBOX: qj.INBOX_RETENTION_MIN}  # fmt: skip
 
 
 @pytest.mark.db

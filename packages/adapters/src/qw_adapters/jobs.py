@@ -499,29 +499,33 @@ class Purged:
     outbox: int
     inbox: int
     idempotency: int
+    held: tuple[str, ...] = ()  # windows skipped under a purge hold
 
 
 def purge(
     conn: Conn,
     *,
-    outbox: timedelta = OUTBOX_RETENTION,
-    inbox: timedelta = INBOX_RETENTION,
-    idempotency: timedelta = IDEMPOTENCY_RETENTION,
+    outbox: timedelta | None = OUTBOX_RETENTION,
+    inbox: timedelta | None = INBOX_RETENTION,
+    idempotency: timedelta | None = IDEMPOTENCY_RETENTION,
 ) -> Purged:
     """Delete published outbox events, inbox rows and HTTP idempotency records older
-    than their windows; a window below its minimum raises ValueError."""
+    than their windows; a window below its minimum raises ValueError. A window of
+    None is under a purge hold (T058) and is not purged."""
     minimums = {"outbox": (outbox, OUTBOX_RETENTION_MIN),
                 "inbox": (inbox, INBOX_RETENTION_MIN),
                 "idempotency": (idempotency, IDEMPOTENCY_RETENTION)}  # fmt: skip
     for name, (window, least) in minimums.items():
-        if window < least:
+        if window is not None and window < least:
             raise ValueError(f"{name} retention must be at least {least}")
+    run = [(n, w) for n, (w, _) in minimums.items() if w is not None]
+    counts = dict.fromkeys(minimums, 0)
     _idle(conn)
-    with conn.transaction():
-        row = conn.execute(
-            "SELECT app.outbox_purge(%s), app.inbox_purge(%s), "
-            "app.idempotency_purge(%s)",
-            (outbox, inbox, idempotency),
-        ).fetchone()
-    assert row is not None
-    return Purged(int(row[0]), int(row[1]), int(row[2]))
+    if run:
+        calls = ", ".join(f"app.{n}_purge(%s)" for n, _ in run)  # fixed names only
+        with conn.transaction():
+            row = conn.execute(f"SELECT {calls}", [w for _, w in run]).fetchone()
+        assert row is not None
+        counts.update((n, int(v)) for (n, _), v in zip(run, row, strict=True))
+    held = tuple(n for n, (w, _) in minimums.items() if w is None)
+    return Purged(counts["outbox"], counts["inbox"], counts["idempotency"], held)
