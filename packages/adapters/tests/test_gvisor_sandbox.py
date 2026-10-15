@@ -100,6 +100,114 @@ def test_setup_cgroups_writes_and_verifies_the_limits(
     assert len(made) == 4
 
 
+def _v2_root(tmp_path: Path, controllers: str = "cpuset cpu io memory pids") -> Path:
+    root = tmp_path / "cg2"  # SYNTHETIC unified (cgroup v2) hierarchy
+    root.joinpath("qw-sandbox").mkdir(parents=True)
+    root.joinpath("cgroup.controllers").write_text(controllers + "\n")
+    for d in (root, root / "qw-sandbox"):  # kernel format: names, no "+"
+        d.joinpath("cgroup.subtree_control").write_text("cpu memory pids\n")
+    return root
+
+
+def test_setup_cgroups_v2_writes_and_verifies_the_limits(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    meminfo = tmp_path / "meminfo"  # SYNTHETIC
+    monkeypatch.setattr(gv, "MEMINFO", meminfo)
+    meminfo.write_text("SwapTotal:       2048 kB\n")
+    limits = SandboxLimits(cpu_millicores=250, memory_bytes=64 << 20, pids=9)
+    cfg = GVisorConfig(None, None, tmp_path, cgroup_root=_v2_root(tmp_path))
+    with pytest.raises(OSError, match="swap"):  # no memory.swap.max, swap on
+        gv.setup_cgroups(cfg, "c0", limits, [])
+    meminfo.write_text("SwapTotal:       0 kB\n")
+    made: list[Path] = []
+    gv.setup_cgroups(cfg, "c1", limits, made)
+    run = cfg.cgroup_root / "qw-sandbox" / "c1"
+    assert made == [run.resolve()]  # one directory; v1 controller dirs untouched
+    assert {f.name: f.read_text() for f in run.iterdir()} == {
+        "memory.max": str(64 << 20),
+        "pids.max": str(gv.SENTRY_PIDS_HEADROOM + 9),
+        "cpu.max": "25000 100000",
+    }
+    assert gv.cgroup_v2_limits(limits)["memory.swap.max"] == "0"
+    assert not cfg.cgroup_root.joinpath("memory").exists()
+
+
+@pytest.mark.parametrize("level", [".", "qw-sandbox"])
+def test_setup_cgroups_v2_fails_closed_when_controllers_are_not_delegated(
+    tmp_path: Path, level: str
+) -> None:
+    root = _v2_root(tmp_path)
+    ctl = root.joinpath(level, "cgroup.subtree_control")
+    ctl.write_text("memory\n")  # cpu and pids not enabled for children
+    cfg = GVisorConfig(None, None, tmp_path, cgroup_root=root)
+    with pytest.raises(OSError, match="not enabled"):
+        gv.setup_cgroups(cfg, "c1", SandboxLimits(), [])
+    # it asked for exactly the missing ones; a plain file does not apply the write
+    assert ctl.read_text() == "+cpu +pids"
+    assert not root.joinpath("qw-sandbox", "c1").exists()
+
+
+def test_setup_cgroups_v2_delegates_the_root_before_the_parent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = _v2_root(tmp_path)
+    for d in (root, root / "qw-sandbox"):
+        d.joinpath("cgroup.subtree_control").write_text("")
+    write = Path.write_text
+
+    def kernel(self: Path, data: str) -> int:  # SYNTHETIC subtree_control rules
+        if self.name != "cgroup.subtree_control":
+            return write(self, data)
+        up = self.parent.parent.joinpath("cgroup.subtree_control")
+        asked = [t[1:] for t in data.split()]
+        if self.parent != root and set(asked) - set(up.read_text().split()):
+            raise OSError("ENOENT: controller not enabled in the parent")
+        names = {*self.read_text().split(), *asked}
+        return write(self, " ".join(sorted(names)))
+
+    monkeypatch.setattr(gv, "MEMINFO", tmp_path / "meminfo")
+    (tmp_path / "meminfo").write_text("SwapTotal:       0 kB\n")
+    monkeypatch.setattr(Path, "write_text", kernel)
+    cfg = GVisorConfig(None, None, tmp_path, cgroup_root=root)
+    gv.setup_cgroups(cfg, "c1", SandboxLimits(), [])
+    for d in (root, root / "qw-sandbox"):
+        assert d.joinpath("cgroup.subtree_control").read_text() == "cpu memory pids"
+
+
+@pytest.mark.parametrize("v2", [False, True])
+def test_setup_cgroups_fails_when_the_kernel_does_not_apply_a_limit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, v2: bool
+) -> None:
+    write = Path.write_text
+
+    def clamping(self: Path, data: str) -> int:  # SYNTHETIC kernel ignoring a write
+        return write(self, "max" if self.name == "pids.max" else data)
+
+    root = _v2_root(tmp_path) if v2 else tmp_path / "cg"
+    monkeypatch.setattr(gv, "MEMINFO", tmp_path / "meminfo")
+    (tmp_path / "meminfo").write_text("SwapTotal:       0 kB\n")
+    monkeypatch.setattr(Path, "write_text", clamping)
+    cfg = GVisorConfig(None, None, tmp_path, cgroup_root=root)
+    with pytest.raises(OSError, match=r"pids\.max not applied"):
+        gv.setup_cgroups(cfg, "c1", SandboxLimits(), [])
+
+
+def test_read_counters_v2(tmp_path: Path) -> None:
+    files = {
+        "cgroup.controllers": "cpu memory pids\n",
+        "qw/c/memory.events": "low 0\nhigh 0\nmax 7\noom 2\noom_kill 1\n",
+        "qw/c/pids.events": "max 3\n",
+        "qw/c/cpu.stat": "usage_usec 2215352\nuser_usec 2000000\n",
+    }  # SYNTHETIC cgroup v2 files
+    for rel, text in files.items():
+        tmp_path.joinpath(rel).parent.mkdir(parents=True, exist_ok=True)
+        tmp_path.joinpath(rel).write_text(text)
+    assert gv.read_counters(tmp_path, "/qw/c") == (1, 3, 2_215_352_000)
+    tmp_path.joinpath("qw/c/cpu.stat").write_text("user_usec 1\n")
+    assert gv.read_counters(tmp_path, "/qw/c") == (1, 3, None)
+
+
 def _runner(tmp_path: Path, **kw: object) -> GVisorRunner:
     (tmp_path / "rootfs/bin").mkdir(parents=True, exist_ok=True)
     base = {"rootfs": tmp_path / "rootfs", "state_dir": tmp_path / "state"} | kw
@@ -117,6 +225,7 @@ def _runner(tmp_path: Path, **kw: object) -> GVisorRunner:
         ({"runsc": "FAKE:exit 1"}, "runsc_version_failed"),
         ({"runsc": "FAKE:echo runc version 1.2"}, "runsc_version_failed"),
         ({"cgroup_root": Path("/nonexistent-cg")}, "cgroup_v1_unavailable"),
+        ({"cgroup_root": "V2:cpu memory"}, "cgroup_v2_controllers_unavailable"),
     ],
 )
 def test_probe_and_run_fail_closed(
@@ -130,6 +239,8 @@ def test_probe_and_run_fail_closed(
         fake = kw["runsc"] = tmp_path / "fake-runsc"
         fake.write_text(f'#!/bin/sh\necho "$@" >> {calls}; {runsc[5:]}\n')
         fake.chmod(stat.S_IRWXU)
+    if str(kw.get("cgroup_root")).startswith("V2:"):  # pids not available
+        kw["cgroup_root"] = _v2_root(tmp_path, str(kw["cgroup_root"])[3:])
     runner = _runner(tmp_path, **kw)
     gate = runner.probe()
     assert not gate.available and gate.reason.startswith(reason)
@@ -139,6 +250,19 @@ def test_probe_and_run_fail_closed(
     logged = calls.read_text().split("\n") if calls.exists() else []
     assert set(logged) <= {"--version", ""}  # probed only; never `run`
     assert not (tmp_path / "state").exists()
+
+
+def test_probe_accepts_a_unified_hierarchy_with_the_controllers(
+    tmp_path: Path,
+) -> None:
+    fake = tmp_path / "fake-runsc"  # SYNTHETIC
+    fake.write_text('#!/bin/sh\necho "runsc version release-20990101.0"\n')
+    fake.chmod(stat.S_IRWXU)
+    gate = _runner(tmp_path, runsc=fake, cgroup_root=_v2_root(tmp_path)).probe()
+    if os.geteuid() == 0:
+        assert gate.available and gate.runtime.endswith("platform=systrap"), gate
+    else:
+        assert gate.reason == "runsc_requires_root: cgroup limits"
 
 
 def test_cleanup_reports_a_listed_container_and_runs_every_step(
@@ -188,7 +312,8 @@ def gvisor(tmp_path_factory: pytest.TempPathFactory) -> Iterator[GVisorRunner]:
     runner.close()
     assert not os.path.ismount(state / "null-netns")
     cg = runner.config.cgroup_root
-    leaked = [p for c in gv.CONTROLLERS for p in cg.glob(f"{c}/qw-sandbox/qw-t007*")]
+    dirs = ["qw-sandbox", *(f"{c}/qw-sandbox" for c in gv.CONTROLLERS)]  # v2, v1
+    leaked = [p for d in dirs for p in cg.glob(f"{d}/qw-t007*")]
     assert leaked == [] and not list(state.glob("bundle-*"))
 
 

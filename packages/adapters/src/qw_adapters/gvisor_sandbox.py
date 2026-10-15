@@ -6,10 +6,11 @@ A foreground `runsc --network=none run` of an OCI bundle (exit code = candidate'
 read-only root; only proc/tmpfs mounts (no host path, socket or key); read-only /dev
 and /dev/shm; /tmp the one capped noexec scratch dir; uid 65534, no capabilities, a
 fixed env; guest RLIMIT_CPU/NPROC. runsc joins an existing cgroup without setting its
-limits, so the adapter creates the run's cgroup v1 dirs, writes and verifies memory
-(+swap), pids and CPU quota, and reads oom_kill, pids events and cpuacct.usage after
-the run. Probe failures return `blocked` (no fallback); every cleanup step runs and
-any failure makes the result an error. Needs host root.
+limits, so the adapter creates the run's cgroup (v1 controller dirs, or one v2 dir
+whose parents delegate cpu, memory and pids), writes and verifies memory (+swap), pids
+and CPU quota, and reads OOM kills, pids events and CPU usage after the run. Probe
+failures return `blocked` (no fallback); every cleanup step runs and any failure makes
+the result an error. Needs host root.
 """
 
 import hashlib
@@ -36,6 +37,7 @@ CPU_PERIOD_US = 100_000
 PLATFORMS = frozenset({"systrap", "ptrace"})
 CONTROL_TIMEOUT_S = 30
 CONTROLLERS = ("memory", "pids", "cpu", "cpuacct")  # cgroup v1
+V2_CONTROLLERS = ("cpu", "memory", "pids")  # cgroup v2 (unified)
 MEMINFO = Path("/proc/meminfo")
 _CAPS = ("bounding", "effective", "inheritable", "permitted", "ambient")
 _NAMESPACES = ("pid", "network", "ipc", "uts", "mount")
@@ -84,6 +86,22 @@ def cgroup_limits(limits: sb.SandboxLimits) -> dict[str, int]:
     }
 
 
+def cgroup_v2_limits(limits: sb.SandboxLimits) -> dict[str, str]:
+    """cgroup v2 file -> value, in write order (swap only after the memory limit)."""
+    quota = limits.cpu_millicores * CPU_PERIOD_US // 1000
+    return {
+        "memory.max": str(limits.memory_bytes),
+        "memory.swap.max": "0",
+        "pids.max": str(SENTRY_PIDS_HEADROOM + limits.pids),
+        "cpu.max": f"{quota} {CPU_PERIOD_US}",
+    }
+
+
+def unified(cgroup_root: Path) -> bool:
+    """True on a cgroup v2 host; a v1 or hybrid root has no cgroup.controllers."""
+    return cgroup_root.joinpath("cgroup.controllers").is_file()
+
+
 def drain(stream: IO[bytes], limit: int) -> StreamCapture:
     """Read to EOF, keeping at most `limit` bytes and hashing everything."""
     head, total, digest = bytearray(), 0, hashlib.sha256()
@@ -109,8 +127,16 @@ def _counter(path: Path, key: str | None) -> int | None:
 
 
 def read_counters(cgroups: Path, cgroup: str) -> tuple[int | None, ...]:
-    """(oom kills, pids-limit events, CPU ns) from cgroup v1; None if unreadable."""
+    """(oom kills, pids-limit events, CPU ns) from cgroup v1/v2; None if unreadable."""
     rel = cgroup.lstrip("/")
+    if unified(cgroups):
+        run = cgroups.joinpath(rel)
+        usec = _counter(run.joinpath("cpu.stat"), "usage_usec")
+        return (
+            _counter(run.joinpath("memory.events"), "oom_kill"),
+            _counter(run.joinpath("pids.events"), "max"),
+            None if usec is None else usec * 1000,
+        )
     return (
         _counter(cgroups.joinpath("memory", rel, "memory.oom_control"), "oom_kill"),
         _counter(cgroups.joinpath("pids", rel, "pids.events"), "max"),
@@ -148,10 +174,47 @@ def runsc_argv(config: GVisorConfig, *args: str) -> list[str]:
             f"--platform={config.platform}", *args]  # fmt: skip
 
 
+def _swap_unaccounted() -> None:
+    if _counter(MEMINFO, "SwapTotal:") != 0:
+        raise OSError("swap is enabled but not accounted (swapaccount=0)")
+
+
+def _delegate(directory: Path) -> None:
+    """Enable the v2 controllers for `directory`'s children and verify it."""
+    ctl = directory.joinpath("cgroup.subtree_control")
+    have = set(ctl.read_text().split()) if ctl.exists() else set()
+    if missing := [c for c in V2_CONTROLLERS if c not in have]:
+        ctl.write_text(" ".join(f"+{c}" for c in missing))
+        if not set(V2_CONTROLLERS) <= set(ctl.read_text().split()):
+            raise OSError(f"{ctl}: controllers {missing} not enabled")
+
+
+def _setup_v2(
+    config: GVisorConfig, cid: str, limits: sb.SandboxLimits, made: list[Path]
+) -> None:
+    parent = config.cgroup_root.joinpath(config.cgroup_parent)
+    _delegate(config.cgroup_root)
+    parent.mkdir(exist_ok=True)
+    _delegate(parent)
+    path = parent.joinpath(cid)
+    path.mkdir()
+    made.append(path.resolve())
+    for name, value in cgroup_v2_limits(limits).items():
+        file = path.joinpath(name)
+        if name == "memory.swap.max" and not file.exists():
+            _swap_unaccounted()
+            continue
+        file.write_text(value)
+        if file.read_text().strip() != value:
+            raise OSError(f"{name} not applied")
+
+
 def setup_cgroups(
     config: GVisorConfig, cid: str, limits: sb.SandboxLimits, made: list[Path]
 ) -> None:
     """Create the run's cgroups (appending to `made`), write and verify the limits."""
+    if unified(config.cgroup_root):
+        return _setup_v2(config, cid, limits, made)
     for ctrl in CONTROLLERS:
         path = config.cgroup_root.joinpath(ctrl, config.cgroup_parent, cid)
         if path.resolve() not in made:  # cpu and cpuacct may be one hierarchy
@@ -161,8 +224,7 @@ def setup_cgroups(
         ctrl, name = rel.split("/")
         file = config.cgroup_root.joinpath(ctrl, config.cgroup_parent, cid, name)
         if name.startswith("memory.memsw") and not file.exists():
-            if _counter(MEMINFO, "SwapTotal:") != 0:
-                raise OSError("swap is enabled but not accounted (swapaccount=0)")
+            _swap_unaccounted()
             continue
         file.write_text(str(value))
         if _counter(file, None) != value:
@@ -215,8 +277,13 @@ class GVisorRunner:
         if out.returncode != 0 or first[:2] != ["runsc", "version"] or len(first) < 3:
             return no(f"runsc_version_failed: {first}")
         cg = c.cgroup_root
-        missing = [x for x in CONTROLLERS if not cg.joinpath(x, "tasks").exists()]
-        if missing:
+        if unified(cg):
+            have = cg.joinpath("cgroup.controllers").read_text().split()
+            if missing := [x for x in V2_CONTROLLERS if x not in have]:
+                return no(f"cgroup_v2_controllers_unavailable: {missing}")
+        elif missing := [
+            x for x in CONTROLLERS if not cg.joinpath(x, "tasks").exists()
+        ]:
             return no(f"cgroup_v1_unavailable: {missing}")
         if os.geteuid() != 0:
             return no("runsc_requires_root: cgroup limits")
