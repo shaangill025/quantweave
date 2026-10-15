@@ -15,6 +15,8 @@ const materialReason = (reasons: string[], id: string) => {
   const why = reasonFor(reasons, id, "material");
   return why === undefined ? "Unavailable" : `Unavailable (${why})`;
 };
+/** The reason a claim's text is withheld (rights: owner decision 2026-10-15), if any. */
+const withheldText = (c: Claim) => c.coverage.reasons.find((r) => r.startsWith(`withheld:${c.id}/text`));
 import { formatDecimal, type DecimalString } from "./wire";
 
 export interface SimMode { current: SimulationSummary | null; set: (s: SimulationSummary | null) => void }
@@ -116,7 +118,8 @@ function ClaimPanel({ id, research }: { id: string; research: ResearchSource }) 
                 : materialReason(c.coverage.reasons, c.id)}</Tag>
             </p>
             <p>Evidence support says how well sources back this claim; it is not a forecast of investment outcome.</p>
-            <blockquote>{c.text}</blockquote>
+            {withheldText(c) === undefined ? <blockquote>{c.text}</blockquote>
+              : <p>Claim text: Withheld ({withheldText(c)})</p>}
             <p>Valid at {utc(c.valid_at)}. Instruments: {c.instrument_ids.join(", ") || "none"}.</p>
             {list("Supporting sources", c.evidence_ids, "No supporting source is cited.",
               (e) => <EvidenceItem id={e} research={research} />)}

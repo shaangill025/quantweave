@@ -52,6 +52,12 @@ const ROUTES: Record<string, unknown> = {
     evidence_ids: [], calculation_ids: [], material: null, verification: "unavailable",
     counterevidence_ids: [], valid_at: "2026-10-10T00:00:00Z", coverage: { status: "partial", reasons: [] },
   },
+  "/api/v1/claims/clm-withheld": {  // owner decision 2026-10-15: display not granted for its evidence
+    id: "clm-withheld", kind: "reported_fact", text: "", instrument_ids: [], evidence_ids: ["ev-1"],
+    calculation_ids: [], material: null, verification: "supported", counterevidence_ids: [],
+    valid_at: "2026-10-10T00:00:00Z",
+    coverage: { status: "partial", reasons: ["unknown:material", "withheld:clm-withheld/text:rights"] },
+  },
   "/api/v1/evidence/ev-1": evidence("ev-1"),
   "/api/v1/evidence/ev-gone": evidence("ev-gone", { passage: null, availability: "deleted", published_at: null }),
   "/api/v1/evidence/ev-contra": evidence("ev-contra", { passage: "SYNTHETIC contrary passage" }),
@@ -212,6 +218,20 @@ describe("evidence drilldown (AT019, AT085)", () => {
     const bare = await screen.findByRole("region", { name: /Claim clm-unnamed/ });
     await waitFor(() => { expect(bare.textContent).toContain("Unavailable"); });
     expect(bare.textContent).not.toMatch(/unknown:material|Not material|Material to the decision/);
+  });
+
+  it("names withheld claim text instead of showing an empty quote", async () => {
+    setHash("#/research");
+    render(<App fetcher={fakeFetch} now={now} research={source()} />);
+    open("Claim id", "clm-withheld");
+    const panel = await screen.findByRole("region", { name: /Claim clm-withheld/ });
+    await waitFor(() => { expect(panel.textContent).toContain("Claim text: Withheld (withheld:clm-withheld/text:rights)"); });
+    const quote = (el: HTMLElement) => [...el.querySelectorAll("blockquote")].filter((b) => !b.closest("li"));
+    expect(quote(panel)).toEqual([]);  // evidence passages are quoted inside list items
+    expect(panel.textContent).toContain("[Supported");
+    open("Claim id", "clm-1");  // text with no withheld reason is quoted
+    const shown = await screen.findByRole("region", { name: /Claim clm-1/ });
+    await waitFor(() => { expect(quote(shown).map((b) => b.textContent)).toEqual(["SYNTHETIC: revenue grows next year"]); });
   });
 
   it("requires claim coverage", () => {
