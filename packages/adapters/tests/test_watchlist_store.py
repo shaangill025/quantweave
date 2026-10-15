@@ -6,8 +6,8 @@ from __future__ import annotations
 
 import ast
 import uuid
-from dataclasses import dataclass
-from datetime import timedelta
+from dataclasses import dataclass, replace
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -17,6 +17,10 @@ from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 from qw_adapters import tenancy as tn
 from qw_adapters import watchlist_store as ws
+from qw_domain.identity import InstrumentId
+from qw_domain.instants import format_instant
+from qw_domain.monitoring import Condition
+from qw_domain.watchlists import Entry
 
 pytestmark = pytest.mark.db
 Conn = psycopg.Connection[Any]
@@ -319,3 +323,277 @@ def test_the_store_and_its_table_reach_no_holdings(app_conn: Conn, conn: Conn) -
         "AND conrelid = 'app.watchlist_revision'::regclass ORDER BY 1"
     ).fetchall()
     assert [r[0] for r in refs] == ["app.membership", "app.session"]
+
+
+# --- entries (0023, increment 3) ---
+
+A = "00000000-0000-4000-8000-00000000000a"  # sorts after B
+B = "00000000-0000-4000-8000-000000000001"
+C = "00000000-0000-4000-8000-00000000000c"
+FEED = "SYNTHETIC-feed-iex"
+
+
+def entry(iid: str, thesis: str = "SYNTHETIC thesis", priority: int = 40) -> Entry:
+    cond = Condition("price_cross", "gt", ("100.25",), FEED, "SYNTHETIC cross")
+    return Entry(InstrumentId.from_wire(iid), thesis, ("SYNTHETIC-tag",),
+                      None, priority, (cond,), "SYNTHETIC invalidation")  # fmt: skip
+
+
+def stored(iid: str, thesis: str = "SYNTHETIC thesis") -> dict[str, Any]:
+    """Hand-written storage form (independent of `entry_json`)."""
+    return {"instrument_id": iid, "thesis": thesis, "tags": ["SYNTHETIC-tag"],
+            "review_at": None, "monitoring_priority": 40, "conditions": [
+                {"metric": "price_cross", "operator": "gt", "values": ["100.25"],
+                 "data_spec_id": FEED, "description": "SYNTHETIC cross"}],
+            "invalidation_text": "SYNTHETIC invalidation",
+            "needs": "realtime_exchange_limited"}  # fmt: skip
+
+
+def iid_of(s: str) -> InstrumentId:
+    return InstrumentId.from_wire(s)
+
+
+def test_entries_follow_the_domain_and_round_trip(
+    app_conn: Conn, conn: Conn, c: Ctx
+) -> None:
+    r, _ = run(app_conn, c, "create", K1, "SYNTHETIC a", "")
+    wid = r.watchlist.watchlist_id
+    r2, wrote = run(app_conn, c, "add_entry", wid, K2, 1, entry(A))
+    assert wrote and (r2.revision, r2.action, r2.instrument) == (2, "add_entry", A)
+    assert rows(conn)[-1]["entries"] == [stored(A)]
+    assert rows(conn)[-1]["instrument_id"] == uuid.UUID(A)
+    assert run(app_conn, c, "load", wid) == r2
+    refusals = [("add_entry", (K3, 2, entry(A)), "entry_exists"),
+                ("update_entry", (K3, 2, entry(C)), "entry_missing"),
+                ("remove_entry", (K3, 2, iid_of(C)), "entry_missing"),
+                ("add_entry", (K3, 1, entry(B)), "stale"),
+                ("add_entry", (K3, 3, entry(B)), "stale")]  # fmt: skip
+    for fn, args, code in refusals:
+        with pytest.raises(ws.WatchlistStoreError) as err:
+            run(app_conn, c, fn, wid, *args)
+        assert err.value.code == code, fn
+    assert count(conn) == 2
+    run(app_conn, c, "add_entry", wid, K3, 2, entry(B))
+    assert [e["instrument_id"] for e in rows(conn)[-1]["entries"]] == [B, A]
+    r4, _ = run(app_conn, c, "update_entry", wid, K4, 3, entry(A, "SYNTHETIC new"))
+    assert rows(conn)[-1]["entries"] == [stored(B), stored(A, "SYNTHETIC new")]
+    assert r4.watchlist.entry(iid_of(A)).thesis == "SYNTHETIC new"
+    r5, _ = run(app_conn, c, "remove_entry", wid, K1, 4, iid_of(B))
+    assert (r5.instrument, rows(conn)[-1]["entries"]) == (
+        B,
+        [stored(A, "SYNTHETIC new")],
+    )
+    run(app_conn, c, "update", wid, K2, 5, "SYNTHETIC b", "")  # a rename keeps entries
+    gone, _ = run(app_conn, c, "delete", wid, K3, 6)
+    assert rows(conn)[-1]["entries"] == [stored(A, "SYNTHETIC new")]
+    assert gone.instrument is None and run(app_conn, c, "load", wid) is None
+    with pytest.raises(ws.WatchlistStoreError) as err:
+        run(app_conn, c, "add_entry", wid, "SYNTHETIC-wl-key-0005", 7, entry(C))
+    assert err.value.code == "not_found" and count(conn) == 7
+
+
+def test_entry_keys_replay_the_same_request_only(app_conn: Conn, conn: Conn,
+                                                 c: Ctx) -> None:  # fmt: skip
+    wid = run(app_conn, c, "create", K1, "SYNTHETIC a", "")[0].watchlist.watchlist_id
+    added, _ = run(app_conn, c, "add_entry", wid, K2, 1, entry(A))
+    upd, _ = run(app_conn, c, "update_entry", wid, K2, 2, entry(A, "SYNTHETIC u"))
+    rem, _ = run(app_conn, c, "remove_entry", wid, K2, 3, iid_of(A))
+    assert run(app_conn, c, "add_entry", wid, K2, 1, entry(A)) == (added, False)
+    assert run(app_conn, c, "update_entry", wid, K2, 2,
+               entry(A, "SYNTHETIC u")) == (upd, False)  # fmt: skip
+    assert run(app_conn, c, "remove_entry", wid, K2, 3, iid_of(A)) == (rem, False)
+    for expected in (2, None):  # add: the contract names no If-Match; body only
+        assert run(app_conn, c, "add_entry", wid, K2, expected, entry(A)) == (
+            added, False)  # fmt: skip
+    cond = Condition("volume", "gt", ("1000",), FEED, "SYNTHETIC cross")
+    for fn, args in (("add_entry", (K2, 1, entry(A, "SYNTHETIC other"))),
+                     ("add_entry", (K2, 1, entry(B))),
+                     ("add_entry", (K2, 1, entry(A, priority=41))),
+                     ("add_entry", (K2, 1, replace(entry(A), conditions=(cond,)))),
+                     ("add_entry", (K2, 1, replace(entry(A), tags=("SYNTHETIC-x",)))),
+                     ("add_entry", (K2, 1, replace(entry(A), invalidation_text="x"))),
+                     ("update_entry", (K2, 2, entry(A, "SYNTHETIC v"))),
+                     ("remove_entry", (K2, 3, iid_of(B)))):  # fmt: skip
+        with pytest.raises(ws.WatchlistStoreError) as err:
+            run(app_conn, c, fn, wid, *args)
+        assert err.value.code == "idempotency_key_reused", args
+    theirs, wrote = run(app_conn, c, "add_entry", wid, K2, 4, entry(A), other=True)
+    assert wrote and theirs.revision == 5
+    latest, wrote = run(app_conn, c, "add_entry", wid, K3, None, entry(B))
+    assert wrote and latest.revision == 6 and count(conn) == 6  # the latest, locked
+
+
+def test_entry_limit(app_conn: Conn, c: Ctx, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(ws, "MAX_ENTRIES", 1)
+    wid = run(app_conn, c, "create", K1, "SYNTHETIC a", "")[0].watchlist.watchlist_id
+    run(app_conn, c, "add_entry", wid, K2, 1, entry(A))
+    with pytest.raises(ws.WatchlistStoreError) as err:
+        run(app_conn, c, "add_entry", wid, K3, 2, entry(B))
+    assert err.value.code == "entry_limit"
+    run(app_conn, c, "update_entry", wid, K3, 2, entry(A, "SYNTHETIC u"))  # still ok
+
+
+def test_0023_names_one_instrument_per_entry_action(
+    app_conn: Conn, conn: Conn, c: Ctx
+) -> None:
+    run(app_conn, c, "create", K1, "SYNTHETIC a", "")
+    last = rows(conn)[-1]
+    nxt = {**last, "revision": 2, "previous_hash": last["event_hash"],
+           "idempotency_key": K2, "action": "add_entry",
+           "instrument_id": uuid.UUID(A)}  # fmt: skip
+    bad = [{**nxt, "instrument_id": None}, {**nxt, "action": "update"},
+           {**nxt, "action": "rename_entry"},
+           {**nxt, "entries": [stored(A)] * 501}]  # fmt: skip
+    for row in [*bad, nxt, {**nxt, "entries": [stored(A)] * 500}]:  # two controls
+        with tn.tenant_transaction(app_conn, c.tenant) as tx:
+            stamp = tx.conn.execute("SELECT clock_timestamp()").fetchone()
+            assert stamp is not None
+            with tx.conn.transaction(force_rollback=True):
+                if row in bad:
+                    with pytest.raises(psycopg.errors.CheckViolation):
+                        insert(tx.conn, {**row, "recorded_at": stamp[0]})
+                else:
+                    insert(tx.conn, {**row, "recorded_at": stamp[0]})
+    assert count(conn) == 1
+
+
+def _rehash(row: dict[str, Any]) -> str:
+    return ws.revision_hash(*(row[k] for k in (
+        "tenant_id", "watchlist_id", "revision", "action", "principal_id",
+        "session_id", "idempotency_key", "name", "description", "entries",
+        "recorded_at", "previous_hash")), instrument=row["instrument_id"])  # fmt: skip
+
+
+def _forge(change: str, row: dict[str, Any]) -> None:
+    e = row["entries"]
+    if change == "priority-text":
+        e[0]["monitoring_priority"] = "40"
+    elif change == "no-needs":
+        del e[0]["needs"]
+    elif change == "extra-key":
+        e[0]["owned"] = True
+    elif change == "unsorted":
+        e.reverse()
+    elif change == "other-entry-too":
+        e[0]["thesis"] = "SYNTHETIC forged"  # B also changed by A's add
+    elif change == "target-absent":
+        row["instrument_id"] = uuid.UUID(C)
+    elif change == "review-at-format":
+        e[1]["review_at"] = row["recorded_at"].isoformat()  # "+00:00", not "Z"
+    elif change == "unsupported-op":
+        e[1]["conditions"][0]["operator"] = "eq"
+    elif change == "values-not-list":
+        e[1]["conditions"][0]["values"] = "100.25"
+    elif change == "renamed":
+        row["name"] = "SYNTHETIC renamed by an entry"
+    elif change == "as-remove":
+        row["action"] = "remove_entry"
+    elif change == "described":
+        row["description"] = "SYNTHETIC forged description"
+
+
+FORGED = ["priority-text", "no-needs", "extra-key", "unsorted", "other-entry-too",
+          "target-absent", "review-at-format", "unsupported-op", "values-not-list",
+          "renamed", "as-remove", "described"]  # fmt: skip
+
+
+@pytest.mark.parametrize("change", FORGED)
+def test_a_rehashed_entry_snapshot_must_replay(app_conn: Conn, conn: Conn, c: Ctx,
+                                               change: str) -> None:  # fmt: skip
+    wid = run(app_conn, c, "create", K1, "SYNTHETIC a", "")[0].watchlist.watchlist_id
+    run(app_conn, c, "add_entry", wid, K2, 1, entry(B))
+    run(app_conn, c, "add_entry", wid, K3, 2, entry(A))
+    row = rows(conn)[-1]
+    assert [e["instrument_id"] for e in row["entries"]] == [B, A]
+    _forge(change, row)
+    row["event_hash"] = _rehash(row)
+    tamper(conn, "DELETE FROM app.watchlist_revision WHERE revision = 3")
+    insert(conn, row, replica=True)
+    for fn, args in (("load", (wid,)), ("page", (9, None)),
+                     ("remove_entry", (wid, K4, 3, iid_of(A)))):  # fmt: skip
+        with pytest.raises(ws.WatchlistStoreError) as err:
+            run(app_conn, c, fn, *args)
+        assert err.value.code == "integrity", fn
+
+
+def test_an_unrehashed_instrument_edit_fails_the_hash(app_conn: Conn, conn: Conn,
+                                                     c: Ctx) -> None:  # fmt: skip
+    """A no-op update of B re-pointed at A still replays, so only the hash (which
+    covers the instrument that key replays match on) refuses it."""
+    wid = run(app_conn, c, "create", K1, "SYNTHETIC a", "")[0].watchlist.watchlist_id
+    run(app_conn, c, "add_entry", wid, K2, 1, entry(A))
+    run(app_conn, c, "add_entry", wid, K3, 2, entry(B))
+    run(app_conn, c, "update_entry", wid, K4, 3, entry(B))  # unchanged
+    tamper(conn, "UPDATE app.watchlist_revision SET instrument_id = %s "
+           "WHERE revision = 4", (uuid.UUID(A),))  # fmt: skip
+    with pytest.raises(ws.WatchlistStoreError) as err:
+        run(app_conn, c, "load", wid)
+    assert err.value.code == "integrity"
+
+
+def test_a_list_action_naming_an_instrument_fails_without_0023(
+    app_conn: Conn, conn: Conn, c: Ctx
+) -> None:
+    """The adapter check behind the 0023 CHECK: with the constraint dropped (this
+    test's own database), a rehashed rename that names an instrument is refused."""
+    wid = run(app_conn, c, "create", K1, "SYNTHETIC a", "")[0].watchlist.watchlist_id
+    run(app_conn, c, "update", wid, K2, 1, "SYNTHETIC b", "")
+    conn.execute("ALTER TABLE app.watchlist_revision "
+                 "DROP CONSTRAINT watchlist_revision_instrument")  # fmt: skip
+    row = rows(conn)[-1] | {"instrument_id": uuid.UUID(A)}
+    row["event_hash"] = _rehash(row)
+    tamper(conn, "DELETE FROM app.watchlist_revision WHERE revision = 2")
+    insert(conn, row, replica=True)
+    with pytest.raises(ws.WatchlistStoreError) as err:
+        run(app_conn, c, "load", wid)
+    assert err.value.code == "integrity"
+
+
+def test_a_canonical_review_time_loads(app_conn: Conn, conn: Conn, c: Ctx) -> None:
+    """Control for `review-at-format`: the canonical `Z` form replays and is kept,
+    also through an update."""
+    wid = run(app_conn, c, "create", K1, "SYNTHETIC a", "")[0].watchlist.watchlist_id
+    run(app_conn, c, "add_entry", wid, K2, 1, entry(A))
+    row = rows(conn)[-1]
+    at = row["recorded_at"] + timedelta(days=7)
+    row["entries"][0] |= {"review_at": format_instant(at), "needs": "delayed"}
+    row["event_hash"] = _rehash(row)
+    tamper(conn, "DELETE FROM app.watchlist_revision WHERE revision = 2")
+    insert(conn, row, replica=True)
+    assert run(app_conn, c, "load", wid).watchlist.entries[0].review_at == at
+    # An update sets only the contract fields: the review time and needs are kept.
+    run(app_conn, c, "update_entry", wid, K3, 2, entry(A, "SYNTHETIC u"))
+    assert rows(conn)[-1]["entries"] == [stored(A, "SYNTHETIC u") | {
+        "review_at": format_instant(at), "needs": "delayed"}]  # fmt: skip
+
+
+def test_a_rehashed_update_must_keep_review_at_and_needs(
+    app_conn: Conn, conn: Conn, c: Ctx
+) -> None:
+    """The store keeps both on an update, so a stored update that changes either is
+    forged even when its snapshot replays."""
+    wid = run(app_conn, c, "create", K1, "SYNTHETIC a", "")[0].watchlist.watchlist_id
+    run(app_conn, c, "add_entry", wid, K2, 1, entry(A))
+    run(app_conn, c, "update_entry", wid, K3, 2, entry(A, "SYNTHETIC u"))
+    row = rows(conn)[-1]
+    row["entries"][0]["needs"] = "delayed"
+    row["event_hash"] = _rehash(row)
+    tamper(conn, "DELETE FROM app.watchlist_revision WHERE revision = 3")
+    insert(conn, row, replica=True)
+    with pytest.raises(ws.WatchlistStoreError) as err:
+        run(app_conn, c, "load", wid)
+    assert err.value.code == "integrity"
+
+
+def test_0022_era_hashes_are_golden() -> None:
+    """Hard-coded: sha256 of the hand-written canonical JSON of a SYNTHETIC create
+    and rename with no instrument (computed outside `revision_hash`)."""
+    t, w, p, s = (uuid.UUID(f"{d * 8}-{d * 4}-4{d * 3}-8{d * 3}-{d * 12}")
+                  for d in "1234")  # fmt: skip
+    at = datetime(2026, 1, 1, tzinfo=UTC)  # a fixed hash input, not a stored time
+    h1 = ws.revision_hash(t, w, 1, "create", p, s, K1, "SYNTHETIC a", "", [], at,
+                          None)  # fmt: skip
+    assert h1 == "4e9985f1f6419432be688b60b8b743824ddea2ce32c3d4e19778990ed07b1df7"
+    h2 = ws.revision_hash(t, w, 2, "update", p, s, K2, "SYNTHETIC b", "d", [],
+                          at + timedelta(seconds=1.5), h1)  # fmt: skip
+    assert h2 == "ee7cdb7d31d7f8af7b4dbfc2a441eba5d7046f79153d84bf7e23ea72674de9c2"
