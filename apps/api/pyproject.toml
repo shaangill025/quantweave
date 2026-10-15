@@ -14,6 +14,7 @@ dependencies = [
 
 [project.scripts]
 qw-bootstrap = "qw_api.bootstrap:main"
+qw-seed-strategies = "qw_api.bootstrap:seed_main"
 
 [tool.uv.sources]
 qw-adapters = { workspace = true }
