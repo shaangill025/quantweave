@@ -134,3 +134,40 @@ def test_a_tampered_manifest_is_a_crash_not_an_answer(
         got = world.client.get(f"/api/v1/strategies{path}")
         assert_problem(got, 500, "internal_error")
         assert "forged" not in got.text
+
+
+@pytest.mark.db
+def test_seeded_families_are_listed_not_tested_and_never_eligible(
+    world: Any, database_url: str, runtime_urls: dict[str, str], rows: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:  # fmt: skip
+    """`qw-seed-strategies` (owner decision 10): all six, nothing qualified."""
+    from qw_api.bootstrap import seed_main
+
+    monkeypatch.delenv("QW_MIGRATE_DATABASE_URL", raising=False)
+    assert seed_main([]) == 2
+    monkeypatch.setenv("QW_MIGRATE_DATABASE_URL", runtime_urls["qw_app"])
+    assert seed_main([]) == 1  # a runtime login is not the schema owner
+    assert rows() == [(0,), (0,)]
+    monkeypatch.setenv("QW_MIGRATE_DATABASE_URL", database_url)
+    assert seed_main([]) == 0
+    seeded = rows()
+    assert seed_main([]) == 0 and rows() == seeded == [(6,), (0,)]
+    login(world.client, "bob")
+    got = world.client.get("/api/v1/strategies").json()
+    conforms(PC.page("strategy_version"), got)
+    assert got["coverage"] == {"status": "partial", "reasons": GAPS}  # no none:family
+    items = {i["family"]: i for i in got["items"]}
+    assert sorted(items) == sorted(FAMILIES)
+    for i in items.values():
+        assert (i["version"], i["operational_status"], i["evidence_status"],
+                i["action_eligible"], i["approved_by"]) == (
+            "0.1.0-research", "not_tested", "none", False, None)  # fmt: skip
+        assert all(f.startswith("free-") for f in i["required_feed_spec_ids"])
+    thesis = items["ai_thesis"]
+    assert (thesis["id"], thesis["required_feed_spec_ids"]) == (
+        "STR-AITHESIS-001", ["free-public-filings"])  # fmt: skip
+    assert thesis["policy_requirements"] == [
+        "ai_mode:ai_enabled", "horizon:long_term", "instrument:stocks"]  # fmt: skip
+    assert items["opening_range_breakout"]["required_feed_spec_ids"] == [
+        "free-delayed-intraday-bars"]  # fmt: skip

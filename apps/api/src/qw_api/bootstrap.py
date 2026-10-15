@@ -9,7 +9,7 @@ import argparse
 import os
 import sys
 
-from qw_adapters import tenancy
+from qw_adapters import rights_store, strategy_seed, strategy_store, tenancy
 
 from qw_api.routes import Login
 from qw_api.security import LocalPasswordAuthenticator
@@ -40,4 +40,28 @@ def main(argv: list[str] | None = None) -> int:
         print(f"refused: {exc}", file=sys.stderr)
         return 1
     print("bootstrapped: first owner created")
+    return 0
+
+
+def seed_main(argv: list[str] | None = None) -> int:
+    """`qw-seed-strategies`: record the six strategy families' manifests and declare
+    their placeholder feeds (T027, owner decision 10), at install and at each release.
+    Idempotent; a family whose module changed under the same VERSION is refused
+    (`immutable`) and nothing is recorded. The URL comes from QW_MIGRATE_DATABASE_URL
+    (new with this command): a login that is a member of qw_migrate, the role 0015
+    lets insert manifests; the command then acts as qw_migrate."""
+    argparse.ArgumentParser(prog="qw-seed-strategies", description=seed_main.__doc__
+                            ).parse_args(argv)  # fmt: skip
+    conninfo = os.environ.get("QW_MIGRATE_DATABASE_URL")
+    if not conninfo:
+        print("need QW_MIGRATE_DATABASE_URL", file=sys.stderr)
+        return 2
+    try:
+        with strategy_seed.connect(conninfo) as conn:
+            done = strategy_seed.seed(conn)
+    except (strategy_store.StrategyStoreError, rights_store.RightsStoreError) as exc:
+        print(f"refused: {exc}", file=sys.stderr)
+        return 1
+    print(f"seeded: {len(done.manifests)} manifests, {len(done.feeds)} feeds "
+          "(all not_tested, no rights granted)")  # fmt: skip
     return 0

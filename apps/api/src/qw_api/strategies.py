@@ -17,7 +17,8 @@ version of a strategy (spec strategy_version schema, no amendment):
   empty (`unavailable:source_decisions`). `policy_requirements` are the manifest
   facts the gate checks against the adopted investment policy.
 - A page names every family missing from the installed registry as
-  `none:family/<family>` (the six are first-release scope; nothing is seeded).
+  `none:family/<family>` (the six are first-release scope; `qw-seed-strategies`
+  records them, T027 owner decision 10, so a seeded install names none).
 POST /strategies/{id}/adopt is not served (step-up and If-Match design pending).
 """
 
