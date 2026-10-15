@@ -1,4 +1,4 @@
-"""Watchlist routes (T024 increments 2 and 3) over qw_adapters.watchlist_store:
+"""Watchlist routes (T024 increments 2 to 4) over qw_adapters.watchlist_store:
 `GET /watchlists` (listWatchlists), `POST /watchlists` (createWatchlist),
 `GET /watchlists/{id}` (readWatchlist), `PATCH` (updateWatchlist), `DELETE`
 (deleteWatchlist), `POST /watchlists/{id}/entries` (addWatchlistEntry), and
@@ -21,9 +21,11 @@ Entry operations need CSRF and Idempotency-Key. Update and delete need If-Match 
 the list's revision (428/412). addWatchlistEntry follows its contract, which names
 no If-Match: one sent is honoured (412 when stale or malformed); without one the
 latest revision is used under the lock, and a key replays on the body alone.
-Bodies are the contract request `WatchlistEntry`, closed: `review_at` and `needs`
-are refused. A new entry has `review_at` null and the domain's default `needs`; an
-update keeps both. Conditions
+Bodies are the request `WatchlistEntry` of project contract 0.5.0, closed: `needs`
+is refused, and `review_at` is optional and nullable, an RFC 3339 time with an
+offset (C-05), stored and served in UTC. A new entry gets the domain's default
+`needs` and `review_at` as sent (omitted: null). An update keeps `needs`, and keeps
+`review_at` unless the body has the field (null clears it). Conditions
 and the instrument id (a canonical UUID; no instrument registry exists to check
 against) must be accepted by the domain, else 422 `invalid_entry`. The path and body
 instrument must agree (400 `instrument_mismatch`). Served entries are the contract
@@ -41,11 +43,11 @@ from collections.abc import Callable
 from typing import Annotated, Any
 
 from fastapi import APIRouter, Header, Path, Request, Response
-from pydantic import Field
+from pydantic import Field, field_validator
 from qw_adapters import watchlist_store as store
 from qw_adapters.tenancy import TenantTx
 from qw_domain.identity import IdentityError, InstrumentId
-from qw_domain.instants import format_instant
+from qw_domain.instants import format_instant, parse_instant
 from qw_domain.monitoring import Condition, MonitoringError
 from qw_domain.watchlists import Entry, WatchlistError
 
@@ -95,13 +97,31 @@ class WatchlistEntry(routes.Body):
     monitoring_priority: int = Field(ge=0, le=100)
     conditions: list[WireCondition] = Field(max_length=16)
     invalidation_text: Text
+    review_at: str | None = None
+
+    @field_validator("review_at")
+    @classmethod
+    def _instant(cls, v: str | None) -> str | None:
+        if v is not None:
+            parse_instant(v)  # C-05: the offset form, a real date, the UTC range
+        return v
+
+    @property
+    def review_set(self) -> bool:
+        """The body has `review_at` (null included): an update replaces it."""
+        return "review_at" in self.model_fields_set
+
+    def payload(self) -> dict[str, Any]:
+        """The idempotency body: an omitted `review_at` differs from a null one."""
+        return self.model_dump(mode="json", exclude_unset=True)
 
     def domain(self) -> Entry:
-        """New entries: `review_at` None, the domain's default `needs`."""
+        """The domain entry, with the domain's default `needs`."""
+        at = None if self.review_at is None else parse_instant(self.review_at)
         try:
             return Entry(
                 InstrumentId.from_wire(self.instrument_id), self.thesis,
-                tuple(self.tags), None, self.monitoring_priority,
+                tuple(self.tags), at, self.monitoring_priority,
                 tuple(Condition(c.metric, c.operator, tuple(c.values), c.data_spec_id,
                                 c.description) for c in self.conditions),
                 self.invalidation_text,
@@ -269,7 +289,7 @@ def add_watchlist_entry(
                                expected, body.domain())  # fmt: skip
 
     return _entry_write(request, principal, key, if_match, "watchlist.entry_added",
-                        watchlist_id, {"body": body.model_dump(mode="json")},
+                        watchlist_id, {"body": body.payload()},
                         _optional, change)  # fmt: skip
 
 
@@ -286,11 +306,12 @@ def update_watchlist_entry(
             raise ApiError(400, "instrument_mismatch",
                            "The path and body name different instruments.")  # fmt: skip
         return store.update_entry(tx, watchlist_id, s.user_id, s.session_id, key,
-                                  expected, body.domain())  # fmt: skip
+                                  expected, body.domain(),
+                                  body.review_set)  # fmt: skip
 
     return _entry_write(request, principal, key, if_match, "watchlist.entry_updated",
                         watchlist_id, {"if_match": if_match,
-                                       "body": body.model_dump(mode="json")},
+                                       "body": body.payload()},
                         _expected, change)  # fmt: skip
 
 

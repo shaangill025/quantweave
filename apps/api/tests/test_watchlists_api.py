@@ -243,7 +243,7 @@ def test_entries_follow_if_match_and_idempotency_and_never_touch_holdings(
     assert ok(world.client.get(f"{URL}/{wid}"), 200, 2, [SERVED]) == added
     assert_problem(write(world, "POST", url, ENTRY, '"2"'), 409, "entry_exists")
     bad: list[tuple[dict[str, Any], int, str]] = [
-        (ENTRY | {"review_at": None}, 400, "invalid_request"),  # not in the contract
+        (ENTRY | {"review_at": "2026-11-02"}, 400, "invalid_request"),  # 0.5.0
         (ENTRY | {"needs": "delayed"}, 400, "invalid_request"),
         (ENTRY | {"monitoring_priority": 101}, 400, "invalid_request"),
         (ENTRY | {"monitoring_priority": True}, 400, "invalid_request"),
@@ -348,3 +348,67 @@ def test_add_entry_if_match_is_optional_as_in_the_contract(world: Any) -> None:
                   [SERVED]) == first  # fmt: skip
     assert revisions(world) == 4
     assert len(api.audit(world, "watchlist.entry_added")) == 3
+
+
+REQUEST = Draft202012Validator(rd.PC.request("WatchlistEntry"), registry=rd.REGISTRY,
+                               format_checker=FormatChecker())  # fmt: skip
+BAD_REVIEW = ["2026-11-02", "2026-11-02T14:00:00", "2026-11-02 14:00:00Z",
+              "2026-02-30T14:00:00Z", "2026-11-02T14:00:00-00:00", "soon", "",
+              1798207200, True, ["2026-11-02T14:00:00Z"]]  # fmt: skip
+
+
+@pytest.mark.db
+def test_review_at_is_settable_and_kept_when_omitted(world: Any) -> None:
+    """Project contract 0.5.0: `review_at` is optional on the request, an offset
+    timestamp served in UTC; an update without it keeps the stored value."""
+    login(world.client, "alice")
+    wid = ok(write(world, "POST", URL, GROWTH), 201, 1)["id"]
+    url, one = f"{URL}/{wid}/entries", f"{URL}/{wid}/entries/{IID}"
+    set_at = ENTRY | {"review_at": "2026-11-02T09:00:00-05:00"}
+    assert [e.message for e in REQUEST.iter_errors(set_at)] == []
+    k = "SYNTHETIC-wl-api-r-01"
+    at_14 = [ENTRY | {"review_at": "2026-11-02T14:00:00Z"}]
+    added = ok(write(world, "POST", url, set_at, '"1"', k), 200, 2, at_14)
+    assert ok(write(world, "POST", url, set_at, '"1"', k), 200, 2, at_14) == added
+    purge(world)  # the store replays too
+    assert ok(write(world, "POST", url, set_at, '"1"', k), 200, 2, at_14) == added
+    assert_problem(write(world, "POST", url, ENTRY | {
+        "review_at": "2026-11-03T14:00:00Z"}, '"1"', k), 409,
+        "idempotency_key_reused")  # fmt: skip
+    new = ENTRY | {"thesis": "SYNTHETIC kept"}
+    kept = [new | {"review_at": "2026-11-02T14:00:00Z"}]
+    ok(write(world, "PATCH", one, new, '"2"'), 200, 3, kept)  # omitted: kept
+    later = new | {"review_at": "2026-12-01T09:30:00.250000+00:00"}
+    k2 = "SYNTHETIC-wl-api-r-02"
+    moved = [new | {"review_at": "2026-12-01T09:30:00.250000Z"}]
+    changed = ok(write(world, "PATCH", one, later, '"3"', k2), 200, 4, moved)
+    purge(world)
+    assert ok(write(world, "PATCH", one, later, '"3"', k2), 200, 4, moved) == changed
+    for other in (new | {"review_at": "2026-12-02T09:30:00Z"}, new):
+        assert_problem(write(world, "PATCH", one, other, '"3"', k2), 409,
+                       "idempotency_key_reused")  # fmt: skip
+    k3 = "SYNTHETIC-wl-api-r-03"
+    ok(write(world, "PATCH", one, new | {"review_at": None}, '"4"', k3), 200, 5,
+       [new | {"review_at": None}])  # null clears it  # fmt: skip
+    assert_problem(write(world, "PATCH", one, new, '"4"', k3), 409,
+                   "idempotency_key_reused")  # omitted is not null  # fmt: skip
+    for bad in BAD_REVIEW:  # the route refuses each; the contract all but -00:00
+        body = ENTRY | {"review_at": bad}
+        contract = [e.message for e in REQUEST.iter_errors(body)]
+        assert (contract == []) == (bad == "2026-11-02T14:00:00-00:00"), bad  # C-05
+        assert_problem(write(world, "PATCH", one, body, '"5"'), 400,
+                       "invalid_request")  # fmt: skip
+        assert_problem(write(world, "POST", url, body | {
+            "instrument_id": IID.replace("a1", "b2")}, '"5"'), 400,
+            "invalid_request")  # fmt: skip
+    assert_problem(write(world, "PATCH", one, ENTRY | {"needs": "delayed"}, '"5"'),
+                   400, "invalid_request")  # fmt: skip
+    assert revisions(world) == 5
+    stored = world.db.execute(
+        "SELECT entries->0->>'needs', review_at_set FROM "
+        "app.watchlist_revision ORDER BY revision"
+    ).fetchall()
+    assert stored[1:] == [("realtime_exchange_limited", False),
+                          ("realtime_exchange_limited", False),
+                          ("realtime_exchange_limited", True),
+                          ("realtime_exchange_limited", True)]  # fmt: skip
