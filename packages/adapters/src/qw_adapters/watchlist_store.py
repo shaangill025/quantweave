@@ -50,7 +50,7 @@ from qw_adapters.tenancy import TenantTx
 
 __all__ = ["MAX_ENTRIES", "Revision", "WatchlistStoreError", "add_entry", "create",
            "delete", "entry_json", "load", "page", "remove_entry", "revision_hash",
-           "update", "update_entry"]  # fmt: skip
+           "tombstone", "update", "update_entry"]  # fmt: skip
 
 MAX_ENTRIES = 500  # per list; 0023 refuses a larger snapshot
 _ENTRY_ACTIONS = ("add_entry", "update_entry", "remove_entry")
@@ -226,6 +226,16 @@ def load(tx: TenantTx, wid: str) -> Revision | None:
     _lock(tx, shared=True)
     chain = _chains(tx, u)[0].get(wid)
     return None if not chain or chain[-1].deleted else chain[-1]
+
+
+def tombstone(tx: TenantTx, wid: str) -> Revision | None:
+    """The deleted list's tombstone revision (readJob), verified; None when unknown,
+    non-canonical or live."""
+    if (u := _uuid(wid)) is None:
+        return None
+    _lock(tx, shared=True)
+    chain = _chains(tx, u)[0].get(wid)
+    return chain[-1] if chain and chain[-1].deleted else None
 
 
 def page(tx: TenantTx, limit: int, after: str | None) -> list[Revision]:
