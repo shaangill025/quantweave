@@ -88,7 +88,7 @@
       "requirements": "R033,R036,R037,R038,R076,R086,R092,R096",
       "deliverable": "Prove bounded gVisor candidate execution on reference Linux and document host/VM compatibility.",
       "verification": "Isolation, egress, filesystem, CPU/memory/time limits and no-host-control tests pass or gate stays blocked.",
-      "status": "Not started",
+      "status": "In progress",
       "size": "M",
       "release_required": "Yes"
     },
@@ -634,7 +634,7 @@
       "requirements": "R028,R030,R033,R038,R039,R076,R086,R092,R099",
       "deliverable": "Generate reviewed code patches in immutable sandbox inputs; test, package and route human release approval.",
       "verification": "No host/secret/prod writes; test-improving and malicious candidate negative controls.",
-      "status": "Not started",
+      "status": "In progress",
       "size": "L",
       "release_required": "Yes"
     },
