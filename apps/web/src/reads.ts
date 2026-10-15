@@ -1,6 +1,6 @@
 // Guards for reads apps/api serves since T021, T027 and T053-api: GET /capabilities,
 // /strategies, /strategies/{id}, /accounts/{id}/ledger and /proposals/{id} (openapi.yaml 1.0.0
-// as amended by project contract 0.4.0, proposed: proposal coverage, nullable lot_policy_id).
+// as amended by project contract 0.4.0, owner-confirmed: proposal coverage, nullable lot_policy_id).
 // Each refuses a payload the views could not show honestly; decimals stay strings.
 import { checks as c, isProposal, pageOf, proposalPage, type Coverage, type Guard, type Page, type Proposal } from "./api";
 import type { DecimalString as Dec } from "./wire";

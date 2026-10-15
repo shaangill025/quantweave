@@ -1,7 +1,7 @@
-"""Watchlists (T024 increments 2 and 3; `0022_watchlists.sql`,
-`0023_watchlist_entries.sql`; contract listWatchlists, createWatchlist,
-readWatchlist, updateWatchlist, deleteWatchlist, addWatchlistEntry,
-updateWatchlistEntry, deleteWatchlistEntry).
+"""Watchlists (T024 increments 2 to 4; `0022_watchlists.sql`,
+`0023_watchlist_entries.sql`, `0024_watchlist_review_at.sql`; contract
+listWatchlists, createWatchlist, readWatchlist, updateWatchlist, deleteWatchlist,
+addWatchlistEntry, updateWatchlistEntry, deleteWatchlistEntry).
 
 - Every read re-hashes each revision, checks revisions run 1..n from the create,
   each names the previous hash, times never go back and nothing follows a delete,
@@ -12,8 +12,11 @@ updateWatchlistEntry, deleteWatchlistEntry).
   order). Any failure is `integrity`. Hash-only, no C-20 signing (as pause_store):
   removing a chain's latest rows is not detected.
 - Entries are stored as the contract response `WatchlistEntry` plus the domain's
-  monitoring `needs`. The entry operations take a domain `Entry`; an update keeps
-  the stored `review_at` and `needs` (the contract request carries neither).
+  monitoring `needs`. The entry operations take a domain `Entry`. An add stores its
+  `review_at`. An update always keeps the stored `needs` (server-derived) and keeps
+  `review_at` unless its request set one (project contract 0.5.0); the row records
+  that in `review_at_set`, which is hashed when true, and replay allows a changed
+  `review_at` only on such a row.
 - Ids are canonical UUID text; unknown, foreign, deleted and other spellings all
   read as absent (`None`, or `not_found` for a change).
 - Every write is under the tenant lock and says whether it wrote: a key the
@@ -72,6 +75,7 @@ class Revision:
     digest: str
     watchlist: W.Watchlist  # the state it recorded (a tombstone: the last live one)
     instrument: str | None = None  # the entry an entry action changed
+    review_set: bool = False  # an update_entry whose request set review_at
 
     @property
     def deleted(self) -> bool:
@@ -82,13 +86,15 @@ def revision_hash(
     tenant: uuid.UUID, wid: uuid.UUID, revision: int, action: str,
     principal: uuid.UUID, session: uuid.UUID, key: str, name: str, description: str,
     entries: list[Any], at: datetime, previous: str | None, *,
-    instrument: uuid.UUID | None = None,
+    instrument: uuid.UUID | None = None, review_set: bool = False,
 ) -> str:  # fmt: skip
     fields = ["watchlist_revision", str(tenant), str(wid), revision, action,
               str(principal), str(session), key, name, description, entries,
               format_instant(at), previous]  # fmt: skip
     if instrument is not None:  # entry actions (0023); earlier hashes are unchanged
         fields.append(str(instrument))
+    if review_set:  # 0024; a row without it hashes as before
+        fields.append("review_at_set")
     text = json.dumps(fields, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(text.encode()).hexdigest()
 
@@ -120,7 +126,7 @@ def _entry(d: dict[str, Any]) -> W.Entry:
 
 
 def _editable(e: W.Entry | None) -> tuple[Any, ...] | None:
-    """What the contract request sets (not `review_at` or `needs`)."""
+    """What the contract request sets, but `review_at` (compared on its own)."""
     return None if e is None else (e.instrument_id, e.thesis, e.tags, e.priority,
                                    e.conditions, e.invalidation_text)  # fmt: skip
 
@@ -141,8 +147,8 @@ def _uuid(wid: str) -> uuid.UUID | None:
 
 _SELECT = ("SELECT watchlist_id, revision, action, principal_id, session_id, "
            "idempotency_key, name, description, entries, recorded_at, previous_hash, "
-           "event_hash, instrument_id FROM app.watchlist_revision WHERE "
-           "tenant_id = %s{} ORDER BY watchlist_id, revision")  # fmt: skip
+           "event_hash, instrument_id, review_at_set FROM app.watchlist_revision "
+           "WHERE tenant_id = %s{} ORDER BY watchlist_id, revision")  # fmt: skip
 
 
 def _chains(
@@ -172,6 +178,7 @@ def _chains(
             prev,
             h,
             i,
+            flag,
         ) in rows:
             chain = out.setdefault(str(w), [])
             last, at = (chain[-1] if chain else None), ensure_aware_utc(at)
@@ -179,8 +186,10 @@ def _chains(
                 rev == len(chain) + 1 and prev == (last.digest if last else None)
                 and (last is None or (at >= last.recorded_at and not last.deleted))
                 and (i is not None) == (action in _ENTRY_ACTIONS)
+                and (not flag or action == "update_entry")
                 and h == revision_hash(tx.tenant_id, w, rev, action, who, session, key,
-                                       name, text, entries, at, prev, instrument=i)
+                                       name, text, entries, at, prev, instrument=i,
+                                       review_set=flag)
             )  # fmt: skip
             if not ok:
                 raise ValueError(f"{w} revision {rev}")
@@ -202,8 +211,11 @@ def _chains(
                 if (
                     action == "update_entry"
                     and old is not None
-                    and ((new.review_at, new.needs) != (old.review_at, old.needs))
-                ):  # the store keeps both on an update
+                    and (
+                        new.needs != old.needs
+                        or (not flag and new.review_at != old.review_at)
+                    )
+                ):  # an update keeps needs, and review_at unless its request set it
                     raise ValueError(f"{w} revision {rev} kept fields")
                 state = put(by, str(w), rev - 1, stored[i])  # a duplicate: snapshot
             else:
@@ -213,7 +225,7 @@ def _chains(
             if snapshot != (name, text, entries):
                 raise ValueError(f"{w} snapshot {rev}")
             chain.append(Revision(rev, action, who, key, at, h, state,
-                                  None if i is None else str(i)))  # fmt: skip
+                                  None if i is None else str(i), flag))  # fmt: skip
     except (ValueError, TypeError, KeyError, AttributeError) as exc:  # domain errors
         raise WatchlistStoreError("integrity", str(exc)) from None
     return out, domain
@@ -294,7 +306,7 @@ def add_entry(
     tx: TenantTx, wid: str, principal: uuid.UUID, session: uuid.UUID, key: str,
     expected: int | None, entry: W.Entry,
 ) -> tuple[Revision, bool]:  # fmt: skip
-    """Add `entry` as given (the routes set `review_at` None, `needs` the default).
+    """Add `entry` as given (the routes set `needs` to the domain default).
     `expected` None: the latest revision under the lock (the contract names no
     If-Match here). A key replays on the request alone, whatever `expected` is."""
 
@@ -304,23 +316,25 @@ def add_entry(
         return d.add_entry(by, w, n, entry)
 
     return _entry_change(tx, wid, "add_entry", principal, session, key, expected,
-                         entry, op)  # fmt: skip
+                         entry, op, True)  # fmt: skip
 
 
 def update_entry(
     tx: TenantTx, wid: str, principal: uuid.UUID, session: uuid.UUID, key: str,
-    expected: int, entry: W.Entry,
+    expected: int, entry: W.Entry, review_set: bool = False,
 ) -> tuple[Revision, bool]:  # fmt: skip
-    """Replace the editable fields; the stored `review_at` and `needs` are kept."""
+    """Replace the editable fields, and `review_at` when `review_set` (the request
+    set it, possibly to None); otherwise the stored `review_at` is kept. The stored
+    `needs` is always kept."""
 
     def op(d: W.WatchlistStore, by: W.Who, w: str, n: int) -> W.Watchlist:
         old = d.get(by.tenant_id, w).entry(entry.instrument_id)
         keep = old or entry  # missing: the domain refuses
-        e = replace(entry, review_at=keep.review_at, needs=keep.needs)
-        return d.update_entry(by, w, n, e)
+        at = entry.review_at if review_set else keep.review_at
+        return d.update_entry(by, w, n, replace(entry, review_at=at, needs=keep.needs))
 
     return _entry_change(tx, wid, "update_entry", principal, session, key, expected,
-                         entry, op)  # fmt: skip
+                         entry, op, review_set)  # fmt: skip
 
 
 def remove_entry(
@@ -337,23 +351,31 @@ def remove_entry(
 
 def _entry_change(
     tx: TenantTx, wid: str, action: str, principal: uuid.UUID, session: uuid.UUID,
-    key: str, expected: int | None, entry: W.Entry, op: Op,
+    key: str, expected: int | None, entry: W.Entry, op: Op, review_set: bool,
 ) -> tuple[Revision, bool]:  # fmt: skip
+    """`review_set`: the request set `review_at` (always, for an add)."""
     iid = entry.instrument_id
 
     def same(old: Revision) -> bool:
-        return old.instrument == iid.to_wire() and _editable(
-            old.watchlist.entry(iid)
-        ) == _editable(entry)
+        was = old.watchlist.entry(iid)
+        flag = review_set and action == "update_entry"
+        return (
+            old.instrument == iid.to_wire()
+            and _editable(was) == _editable(entry)
+            and old.review_set == flag
+            and (
+                not review_set or (was is not None and was.review_at == entry.review_at)
+            )
+        )
 
     return _change(tx, wid, action, principal, session, key, expected, op, same,
-                   iid.uuid)  # fmt: skip
+                   iid.uuid, action == "update_entry" and review_set)  # fmt: skip
 
 
 def _change(
     tx: TenantTx, wid: str, action: str, principal: uuid.UUID, session: uuid.UUID,
     key: str, expected: int | None, op: Op, same: Callable[[Revision], bool],
-    instrument: uuid.UUID | None = None,
+    instrument: uuid.UUID | None = None, review_set: bool = False,
 ) -> tuple[Revision, bool]:  # fmt: skip
     """`op` applies the change to the replayed domain store; `same` says whether a
     revision recorded under this key answered this request."""
@@ -383,7 +405,7 @@ def _change(
         raise WatchlistStoreError(exc.code, "refused by the domain") from None
     return _insert(tx, u, chain, action, principal, session, key,
                    (state.name, state.description, state.entries), instrument,
-                   at), True  # fmt: skip
+                   at, review_set), True  # fmt: skip
 
 
 def _now(tx: TenantTx) -> datetime:
@@ -396,7 +418,7 @@ def _insert(
     tx: TenantTx, wid: uuid.UUID, chain: list[Revision], action: str,
     principal: uuid.UUID, session: uuid.UUID, key: str,
     snapshot: tuple[str, str, tuple[W.Entry, ...]], instrument: uuid.UUID | None,
-    at: datetime | None = None,
+    at: datetime | None = None, review_set: bool = False,
 ) -> Revision:  # fmt: skip
     at, rev = at or _now(tx), len(chain) + 1
     name, description, entries = snapshot
@@ -404,18 +426,18 @@ def _insert(
     previous = chain[-1].digest if chain else None
     digest = revision_hash(tx.tenant_id, wid, rev, action, principal, session, key,
                            name, description, stored, at, previous,
-                           instrument=instrument)  # fmt: skip
+                           instrument=instrument, review_set=review_set)  # fmt: skip
     args: tuple[Any, ...] = (tx.tenant_id, wid, rev, action, principal, session, key,
                              name, description, Jsonb(stored), at, previous,
-                             digest, instrument)  # fmt: skip
+                             digest, instrument, review_set)  # fmt: skip
     try:
         with tx.conn.transaction():
             tx.conn.execute(
                 "INSERT INTO app.watchlist_revision (tenant_id, watchlist_id, "
                 "revision, action, principal_id, session_id, idempotency_key, name, "
                 "description, entries, recorded_at, previous_hash, event_hash, "
-                "instrument_id) "
-                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)", args,
+                "instrument_id, review_at_set) VALUES "
+                "(%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)", args,
             )  # fmt: skip
     except psycopg.Error as exc:
         raise WatchlistStoreError("database", type(exc).__name__) from None
