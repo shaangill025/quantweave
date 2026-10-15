@@ -48,4 +48,5 @@ addopts = ["--import-mode=importlib", "-ra", "--strict-markers", "--strict-confi
 pythonpath = ["packages/domain/tests"]  # shared SYNTHETIC test helpers (no conftest)
 markers = [
     "db: needs PostgreSQL 16 (QW_TEST_DATABASE_URL or host binaries); QW_REQUIRE_DB=1 turns a skip into a failure",
+    "gvisor: needs root, runsc and QW_SANDBOX_ROOTFS (docs/receipts/T007.md); QW_REQUIRE_GVISOR=1 turns a skip into a failure",
 ]
