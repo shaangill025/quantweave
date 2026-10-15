@@ -4,6 +4,8 @@ is the database clock."""
 
 from __future__ import annotations
 
+import threading
+import time
 import uuid
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
@@ -429,3 +431,68 @@ def test_the_database_requires_step_up_to_enable(app_conn: Conn, conn: Conn,
     raw_insert(app_conn, c, email=True, idempotency_key="SYNTHETIC-pref-key-0004")
     raw_insert(app_conn, c, idempotency_key="SYNTHETIC-pref-key-0005")  # off
     assert count(conn) == 4
+
+
+def test_the_0025_check_refuses_a_step_up_after_the_revision(
+    app_conn: Conn, conn: Conn, c: Ctx
+) -> None:
+    """A qw_app insert that passes the guard (the session's own fresh step-up, a
+    recorded_at after the previous revision and within the clock bound) but records
+    the step-up after the revision is refused by the CHECK itself."""
+    one = put(app_conn, c, 0, QUIET)
+    assert one.recorded_at is not None
+    at = step_up(app_conn, c)
+    assert at > one.recorded_at
+    with pytest.raises(psycopg.errors.CheckViolation) as err:
+        raw_insert(app_conn, c, email=True, step_up_at=at, recorded_at=one.recorded_at)
+    assert err.value.diag.constraint_name == "notification_preference_step_up_before"
+    assert count(conn) == 1
+    raw_insert(app_conn, c, email=True, step_up_at=at)  # the control: recorded after
+    assert count(conn) == 2
+
+
+def test_a_revoked_session_cannot_enable_even_after_a_step_up(
+    app_conn: Conn, conn: Conn, c: Ctx
+) -> None:
+    put(app_conn, c, 0, QUIET)
+    step_up(app_conn, c)
+    with tn.tenant_transaction(app_conn, c.tenant) as tx:
+        assert tn.revoke_session(tx, c.session)
+    for p in (replace(QUIET, email=True), replace(QUIET, browser_push=True)):
+        refused(app_conn, conn, c, "step_up_required", 1, p, KEY2)  # not `database`
+
+
+def test_concurrent_writers_at_one_revision_one_wins_one_is_stale(
+    app_conn: Conn, conn: Conn, c: Ctx, runtime_urls: dict[str, str]
+) -> None:
+    """A holds revision 2 uncommitted; B, at the same expected revision, is let
+    through only once the database shows it waiting on an advisory lock (the
+    store's own lock, or the 0020/0025 guard's without it). B must then read A's
+    revision and answer `stale`, never reach the insert (`database`)."""
+    put(app_conn, c, 0, QUIET)
+    got: dict[str, object] = {}
+    with psycopg.connect(runtime_urls["qw_app"], autocommit=True) as b_conn:
+
+        def b() -> None:
+            try:
+                got["b"] = put(b_conn, c, 1, replace(QUIET, in_app=True), KEY3)
+            except pst.PreferenceStoreError as exc:
+                got["b"] = exc.code
+
+        thread = threading.Thread(target=b)
+        with tn.tenant_transaction(app_conn, c.tenant) as tx:
+            a, wrote = pst.set_preferences(tx, c.user, c.session, KEY2, 1,
+                                           N.Preferences())  # fmt: skip
+            assert wrote and a.revision == 2
+            thread.start()
+            deadline = time.monotonic() + 30
+            while conn.execute(
+                "SELECT EXISTS (SELECT 1 FROM pg_locks WHERE pid = %s AND locktype ="
+                " 'advisory' AND NOT granted)", (b_conn.info.backend_pid,),
+            ).fetchone() != (True,):  # fmt: skip
+                assert thread.is_alive() and time.monotonic() < deadline, got
+                time.sleep(0.01)
+        thread.join(30)
+    assert not thread.is_alive()
+    assert got == {"b": "stale"}
+    assert count(conn) == 2 and get(app_conn, c) == a
