@@ -17,6 +17,8 @@ from typing import Any
 
 import pytest
 from jsonschema import Draft202012Validator  # type: ignore[import-untyped]
+from qw_adapters import notification_preference_store as prefs_store
+from qw_adapters import tenancy as tn
 from qw_domain import notifications as dn
 
 ROOT = Path(__file__).parents[3]
@@ -134,6 +136,7 @@ def test_the_feed_honours_in_app_and_fails_closed_on_tamper(
 ) -> None:
     ids, *_ = nt.seed(world, app_conn, runtime_urls)
     pause = next(k for k in ids if k not in ("job-syn-1", "prop-syn-n"))
+    job = f"unavailable:{ids['job-syn-1']}"  # qw_app cannot read job outcomes
     login(world.client, "alice")  # alice turning the feed off does not touch bob's
     ok(patch(world, QUIET, '"0"'), QUIET, '"1"')
     login(world.client, "bob")
@@ -145,8 +148,13 @@ def test_the_feed_honours_in_app_and_fails_closed_on_tamper(
         assert [(i["object_id"], i["channel"]) for i in items] == [
             ("job-syn-1", "email"), (pause, "in_app"), (pause, "email"),
             ("prop-syn-n", "email")]  # fmt: skip
-    ok(patch(world, DEFAULTS, '"1"', "SYNTHETIC-pref-k-03"), DEFAULTS, '"2"')
+    assert api.step_up(world.client).status_code == 200
+    email = DEFAULTS | {"email": True}  # so a verified read would name no_transport
+    ok(patch(world, email, '"1"', "SYNTHETIC-pref-k-03"), email, '"2"')
     assert nt.walk(world.client, 50)[0] == everything  # nothing was lost
+    assert world.client.get(nt.URL).json()["coverage"]["reasons"] == [
+        "unavailable:delivery/email:no_transport", f"{job}/current_object_state",
+        f"{job}:email/current_object_state"]  # fmt: skip
     nt.tamper(world, "UPDATE app.notification_preference SET quiet_hours_timezone ="
               " 'Europe/Paris' WHERE revision = 2")  # fmt: skip
     body = world.client.get(nt.URL).json()
@@ -155,11 +163,13 @@ def test_the_feed_honours_in_app_and_fails_closed_on_tamper(
         ("job-syn-1", "email"), (pause, "in_app"), (pause, "email"),
         ("prop-syn-n", "email")]  # fmt: skip
     assert body["coverage"]["status"] == "partial"
-    assert "unavailable:notification_preferences/integrity" in body["coverage"][
-        "reasons"]  # fmt: skip
+    # exactly: an unverifiable user is never told about a channel (no_transport)
+    assert body["coverage"]["reasons"] == [
+        "unavailable:notification_preferences/integrity",
+        f"{job}:email/current_object_state"]  # fmt: skip
     assert_problem(patch(world, QUIET, '"2"'), 409, "integrity")
     # a stored replay is served, but its ETag lookup fails closed, never a 500
-    replay = patch(world, DEFAULTS, '"1"', "SYNTHETIC-pref-k-03")
+    replay = patch(world, email, '"1"', "SYNTHETIC-pref-k-03")
     assert_problem(replay, 409, "integrity")
     assert revisions(world) == 3
     login(world.client, "alice")  # one user's tampered row does not affect another
@@ -233,6 +243,30 @@ def test_external_channels_need_step_up_and_nothing_is_sent(
         "unavailable:delivery/email:no_transport",
         "unavailable:delivery/browser_push:no_transport"]  # fmt: skip
     assert revisions(world) == 4 and calls == []
+
+
+@pytest.mark.db
+def test_a_session_revoked_after_authentication_cannot_enable(
+    world: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The session is revoked inside the request's transaction, after it was
+    authenticated and stepped up: 401 step_up_required, never a 500, nothing
+    written."""
+    login(world.client, "bob")
+    assert api.step_up(world.client).status_code == 200
+    original = prefs_store.set_preferences
+
+    def revoked_first(tx: Any, user: Any, session: Any, *args: Any,
+                      **kwargs: Any) -> Any:  # fmt: skip
+        assert tn.revoke_session(tx, session)
+        return original(tx, user, session, *args, **kwargs)
+
+    monkeypatch.setattr(prefs_store, "set_preferences", revoked_first)
+    for name in ("email", "browser_push"):
+        got = assert_problem(patch(world, DEFAULTS | {name: True}, '"0"'), 401,
+                             "step_up_required")  # fmt: skip
+        assert got["detail"] == "Re-authenticate to continue."
+    assert revisions(world) == 0
 
 
 def test_no_source_module_can_dispatch_externally() -> None:
