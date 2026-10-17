@@ -359,3 +359,70 @@ def test_unsafe_work_dir_and_rootfs_digest_mismatch_fail_closed(
         assert ev["host_passes_sandbox_suite"] is False
         assert any(r.startswith(reason) for r in ev["reasons"]), ev["reasons"]
     assert list((tmp_path / "elsewhere").iterdir()) == []  # nothing written there
+
+
+@pytest.mark.parametrize(
+    ("tree", "override", "want"),
+    [
+        (("bin/sh",), None, "busybox"),
+        (("bin/sh", "usr/local/bin/python3"), None, "python"),
+        (("usr/bin/python3",), None, "python"),
+        (("bin/sh", "usr/bin/python3"), "busybox", "busybox"),
+        (("bin/busybox",), None, None),
+        (("bin/sh",), "python", None),
+        (("usr/bin/python3",), "busybox", None),
+    ],
+)
+def test_probe_form_follows_the_rootfs_and_fails_closed(
+    tmp_path: Path, tree: tuple[str, ...], override: str | None, want: str | None
+) -> None:
+    for rel in tree:  # SYNTHETIC; a dangling link is not followed on the host
+        tmp_path.joinpath(rel).parent.mkdir(parents=True, exist_ok=True)
+        tmp_path.joinpath(rel).symlink_to("/nonexistent-on-the-host")
+    if want is None:
+        with pytest.raises(ValueError, match="probe form"):
+            qs.probe_form(tmp_path, override)
+    else:
+        assert qs.probe_form(tmp_path, override) == want
+
+
+@pytest.mark.parametrize(
+    ("tree", "argv", "want"),
+    [
+        (("bin/sh", "usr/local/bin/python3"), [], "python"),
+        (("bin/sh", "usr/local/bin/python3"), ["--probes", "busybox"], "busybox"),
+        (("bin/sh",), [], "busybox"),
+        ((), [], None),
+    ],
+)
+def test_probe_form_is_passed_to_the_tests_and_recorded(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+    tree: tuple[str, ...], argv: list[str], want: str | None,
+) -> None:  # fmt: skip
+    root = tmp_path / "rootfs"  # SYNTHETIC rootfs and host
+    (root / "bin").mkdir(parents=True)
+    for rel in tree:
+        root.joinpath(rel).parent.mkdir(parents=True, exist_ok=True)
+        root.joinpath(rel).write_text("")
+    monkeypatch.setenv("QW_SANDBOX_RUNSC", str(tmp_path / "runsc"))
+    monkeypatch.setenv("QW_SANDBOX_ROOTFS", str(root))
+    monkeypatch.setenv("QW_SANDBOX_PROBES", "inherited-is-never-used")
+    host = {"root": True, "cgroup": {"supported": True, "version": "v1"}}
+    monkeypatch.setattr(qs, "host_facts", lambda: host)
+    monkeypatch.setattr(qs, "git_state", lambda: {"commit": "c0", "dirty": False})
+    monkeypatch.setattr(qs, "runsc_info", lambda p, s, a: ({"path": str(p)}, ""))
+    seen: list[str] = []
+
+    def run(name: str, env: dict[str, str], log_dir: Path) -> dict[str, Any]:
+        seen.append(env["QW_SANDBOX_PROBES"])
+        passed = {"real_runtime_passed": 1, "real_runtime_tests": 1, "counts": {}}
+        return {"platform": name, "all_real_runtime_passed": True, **passed}
+
+    monkeypatch.setattr(qs, "run_platform", run)
+    code = qs.main(["--work-dir", str(tmp_path / "wd"), *argv])
+    ev = json.loads(capsys.readouterr().out.split(qs.BEGIN)[1].split(qs.END)[0])
+    if want is None:  # neither python3 nor /bin/sh: no test run, never a pass
+        assert code == 1 and seen == [] and "probes" not in ev["rootfs"]
+        assert any(r.startswith("probe_form_unavailable") for r in ev["reasons"])
+    else:
+        assert code == 0 and seen == [want, want] and ev["rootfs"]["probes"] == want

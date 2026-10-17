@@ -21,22 +21,35 @@ G11) stays blocked. A development VM run is not a qualification.
   `20261005.0` (`--runsc-release` overrides), verifies its sha512 and prints the
   version. That flag is the only network access. runsc must be owned by root or you,
   and must not be group- or world-writable.
-- The rootfs: the pinned `busybox:1.37.0@sha256:bdf57e52…5013f82e` exported to a
-  directory (the script prints the steps). Only its tree digest is **recorded**. Pass
-  `--expect-rootfs-digest <sha256_tree>` to require a known digest: a mismatch fails.
-  The digest (`quantweave.rootfs_tree/3`, from `tools/candidate_rootfs.py`, as in CI)
-  of the T007 busybox export is `80e3966b…bf4d22b9` (earlier values are superseded,
-  see the receipt). Busybox stays the qualification rootfs: two real-runtime tests
-  probe with its `wget`, `nslookup` and `mount`.
+- The rootfs: the pinned Python candidate rootfs, built as in the last section
+  (preferred: it is what candidates run on), or the pinned
+  `busybox:1.37.0@sha256:bdf57e52…5013f82e` exported to a directory (the script
+  prints the steps). Only its tree digest is **recorded** unless you pass
+  `--expect-rootfs-digest <sha256_tree>`; then a mismatch fails. Digests
+  (`quantweave.rootfs_tree/3`, from `tools/candidate_rootfs.py`, as in CI): the
+  Python rootfs is `tree_sha256` in `tools/candidate_rootfs.json`; the T007 busybox
+  export is `80e3966b…bf4d22b9` (earlier values are superseded, see the receipt).
+- The probe form. Every real-runtime test has a busybox form (`/bin/sh` scripts over
+  `wget`, `nslookup`, `mount` and other tools) and a `python` form that uses only the
+  rootfs's own `python3 -I -c` (sockets, `/proc`, `os.statvfs`, `ctypes` for the
+  mount attempt). The script picks `python` when the rootfs has
+  `usr/local/bin/python3` or `usr/bin/python3`, else `busybox` when it has `bin/sh`;
+  `--probes busybox|python` overrides. It passes the form to the tests as
+  `QW_SANDBOX_PROBES` and records it as `rootfs.probes`. A rootfs with neither form
+  fails (`probe_form_unavailable`), and so does a form whose guest preflight cannot
+  run: missing busybox tools, or no Python 3.12+. A probe that cannot run fails its
+  test; it never passes or skips.
 
 ## Commands
 ```sh
 git status --short --untracked-files=all    # must print nothing
 sudo env "PATH=$PATH" \
   QW_SANDBOX_RUNSC=/var/tmp/qw-sandbox/gvisor/runsc \
-  QW_SANDBOX_ROOTFS=/var/tmp/qw-sandbox/rootfs-busybox \
-  uv run --frozen --no-sync python tools/qualify_sandbox.py
+  QW_SANDBOX_ROOTFS=/var/tmp/qw-sandbox/rootfs-python \
+  uv run --frozen --no-sync python tools/qualify_sandbox.py \
+  --expect-rootfs-digest "$(python3 tools/candidate_rootfs.py show tree_sha256)"
 ```
+For busybox, set `QW_SANDBOX_ROOTFS` to the busybox export and pass its digest.
 The work dir (`/var/tmp/qw-sandbox`, or `--work-dir`) must be a real directory owned by
 root or you that is not group- or world-writable; otherwise the run is refused. Each
 run writes its logs and downloads to a fresh private `run-*` dir inside it. The run
@@ -48,8 +61,8 @@ on systrap and then on ptrace. Keep any custom `--work-dir`, and the directory t
 - on at least one platform, pytest printed its summary with exit code 0 and zero
   failed, errors or skipped, and every collected real-runtime (`gvisor`) test passed;
 - cgroup support is available;
-- the script ran as root, with a safe work dir and a usable runsc and rootfs (and the
-  expected rootfs digest, if one was given);
+- the script ran as root, with a safe work dir, a usable runsc and a rootfs with a
+  probe form (and the expected rootfs digest, if one was given);
 - the tree was clean at a known commit.
 
 Otherwise it is false and `reasons` says why. The exit code is 0 or 1 to match.
@@ -80,5 +93,5 @@ for c in prune audit; do sudo python3 tools/candidate_rootfs.py $c "$dir"; done
 sudo python3 tools/candidate_rootfs.py digest "$dir" --expect "$(python3 \
   tools/candidate_rootfs.py show tree_sha256)"
 ```
-Pass the same value as `--expect-rootfs-digest`. The audit forbids `wget` and
-`nslookup`, so the egress probe test fails on this rootfs; QUAL17 stays on busybox.
+Pass the same value as `--expect-rootfs-digest` (see Commands). The audit forbids
+busybox, `wget` and `nslookup`, so the tests run in their `python` form here.
