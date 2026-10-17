@@ -8,6 +8,11 @@ R052, R075, R077, R086, R087, R088). Domain, stdlib only, in memory.
   any class (counsel and provider terms do), so `spec_baseline` leaves every class
   unconfigured and nothing is deleted or expired under it: fail closed, and each gap
   is reported as a reason code. Configured rules name an authority and a basis.
+- `owner_defaults` (increment 2, owner decision 9 of 2026-10-15: minimal defaults,
+  legal hold, held as configuration) gives every class a rule: backups 30 days,
+  audit events (ids only) 7 years, everything else the implementer's minimal
+  choice in `IMPLEMENTER_DEFAULTS` that the owner may change. `Retention` applies it
+  unless a policy is passed; `retention_config` loads operator overrides.
 - Fixed rules, whatever the policy: the tombstone ledger (`privacy`) is never deleted
   by a job; financial records never expire by age (deletion is an explicit workflow,
   data dictionary `ledger_event`), and a request for them follows the policy rule.
@@ -50,11 +55,11 @@ from qw_domain.sources import ID_PATTERN
 _CODE = re.compile(r"[a-z][a-z0-9_]{0,63}", re.ASCII)
 GENESIS = "0" * 64
 
-OWNER_DECISIONS = (
-    "retention period for every class (spec §12: counsel and provider terms)",
-    "per class: deletable on request or retained under an obligation, including "
-    "financial journal records (§4 'while retained')",
-    "backup retention period, which sets backup expiry",
+OWNER_DECISIONS = (  # still open after decision 9 (backups, audit, idempotency)
+    "confirm or change the implementer defaults (`IMPLEMENTER_DEFAULTS`); counsel "
+    "and provider terms may add obligations (spec §12)",
+    "whether financial journal records become deletable on request (default: "
+    "retained, append-only, §4 'while retained')",
     "how long deletion tombstones themselves are kept",
     "which roles may place and release legal holds",
     "mapping of spec §12 class names onto the data dictionary classes",
@@ -162,6 +167,45 @@ class Policy:
 def spec_baseline(policy_id: str) -> Policy:
     """Every class unconfigured: the spec sets no retention period (§12)."""
     return Policy(policy_id, 1, {c: Rule(c) for c in RetentionClass})
+
+
+DEFAULT_POLICY_ID = "retention-defaults"
+AUDIT_RETENTION = timedelta(days=7 * 365 + 2)  # 7 years: at most 2 leap days in 7
+BACKUP_RETENTION = timedelta(days=30)  # a deleted record's backup copy: 30 days
+_OWNER, _IMPL = "owner-decision-9", "implementer-default"
+_BASIS = "owner-decisions-2026-10-15-9"
+_D, _R = OnRequest.DELETE, OnRequest.RETAIN
+# (on request, age expiry) for the classes the owner gave no number for: the
+# minimal choice that invents no legal period. Deletable classes drop personal
+# content on request; no age expiry where counsel, rights or provider terms decide.
+_IMPLEMENTER: Mapping[RetentionClass, tuple[OnRequest, timedelta | None]] = {
+    RetentionClass.SECURITY: (_D, None),
+    RetentionClass.REFERENCE: (_R, None),  # shared reference data, not personal
+    RetentionClass.FINANCIAL: (_R, None),  # append-only journal until owner policy
+    RetentionClass.POLICY: (_D, None),
+    RetentionClass.RESEARCH: (_D, None),
+    RetentionClass.MARKET: (_D, None),  # age limits come from rights/provider terms
+    RetentionClass.EVIDENCE: (_D, None),  # likewise
+    RetentionClass.RELEASE: (_R, None),  # release and promotion evidence (§15)
+    RetentionClass.IMPROVEMENT: (_D, None),
+    RetentionClass.SIMULATION: (_D, None),
+    RetentionClass.OPERATIONS: (_D, None),  # purge windows: retention_config
+    RetentionClass.PROVIDER_PAYLOAD: (_D, timedelta(hours=48)),  # transient (§12)
+    RetentionClass.LOG: (_D, BACKUP_RETENTION),
+}
+IMPLEMENTER_DEFAULTS = frozenset(_IMPLEMENTER)
+
+
+def owner_defaults() -> Policy:
+    """Owner decision 9: minimal defaults. The tombstone ledger stays protected."""
+    rules = {c: Rule(c, on, after, _IMPL, _BASIS)
+             for c, (on, after) in _IMPLEMENTER.items()}  # fmt: skip
+    rules[RetentionClass.AUDIT] = Rule(RetentionClass.AUDIT, _R, AUDIT_RETENTION,
+                                       _OWNER, _BASIS)  # fmt: skip
+    rules[RetentionClass.BACKUP] = Rule(RetentionClass.BACKUP, _R, BACKUP_RETENTION,
+                                        _OWNER, _BASIS)  # fmt: skip
+    rules[RetentionClass.PRIVACY] = Rule(RetentionClass.PRIVACY)
+    return Policy(DEFAULT_POLICY_ID, 1, rules)
 
 
 def record_hash(tenant_id: str, cls: RetentionClass, record_id: str) -> str:
@@ -434,7 +478,8 @@ class Backup:
 
 
 def backup(backup_id: str, cutoff_at: datetime, completed_at: datetime,
-           policy: Policy) -> Backup:  # fmt: skip
+           policy: Policy | None = None) -> Backup:  # fmt: skip
+    policy = owner_defaults() if policy is None else policy
     period = policy.rule(RetentionClass.BACKUP).expire_after
     end = None if period is None else _utc(completed_at) + period
     return Backup(backup_id, cutoff_at, completed_at, end)
@@ -523,13 +568,17 @@ class Execution:
 
 @dataclass
 class Retention:
-    """One installation's holds, deletion jobs and tombstone ledger."""
+    """One installation's holds, deletion jobs and tombstone ledger. `policy` is
+    the configured policy used when a call passes none (owner decision 9)."""
 
     holds: Holds = field(default_factory=Holds)
     ledger: TombstoneLedger = field(default_factory=TombstoneLedger)
+    policy: Policy = field(default_factory=owner_defaults)
     _jobs: dict[str, tuple[Trigger, Plan]] = field(default_factory=dict)
 
-    def submit(self, trig: Trigger, items: Iterable[Item], policy: Policy) -> Plan:
+    def submit(self, trig: Trigger, items: Iterable[Item],
+               policy: Policy | None = None) -> Plan:  # fmt: skip
+        policy = self.policy if policy is None else policy
         job_id, _ = _job(trig)
         old = self._jobs.get(job_id)
         if old is not None:
@@ -542,10 +591,11 @@ class Retention:
         self._jobs[job_id] = (trig, p)
         return p
 
-    def execute(self, job_id: str, at: datetime, policy: Policy,
+    def execute(self, job_id: str, at: datetime, policy: Policy | None = None,
                 backups: Sequence[Backup] = ()) -> Execution:  # fmt: skip
         """Idempotent: a rerun returns the same tombstones and deletes pending
         intents that holds and the current policy now permit."""
+        policy = self.policy if policy is None else policy
         if job_id not in self._jobs:
             raise RetentionError("not_found", safe_repr(job_id))
         trig, p = self._jobs[job_id]

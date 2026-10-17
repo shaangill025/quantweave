@@ -4,9 +4,11 @@ is the database clock."""
 
 from __future__ import annotations
 
+import threading
+import time
 import uuid
-from dataclasses import dataclass
-from datetime import timedelta
+from dataclasses import dataclass, replace
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import psycopg
@@ -116,7 +118,7 @@ def test_refusals_write_nothing(app_conn: Conn, conn: Conn, c: Ctx) -> None:
         refused(app_conn, conn, c, "stale", expected, N.Preferences(), KEY2)
     for p in (N.Preferences(email=True), N.Preferences(browser_push=True),
               N.Preferences(email=True, browser_push=True)):  # fmt: skip
-        refused(app_conn, conn, c, "external_channel_unavailable", 1, p, KEY2)
+        refused(app_conn, conn, c, "step_up_required", 1, p, KEY2)  # none recorded
     # the key of revision 1 with other content, or not as revision 1: a conflict
     refused(app_conn, conn, c, "idempotency_key_reused", 0, N.Preferences())
     refused(app_conn, conn, c, "idempotency_key_reused", 1, QUIET)
@@ -170,8 +172,9 @@ def test_the_database_guards_every_insert(app_conn: Conn, conn: Conn, c: Ctx) ->
         {"session_id": expired},
         {"recorded_at": one.recorded_at - timedelta(milliseconds=1)},
         {"idempotency_key": KEY1},
-        {"email": True},
+        {"email": True},  # enabling without a step-up (owner decision 4)
         {"browser_push": True},
+        {"email": True, "step_up_at": one.recorded_at},  # not the session's step-up
         {"redact_financial_values": False},
         {"recorded_at": now - timedelta(minutes=5)},
         {"recorded_at": now + timedelta(minutes=5)},
@@ -269,30 +272,34 @@ def rehash(conn: Conn, c: Ctx, at: int, **over: Any) -> None:
         r["tenant_id"], r["user_id"], r["revision"], r["session_id"],
         r["idempotency_key"], r["in_app"], r["email"], r["browser_push"],
         r["quiet_hours_timezone"], r["quiet_hours"], r["redact_financial_values"],
-        r["recorded_at"], r["previous_hash"])  # fmt: skip
+        r["recorded_at"], r["previous_hash"],
+        step_up_at=r["step_up_at"])  # fmt: skip
     sets = ", ".join(f"{k} = %({k})s" for k in r)
     tamper(conn, f"UPDATE app.notification_preference SET {sets} WHERE revision = "
            f"{at}", r)  # fmt: skip
 
 
-@pytest.mark.parametrize("forgery", ["gap", "chain", "time", "email", "push"])
+@pytest.mark.parametrize("forgery", ["gap", "chain", "time", "email", "push",
+                                     "step_up_after"])  # fmt: skip
 def test_rehashed_forgeries_still_fail_closed(app_conn: Conn, conn: Conn, c: Ctx,
                                               forgery: str) -> None:  # fmt: skip
     """Each check that a hash-recomputing writer cannot satisfy by the hash alone:
-    revision numbering, the previous-hash chain, time order, external channels."""
+    revision numbering, the previous-hash chain, time order, and an external
+    channel turned on only by a revision recording step-up evidence (0025)."""
     one = put(app_conn, c, 0, QUIET)
     put(app_conn, c, 1, QUIET, KEY2)
     assert one.recorded_at is not None
-    if forgery in ("email", "push"):  # past the 0020 CHECK, as a schema owner could
-        column = "browser_push" if forgery == "push" else "email"
+    later = one.recorded_at + timedelta(days=1)
+    if forgery == "step_up_after":  # past the 0025 CHECK, as a schema owner could
         conn.execute("ALTER TABLE app.notification_preference DROP CONSTRAINT "
-                     f"notification_preference_{column}_check")  # fmt: skip
+                     "notification_preference_step_up_before")  # fmt: skip
     forged: dict[str, dict[str, Any]] = {
         "gap": {"revision": 3},
         "chain": {"previous_hash": "a" * 64},
         "time": {"recorded_at": one.recorded_at - timedelta(seconds=1)},
-        "email": {"email": True},
+        "email": {"email": True},  # turned on with no step-up recorded
         "push": {"browser_push": True},
+        "step_up_after": {"email": True, "step_up_at": later},  # after the revision
     }
     over = forged[forgery]
     rehash(conn, c, 2)  # the control: a faithful rewrite still reads
@@ -309,3 +316,183 @@ def test_a_missing_middle_revision_fails_closed(app_conn: Conn, conn: Conn,
     tamper(conn, "DELETE FROM app.notification_preference WHERE revision = 2")
     with pytest.raises(pst.PreferenceStoreError, match="integrity"):
         get(app_conn, c)
+
+
+# --- external channels behind step-up (0025, increment 5; owner decision 4) ---
+
+GOLDEN_0020 = (
+    "ba81bd71600f39bc15a4de10db159ccf7120c245f0e47e2ef8478ba8e61a3743",
+    "eb72862b36bf4faf676117ddc7c2bee3955f6af5f4b580621763b95930f5bf4b",
+)
+
+
+def test_hashes_without_step_up_are_the_0020_hashes() -> None:
+    """Golden values computed by the increment 4 code before 0025: a revision with
+    no step-up evidence hashes exactly as before, so earlier revisions still load."""
+    t, u, s = (uuid.UUID(int=n) for n in (1, 2, 3))
+    at = datetime(2026, 10, 15, 12, 0, 0, 123456, tzinfo=UTC)
+    h1 = pst.revision_hash(t, u, 1, s, KEY1, True, False, False, "UTC", [], True, at,
+                           None)  # fmt: skip
+    h2 = pst.revision_hash(t, u, 2, s, KEY2, False, False, False, "America/Toronto",
+                           ["22:00-07:00"], True, at, h1)  # fmt: skip
+    assert (h1, h2) == GOLDEN_0020
+    assert pst.revision_hash(t, u, 1, s, KEY1, True, False, False, "UTC", [], True,
+                             at, None, step_up_at=None) == h1  # fmt: skip
+    stepped = pst.revision_hash(t, u, 1, s, KEY1, True, False, False, "UTC", [], True,
+                                at, None, step_up_at=at)  # fmt: skip
+    assert stepped not in GOLDEN_0020
+
+
+def stored_step_up(conn: Conn, revision: int) -> Any:
+    row = conn.execute("SELECT step_up_at FROM app.notification_preference WHERE "
+                       "revision = %s", (revision,)).fetchone()  # fmt: skip
+    assert row is not None
+    return row[0]
+
+
+def step_up(app: Conn, c: Ctx) -> Any:
+    with tn.tenant_transaction(app, c.tenant) as tx:
+        return tn.mark_step_up(tx, c.session)
+
+
+def age_step_up(conn: Conn, c: Ctx, by: timedelta) -> None:
+    tamper(conn, "UPDATE app.session SET created_at = least(created_at, now() - "
+           "%(by)s), step_up_at = now() - %(by)s WHERE id = %(s)s",
+           {"by": by, "s": c.session})  # fmt: skip
+
+
+def test_enabling_an_external_channel_needs_a_recent_step_up(
+    app_conn: Conn, conn: Conn, c: Ctx
+) -> None:
+    put(app_conn, c, 0, QUIET)  # recorded before any step-up: no evidence needed
+    assert stored_step_up(conn, 1) is None
+    email, push = replace(QUIET, email=True), replace(QUIET, browser_push=True)
+    refused(app_conn, conn, c, "step_up_required", 1, email, KEY2)
+    at = step_up(app_conn, c)
+    narrow = timedelta(microseconds=1)  # a narrower API window
+    with (tn.tenant_transaction(app_conn, c.tenant) as tx,
+          pytest.raises(pst.PreferenceStoreError, match="step_up")):  # fmt: skip
+        pst.set_preferences(tx, c.user, c.session, KEY2, 1, email,
+                            step_up_window=narrow)  # fmt: skip
+    assert count(conn) == 1
+    two = put(app_conn, c, 1, email, KEY2)
+    assert (two.revision, two.preferences) == (2, email) and get(app_conn, c) == two
+    assert stored_step_up(conn, 2) == at  # the evidence: the session's step-up time
+    age_step_up(conn, c, timedelta(hours=2))  # expired (beyond 1 hour)
+    both = replace(email, browser_push=True)
+    refused(app_conn, conn, c, "step_up_required", 2, both, KEY3)
+    # keeping email on (only the windows change) and turning it off need none
+    keep = replace(email, quiet_hours=())
+    assert put(app_conn, c, 2, keep, KEY3).preferences == keep
+    assert stored_step_up(conn, 3) is None
+    k4, k5 = "SYNTHETIC-pref-key-0004", "SYNTHETIC-pref-key-0005"
+    assert put(app_conn, c, 3, QUIET, k4).preferences == QUIET
+    # a same-key retry of the enabling request replays its revision without step-up
+    with tn.tenant_transaction(app_conn, c.tenant) as tx:
+        again = pst.set_preferences(tx, c.user, c.session, KEY2, 1, email)
+    assert again == (two, False) and count(conn) == 4
+    refused(app_conn, conn, c, "step_up_required", 4, email, k5)  # again off -> on
+    refused(app_conn, conn, c, "step_up_required", 4, push, k5)
+    step_up(app_conn, c)
+    assert put(app_conn, c, 4, push, k5).preferences == push
+    assert [r.current.revision for r in _all(app_conn, c)] == [1, 2, 3, 4, 5]
+
+
+def _all(app: Conn, c: Ctx) -> list[Any]:
+    with tn.tenant_transaction(app, c.tenant) as tx:
+        return pst._read(tx, c.user)
+
+
+def test_the_database_requires_step_up_to_enable(app_conn: Conn, conn: Conn,
+                                                 c: Ctx) -> None:  # fmt: skip
+    """Direct qw_app inserts: turning email or push on needs the inserting session's
+    own step-up, at most 1 hour old; turning one off or keeping it needs none."""
+    put(app_conn, c, 0, QUIET)
+    for over in ({"email": True}, {"browser_push": True},
+                 {"email": True, "step_up_at": db_now(conn)}):  # fmt: skip
+        with pytest.raises(psycopg.Error, match="step-up"):
+            raw_insert(app_conn, c, **over)  # no step-up on the session
+    at = step_up(app_conn, c)
+    early = at - timedelta(microseconds=1)  # not the session's step-up time
+    for over in ({"email": True}, {"email": True, "step_up_at": early},
+                 {"step_up_at": early}):  # fmt: skip
+        with pytest.raises(psycopg.Error, match="step-up"):
+            raw_insert(app_conn, c, **over)
+    age_step_up(conn, c, timedelta(hours=1, seconds=5))
+    with tn.tenant_transaction(conn, c.tenant) as tx:
+        old = tx.conn.execute("SELECT step_up_at FROM app.session WHERE id = %s",
+                              (c.session,)).fetchone()  # fmt: skip
+    assert old is not None
+    with pytest.raises(psycopg.Error, match="step-up"):
+        raw_insert(app_conn, c, email=True, step_up_at=old[0])  # too old
+    assert count(conn) == 1
+    at = step_up(app_conn, c)
+    raw_insert(app_conn, c, email=True, step_up_at=at)  # the control
+    raw_insert(app_conn, c, email=True, idempotency_key="SYNTHETIC-pref-key-0004")
+    raw_insert(app_conn, c, idempotency_key="SYNTHETIC-pref-key-0005")  # off
+    assert count(conn) == 4
+
+
+def test_the_0025_check_refuses_a_step_up_after_the_revision(
+    app_conn: Conn, conn: Conn, c: Ctx
+) -> None:
+    """A qw_app insert that passes the guard (the session's own fresh step-up, a
+    recorded_at after the previous revision and within the clock bound) but records
+    the step-up after the revision is refused by the CHECK itself."""
+    one = put(app_conn, c, 0, QUIET)
+    assert one.recorded_at is not None
+    at = step_up(app_conn, c)
+    assert at > one.recorded_at
+    with pytest.raises(psycopg.errors.CheckViolation) as err:
+        raw_insert(app_conn, c, email=True, step_up_at=at, recorded_at=one.recorded_at)
+    assert err.value.diag.constraint_name == "notification_preference_step_up_before"
+    assert count(conn) == 1
+    raw_insert(app_conn, c, email=True, step_up_at=at)  # the control: recorded after
+    assert count(conn) == 2
+
+
+def test_a_revoked_session_cannot_enable_even_after_a_step_up(
+    app_conn: Conn, conn: Conn, c: Ctx
+) -> None:
+    put(app_conn, c, 0, QUIET)
+    step_up(app_conn, c)
+    with tn.tenant_transaction(app_conn, c.tenant) as tx:
+        assert tn.revoke_session(tx, c.session)
+    for p in (replace(QUIET, email=True), replace(QUIET, browser_push=True)):
+        refused(app_conn, conn, c, "step_up_required", 1, p, KEY2)  # not `database`
+
+
+def test_concurrent_writers_at_one_revision_one_wins_one_is_stale(
+    app_conn: Conn, conn: Conn, c: Ctx, runtime_urls: dict[str, str]
+) -> None:
+    """A holds revision 2 uncommitted; B, at the same expected revision, is let
+    through only once the database shows it waiting on an advisory lock (the
+    store's own lock, or the 0020/0025 guard's without it). B must then read A's
+    revision and answer `stale`, never reach the insert (`database`)."""
+    put(app_conn, c, 0, QUIET)
+    got: dict[str, object] = {}
+    with psycopg.connect(runtime_urls["qw_app"], autocommit=True) as b_conn:
+
+        def b() -> None:
+            try:
+                got["b"] = put(b_conn, c, 1, replace(QUIET, in_app=True), KEY3)
+            except pst.PreferenceStoreError as exc:
+                got["b"] = exc.code
+
+        thread = threading.Thread(target=b)
+        with tn.tenant_transaction(app_conn, c.tenant) as tx:
+            a, wrote = pst.set_preferences(tx, c.user, c.session, KEY2, 1,
+                                           N.Preferences())  # fmt: skip
+            assert wrote and a.revision == 2
+            thread.start()
+            deadline = time.monotonic() + 30
+            while conn.execute(
+                "SELECT EXISTS (SELECT 1 FROM pg_locks WHERE pid = %s AND locktype ="
+                " 'advisory' AND NOT granted)", (b_conn.info.backend_pid,),
+            ).fetchone() != (True,):  # fmt: skip
+                assert thread.is_alive() and time.monotonic() < deadline, got
+                time.sleep(0.01)
+        thread.join(30)
+    assert not thread.is_alive()
+    assert got == {"b": "stale"}
+    assert count(conn) == 2 and get(app_conn, c) == a

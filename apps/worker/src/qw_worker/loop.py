@@ -39,6 +39,7 @@ from qw_adapters import jobs as qj
 from qw_adapters.jobs import ClaimedJob, LeaseLost, OutboxEvent, Purged, Relayed
 from qw_adapters.tenancy import Conn, TenantTx, tenant_transaction
 from qw_domain.jobs import JobState, check_error_code
+from qw_domain.retention_config import Window
 
 from qw_worker.config import WorkerSettings
 
@@ -128,9 +129,13 @@ class Worker:
         now = self.clock()
         due = self._last_purge is None or now - self._last_purge >= s.purge_every
         if due and not self.stopping:
+            held = s.purge_held
             out.purged = qj.purge(
-                self.conn, outbox=s.outbox_retention, inbox=s.inbox_retention,
-                idempotency=s.idempotency_retention,
+                self.conn,
+                outbox=None if Window.OUTBOX in held else s.outbox_retention,
+                inbox=None if Window.INBOX in held else s.inbox_retention,
+                idempotency=None if Window.IDEMPOTENCY in held
+                else s.idempotency_retention,
             )  # fmt: skip
             self._last_purge = now
         return out
