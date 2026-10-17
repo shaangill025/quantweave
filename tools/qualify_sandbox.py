@@ -8,7 +8,10 @@ Run as root from a clean repo checkout on the reference Linux host:
 
 It collects host facts, checks runsc and the rootfs, runs the real gVisor tests
 (`QW_REQUIRE_GVISOR=1`) once per platform (systrap, then ptrace) and prints one JSON
-evidence block between BEGIN/END markers plus a short summary.
+evidence block between BEGIN/END markers plus a short summary. The probe form
+(busybox, or `python` for the pinned Python candidate rootfs, which has no busybox
+tools) is chosen from the rootfs or by `--probes`, passed to the tests as
+`QW_SANDBOX_PROBES` and recorded; a rootfs with neither form fails.
 `host_passes_sandbox_suite` is true only when every real-runtime test passed with
 nothing skipped on at least one platform, cgroup support is available, it ran as root
 on a clean commit (no modified or untracked files) and nothing else failed. Anything
@@ -58,6 +61,7 @@ BEGIN = "----- BEGIN QW SANDBOX QUALIFICATION EVIDENCE -----"
 END = "----- END QW SANDBOX QUALIFICATION EVIDENCE -----"
 PYTEST_TIMEOUT_S = 3600
 MAX_ARCHIVE_BYTES = 512 << 20
+PROBE_PYTHONS = ("usr/local/bin/python3", "usr/bin/python3")  # as in TEST_FILES[0]
 SUMMARY = re.compile(r"(\d+) (passed|failed|skipped|errors?|xfailed|xpassed)\b")
 
 
@@ -175,6 +179,17 @@ def build_evidence(
         "reasons": why, "note": "Evidence for review, recorded in "
         "docs/receipts/T007.md. QUAL17 is not marked by this script.",
     }  # fmt: skip
+
+
+def probe_form(rootfs: Path, override: str | None) -> str:
+    """The tests' probe form: `override`, else python if the rootfs has python3,
+    else busybox if it has /bin/sh (the rule of `probe_form` in TEST_FILES[0]).
+    Only the names are checked; the tests' guest preflight proves the form runs."""
+    python = any(os.path.lexists(rootfs / p) for p in PROBE_PYTHONS)
+    form = override or ("python" if python else "busybox")
+    if not (python if form == "python" else os.path.lexists(rootfs / "bin/sh")):
+        raise ValueError(f"no {form} probe form in {rootfs} (python3, /bin/sh)")
+    return form
 
 
 def owners(environ: Mapping[str, str]) -> set[int]:
@@ -369,14 +384,15 @@ To provide runsc, either re-run with --fetch-runsc (downloads gVisor release
   tar -xjf gvisor.tar.bz2 && ./runsc --version
   export QW_SANDBOX_RUNSC={work}/gvisor/runsc
 
-To provide the rootfs (pinned busybox, as in T007 increment 1):
+To provide the rootfs, either the pinned Python candidate rootfs, built and
+digest-checked as in docs/operator/sandbox-qualification.md (pass
+--expect-rootfs-digest "$(python3 tools/candidate_rootfs.py show tree_sha256)"),
+or the pinned busybox (as in T007 increment 1):
   docker pull {BUSYBOX}
   cid=$(docker create {BUSYBOX})
   mkdir -p {work}/rootfs-busybox
   docker export "$cid" | tar -x -C {work}/rootfs-busybox && docker rm "$cid"
   export QW_SANDBOX_ROOTFS={work}/rootfs-busybox
-The Python candidate rootfs (tools/candidate_rootfs.json) is rebuilt as in
-docs/operator/sandbox-qualification.md; it lacks the busybox probes the suite needs.
 """
 
 
@@ -390,6 +406,10 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--runsc-release", default=GVISOR_RELEASE)
     ap.add_argument("--work-dir", type=Path, default=Path("/var/tmp/qw-sandbox"))
     ap.add_argument("--expect-rootfs-digest", help="sha256_tree the rootfs must have")
+    ap.add_argument(
+        "--probes", choices=("busybox", "python"),
+        help="probe form (default: python if the rootfs has python3, else busybox)",
+    )  # fmt: skip
     args = ap.parse_args(argv)  # fmt: skip
     host, git, reasons = host_facts(), git_state(), []
     allowed = owners(os.environ)
@@ -422,6 +442,10 @@ def main(argv: list[str] | None = None) -> int:
             want = args.expect_rootfs_digest
             if want and want != rootfs["sha256_tree"]:
                 reasons.append(f"rootfs_digest_mismatch: expected {want}")
+            try:
+                rootfs["probes"] = probe_form(Path(env_rootfs), args.probes)
+            except ValueError as exc:
+                reasons.append(f"probe_form_unavailable: {exc}")
         elif env_rootfs:
             reasons.append(f"rootfs_unusable: {env_rootfs} has no bin/")
     except OSError as exc:
@@ -435,7 +459,7 @@ def main(argv: list[str] | None = None) -> int:
     if not pre and runsc is not None and rootfs is not None and run_dir is not None:
         env = child_env(os.environ, {
             "QW_SANDBOX_RUNSC": runsc["path"], "QW_SANDBOX_ROOTFS": rootfs["path"],
-            "PYTHONDONTWRITEBYTECODE": "1",
+            "QW_SANDBOX_PROBES": rootfs["probes"], "PYTHONDONTWRITEBYTECODE": "1",
         })  # fmt: skip
         platforms = [run_platform(p, env, run_dir) for p in PLATFORMS]
     else:
@@ -445,6 +469,8 @@ def main(argv: list[str] | None = None) -> int:
     print(f"\nPaste everything from BEGIN to END back for the T007 receipt.\n{BEGIN}")
     print(json.dumps(ev, indent=2, sort_keys=True))
     print(END)
+    if rootfs is not None and "probes" in rootfs:
+        print(f"probe form: {rootfs['probes']}")
     for p in platforms:
         print(f"{p['platform']}: real-runtime {p['real_runtime_passed']}/"
               f"{p['real_runtime_tests']} passed; {p['counts']}")  # fmt: skip
