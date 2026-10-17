@@ -24,6 +24,10 @@ G11) stays blocked. A development VM run is not a qualification.
 - The rootfs: the pinned `busybox:1.37.0@sha256:bdf57e52…5013f82e` exported to a
   directory (the script prints the steps). Only its tree digest is **recorded**. Pass
   `--expect-rootfs-digest <sha256_tree>` to require a known digest: a mismatch fails.
+  The digest (`quantweave.rootfs_tree/3`, from `tools/candidate_rootfs.py`, as in CI)
+  of the T007 busybox export is `80e3966b…bf4d22b9` (earlier values are superseded,
+  see the receipt). Busybox stays the qualification rootfs: two real-runtime tests
+  probe with its `wget`, `nslookup` and `mount`.
 
 ## Commands
 ```sh
@@ -57,3 +61,24 @@ its `pytest-<platform>.log`. The block holds no secrets, but check the paths in 
 before sharing. The orchestrator appends it verbatim to the T007 receipt, and a
 cross-model reviewer checks it. A passing block is evidence, not authority: G11, hosted
 workers and the other open T007 items still need their own evidence.
+
+## The Python candidate rootfs (owner decision 13)
+CI jobs `python-base-image` and `candidate-rootfs` build it from `python:3.13-slim`,
+pinned in `tools/candidate_rootfs.json` by its linux/amd64 manifest digest (the same
+bytes on Docker Hub and in the GHCR mirror). While a pin is `null` the job prints both
+values and fails; it may fail at the audit first, so fix the manifest, never the audit.
+The pin commit changes only `base_manifest_digest`, `tree_sha256` and `pinned_from`.
+The new GHCR `python` package may need the one-time "Manage Actions access" grant that
+`postgres` needed, or the pull returns 403. Docker-injected stubs (such as `etc/mtab`)
+can differ between Docker versions, so confirm the pin by a local x86_64 rebuild:
+```sh
+digest=$(python3 tools/candidate_rootfs.py show base_manifest_digest)
+dir=/var/tmp/qw-sandbox/rootfs-python && sudo mkdir -m 755 "$dir"  # root mode counts
+cid=$(docker create --platform linux/amd64 "docker.io/library/python@$digest")
+docker export "$cid" | sudo tar -xpf - --numeric-owner -C "$dir" && docker rm "$cid"
+for c in prune audit; do sudo python3 tools/candidate_rootfs.py $c "$dir"; done
+sudo python3 tools/candidate_rootfs.py digest "$dir" --expect "$(python3 \
+  tools/candidate_rootfs.py show tree_sha256)"
+```
+Pass the same value as `--expect-rootfs-digest`. The audit forbids `wget` and
+`nslookup`, so the egress probe test fails on this rootfs; QUAL17 stays on busybox.

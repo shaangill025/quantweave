@@ -345,12 +345,14 @@ def test_isolation_and_no_host_control(
         "ls /proc | grep -c '^[0-9]'; cat /proc/*/environ 2>/dev/null; env; "
         "for s in /var/run/docker.sock /run/docker.sock /run/containerd; do "
         "[ -e $s ] && echo SOCKET $s; done; "
+        "command -v mount >/dev/null || echo NOPROBE; "  # no vacuous pass
         "mkdir -p /tmp/m && mount -t tmpfs none /tmp/m 2>/dev/null && echo MOUNTED; "
         f"kill -9 {os.getpid()} 2>/dev/null && echo KILLED; echo still-here"
     )
     out = _ok(gvisor.run(_req(script)))
     assert CANARY not in out and "HOSTFILE" not in out and "HOSTPID" not in out
     assert "SOCKET" not in out and "MOUNTED" not in out and "KILLED" not in out
+    assert "NOPROBE" not in out
     lines = out.split("\n")
     assert int(lines[0]) <= 4  # only the candidate's own processes are visible
     assert lines[-2] == "still-here"
@@ -366,7 +368,9 @@ def test_egress_is_denied_including_host_listeners(gvisor: GVisorRunner) -> None
         socket.create_server(("127.0.0.1", 0)) as lo,
         socket.create_server((host_ip, 0)) as eth,
     ):
-        script = (
+        script = (  # a rootfs without these probes fails here, never passes
+            "for t in wget nslookup; do command -v $t >/dev/null || echo NOPROBE; "
+            "done; "
             f"wget -q -T 2 -O- http://127.0.0.1:{lo.getsockname()[1]}/ && echo LOOP; "
             f"wget -q -T 2 -O- http://{host_ip}:{eth.getsockname()[1]}/ && echo HOST; "
             "wget -q -T 2 -O- http://1.1.1.1/ && echo EGRESS; "

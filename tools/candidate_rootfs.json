@@ -1,0 +1,35 @@
+{
+  "schema": "quantweave.candidate_rootfs/1",
+  "decision": "Owner decision 13, docs/decisions/2026-10-15-owner-decisions.md: the Python candidate rootfs is built in CI and pinned by digest.",
+  "base_image": "python:3.13-slim",
+  "mirror": "ghcr.io/<this repository>/python:3.13-slim (job python-base-image; copied from Docker Hub, ECR Public as fallback)",
+  "platform": "linux/amd64",
+  "python": "3.13",
+  "base_manifest_digest": "sha256:8fb4cfa1a2616d7b8e0c2175cc6ad68f5729c34ea8488c0b360d2934b7be9024",
+  "tree_sha256": "fa51c86715be2a5ec0c8d0a66ecd90370d1699a08df462bd068064fafe4e941f",
+  "pinned_from": "https://github.com/shaangill025/quantweave/actions/runs/38998383774/job/117295989000",
+  "pinning": "Both digests are null until the first candidate-rootfs CI run prints them; that job fails while either is null. Copy the printed values here in a reviewed edit, with the run URL as pinned_from. base_manifest_digest is the linux/amd64 image manifest, the same bytes on Docker Hub and in the mirror.",
+  "remove": [
+    ".dockerenv", "etc/hostname", "etc/hosts", "etc/resolv.conf",
+    "dev/*", "usr/local/bin/pip*", "usr/local/lib/python3.13/ensurepip", "usr/local/lib/python3.13/site-packages/pip",
+    "usr/local/lib/python3.13/site-packages/pip-*.dist-info", "usr/bin/apt*", "usr/bin/dpkg*", "usr/sbin/dpkg*",
+    "usr/bin/debconf*", "usr/lib/apt", "usr/lib/dpkg", "usr/libexec/dpkg",
+    "etc/apt", "etc/dpkg", "var/lib/apt", "var/cache/apt",
+    "var/cache/debconf", "var/log/apt", "var/log/dpkg.log",
+    "etc/cron.daily/apt-compat", "etc/cron.daily/dpkg",
+    "etc/systemd/system/timers.target.wants/apt-daily*", "etc/systemd/system/timers.target.wants/dpkg-db-backup.timer",
+    "usr/lib/systemd/system/apt-daily*", "usr/lib/systemd/system/dpkg-db-backup.*"
+  ],
+  "forbidden": [
+    "^pip[0-9.]*$", "^easy_install", "^(apt|apt-.*|aptitude)$", "^dpkg(-.*)?$",
+    "^(curl|wget|nc|ncat|netcat|socat|telnet|ftp|tftp|ssh|scp|sftp|rsync|ping|ping6|nslookup|dig|host|ip|ifconfig|busybox)$",
+    "^(uv|uvx|conda|mamba|micromamba)$"
+  ],
+  "required": ["usr/local/bin/python3", "bin", "tmp"],
+  "kept": [
+    "var/lib/dpkg: the package database (data, not a tool), kept so the tree can be scanned for known vulnerabilities",
+    "sh, bash and perl from the Debian base, and Python's own socket module: general interpreters; the sandbox gives no network (runsc --network=none), so they reach nothing",
+    "setgid directories such as var/mail: group inheritance only; setuid/setgid bits are stripped from every regular file",
+    "extended attributes: tar in CI extracts none (no --xattrs), the digest covers any present except security.selinux, and a security.capability fails the audit"
+  ]
+}

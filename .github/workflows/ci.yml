@@ -54,6 +54,111 @@ jobs:
           echo "mirror digest: $(docker buildx imagetools inspect "$MIRROR" --format '{{.Manifest.Digest}}')"
           docker logout ghcr.io
 
+  # Owner decision 13: the Python candidate rootfs is built in CI and pinned by digest.
+  # Mirrors python:3.13-slim exactly as postgres-image mirrors postgres:16.
+  python-base-image:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      packages: write
+    env:
+      MIRROR: ghcr.io/${{ github.repository }}/python:3.13-slim
+      SOURCE_URL: https://github.com/${{ github.repository }}
+      ACTOR: ${{ github.actor }}
+      SAME_REPO: ${{ github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository }}
+    steps:
+      - name: Mirror python:3.13-slim into GHCR when absent
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "$GH_TOKEN" | docker login ghcr.io -u "$ACTOR" --password-stdin
+          if ! docker buildx imagetools inspect "$MIRROR" >/dev/null 2>&1; then
+            if [ "$SAME_REPO" != "true" ]; then
+              echo "::error::$MIRROR is absent and a fork PR cannot create it"; exit 1
+            fi
+            note="index:org.opencontainers.image.source=$SOURCE_URL"
+            docker buildx imagetools create --annotation "$note" -t "$MIRROR" docker.io/library/python:3.13-slim ||
+              docker buildx imagetools create --annotation "$note" -t "$MIRROR" public.ecr.aws/docker/library/python:3.13-slim
+          fi
+          echo "mirror digest: $(docker buildx imagetools inspect "$MIRROR" --format '{{.Manifest.Digest}}')"
+          docker logout ghcr.io
+
+  # Builds the candidate rootfs from the linux/amd64 manifest pinned in
+  # tools/candidate_rootfs.json, twice; each tree is pruned, audited and digested, the
+  # digests must agree and equal the pin. Fails while a pin is null (it prints them).
+  candidate-rootfs:
+    needs: python-base-image
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      packages: read
+    env:
+      REPO: ghcr.io/${{ github.repository }}/python
+      MIRROR: ghcr.io/${{ github.repository }}/python:3.13-slim
+      ACTOR: ${{ github.actor }}
+      TOOL: tools/candidate_rootfs.py
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Pull the pinned base image manifest
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -o pipefail
+          echo "$GH_TOKEN" | docker login ghcr.io -u "$ACTOR" --password-stdin
+          platform=$(python3 "$TOOL" show platform)
+          digest=$(python3 "$TOOL" show base_manifest_digest)
+          if [ -z "$digest" ]; then
+            digest=$(docker buildx imagetools inspect "$MIRROR" --raw |
+              python3 "$TOOL" platform-digest --platform "$platform")
+            echo "::warning::base_manifest_digest is not pinned; $MIRROR resolves to $digest"
+          fi
+          docker pull --platform "$platform" "$REPO@$digest"
+          docker logout ghcr.io
+          echo "BASE_DIGEST=$digest" >> "$GITHUB_ENV"
+          echo "PLATFORM=$platform" >> "$GITHUB_ENV"
+      - name: Build, prune, audit and digest the rootfs twice
+        run: |
+          set -o pipefail
+          for n in 1 2; do
+            dir="$RUNNER_TEMP/rootfs-$n"
+            mkdir -m 755 "$dir"  # the root's mode is part of the digest
+            cid=$(docker create --platform "$PLATFORM" "$REPO@$BASE_DIGEST")
+            docker export "$cid" | sudo tar -xpf - --numeric-owner -C "$dir"
+            docker rm "$cid"
+            sudo python3 "$TOOL" prune "$dir"
+            sudo python3 "$TOOL" audit "$dir"
+            sudo python3 "$TOOL" digest "$dir" > "$RUNNER_TEMP/digest-$n.json"
+          done
+          tree=$(jq -r .sha256_tree "$RUNNER_TEMP/digest-1.json")
+          if [ "$tree" != "$(jq -r .sha256_tree "$RUNNER_TEMP/digest-2.json")" ]; then
+            echo "::error::two exports of the same image gave different tree digests"; exit 1
+          fi
+          echo "TREE=$tree" >> "$GITHUB_ENV"
+      - name: Check Python in the tree, then the pinned digests
+        run: |
+          set -o pipefail
+          dir="$RUNNER_TEMP/rootfs-1"
+          ver=$(sudo chroot --userspec=65534:65534 "$dir" /usr/local/bin/python3 -I -c \
+            'import sys; print("%d.%d.%d" % sys.version_info[:3])')
+          want=$(python3 "$TOOL" show python)
+          {
+            echo "### Python candidate rootfs"
+            echo "- base: \`$REPO@$BASE_DIGEST\` ($PLATFORM)"
+            echo "- python: $ver (pinned $want)"
+            echo "- tree_sha256: \`$TREE\` ($(jq -r '.entries, .format' "$RUNNER_TEMP/digest-1.json" | paste -sd' '))"
+          } >> "$GITHUB_STEP_SUMMARY"
+          case "$ver" in "$want".*) ;; *) echo "::error::python $ver is not $want"; exit 1 ;; esac
+          pinned=$(python3 "$TOOL" show tree_sha256)
+          if [ -z "$pinned" ] || [ -z "$(python3 "$TOOL" show base_manifest_digest)" ]; then
+            echo "::error::not pinned: set base_manifest_digest to $BASE_DIGEST and tree_sha256 to $TREE in tools/candidate_rootfs.json (reviewed edit)"
+            exit 1
+          fi
+          sudo python3 "$TOOL" digest "$dir" --expect "$pinned"
+
   python:
     needs: postgres-image
     runs-on: ubuntu-24.04
