@@ -1,11 +1,13 @@
 """Recursive optimizer improvement (T050 increment 1). All data, keys and proposers
 are SYNTHETIC and deterministic; expected values are hand-computed. Records marked
-GATE-LIFTED stand in for what T044 `assess` and T051 `prepare_release` cannot yet
-produce for an optimizer target (T007 sandbox unqualified); the real path is tested
-separately and stops at `sandbox_unqualified`.
+GATE-LIFTED stand in for what T044 `assess`, T051 `prepare_release` and T051
+`install` refuse for an optimizer target (T007 sandbox unqualified): `lifted()`
+hand-builds the verdict and release, and the `gate_lifted_install` fixture lifts the
+install gate. The real path is tested separately and stops at `sandbox_unqualified`.
 """
 
 import ast
+from collections.abc import Collection
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta
 from decimal import Decimal
@@ -126,6 +128,20 @@ def lifted(reg: im.ExperimentRegistry, sc: oi.SelfChange, *, verdict: bool = Tru
                           "stepup-op-0", INST, strategies=NO)  # fmt: skip
 
 
+@pytest.fixture
+def gate_lifted_install(monkeypatch: pytest.MonkeyPatch) -> None:
+    """GATE-LIFTED SYNTHETIC: drops T051's `sandbox_unqualified` target gate for the
+    optimizer only, so the hand-built release of `lifted()` installs and stays
+    runnable. Production keeps the gate (`test_real_gates_...` installs nothing)."""
+    real = rl._target_gates
+
+    def gates(target: im.Target, approvals: Collection[str]) -> list[str]:
+        out = real(target, approvals)
+        return [g for g in out if (target, g) != (oi.OPT, "sandbox_unqualified")]
+
+    monkeypatch.setattr(rl, "_target_gates", gates)
+
+
 def chain(payload: dict[str, str] = V1_PAYLOAD) -> tuple[
     im.ExperimentRegistry, rl.DeploymentLedger, oi.CycleReceipt, oi.CycleReceipt,
     im.Candidate,
@@ -177,6 +193,7 @@ def test_optimizer_artifact_is_closed_and_hashed_on_behaviour() -> None:
         oi.Limits(2, 2, Usd("20.01"), Usd("0.50"))
 
 
+@pytest.mark.usefixtures("gate_lifted_install")
 def test_cycles_are_deterministic_and_hand_computed() -> None:
     # DEV: two docs whose Updated line differs from Published; values are first.
     # Base score = dates 0 + values 2 = 2. V0 tries only last_number: 0 + 0.
@@ -278,11 +295,14 @@ def test_real_gates_stop_the_path_before_v1_runs() -> None:
     why = verify(reg, deployment(), v0_cycle(), forged, None)
     assert {"not_installed", "sandbox_unqualified", "receipt_not_reproduced",
             "replayed_output"} <= set(why)  # fmt: skip
+    with pytest.raises(rl.ReleaseError, match="sandbox_unqualified"):
+        lifted(*self_change())  # without the lift, T051 refuses to install it
     fresh, _ = self_change()  # nothing assessed at all
     assert oi.runner_authority(V1, fresh, EXP, deployment(), RUN) == oi.Blocked(
         "authority", ("not_installed", "assessment_skipped"))  # fmt: skip
 
 
+@pytest.mark.usefixtures("gate_lifted_install")
 def test_gate_lifted_chain_passes_necessary_recursion_checks_only() -> None:
     reg, lg, r0, r1, nxt = chain()
     assert r1.authority == "release:rel-opt-1" and r1.runner_hash == V1.content_hash
@@ -309,6 +329,7 @@ def lift(**kw: object) -> tuple[str, ...]:
     return gate(*lifted(g, sc, **kw))  # type: ignore[arg-type]
 
 
+@pytest.mark.usefixtures("gate_lifted_install")
 def test_recursion_negative_controls() -> None:
     reg, lg, r0, r1, nxt = chain()
 
@@ -418,6 +439,7 @@ def test_recursion_negative_controls() -> None:
         "promote", "approve", "install", "adopt", "sign", "release"))}  # fmt: skip
 
 
+@pytest.mark.usefixtures("gate_lifted_install")
 def test_review_round2_strict_default_ambiguity_and_utc_month() -> None:
     from datetime import UTC, timezone
 
