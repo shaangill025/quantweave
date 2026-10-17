@@ -5,9 +5,9 @@
   "mirror": "ghcr.io/<this repository>/python:3.13-slim (job python-base-image; copied from Docker Hub, ECR Public as fallback)",
   "platform": "linux/amd64",
   "python": "3.13",
-  "base_manifest_digest": null,
-  "tree_sha256": null,
-  "pinned_from": null,
+  "base_manifest_digest": "sha256:8fb4cfa1a2616d7b8e0c2175cc6ad68f5729c34ea8488c0b360d2934b7be9024",
+  "tree_sha256": "fa51c86715be2a5ec0c8d0a66ecd90370d1699a08df462bd068064fafe4e941f",
+  "pinned_from": "https://github.com/shaangill025/quantweave/actions/runs/38998383774/job/117295989000",
   "pinning": "Both digests are null until the first candidate-rootfs CI run prints them; that job fails while either is null. Copy the printed values here in a reviewed edit, with the run URL as pinned_from. base_manifest_digest is the linux/amd64 image manifest, the same bytes on Docker Hub and in the mirror.",
   "remove": [
     ".dockerenv", "etc/hostname", "etc/hosts", "etc/resolv.conf",
