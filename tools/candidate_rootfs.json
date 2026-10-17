@@ -15,7 +15,10 @@
     "usr/local/lib/python3.13/site-packages/pip-*.dist-info", "usr/bin/apt*", "usr/bin/dpkg*", "usr/sbin/dpkg*",
     "usr/bin/debconf*", "usr/lib/apt", "usr/lib/dpkg", "usr/libexec/dpkg",
     "etc/apt", "etc/dpkg", "var/lib/apt", "var/cache/apt",
-    "var/cache/debconf", "var/log/apt", "var/log/dpkg.log"
+    "var/cache/debconf", "var/log/apt", "var/log/dpkg.log",
+    "etc/cron.daily/apt-compat", "etc/cron.daily/dpkg",
+    "etc/systemd/system/timers.target.wants/apt-daily*", "etc/systemd/system/timers.target.wants/dpkg-db-backup.timer",
+    "usr/lib/systemd/system/apt-daily*", "usr/lib/systemd/system/dpkg-db-backup.*"
   ],
   "forbidden": [
     "^pip[0-9.]*$", "^easy_install", "^(apt|apt-.*|aptitude)$", "^dpkg(-.*)?$",
