@@ -41,6 +41,9 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import IO, Any
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))  # also under python -P
+from candidate_rootfs import tree_digest  # shared with the CI rootfs job
+
 ROOT = Path(__file__).resolve().parent.parent
 TEST_FILES = ("packages/adapters/tests/test_gvisor_sandbox.py",
               "packages/domain/tests/test_sandbox.py")  # fmt: skip
@@ -230,31 +233,6 @@ def _file_sha(path: Path, algo: str) -> str:
     return h.hexdigest()
 
 
-def tree_digest(root: Path) -> dict[str, Any]:
-    """SHA-256 over every entry's path, type, mode, link target and content."""
-    lines: list[str] = []
-    seen: dict[tuple[int, int], str] = {}  # hard links (busybox) hashed once
-    for dirpath, dirs, files in os.walk(root):
-        dirs.sort()
-        for name in sorted([*dirs, *files]):
-            p = Path(dirpath, name)
-            st = p.lstat()
-            mode = f"{stat.S_IMODE(st.st_mode):o}"
-            rel = p.relative_to(root).as_posix()
-            if stat.S_ISLNK(st.st_mode):
-                extra = "l " + os.readlink(p)
-            elif stat.S_ISREG(st.st_mode):
-                key = (st.st_dev, st.st_ino)
-                if key not in seen:
-                    seen[key] = _file_sha(p, "sha256")
-                extra = "f " + seen[key]
-            else:
-                extra = "d" if stat.S_ISDIR(st.st_mode) else f"o {st.st_mode:o}"
-            lines.append(f"{rel}\0{mode}\0{extra}")
-    digest = hashlib.sha256("\n".join(lines).encode()).hexdigest()
-    return {"path": str(root), "sha256_tree": digest, "entries": len(lines)}
-
-
 def verify_sha512(path: Path, sha_text: str) -> str:
     expected = (sha_text.split() or [""])[0].lower()
     actual = _file_sha(path, "sha512")
@@ -397,6 +375,8 @@ To provide the rootfs (pinned busybox, as in T007 increment 1):
   mkdir -p {work}/rootfs-busybox
   docker export "$cid" | tar -x -C {work}/rootfs-busybox && docker rm "$cid"
   export QW_SANDBOX_ROOTFS={work}/rootfs-busybox
+The Python candidate rootfs (tools/candidate_rootfs.json) is rebuilt as in
+docs/operator/sandbox-qualification.md; it lacks the busybox probes the suite needs.
 """
 
 
