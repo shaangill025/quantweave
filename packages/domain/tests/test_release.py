@@ -435,3 +435,96 @@ def test_review_nits_duties_targets_receipts_keys_and_read_time() -> None:
     assert rl.verify_release(signed(), boom, INST, True) == ["bad_signature"]
     with pytest.raises(rl.ReleaseError, match="time_order"):  # N8
         rl.strategy_state(lg, NO, USER_A, SID, ADOPT - timedelta(seconds=1))
+
+
+def _hand_built(target: im.Target, **kw: object) -> rl.SignedRelease:
+    """A manifest assembled without `prepare_release` and signed with the trusted
+    key: the bypass the T050 cross-model review found (SYNTHETIC)."""
+    base = signed().manifest
+    fields: dict[str, object] = {
+        "release_id": f"rel-hand-{target.value}", "target": target,
+        "component": f"{target.value}:{target.value}", "strategy_version": None,
+        "strategy_material_hash": None,
+        "approval": approval(step=f"stepup-hand-{target.value}"),
+    } | kw  # fmt: skip
+    return rl.sign_release(replace(base, **fields), KEY)  # type: ignore[arg-type]
+
+
+def test_followup_install_rechecks_the_sandbox_gate() -> None:
+    lg = installed(signed())
+    for target in sorted(im.SANDBOX_TARGETS):  # R076: T007 still unqualified
+        sr = _hand_built(target)
+        assert rl.verify_release(sr, KEYS, INST, True) == ["sandbox_unqualified"]
+        assert rl.verify_release(sr, {}, INST, True) == ["sandbox_unqualified",
+                                                         "untrusted_key"]  # fmt: skip
+        with pytest.raises(rl.ReleaseError, match=r"^sandbox_unqualified"):
+            lg.install("ev-h", sr, "operator-synth", "stepup-op-h",
+                       INST + timedelta(hours=1), strategies=NO)  # fmt: skip
+        assert lg.head(sr.manifest.component) is None and len(lg.entries) == 1
+        assert lg.schema == 1 and "stepup-op-h" not in lg.step_ups
+        ev = rl.Install("ev-h", sr, "operator-synth", "stepup-op-h",
+                        INST + timedelta(hours=1))  # fmt: skip
+        with pytest.raises(rl.ReleaseError, match=r"^sandbox_unqualified"):
+            rl.DeploymentLedger(lg.deployment, KEYS, (*lg.entries, ev))  # replay
+
+
+def test_followup_install_rechecks_prepare_invariants_in_the_manifest() -> None:
+    S, R = im.Target.STRATEGY, im.Target.RESEARCH
+    m = signed().manifest
+    named = {"strategy_version": m.strategy_version,
+             "strategy_material_hash": m.strategy_material_hash}  # fmt: skip
+    cases = {
+        "maintainer_release_not_required": _hand_built(
+            R, required_approvals=("operator_install",)
+        ),
+        "strategy_binding": _hand_built(S, component=COMP),  # no strategy version
+        "component": _hand_built(R, component="strategy:research"),
+    }
+    more = (("strategy_binding", _hand_built(S, component=COMP,
+                                             strategy_version="0.2.0")),
+            ("component", _hand_built(S, component=f"research:{SID}", **named)),
+            ("component", _hand_built(S, component="strategy:", **named)),
+            ("component", _hand_built(R, component="research:other")))  # fmt: skip
+    for code, sr in more:
+        assert rl.verify_release(sr, KEYS, INST, True) == [code]
+    lg = deployment()
+    for code, sr in cases.items():
+        assert rl.verify_release(sr, KEYS, INST, True) == [code]
+        with pytest.raises(rl.ReleaseError, match=rf"^{code}"):
+            lg.install("ev-h", sr, "operator-synth", "stepup-op-h", INST,
+                       strategies=NO)  # fmt: skip
+        assert lg.entries == ()
+    odd = _hand_built(R, **named)  # a research manifest carrying strategy fields
+    assert rl.verify_release(odd, KEYS, INST, True) == ["strategy_binding"]
+    # Legitimate targets assembled the same way still install (no over-refusal).
+    ok = _hand_built(R)
+    assert rl.verify_release(ok, KEYS, INST, True) == []
+    lg = lg.install("ev-ok", ok, "operator-synth", "stepup-op-ok", INST,
+                    strategies=NO)  # fmt: skip
+    assert lg.head("research:research") == ok.manifest.release_id
+
+
+def test_review_manifest_types_and_two_rule_order() -> None:
+    lg, at = deployment(), INST
+
+    def install_code(sr: rl.SignedRelease) -> str:
+        with pytest.raises(rl.ReleaseError) as e:
+            lg.install("ev-h", sr, "operator-synth", "stepup-op-h", at, strategies=NO)
+        return e.value.code
+
+    base = _hand_built(im.Target.RESEARCH)
+    bare = replace(base.manifest, target="research")  # type: ignore[arg-type]
+    untyped = rl.SignedRelease(bare, "0" * 64, KEY.key_id, KEY.algorithm, "sig")
+    assert rl.verify_release(untyped, KEYS, at, True) == ["target_type"]
+    assert install_code(untyped) == "target_type"
+    for approvals in ("maintainer_release", ["maintainer_release"],
+                      ("maintainer_release", 1)):  # fmt: skip
+        sr = _hand_built(im.Target.RESEARCH, required_approvals=approvals)
+        assert rl.verify_release(sr, KEYS, at, True) == ["approvals_type"]
+        assert install_code(sr) == "approvals_type"
+    both = _hand_built(im.Target.APPLICATION_CODE,
+                       required_approvals=("operator_install",))  # fmt: skip
+    assert rl.verify_release(both, KEYS, at, True) == [
+        "sandbox_unqualified", "maintainer_release_not_required"]  # fmt: skip
+    assert install_code(both) == "sandbox_unqualified"
+    assert lg.entries == ()
