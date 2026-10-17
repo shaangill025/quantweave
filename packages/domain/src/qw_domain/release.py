@@ -9,6 +9,9 @@ R030, R034, R039, R051, R076, R087, R092, R096, R099). Domain only, stdlib only.
   installation-scope protocol that requires maintainer release can be released.
   Tenant-scope candidates (R039) and code/optimizer targets (T007 sandbox not
   qualified, R076) are refused. Producer and assessor actors cannot sign (R030).
+  Verification and install re-check the gates the manifest can show (target,
+  required approvals, strategy binding, component), so a hand-built manifest signed
+  with a trusted key cannot skip them.
 - The signature covers the canonical manifest: candidate, artifact, protocol and
   strategy hashes, verdict id, required approvals, schema compatibility, rollback
   version and the maintainer's approval. Verification checks the key id against the
@@ -24,7 +27,7 @@ so operators hold public keys only (R096). No persistence; times, actor ids and
 step-up receipts are caller-asserted. Verdicts are trusted as recorded (T044 N3).
 """
 
-from collections.abc import Mapping
+from collections.abc import Collection, Mapping
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import StrEnum
@@ -185,6 +188,37 @@ class ReleaseManifest:
         return ApprovalClass.USER_STRATEGY_ADOPTION.value in self.required_approvals
 
 
+def _target_gates(target: Target, approvals: Collection[str]) -> list[str]:
+    """Target gates shared by `prepare_release` and `verify_release`, so a signed
+    manifest that skipped preparation cannot pass a gate preparation enforces."""
+    out = []
+    if target in SANDBOX_TARGETS:  # R076: T007 sandbox not qualified
+        out.append("sandbox_unqualified")
+    if ApprovalClass.MAINTAINER_RELEASE not in approvals:
+        out.append("maintainer_release_not_required")
+    return out
+
+
+def manifest_refusals(m: ReleaseManifest) -> list[str]:
+    """`prepare_release` invariants that the manifest alone can show. Self-approval,
+    scope and verdict order need the registry and are checked only when preparing.
+    A mistyped target or approval list is refused alone: nothing else can be read."""
+    if not isinstance(m.target, Target):
+        return ["target_type"]
+    approvals = m.required_approvals
+    if type(approvals) is not tuple or not all(isinstance(a, str) for a in approvals):
+        return ["approvals_type"]  # a bare str would pass a substring `in` test
+    out = _target_gates(m.target, approvals)
+    strategy = m.target is Target.STRATEGY
+    absent = (m.strategy_version is None, m.strategy_material_hash is None)
+    if absent != (not strategy, not strategy):  # strategy releases name both
+        out.append("strategy_binding")
+    kind, _, sid = m.component.partition(":")
+    if kind != m.target.value or not sid or (not strategy and sid != kind):
+        out.append("component")
+    return out
+
+
 def prepare_release(
     reg: ExperimentRegistry, candidate_id: str, release_id: str,
     compatibility: Compatibility, approval: MaintainerApproval,
@@ -199,10 +233,8 @@ def prepare_release(
     p = reg.protocol(c.experiment_id)
     if p.scope is not Scope.INSTALLATION:
         raise ReleaseError("tenant_scope", "private learning is not a shared release")
-    if p.target in SANDBOX_TARGETS:
-        raise ReleaseError("sandbox_unqualified", p.target.value)
-    if ApprovalClass.MAINTAINER_RELEASE not in p.approvals:
-        raise ReleaseError("maintainer_release_not_required", p.target.value)
+    if gates := _target_gates(p.target, p.approvals):
+        raise ReleaseError(gates[0], p.target.value)
     verdicts = reg.verdicts(candidate_id)
     if not verdicts or verdicts[-1].decision is not Decision.ACCEPT_FOR_REVIEW:
         raise ReleaseError("not_accepted", candidate_id)
@@ -254,12 +286,15 @@ def verify_release(
     sr: SignedRelease, keys: Mapping[str, TrustedKey], at: datetime,
     allow_test_keys: bool,
 ) -> list[str]:  # fmt: skip
-    """Reasons the release cannot be trusted at `at`; empty when it verifies."""
+    """Reasons the release cannot be trusted at `at`; empty when it verifies. A
+    validly signed manifest is still refused if it breaks a preparation gate."""
     at, m = ensure_aware_utc(at), sr.manifest
+    out = manifest_refusals(m)
+    if out[:1] in (["target_type"], ["approvals_type"]):
+        return out  # the manifest cannot be hashed or read further
     k = keys.get(sr.key_id)
     if k is None or k.key_id != sr.key_id or k.algorithm != sr.algorithm:
-        return ["untrusted_key"]
-    out = []
+        return [*out, "untrusted_key"]
     if k.principal_id != m.approval.principal_id:
         out.append("key_principal")
     if m.approval.approved_at < k.valid_from or (
@@ -424,6 +459,8 @@ class DeploymentLedger:
         at = self._act(e.operator_id, e.step_up_receipt_id, e.at)
         if isinstance(e, Install):
             m = e.release.manifest
+            if why := manifest_refusals(m):  # typed, before any state change
+                raise ReleaseError(why[0], ",".join(why))
             if m.release_id in s.installs:
                 raise ReleaseError("release_conflict", m.release_id)
             if m.approval.step_up_receipt_id in s.step_ups | {e.step_up_receipt_id}:
