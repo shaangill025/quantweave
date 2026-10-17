@@ -260,3 +260,19 @@ def test_direct_construction_fails_closed() -> None:
     assert rc.RetentionConfig(base.policy, ok, (met,)).obligations == (met,)
     with pytest.raises(rt.RetentionError):
         rc.Obligation(C.AUDIT, -D, "counsel-1", "synthetic-opinion-1")
+
+
+def test_an_obligation_is_met_exactly_at_its_minimum() -> None:
+    """30 days owed: a rule one hour (or 1 µs) short is refused; exactly 30 days and
+    longer are accepted."""
+    owed = rc.Obligation(C.BACKUP, 30 * D, "counsel-1", "synthetic-opinion-1")
+
+    def rule(after: timedelta) -> rt.Rule:
+        return rt.Rule(C.BACKUP, OR.RETAIN, after, "owner", "synthetic-basis-1")
+
+    for short in (29 * D + 23 * H, 30 * D - timedelta(microseconds=1)):
+        with pytest.raises(rt.RetentionError) as err:
+            owed.check(rule(short))
+        assert err.value.code == "obligation"
+    for enough in (30 * D, 30 * D + timedelta(microseconds=1), 31 * D):
+        owed.check(rule(enough))

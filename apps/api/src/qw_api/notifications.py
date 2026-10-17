@@ -16,15 +16,19 @@ objects and resolver errors read `unavailable`, named in coverage.
 With the user's `in_app` preference off, only safety categories (risk pauses) keep
 their in-app row; preferences failing verification list as if it were off and
 name `unavailable:notification_preferences/integrity` (never more than allowed).
+An enabled external channel names `unavailable:delivery/<channel>:no_transport`.
 
-`PATCH /notifications/preferences` (setNotificationPreferences, increment 4): any
+`PATCH /notifications/preferences` (setNotificationPreferences, increments 4-5): any
 member's own preferences (the session user; no id names another user), CSRF,
 Idempotency-Key (C-03) and If-Match `"N"` (T010 form; 428 absent, 412 otherwise
 stale or malformed; the openapi text says 409, as recorded for T019). There is no
 read operation: nothing recorded is revision `"0"` (the domain defaults), and each
 response, replays too, carries the ETag of the revision its request recorded.
-Enabling email or browser push is refused (422 `external_channel_unavailable`,
-a neutral detail): step-up for it is an open owner decision, no transport exists.
+Turning email or browser push on needs the session's step-up within
+`Settings.step_up_window` (owner decision 4; the store checks it under the lock),
+else 401 `step_up_required` as `security.require_step_up`, writing nothing;
+keeping one on or turning it off needs none. Nothing is sent: no transport exists,
+and `NotificationPreferences` has no field to say so (the feed's coverage does).
 Detail exposure is refused (422). Stored preferences failing checks, the replay
 ETag lookup included, are 409 `integrity`; a purged-key replay writes no audit.
 """
@@ -118,6 +122,7 @@ def list_notifications(
         raise ApiError(400, "invalid_cursor", "The cursor is not valid here.") from None
     keys, user = keyring(sec.settings_of(request)), str(principal.session.user_id)
     reasons = list[str]()
+    prefs = dn.Preferences(in_app=False)
     with principal.tx() as tx:
         try:
             try:  # lock order: pause, then preference
@@ -125,16 +130,16 @@ def list_notifications(
             except pause_store.PauseStoreError:
                 held = None
             try:
-                in_app = prefs_store.load(
-                    tx, principal.session.user_id
-                ).preferences.in_app
+                prefs = prefs_store.load(tx, principal.session.user_id).preferences
             except prefs_store.PreferenceStoreError as exc:
                 if exc.code != "integrity":
                     raise
-                in_app = False  # unverifiable: never list more than allowed
+                # unverifiable: never list more than allowed
                 reasons.append(PREFERENCES_INTEGRITY)
-            rows = ns.page(tx, keys, user, limit + 1,
-                           None if seq is None else (seq, rank), in_app)  # fmt: skip
+            reasons += [f"unavailable:delivery/{ch}:no_transport"
+                        for ch in dn.EXTERNAL if prefs.enabled(ch)]  # fmt: skip
+            after = None if seq is None else (seq, rank)
+            rows = ns.page(tx, keys, user, limit + 1, after, prefs.in_app)
             now, views = _now(tx), dict[str, dn.CurrentView | None]()
             for r in rows[:limit]:
                 if r.item is None:
@@ -187,8 +192,7 @@ class PreferencesBody(routes.Body):
 
 
 _REFUSED = {
-    "external_channel_unavailable": (422, "External notification channels are not "
-        "available."),
+    "step_up_required": (401, "Re-authenticate to continue."),
     "detail_exposure_unsupported": (422, "Financial values are always redacted."),
     "stale": (412, "The preferences have changed."),
     "idempotency_key_reused": (409, "Key used elsewhere."),
@@ -235,7 +239,8 @@ def set_notification_preferences(
         p = _preferences(body)
         try:
             cur, wrote = prefs_store.set_preferences(
-                tx, session.user_id, session.session_id, key, int(m[1]), p)  # fmt: skip
+                tx, session.user_id, session.session_id, key, int(m[1]), p,
+                step_up_window=sec.settings_of(request).step_up_window)  # fmt: skip
         except prefs_store.PreferenceStoreError as exc:
             if exc.code not in _REFUSED:
                 raise  # database: a crash (500), never a client answer

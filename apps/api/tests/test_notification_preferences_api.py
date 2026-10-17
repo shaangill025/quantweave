@@ -7,12 +7,19 @@ validated strictly against the contract `NotificationPreferences`."""
 from __future__ import annotations
 
 import importlib.util
+import re
+import smtplib
+import socket
 import sys
+from datetime import timedelta
 from pathlib import Path
 from typing import Any
 
 import pytest
 from jsonschema import Draft202012Validator  # type: ignore[import-untyped]
+from qw_adapters import notification_preference_store as prefs_store
+from qw_adapters import tenancy as tn
+from qw_domain import notifications as dn
 
 ROOT = Path(__file__).parents[3]
 
@@ -58,7 +65,7 @@ def revisions(w: Any) -> int:
 
 
 @pytest.mark.db
-def test_preferences_follow_if_match_idempotency_and_refuse_external(
+def test_preferences_follow_if_match_and_idempotency(
     world: Any,
 ) -> None:
     login(world.client, "bob")
@@ -76,12 +83,12 @@ def test_preferences_follow_if_match_idempotency_and_refuse_external(
     ok(patch(world, DEFAULTS, '"1"', "SYNTHETIC-pref-k-02"), DEFAULTS, '"2"')
     replay = patch(world, QUIET, '"0"', "SYNTHETIC-pref-k-01")  # its own revision
     ok(replay, QUIET, '"1"')
-    # Refused, writing nothing: external channels (owner decision), detail
-    # exposure, malformed windows and zones, wrong types and unknown fields.
+    # Refused, writing nothing: external channels without step-up (owner decision
+    # 4), detail exposure, malformed windows and zones, wrong types, unknown fields.
     for name in ("email", "browser_push"):
-        got = assert_problem(patch(world, DEFAULTS | {name: True}, '"2"'), 422,
-                             "external_channel_unavailable")  # fmt: skip
-        assert got["detail"] == "External notification channels are not available."
+        got = assert_problem(patch(world, DEFAULTS | {name: True}, '"2"'), 401,
+                             "step_up_required")  # fmt: skip
+        assert got["detail"] == "Re-authenticate to continue."
     assert_problem(patch(world, DEFAULTS | {"redact_financial_values": False},
                          '"2"'), 422, "detail_exposure_unsupported")  # fmt: skip
     for field, value in (("quiet_hours", ["7:00-8:00"]),
@@ -129,6 +136,7 @@ def test_the_feed_honours_in_app_and_fails_closed_on_tamper(
 ) -> None:
     ids, *_ = nt.seed(world, app_conn, runtime_urls)
     pause = next(k for k in ids if k not in ("job-syn-1", "prop-syn-n"))
+    job = f"unavailable:{ids['job-syn-1']}"  # qw_app cannot read job outcomes
     login(world.client, "alice")  # alice turning the feed off does not touch bob's
     ok(patch(world, QUIET, '"0"'), QUIET, '"1"')
     login(world.client, "bob")
@@ -140,8 +148,13 @@ def test_the_feed_honours_in_app_and_fails_closed_on_tamper(
         assert [(i["object_id"], i["channel"]) for i in items] == [
             ("job-syn-1", "email"), (pause, "in_app"), (pause, "email"),
             ("prop-syn-n", "email")]  # fmt: skip
-    ok(patch(world, DEFAULTS, '"1"', "SYNTHETIC-pref-k-03"), DEFAULTS, '"2"')
+    assert api.step_up(world.client).status_code == 200
+    email = DEFAULTS | {"email": True}  # so a verified read would name no_transport
+    ok(patch(world, email, '"1"', "SYNTHETIC-pref-k-03"), email, '"2"')
     assert nt.walk(world.client, 50)[0] == everything  # nothing was lost
+    assert world.client.get(nt.URL).json()["coverage"]["reasons"] == [
+        "unavailable:delivery/email:no_transport", f"{job}/current_object_state",
+        f"{job}:email/current_object_state"]  # fmt: skip
     nt.tamper(world, "UPDATE app.notification_preference SET quiet_hours_timezone ="
               " 'Europe/Paris' WHERE revision = 2")  # fmt: skip
     body = world.client.get(nt.URL).json()
@@ -150,13 +163,123 @@ def test_the_feed_honours_in_app_and_fails_closed_on_tamper(
         ("job-syn-1", "email"), (pause, "in_app"), (pause, "email"),
         ("prop-syn-n", "email")]  # fmt: skip
     assert body["coverage"]["status"] == "partial"
-    assert "unavailable:notification_preferences/integrity" in body["coverage"][
-        "reasons"]  # fmt: skip
+    # exactly: an unverifiable user is never told about a channel (no_transport)
+    assert body["coverage"]["reasons"] == [
+        "unavailable:notification_preferences/integrity",
+        f"{job}:email/current_object_state"]  # fmt: skip
     assert_problem(patch(world, QUIET, '"2"'), 409, "integrity")
     # a stored replay is served, but its ETag lookup fails closed, never a 500
-    replay = patch(world, DEFAULTS, '"1"', "SYNTHETIC-pref-k-03")
+    replay = patch(world, email, '"1"', "SYNTHETIC-pref-k-03")
     assert_problem(replay, 409, "integrity")
     assert revisions(world) == 3
     login(world.client, "alice")  # one user's tampered row does not affect another
     assert world.client.get(nt.URL).json()["coverage"] == {"status": "complete",
                                                            "reasons": []}  # fmt: skip
+
+
+def age_step_up(w: Any, user: str, by: timedelta) -> None:
+    nt.tamper(w, f"UPDATE app.session SET created_at = least(created_at, now() - "
+              f"interval '{by.total_seconds()} seconds'), step_up_at = now() - "
+              f"interval '{by.total_seconds()} seconds' WHERE user_id = "
+              f"'{w.users[user]}'")  # fmt: skip
+
+
+@pytest.mark.db
+def test_external_channels_need_step_up_and_nothing_is_sent(
+    world: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Owner decision 4: enabling email or push needs a step-up within the window;
+    keeping or disabling one does not. No transport exists, nothing dispatches."""
+    calls: list[str] = []
+
+    def record(name: str) -> Any:
+        def call(*args: Any, **kwargs: Any) -> Any:
+            calls.append(name)
+            raise AssertionError(f"{name} invoked")
+
+        return call
+
+    monkeypatch.setattr(dn.Center, "attempt", record("Center.attempt"))
+    monkeypatch.setattr(smtplib, "SMTP", record("smtplib.SMTP"))
+    monkeypatch.setattr(smtplib, "SMTP_SSL", record("smtplib.SMTP_SSL"))
+    monkeypatch.setattr(socket, "create_connection", record("socket"))
+    monkeypatch.setattr(socket.socket, "connect", record("socket.connect"))
+    nt.keys(world, nt.KEY)
+    login(world.client, "bob")
+    email = DEFAULTS | {"email": True}
+    both = email | {"browser_push": True}
+    got = assert_problem(patch(world, email, '"0"', "SYNTHETIC-pref-k-11"), 401,
+                         "step_up_required")  # fmt: skip
+    assert got["detail"] == "Re-authenticate to continue." and revisions(world) == 0
+    assert api.step_up(world.client).status_code == 200
+    first = patch(world, email, '"0"', "SYNTHETIC-pref-k-11")  # the same key retried
+    ok(first, email, '"1"')
+    replay = patch(world, email, '"0"', "SYNTHETIC-pref-k-11")
+    assert replay.content == first.content and replay.headers["etag"] == '"1"'
+    stored = world.db.execute("SELECT step_up_at FROM app.notification_preference "
+                              "WHERE revision = 1").fetchone()  # fmt: skip
+    assert stored is not None and stored[0] is not None
+    body = world.client.get(nt.URL).json()
+    assert body["coverage"] == {"status": "partial", "reasons": [
+        "unavailable:delivery/email:no_transport"]}  # fmt: skip
+    age_step_up(world, "bob", timedelta(hours=2))  # expired
+    assert_problem(patch(world, both, '"1"'), 401, "step_up_required")
+    with api.client_for(world.url, step_up_window=timedelta(microseconds=1)) as strict:
+        login(strict, "bob")  # the API's window, narrower than the database's
+        assert api.step_up(strict).status_code == 200
+        headers = {**api.csrf(strict), "If-Match": '"1"'}
+        assert_problem(strict.patch(URL, json=both, headers=headers), 401,
+                       "step_up_required")  # fmt: skip
+    assert revisions(world) == 1
+    # keeping email on and turning it off need no step-up
+    keep = email | {"quiet_hours": ["22:00-07:00"]}
+    ok(patch(world, keep, '"1"', "SYNTHETIC-pref-k-12"), keep, '"2"')
+    ok(patch(world, DEFAULTS, '"2"', "SYNTHETIC-pref-k-13"), DEFAULTS, '"3"')
+    assert world.client.get(nt.URL).json()["coverage"]["status"] == "complete"
+    assert_problem(patch(world, both, '"3"'), 401, "step_up_required")
+    assert api.step_up(world.client).status_code == 200
+    ok(patch(world, both, '"3"', "SYNTHETIC-pref-k-14"), both, '"4"')
+    assert world.client.get(nt.URL).json()["coverage"]["reasons"] == [
+        "unavailable:delivery/email:no_transport",
+        "unavailable:delivery/browser_push:no_transport"]  # fmt: skip
+    assert revisions(world) == 4 and calls == []
+
+
+@pytest.mark.db
+def test_a_session_revoked_after_authentication_cannot_enable(
+    world: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The session is revoked inside the request's transaction, after it was
+    authenticated and stepped up: 401 step_up_required, never a 500, nothing
+    written."""
+    login(world.client, "bob")
+    assert api.step_up(world.client).status_code == 200
+    original = prefs_store.set_preferences
+
+    def revoked_first(tx: Any, user: Any, session: Any, *args: Any,
+                      **kwargs: Any) -> Any:  # fmt: skip
+        assert tn.revoke_session(tx, session)
+        return original(tx, user, session, *args, **kwargs)
+
+    monkeypatch.setattr(prefs_store, "set_preferences", revoked_first)
+    for name in ("email", "browser_push"):
+        got = assert_problem(patch(world, DEFAULTS | {name: True}, '"0"'), 401,
+                             "step_up_required")  # fmt: skip
+        assert got["detail"] == "Re-authenticate to continue."
+    assert revisions(world) == 0
+
+
+def test_no_source_module_can_dispatch_externally() -> None:
+    """No transport exists (adding one needs owner authorisation): outside the
+    domain's `Transport` protocol and `Center.attempt`, no source names them, and
+    none imports a mail or push client."""
+    sources = sorted([*ROOT.glob("apps/*/src/**/*.py"),
+                      *ROOT.glob("packages/*/src/**/*.py")])  # fmt: skip
+    assert len(sources) > 50
+    domain = ROOT / "packages/domain/src/qw_domain/notifications.py"
+    pattern = re.compile(r"\b(smtplib|aiosmtplib|webpush|pywebpush|Transport)\b"
+                         r"|\.attempt\(|\.send\(")  # fmt: skip
+    hits = [f"{p.relative_to(ROOT)}:{n}" for p in sources if p != domain
+            for n, line in enumerate(p.read_text().splitlines(), 1)
+            if pattern.search(line)]  # fmt: skip
+    assert hits == []
