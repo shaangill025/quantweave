@@ -1,10 +1,14 @@
 """Improvement experiments (T044 increment 2; `0026_experiments.sql`, with the
-project contract 0.6.0 states and revisions of `0027_experiment_states.sql`).
-- `record` takes `qw_domain.improvement.record`'s inputs and calls it, so it can
-  store nothing else (no record is accepted from the caller); as qw_worker (the
-  only INSERT role). Equal to the latest revision it writes nothing, else it must
-  `may_follow` it, and a verdict id never repeats in its chain (a re-assessment
-  is a new verdict). Tenant scope of this tenant only (`scope`).
+project contract 0.6.0 states and revisions of `0027_experiment_states.sql`, and
+the assessor store of `0028_assessor_ledger.sql`).
+- `record` takes `qw_domain.improvement.record`'s inputs and calls `derive`, so it
+  can store nothing else (no record is accepted from the caller); as qw_worker (the
+  only INSERT role), on the stored protocol and lineage and a ledger that
+  `assessor_store` admits (Q7 across ledgers); each verdict is stored as an
+  evaluation receipt before its revision. Equal to the latest revision
+  it writes nothing, else it must `may_follow` it, and a verdict id never repeats
+  in its chain (a re-assessment is a new verdict). Tenant scope of this tenant only
+  (`scope`). The budget book is still the caller's.
 - Every read re-hashes each revision, checks the chain (1..n, previous hash, times),
   rebuilds rows through the domain `ExperimentRecord` and `may_follow` (0.5.0 rows
   stay readable), checks verdict ids are unique per chain and a reservation id
@@ -27,17 +31,13 @@ from qw_domain.budget import BudgetBook
 from qw_domain.instants import ensure_aware_utc, format_instant
 from qw_domain.trial_ledger import SplitPlan
 
+from qw_adapters import assessor_store as ast
+from qw_adapters.assessor_store import ExperimentStoreError
 from qw_adapters.tenancy import TenantTx
 
 __all__ = ["ExperimentStoreError", "Revision", "load", "page", "record",
            "revision_hash"]  # fmt: skip
 _COLUMNS = tuple(f.name for f in fields(im.ExperimentRecord))
-
-
-class ExperimentStoreError(Exception):
-    def __init__(self, code: str, message: str = "") -> None:
-        super().__init__(f"{code}: {message}")
-        self.code = code
 
 
 @dataclass(frozen=True, slots=True)
@@ -142,21 +142,29 @@ def record(
     assessment: im.Assessment | None = None,
 ) -> tuple[Revision, bool]:  # fmt: skip
     """Derive the record (`improvement.record`) and append it as the experiment's
-    next revision; (revision, wrote)."""
+    next revision; (revision, wrote). The protocol and lineage are stored before
+    the transition checks, so a caller must not commit the transaction after
+    catching `ExperimentStoreError` (rolling it back undoes them)."""
     if type(registry) is not im.ExperimentRegistry:
         raise TypeError("the domain registry is required, not a record")
-    rec = im.record(registry, experiment_id, candidate_id, plan, book, outcome,
-                    assessment)  # fmt: skip
-    if rec.scope is not im.Scope.TENANT or rec.scope_id != str(tx.tenant_id):
+    p = registry.protocol(experiment_id)
+    if p.scope is not im.Scope.TENANT or p.scope_id != str(tx.tenant_id):
         raise ExperimentStoreError("scope", "tenant-scope records of this tenant")
     _lock(tx, shared=False)
-    chain = _chains(tx, rec.experiment_id).get(rec.experiment_id, [])
+    chain = _chains(tx, experiment_id).get(experiment_id, [])
+    stored = ast.bind(tx, registry, experiment_id, candidate_id)
+    rec, verdict = im.derive(stored, experiment_id, candidate_id, plan, book,
+                             outcome, assessment)  # fmt: skip
     last = chain[-1] if chain else None
     if last is not None and last.record == rec:
         return last, False
     if last is not None and not (rec.may_follow(last.record)
                                  and _new_verdict(rec, chain)):  # fmt: skip
         raise ExperimentStoreError("transition", "not a later state of this record")
+    if verdict is not None and assessment is not None:
+        ast.admit(tx, stored.protocol(experiment_id), assessment.ledger)
+        ast.put_verdict(tx, stored.protocol(experiment_id), verdict,
+                        assessment.ledger)  # fmt: skip
     row = tx.conn.execute("SELECT clock_timestamp()").fetchone()
     assert row is not None
     at, n = ensure_aware_utc(row[0]), len(chain) + 1

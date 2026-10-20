@@ -34,12 +34,13 @@ R030, R032, R033, R035, R037, R084, R092, R099). Domain only, stdlib only.
   re-assessed on the same frozen protocol under a new verdict id: `assess` admits
   only the plan's first holdout read in the ledger it is given and never
   re-reserves the budget, and a new plan is a new protocol, so a new experiment
-  (owner decision Q7). Ledgers are not persisted, so the single holdout read is
-  enforced against the caller's ledger only. 0.5.0 records
+  (owner decision Q7). experiment_store persists protocols, lineage, holdout reads
+  and verdicts (`derive`), so the single holdout read holds across ledgers there
+  (0028). 0.5.0 records
   (`failed` for insufficient evidence; blocked verdicts and code targets as
   proposed or authorized) stay readable and are never derived.
-LIMITATIONS: only `record` output is persisted (protocols, candidates and verdicts
-are not); times and actor ids are caller-asserted; evidence uses
+LIMITATIONS: the budget book is not persisted; times and actor ids are
+caller-asserted; evidence uses
 are checked against the store only when a candidate is first registered;
 `record_verdict` checks hashes and assessor identity but cannot re-run `assess`.
 """
@@ -51,12 +52,13 @@ from datetime import datetime, timedelta
 from decimal import Decimal
 from enum import StrEnum
 from types import MappingProxyType
+from typing import Any
 
 from qw_domain.budget import BudgetBook, Category, Reservation, Status
 from qw_domain.decimals import UsdBudget, safe_repr
 from qw_domain.feedback import Access as EvidenceAccess
 from qw_domain.feedback import ImprovementEvidence, Purpose, Use
-from qw_domain.instants import ensure_aware_utc, format_instant
+from qw_domain.instants import ensure_aware_utc, format_instant, parse_instant
 from qw_domain.research_data import EvidenceClass, ResearchError, digest
 from qw_domain.sources import ID_PATTERN
 from qw_domain.trial_ledger import Candidate as TrialKey
@@ -307,6 +309,26 @@ class Protocol:
     def content_hash(self) -> str:
         return digest(self.wire())
 
+    @classmethod
+    def from_wire(cls, w: Mapping[str, Any]) -> "Protocol":
+        """The inverse of `wire` (a stored copy); it must give `w` back exactly."""
+        sid, target, ts = w["scorecard"]
+        card = Scorecard(sid, Target(target), tuple(Threshold(
+            m, Direction(d), Decimal(b), h) for m, d, b, h in ts))  # fmt: skip
+        secs = Decimal(w["max_duration"]) * 1_000_000
+        p = cls(**(dict(w) | {
+            "scope": Scope(w["scope"]), "target": Target(w["target"]),
+            "producer": Party(*w["producer"]), "assessor": Party(*w["assessor"]),
+            "scorecard": card, "evidence_purpose": Purpose(w["evidence_purpose"]),
+            "approvals": frozenset(ApprovalClass(a) for a in w["approvals"]),
+            "max_cost": UsdBudget.from_wire(w["max_cost"]),
+            "max_duration": timedelta(microseconds=int(secs)),
+            "registered_at": parse_instant(w["registered_at"]),
+        }))  # fmt: skip
+        if p.wire() != dict(w):
+            raise ImprovementError("protocol_wire", p.experiment_id)
+        return p
+
 
 _PROTECTED = frozenset({f.name for f in fields(Protocol)} | {
     "threshold", "thresholds", "approval", "approval_record", "approval_records",
@@ -347,6 +369,33 @@ class Candidate:
         if not all(type(u) is Use for u in self.evidence_uses):
             raise TypeError("evidence_uses holds T043 Use records")
         object.__setattr__(self, "created_at", ensure_aware_utc(self.created_at))
+
+    def wire(self) -> dict[str, object]:
+        uses = [[u.tenant_id, u.experiment_id, u.purpose.value, u.access.value,
+                 u.recipient, list(u.record_ids), list(u.consent_ids),
+                 format_instant(u.at)] for u in self.evidence_uses]  # fmt: skip
+        pr = self.producer
+        return {"candidate_id": self.candidate_id, "experiment_id": self.experiment_id,
+                "target": self.target.value, "parent_id": self.parent_id,
+                "producer": [pr.actor_id, pr.route_id, pr.family_id, pr.version],
+                "artifact_hash": self.artifact_hash, "payload": dict(self.payload),
+                "runtime_versions": dict(self.runtime_versions),
+                "evidence_uses": uses,
+                "created_at": format_instant(self.created_at)}  # fmt: skip
+
+    @classmethod
+    def from_wire(cls, w: Mapping[str, Any]) -> "Candidate":
+        """The inverse of `wire` (a stored copy); it must give `w` back exactly."""
+        uses = tuple(Use(t, e, Purpose(p), EvidenceAccess(a), r, tuple(ids),
+                         tuple(cs), parse_instant(at))
+                     for t, e, p, a, r, ids, cs, at in w["evidence_uses"])  # fmt: skip
+        c = cls(w["candidate_id"], w["experiment_id"], Target(w["target"]),
+                w["parent_id"], Party(*w["producer"]), w["artifact_hash"],
+                w["payload"], w["runtime_versions"], uses,
+                parse_instant(w["created_at"]))  # fmt: skip
+        if c.wire() != dict(w):
+            raise ImprovementError("candidate_wire", c.candidate_id)
+        return c
 
     @property
     def payload_hash(self) -> str:
@@ -405,6 +454,20 @@ class Verdict:
     @property
     def next_state(self) -> str:
         return NEXT_STATE[self.decision]
+
+    def wire(self) -> dict[str, object]:
+        a = self.assessor
+        return {"verdict_id": self.verdict_id, "experiment_id": self.experiment_id,
+                "candidate_id": self.candidate_id,
+                "candidate_hash": self.candidate_hash,
+                "protocol_hash": self.protocol_hash,
+                "assessor": [a.actor_id, a.route_id, a.family_id, a.version],
+                "decision": self.decision.value, "reasons": list(self.reasons),
+                "scores": {k: str(v) for k, v in sorted(self.scores.items())},
+                "trial_ids": list(self.trial_ids),
+                "failed_trial_ids": list(self.failed_trial_ids),
+                "limitations": list(self.limitations),
+                "assessed_at": format_instant(self.assessed_at)}  # fmt: skip
 
     @property
     def requires_human_promotion(self) -> bool:
@@ -884,8 +947,18 @@ def record(
     plan: SplitPlan, book: BudgetBook, outcome: Scheduled | Deferred | None = None,
     assessment: Assessment | None = None,
 ) -> ExperimentRecord:  # fmt: skip
-    """The experiment's record. A verdict comes only from running `assess` here on
-    the caller's registry, ledger and book (which are not persisted)."""
+    """The experiment's record (`derive` without the verdict)."""
+    return derive(registry, experiment_id, candidate_id, plan, book, outcome,
+                  assessment)[0]  # fmt: skip
+
+
+def derive(
+    registry: ExperimentRegistry, experiment_id: str, candidate_id: str,
+    plan: SplitPlan, book: BudgetBook, outcome: Scheduled | Deferred | None = None,
+    assessment: Assessment | None = None,
+) -> tuple[ExperimentRecord, Verdict | None]:  # fmt: skip
+    """The record and the verdict it carries. A verdict comes only from running
+    `assess` here on the given registry, ledger and book."""
     p, c = registry.protocol(experiment_id), registry.candidate(candidate_id)
     if c.experiment_id != experiment_id:
         raise ImprovementError("candidate_experiment", candidate_id)
@@ -931,4 +1004,4 @@ def record(
         c.candidate_id, p.hypothesis, p.content_hash, p.assessor.version,
         (plan.dataset.dataset_id,), p.budget_reservation_id, p.sandbox_profile_id,
         c.artifact_hash, optimizer, None if v is None else v.verdict_id,
-        None if v is None else v.decision, tuple(sorted(lim)))  # fmt: skip
+        None if v is None else v.decision, tuple(sorted(lim))), v  # fmt: skip

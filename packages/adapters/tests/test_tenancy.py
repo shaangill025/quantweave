@@ -63,7 +63,9 @@ FEEDBACK_TABLES = ("feedback", "feedback_content", "feedback_consent",
                    "feedback_consent_revocation", "feedback_tombstone")  # fmt: skip
 PREFERENCE_TABLES = ("notification_preference",)  # 0020
 WATCHLIST_TABLES = ("watchlist_revision",)  # 0022, test_watchlist_store
-EXPERIMENT_TABLES = ("experiment_revision",)  # 0026, test_experiment_store
+# 0026, 0028: test_experiment_store, test_assessor_store
+EXPERIMENT_TABLES = ("experiment_revision", "assessor_protocol", "assessor_candidate",
+                     "holdout_access", "evaluation_receipt")  # fmt: skip
 
 
 def make_tenant(conn: Conn, name: str) -> tuple[uuid.UUID, uuid.UUID]:

@@ -3,6 +3,7 @@
 """
 
 import ast
+import json
 from dataclasses import replace
 from datetime import timedelta
 from decimal import Decimal
@@ -20,7 +21,9 @@ from qw_domain.feedback import (
     ImprovementEvidence,
     Purpose,
     Split,
+    Use,
 )
+from qw_domain.research_data import digest
 from test_feedback import SUBJ
 from test_trial_ledger import DEV, PROMO, T0, TENANT, ask, ledger, plan, trial
 
@@ -681,3 +684,22 @@ def test_records_stored_under_0_5_0_stay_readable() -> None:
                 )
             ),
         )  # mixed forms
+
+
+def test_stored_wire_forms_round_trip_with_unchanged_hashes() -> None:
+    p = proto(max_duration=timedelta(seconds=90, milliseconds=500),
+              mutation_space_hash="e" * 64)  # fmt: skip
+    w = json.loads(json.dumps(p.wire()))  # as stored in jsonb
+    assert im.Protocol.from_wire(w).content_hash == p.content_hash
+    with pytest.raises(im.ImprovementError, match="protocol_wire"):  # not canonical
+        im.Protocol.from_wire(w | {"max_duration": "90.50"})
+    with pytest.raises(im.ImprovementError, match="approvals"):  # still validated
+        im.Protocol.from_wire(w | {"approvals": []})
+    use = Use(TENANT, EXP, Purpose.PERSONAL_ADAPTATION, Access.DEVELOPMENT,
+              None, ("rec-1",), ("consent-1",), T0)  # fmt: skip
+    c = cand(evidence_uses=(use,))
+    back = im.Candidate.from_wire(json.loads(json.dumps(c.wire())))
+    assert back.content_hash == c.content_hash and back.evidence_uses == (use,)
+    lg = promo_ledger(GOOD)
+    assert lg.checkpoint(3) == digest([tl.entry_wire(e) for e in lg.entries])
+    assert lg.checkpoint(1) == ledger().checkpoint(1) != lg.checkpoint(2)
