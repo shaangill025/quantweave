@@ -27,6 +27,13 @@ from qw_domain.decimals import Money
 from qw_domain.simulation import VirtualPortfolio
 from referencing import Registry, Resource
 
+
+def tamper(cursor: str) -> str:
+    """A cursor whose first character differs from the real one. The first
+    base64url character is always 6 signed bits; the last one may be padding."""
+    return ("B" if cursor[0] != "B" else "C") + cursor[1:]
+
+
 ROOT = Path(__file__).parents[3]
 SPEC = ROOT / "docs/spec/contracts"
 
@@ -118,7 +125,7 @@ def test_simulations_are_listed_tenant_scoped_and_marked_simulated(
     nxt = world.client.get(f"/api/v1/simulations?limit=1&cursor={first['next_cursor']}")
     assert [i["id"] for i in nxt.json()["items"]] == ["SIM-2"]
     assert nxt.json()["next_cursor"] is None
-    for bad in ("x" * 30, first["next_cursor"][:-2] + "AA"):
+    for bad in ("x" * 30, tamper(first["next_cursor"])):
         assert_problem(world.client.get(f"/api/v1/simulations?cursor={bad}"), 400,
                        "invalid_cursor")  # fmt: skip
     login(world.client, "carol")  # tenant B

@@ -740,8 +740,8 @@ _BUCKETS = (  # finding prefix -> the T044 application_code hard control it coun
     *((pre, "protected_control_mutations")
       for pre in ("forbidden_path:", "test_deletion:", "module_mutation:")),
     *((pre, "host_writes")
-      for pre in ("forbidden_import:", "forbidden_call:", "forbidden_name:",
-                  "dunder_")),
+      for pre in ("forbidden_import:", "relative_import:", "forbidden_call:",
+                  "forbidden_name:", "dunder_")),
 )  # fmt: skip
 
 
