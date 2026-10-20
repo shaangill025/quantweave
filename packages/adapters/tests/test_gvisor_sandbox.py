@@ -1,7 +1,9 @@
 """gVisor sandbox adapter (T007). Unit tests always run. `gvisor` tests run SYNTHETIC
-commands under runsc and need root, `QW_SANDBOX_RUNSC` (or runsc on PATH) and a busybox
+probes under runsc and need root, `QW_SANDBOX_RUNSC` (or runsc on PATH) and
 `QW_SANDBOX_ROOTFS`; otherwise they skip (a skip is not a pass), or fail when
-`QW_REQUIRE_GVISOR=1`."""
+`QW_REQUIRE_GVISOR=1`. Each probe has a busybox form and a form that needs only the
+rootfs's own `python3 -I` (the pinned candidate rootfs); `probe_form` picks one and a
+rootfs with neither fails."""
 
 import hashlib
 import io
@@ -12,7 +14,9 @@ import socket
 import stat
 import time
 from collections.abc import Iterator
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 import pytest
 import qw_adapters.gvisor_sandbox as gv
@@ -317,24 +321,167 @@ def gvisor(tmp_path_factory: pytest.TempPathFactory) -> Iterator[GVisorRunner]:
     assert leaked == [] and not list(state.glob("bundle-*"))
 
 
+PYTHONS = ("usr/local/bin/python3", "usr/bin/python3")  # rootfs-relative, in order
+BUSYBOX_TOOLS = (
+    "uname hostname id grep ls cat env mount mkdir kill wget nslookup cut tail tr "
+    "touch dd wc sort head yes sleep"
+)
+PY_ERR = r"""
+import errno, json, os, socket, sys
+def err(f):
+    try:
+        f()
+    except OSError as x:
+        return errno.errorcode.get(x.errno, type(x).__name__)
+    return "OK"
+"""
+
+
+@dataclass(frozen=True)
+class Probes:
+    """The real-runtime probe form for the rootfs under test. `busybox`: /bin/sh
+    scripts over busybox tools. `python`: only the rootfs's own `python3 -I -c`."""
+
+    runner: GVisorRunner
+    form: str
+    python: str = ""
+
+    def run(
+        self, shell: str, py: str, *args: str, run_id: str = "t007", **limits: int
+    ) -> sb.SandboxResult:
+        argv = (self.python, "-I", "-c", py, *args)
+        if self.form == "busybox":
+            argv = ("/bin/sh", "-c", shell)
+        return self.runner.run(SandboxRequest(run_id, argv, SandboxLimits(**limits)))
+
+
+def probe_form(rootfs: Path, override: str | None) -> tuple[str, str]:
+    """`QW_SANDBOX_PROBES` when set (busybox or python), else python if the rootfs
+    has python3, else busybox if it has /bin/sh; nothing else is a form. Only the
+    names are checked on the host; the guest preflight proves the form runs."""
+    python = next((f"/{p}" for p in PYTHONS if os.path.lexists(rootfs / p)), "")
+    shell = os.path.lexists(rootfs / "bin/sh")
+    form = override if override is not None else "python" if python else "busybox"
+    if form not in ("busybox", "python"):
+        raise ValueError(f"QW_SANDBOX_PROBES must be busybox or python: {form!r}")
+    if not (python if form == "python" else shell):
+        raise ValueError(f"no {form} probe form in {rootfs} (python3, /bin/sh)")
+    return form, python
+
+
+@pytest.mark.parametrize(
+    ("tree", "override", "want"),
+    [
+        (("bin/sh",), None, ("busybox", "")),
+        (("bin/sh", "usr/bin/python3"), None, ("python", "/usr/bin/python3")),
+        (("usr/local/bin/python3", "usr/bin/python3"), None,
+         ("python", "/usr/local/bin/python3")),
+        (("bin/sh", "usr/bin/python3"), "busybox", ("busybox", "/usr/bin/python3")),
+        ((), None, "no busybox probe form"),
+        (("bin/sh",), "python", "no python probe form"),
+        (("usr/bin/python3",), "busybox", "no busybox probe form"),
+        (("bin/sh", "usr/bin/python3"), "", "must be busybox or python"),
+        (("bin/sh", "usr/bin/python3"), "auto", "must be busybox or python"),
+    ],
+)  # fmt: skip
+def test_probe_form_is_explicit_and_fails_closed(
+    tmp_path: Path, tree: tuple[str, ...], override: str | None, want: object
+) -> None:
+    for rel in tree:  # SYNTHETIC rootfs; a dangling link still names the form
+        tmp_path.joinpath(rel).parent.mkdir(parents=True, exist_ok=True)
+        tmp_path.joinpath(rel).symlink_to("/nonexistent-on-the-host")
+    if isinstance(want, str):
+        with pytest.raises(ValueError, match=want):
+            probe_form(tmp_path, override)
+    else:
+        assert probe_form(tmp_path, override) == want
+
+
+@pytest.fixture(scope="module")
+def probes(gvisor: GVisorRunner) -> Probes:
+    assert gvisor.config.rootfs is not None
+    try:  # a missing form fails, never skips, once the gate is available
+        form, python = probe_form(
+            gvisor.config.rootfs, os.environ.get("QW_SANDBOX_PROBES")
+        )
+    except ValueError as exc:
+        pytest.fail(str(exc))
+    p = Probes(gvisor, form, python)
+    r = p.run(
+        f"for t in {BUSYBOX_TOOLS}; do command -v $t >/dev/null || echo NOPROBE $t; "
+        "done; echo QW-PROBES busybox",
+        "import sys; print('QW-PROBES python', sys.version_info >= (3, 12))",
+    )
+    out = (
+        r.stdout.head.decode()
+        if (r.status, r.exit_code) == (RunStatus.EXITED, 0)
+        else ""
+    )
+    if out != f"QW-PROBES {form}{' True' if form == 'python' else ''}\n":
+        pytest.fail(f"{form} probes cannot run in {gvisor.config.rootfs}: {r}")
+    return p
+
+
 def _ok(result: sb.SandboxResult) -> str:
     assert result.status is RunStatus.EXITED, result
     return result.stdout.head.decode()
 
 
+def _json(result: sb.SandboxResult) -> Any:
+    assert result.exit_code == 0, (result, result.stderr.head[-800:])
+    return json.loads(_ok(result))
+
+
 @pytest.mark.gvisor
-def test_candidate_runs_on_the_gvisor_kernel_not_the_host(gvisor: GVisorRunner) -> None:
-    r = gvisor.run(_req("uname -r; hostname; id -u; grep CapEff /proc/self/status"))
+def test_candidate_runs_on_the_gvisor_kernel_not_the_host(probes: Probes) -> None:
+    py = r"""
+import os
+caps = [s for s in open("/proc/self/status") if s.startswith("CapEff:")]
+u = os.uname()
+print(u.release, u.nodename, os.getuid(), caps[0].strip(), u.sysname, sep="\n")
+"""
+    sh = "uname -r; hostname; id -u; grep CapEff /proc/self/status; uname -s"
+    r = probes.run(sh, py)
     out = _ok(r).split("\n")
     assert out[0].endswith("gvisor") and out[0] != os.uname().release
     assert out[1:3] == ["candidate", "65534"]
     assert out[3].split() == ["CapEff:", "0000000000000000"]
+    assert out[4:] == ["Linux", ""]
     assert r.runtime.startswith("gvisor runsc release-") and len(r.digest()) == 64
+
+
+PY_ISOLATION = (
+    PY_ERR
+    + r"""
+import ctypes
+host_file, host_pid = sys.argv[1], int(sys.argv[2])
+environ = []
+for p in filter(str.isdigit, os.listdir("/proc")):
+    try:
+        environ.append(open(f"/proc/{p}/environ", "rb").read().decode("latin-1"))
+    except OSError:
+        pass
+os.mkdir("/tmp/m")
+libc = ctypes.CDLL(None, use_errno=True)
+rc = libc.mount(b"none", b"/tmp/m", b"tmpfs", 0, None)
+socks = ("/var/run/docker.sock", "/run/docker.sock", "/run/containerd")
+print(json.dumps({
+    "host_file": err(lambda: open(host_file).read()),
+    "host_pid": os.path.exists(f"/proc/{host_pid}"),
+    "pids": sum(p.isdigit() for p in os.listdir("/proc")),
+    "environ": environ, "env": dict(os.environ),
+    "sockets": [s for s in socks if os.path.lexists(s)],
+    "mount": [rc, errno.errorcode.get(ctypes.get_errno())],
+    "unshare_mount_ns": err(lambda: os.unshare(os.CLONE_NEWNS)),
+    "kill": err(lambda: os.kill(host_pid, 9)),
+}))
+"""
+)
 
 
 @pytest.mark.gvisor
 def test_isolation_and_no_host_control(
-    gvisor: GVisorRunner, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    probes: Probes, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setenv(CANARY_ENV, CANARY)
     host_file = tmp_path / "host-canary.txt"
@@ -349,8 +496,24 @@ def test_isolation_and_no_host_control(
         "mkdir -p /tmp/m && mount -t tmpfs none /tmp/m 2>/dev/null && echo MOUNTED; "
         f"kill -9 {os.getpid()} 2>/dev/null && echo KILLED; echo still-here"
     )
-    out = _ok(gvisor.run(_req(script)))
-    assert CANARY not in out and "HOSTFILE" not in out and "HOSTPID" not in out
+    r = probes.run(script, PY_ISOLATION, str(host_file), str(os.getpid()))
+    out = _ok(r)
+    assert CANARY not in out
+    if probes.form == "python":
+        got = _json(r)
+        assert (got["host_file"], got["host_pid"], got["sockets"]) == (
+            "ENOENT",
+            False,
+            [],
+        )
+        assert 1 <= got["pids"] <= 4  # only the candidate's own processes
+        assert got["mount"] == [-1, "EPERM"] and got["unshare_mount_ns"] == "EPERM"
+        assert got["kill"] == "ESRCH"  # the host pid does not exist in the guest
+        assert {k: v for k, v in got["env"].items() if k != "LC_CTYPE"} == dict(
+            e.split("=", 1) for e in gv.GUEST_ENV
+        )  # the fixed guest env (Python may add its own LC_CTYPE coercion)
+        return
+    assert "HOSTFILE" not in out and "HOSTPID" not in out
     assert "SOCKET" not in out and "MOUNTED" not in out and "KILLED" not in out
     assert "NOPROBE" not in out
     lines = out.split("\n")
@@ -358,8 +521,41 @@ def test_isolation_and_no_host_control(
     assert lines[-2] == "still-here"
 
 
+PY_EGRESS = (
+    PY_ERR
+    + r"""
+loop, eth, udp_port = (int(sys.argv[i]) for i in (1, 3, 4))
+host = sys.argv[2]
+def tcp(addr):
+    with socket.create_connection(addr, timeout=3):
+        pass
+def udp(addr):
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+        s.sendto(b"SYNTHETIC", addr)
+try:
+    socket.getaddrinfo("example.com", 80)
+    dns = "OK"
+except socket.gaierror as x:
+    dns = [n for n in dir(socket) if n.startswith("EAI_")
+           and getattr(socket, n) == x.errno]
+dev = open("/proc/net/dev").read().splitlines()[2:]
+print(json.dumps({
+    "tcp_loop": err(lambda: tcp(("127.0.0.1", loop))),
+    "tcp_host": err(lambda: tcp((host, eth))),
+    "tcp_egress": err(lambda: tcp(("1.1.1.1", 80))),
+    "udp_host": err(lambda: udp((host, udp_port))),
+    "udp_egress": err(lambda: udp(("1.1.1.1", 53))),
+    "dns": dns,
+    "if_nameindex": [n for _, n in socket.if_nameindex()],
+    "proc_net_dev": [line.split(":")[0].strip() for line in dev],
+}))
+"""
+)
+UNREACHABLE = {"ENETUNREACH", "EHOSTUNREACH"}
+
+
 @pytest.mark.gvisor
-def test_egress_is_denied_including_host_listeners(gvisor: GVisorRunner) -> None:
+def test_egress_is_denied_including_host_listeners(probes: Probes) -> None:
     with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as udp:
         udp.connect(("192.0.2.1", 9))  # route lookup only; nothing is sent
         host_ip = udp.getsockname()[0]  # a host interface address, not loopback
@@ -367,7 +563,9 @@ def test_egress_is_denied_including_host_listeners(gvisor: GVisorRunner) -> None
     with (
         socket.create_server(("127.0.0.1", 0)) as lo,
         socket.create_server((host_ip, 0)) as eth,
+        socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as dgram,
     ):
+        dgram.bind((host_ip, 0))
         script = (  # a rootfs without these probes fails here, never passes
             "for t in wget nslookup; do command -v $t >/dev/null || echo NOPROBE; "
             "done; "
@@ -377,11 +575,22 @@ def test_egress_is_denied_including_host_listeners(gvisor: GVisorRunner) -> None
             "nslookup example.com >/dev/null 2>&1 && echo DNS; "
             "cut -d: -f1 /proc/net/dev | tail -n +3 | tr -d ' '"
         )
-        out = _ok(gvisor.run(_req(script, wall_millis=20_000)))
-        for srv in (lo, eth):  # a completed handshake would wait in the backlog
+        ports = (lo.getsockname()[1], eth.getsockname()[1], dgram.getsockname()[1])
+        args = (str(ports[0]), host_ip, str(ports[1]), str(ports[2]))
+        r = probes.run(script, PY_EGRESS, *args, wall_millis=20_000)
+        out = _ok(r)
+        for srv in (lo, eth, dgram):  # a completed handshake would wait in the backlog
             srv.setblocking(False)
             with pytest.raises(BlockingIOError):
-                srv.accept()
+                srv.recv(1) if srv is dgram else srv.accept()
+    if probes.form == "python":
+        got = _json(r)
+        assert got["tcp_loop"] == "ECONNREFUSED"  # the guest's own empty loopback
+        for k in ("tcp_host", "tcp_egress", "udp_host", "udp_egress"):
+            assert got[k] in UNREACHABLE, (k, got)
+        assert got["dns"] in (["EAI_AGAIN"], ["EAI_NONAME"], ["EAI_FAIL"]), got
+        assert got["if_nameindex"] == got["proc_net_dev"] == ["lo"]
+        return
     assert (
         "HOST" not in out
         and "LOOP" not in out
@@ -391,9 +600,39 @@ def test_egress_is_denied_including_host_listeners(gvisor: GVisorRunner) -> None
     assert out.split() == ["lo"]
 
 
+PY_ROOT_RO = (
+    PY_ERR
+    + r"""
+points, opts = [], {}
+for line in open("/proc/self/mounts"):
+    f = line.split()
+    points.append(f[1])
+    opts[f[1]] = f[3].split(",")[0]
+fd, fill = os.open("/tmp/fill", os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), "OK"
+for _ in range(4096):
+    try:
+        os.write(fd, bytes(1024))
+    except OSError as x:
+        fill = errno.errorcode[x.errno]
+        break
+os.close(fd)
+ro = ("/", "/usr", "/dev", "/dev/shm", "/tmp")
+print(json.dumps({
+    "points": sorted(points), "opts": {d: opts.get(d) for d in ro},
+    "statvfs_ro": {d: bool(os.statvfs(d).f_flag & os.ST_RDONLY) for d in ro},
+    "write": {d: err(lambda: open(os.path.join(d, ".w"), "x").close())
+              for d in sys.argv[1:]},
+    "fill": fill, "fill_bytes": os.stat("/tmp/fill").st_size,
+}))
+"""
+)
+WRITE_DIRS = ("/", "/usr", "/etc", "/bin", "/dev", "/dev/shm", "/proc", "/sys",
+              "/home", "/root", "/var", "/tmp")  # fmt: skip
+
+
 @pytest.mark.gvisor
 def test_root_is_read_only_and_scratch_is_the_only_bounded_writable_dir(
-    gvisor: GVisorRunner,
+    probes: Probes,
 ) -> None:
     script = (
         "grep -E ' (/|/dev|/dev/shm|/tmp) ' /proc/mounts | cut -d' ' -f2,4 | "
@@ -403,33 +642,55 @@ def test_root_is_read_only_and_scratch_is_the_only_bounded_writable_dir(
         "dd if=/dev/zero of=/tmp/fill bs=1024 count=4096 2>/dev/null; "
         "wc -c < /tmp/fill; cut -d' ' -f2 /proc/mounts | sort | tr '\\n' ' '"
     )
-    out = _ok(gvisor.run(_req(script, scratch_bytes=1 << 20))).split("\n")
+    r = probes.run(script, PY_ROOT_RO, *WRITE_DIRS, scratch_bytes=1 << 20)
+    # the complete mount table: gVisor's own /sys and /dev/pts, nothing from the host
+    mounts = ["/", "/dev", "/dev/pts", "/dev/shm", "/proc", "/sys", "/tmp"]
+    if probes.form == "python":
+        got = _json(r)
+        assert got["points"] == mounts
+        modes = {"/": "ro", "/usr": None, "/dev": "ro", "/dev/shm": "ro", "/tmp": "rw"}
+        assert got["opts"] == modes  # /usr is part of the read-only root mount
+        assert got["statvfs_ro"] == {d: d != "/tmp" for d in modes}
+        assert got["write"].pop("/tmp") == "OK"
+        assert set(got["write"]) == set(WRITE_DIRS) - {"/tmp"}
+        # Defence in depth only: uid 65534 gets EACCES on any root-owned directory,
+        # even a writable one. The read-only proof is the exact mount table and
+        # statvfs above.
+        assert set(got["write"].values()) <= {"EROFS", "EACCES"}, got["write"]
+        assert got["fill"] == "ENOSPC" and 0 < got["fill_bytes"] <= 1 << 20
+        return
+    out = _ok(r).split("\n")
     assert sorted(out[:4]) == ["/ ro", "/dev ro", "/dev/shm ro", "/tmp rw"]
     assert out[4] == "WRITABLE /tmp"
     assert int(out[5]) <= 1 << 20  # the 4 MiB write stopped at the 1 MiB bound
-    # the complete mount table: gVisor's own /sys and /dev/pts, nothing from the host
-    mounts = ["/", "/dev", "/dev/pts", "/dev/shm", "/proc", "/sys", "/tmp"]
     assert out[6].split() == mounts
 
 
+PY_SPIN = {
+    "": "while True: pass",
+    "trap '' XCPU;": "import signal\nsignal.signal(signal.SIGXCPU, signal.SIG_IGN)\n"
+    "while True: pass",
+    "trap 'exit 0' XCPU;": "import os, signal\n"
+    "signal.signal(signal.SIGXCPU, lambda *_: os._exit(0))\nwhile True: pass",
+}
+
+
 @pytest.mark.gvisor
-@pytest.mark.parametrize("trap", ["", "trap '' XCPU;", "trap 'exit 0' XCPU;"])
-def test_cpu_time_limit_is_measured_not_inferred(
-    gvisor: GVisorRunner, trap: str
-) -> None:
+@pytest.mark.parametrize("trap", list(PY_SPIN))
+def test_cpu_time_limit_is_measured_not_inferred(probes: Probes, trap: str) -> None:
     # Ignoring SIGXCPU ends in the hard-limit SIGKILL; `exit 0` hides it entirely.
     t0 = time.monotonic()
-    r = gvisor.run(
-        _req(trap + "while :; do :; done", cpu_seconds=1, wall_millis=30_000)
-    )
+    shell = trap + "while :; do :; done"
+    r = probes.run(shell, PY_SPIN[trap], cpu_seconds=1, wall_millis=30_000)
     assert (r.status, r.limit_hit) == (RunStatus.LIMIT, LimitHit.CPU_TIME), r
     assert time.monotonic() - t0 < 15
 
 
 @pytest.mark.gvisor
 @pytest.mark.parametrize("code", [0, 3])
-def test_instant_exit_keeps_its_status(gvisor: GVisorRunner, code: int) -> None:
-    r = gvisor.run(_req(f"exit {code}"))
+def test_instant_exit_keeps_its_status(probes: Probes, code: int) -> None:
+    py = "import sys; sys.exit(int(sys.argv[1]))"
+    r = probes.run(f"exit {code}", py, str(code))
     assert (r.status, r.limit_hit, r.exit_code) == (
         RunStatus.EXITED,
         LimitHit.NONE,
@@ -438,12 +699,13 @@ def test_instant_exit_keeps_its_status(gvisor: GVisorRunner, code: int) -> None:
 
 
 @pytest.mark.gvisor
-def test_cpu_quota_throttles_the_sandbox(gvisor: GVisorRunner) -> None:
+def test_cpu_quota_throttles_the_sandbox(probes: Probes) -> None:
     work = "i=0; while [ $i -lt 150000 ]; do i=$((i+1)); done; echo done"
+    py = "i = 0\nwhile i < 3_000_000:\n    i += 1\nprint('done')"
 
     def elapsed(millicores: int) -> float:
         t0 = time.monotonic()
-        r = gvisor.run(_req(work, cpu_millicores=millicores, wall_millis=120_000))
+        r = probes.run(work, py, cpu_millicores=millicores, wall_millis=120_000)
         assert _ok(r) == "done\n"
         return time.monotonic() - t0
 
@@ -452,39 +714,58 @@ def test_cpu_quota_throttles_the_sandbox(gvisor: GVisorRunner) -> None:
 
 
 @pytest.mark.gvisor
-def test_memory_limit(gvisor: GVisorRunner) -> None:
+def test_memory_limit(probes: Probes) -> None:
     hog = 'x=$(head -c 300000000 /dev/zero | tr "\\0" a); echo ${#x}'
-    r = gvisor.run(
-        _req(hog, memory_bytes=64 << 20, cpu_seconds=120, wall_millis=180_000)
-    )
+    py = "x = b'a' * 300_000_000\nprint(len(x))"
+    r = probes.run(hog, py, memory_bytes=64 << 20, cpu_seconds=120, wall_millis=180_000)
     assert (r.status, r.limit_hit) == (RunStatus.LIMIT, LimitHit.MEMORY), r
 
 
 @pytest.mark.gvisor
-def test_wall_time_limit_kills_and_cleans_up(gvisor: GVisorRunner) -> None:
+def test_wall_time_limit_kills_and_cleans_up(probes: Probes) -> None:
     t0 = time.monotonic()
-    r = gvisor.run(_req("echo started; sleep 60", run_id="t007-wall", wall_millis=1500))
+    py = "import time\nprint('started', flush=True)\ntime.sleep(60)"
+    r = probes.run("echo started; sleep 60", py, run_id="t007-wall", wall_millis=1500)
     assert (r.status, r.limit_hit) == (RunStatus.LIMIT, LimitHit.WALL_TIME)
     assert r.stdout.head == b"started\n" and time.monotonic() - t0 < 15
-    assert b"t007-wall" not in gvisor._control("list").stdout
+    assert b"t007-wall" not in probes.runner._control("list").stdout
+
+
+PY_FORK = r"""
+import errno, os, time
+failed = set()
+for _ in range(50):
+    try:
+        pid = os.fork()
+    except OSError as x:
+        failed.add(errno.errorcode[x.errno])
+        continue
+    if pid == 0:
+        time.sleep(20)
+        os._exit(0)
+print(sum(p.isdigit() for p in os.listdir("/proc")), *sorted(failed))
+"""
 
 
 @pytest.mark.gvisor
-def test_process_limit_holds_a_fork_bomb(gvisor: GVisorRunner) -> None:
+def test_process_limit_holds_a_fork_bomb(probes: Probes) -> None:
     # Ignores fork failures; counts live tasks with a builtin glob (no fork).
     script = (
         "i=0; while [ $i -lt 50 ]; do (sleep 20 &) 2>/dev/null; i=$((i+1)); done; "
         "set -- /proc/[0-9]*; echo $#; exit 0"
     )
-    r = gvisor.run(_req(script, pids=8, wall_millis=20_000))
-    assert r.exit_code == 0 and 2 <= int(r.stdout.head) <= 8, r  # never more than 8
+    r = probes.run(script, PY_FORK, pids=8, wall_millis=20_000)
+    live, *failed = r.stdout.head.split()
+    assert r.exit_code == 0 and 2 <= int(live) <= 8, r  # never more than 8
+    assert failed == ([b"EAGAIN"] if probes.form == "python" else [])
     # Not detected: the breach attempt reads as a clean exit (docs/receipts/T007.md).
     assert (r.status, r.limit_hit) == (RunStatus.EXITED, LimitHit.NONE)
 
 
 @pytest.mark.gvisor
-def test_output_is_truncated_with_a_full_stream_digest(gvisor: GVisorRunner) -> None:
-    r = gvisor.run(_req("yes | head -c 200000", output_bytes=1024))
+def test_output_is_truncated_with_a_full_stream_digest(probes: Probes) -> None:
+    py = "import sys\nsys.stdout.buffer.write(b'y\\n' * 100_000)"
+    r = probes.run("yes | head -c 200000", py, output_bytes=1024)
     full = b"y\n" * 100_000  # independent oracle
     assert r.status is RunStatus.EXITED and r.exit_code == 0
     assert r.stdout.head == full[:1024] and r.stdout.truncated

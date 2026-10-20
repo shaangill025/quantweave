@@ -71,3 +71,32 @@ export const isProposalDetail = ((v: unknown) => {
   const own = (v as { coverage?: unknown }).coverage;
   return own !== undefined && coverage(own) && proposalPage({ items: [v], next_cursor: null, coverage: own });
 }) as Guard<Proposal & { coverage: Coverage }>;
+
+// listExperiments (openapi.yaml 1.0.0, experiment.schema.json; experimentPage with the project
+// contract page coverage). Designed in the contract; apps/api does not serve it yet (T055), so the
+// Improvement view shows its not_found plainly. The schema carries ids and lineage fields only:
+// no scorecard, verdict, budget amount, approval or installation record.
+export const TARGETS = ["personal_adaptation", "research", "strategy", "evaluator", "application_code", "recursive_optimizer"] as const;
+export type Target = (typeof TARGETS)[number];
+export const EXPERIMENT_STATES = ["proposed", "authorized", "running", "evaluating", "awaiting_review", "rejected",
+  "approved", "promoted", "rolled_back", "failed", "cancelled"] as const;
+export interface Experiment {
+  id: string; target: Target; scope: "tenant" | "installation"; scope_id: string;
+  state: (typeof EXPERIMENT_STATES)[number]; baseline_version: string; candidate_version: string; hypothesis: string;
+  protocol_id: string; protected_assessor_version: string; data_snapshot_ids: string[]; budget_reservation_id: string;
+  sandbox_profile_id: string; candidate_hash: string; evaluation_receipt_ids: string[]; parent_optimizer_version: string;
+  next_cycle_run_id: string | null; requires_human_promotion: true; release_receipt_id: string | null;
+}
+const isExperiment = obj({
+  id, target: oneOf(...TARGETS), scope: oneOf("tenant", "installation"), scope_id: id,
+  state: oneOf(...EXPERIMENT_STATES), baseline_version: id, candidate_version: id, hypothesis: str, protocol_id: id,
+  protected_assessor_version: id, data_snapshot_ids: arr(id), budget_reservation_id: id, sandbox_profile_id: id,
+  candidate_hash: hash, evaluation_receipt_ids: arr(id), parent_optimizer_version: id, next_cycle_run_id: n(str),
+  requires_human_promotion: (v) => v === true, release_receipt_id: n(str),
+}) as Guard<Experiment>;
+/** Experiment ids are unique within a page, so lineage links cannot be ambiguous. */
+export const isExperimentPage = ((v: unknown) => {
+  if (!covered(pageOf(isExperiment))(v)) return false;
+  const ids = v.items.map((e) => e.id);
+  return new Set(ids).size === ids.length;
+}) as Guard<Page<Experiment> & { coverage: Coverage }>;

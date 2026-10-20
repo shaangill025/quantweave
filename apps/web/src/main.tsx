@@ -1,6 +1,7 @@
 import { StrictMode, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { createRoot } from "react-dom/client";
 import type { Fetcher } from "./api";
+import { Improvement } from "./ImprovementViews";
 import { focusTarget } from "./labels";
 import { Research, Simulation, type ViewProps } from "./ResearchViews";
 import { httpSource, type ResearchSource, type SimulationSummary } from "./sources";
@@ -22,7 +23,7 @@ const SECTIONS = [
 
 type Section = (typeof SECTIONS)[number];
 const VIEWS: Partial<Record<Section, (props: ViewProps) => ReactNode>> = {
-  Overview, Accounts, Decisions, Research, Strategies, Simulation, Settings,
+  Overview, Accounts, Decisions, Research, Strategies, Simulation, Improvement, Settings,
 };
 
 function sectionOf(hash: string): Section {
