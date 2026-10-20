@@ -17,7 +17,14 @@ Artifact check only: it reads the designed contracts, not a running API.
    offset, in range, not `-00:00`, and parses as a real instant.
 5. Every project contract schema (contracts/amendments.json applied by
    tools/project_contract.py) is a valid 2020-12 schema that keeps rule 3, and its
-   `all_of` rules name only properties the schema has.
+   `all_of` rules name only properties the schema has. A new schema (`new_schemas`)
+   is also closed, and each `*_at` property is a `Timestamp` (nullable at most).
+6. Every new operation (`operations`, merged into openapi.yaml by
+   `project_contract.openapi`, which refuses a path, operationId or schema name the
+   contract already has) passes rules 1 to 3 and the contract's conventions: session
+   security, a `default` Problem response, a 2xx JSON response naming a known
+   component, `Cache-Control: no-store` on that response (the API sends no-store on
+   every response) and no tenant parameter (the tenant comes from the session).
 
 Known limits: money fields are found by name (a field called `pnl`, `nav` or
 `premium` is not checked); timestamps are checked only in examples and only under keys
@@ -272,6 +279,63 @@ def _named(rule: Json) -> set[str]:
     return out
 
 
+def check_times(where: str, node: Json, path: str = "") -> list[str]:
+    errors: list[str] = []
+    if isinstance(node, dict):
+        stamp = {"$ref": "common.schema.json#/$defs/Timestamp"}
+        for key, sub in (node.get("properties") or {}).items():
+            if key.endswith("_at") and sub not in (
+                stamp,
+                {"anyOf": [stamp, {"type": "null"}]},
+            ):
+                errors.append(f"{where}{path}/{key}: not a Timestamp")
+        for key, sub in node.items():
+            errors += check_times(where, sub, f"{path}/{key}")
+    elif isinstance(node, list):
+        for i, sub in enumerate(node):
+            errors += check_times(where, sub, f"{path}[{i}]")
+    return errors
+
+
+def amended_api(api: Json, amendments: Json) -> tuple[Json, list[str]]:
+    saved, pc.AMENDMENTS = pc.AMENDMENTS, amendments
+    try:
+        return pc.openapi(api), []
+    except (KeyError, ValueError) as exc:
+        return api, [f"project contract operations: amendment refused: {exc!r}"]
+    finally:
+        pc.AMENDMENTS = saved
+
+
+def check_operations(api: Json, amendments: Json) -> list[str]:
+    errors: list[str] = []
+    schemes = set(api["components"].get("securitySchemes", {}))
+    problem = {"$ref": "#/components/schemas/Problem"}
+    for path, item in amendments.get("operations", {}).items():
+        for method, op in item.items():
+            where = f"project contract {method.upper()} {path}"
+            security = op.get("security", api.get("security"))
+            if not security or not all(req and set(req) <= schemes for req in security):
+                errors.append(f"{where}: no session security")
+            responses = op.get("responses", {})
+            media = responses.get("default", {}).get("content", {})
+            if media.get("application/problem+json", {}).get("schema") != problem:
+                errors.append(f"{where}: default is not a Problem response")
+            ok = sorted(k for k in responses if re.fullmatch(r"2\d\d", k))
+            body = responses[ok[0]] if ok else {}
+            ref = body.get("content", {}).get("application/json", {})
+            ref = ref.get("schema", {}).get("$ref", "")
+            if ref.rsplit("/", 1)[-1] not in api["components"]["schemas"]:
+                errors.append(f"{where}: unknown response schema {ref!r}")
+            cache = body.get("headers", {}).get("Cache-Control", {})
+            if cache.get("schema") != {"type": "string", "const": "no-store"}:
+                errors.append(f"{where}: success lacks Cache-Control: no-store")
+            for param in op.get("parameters", []):
+                if "tenant" in str(param.get("name", "")).lower():
+                    errors.append(f"{where}: tenant parameter {param['name']}")
+    return errors
+
+
 def check_amended(schemas: dict[str, Json], amendments: Json) -> list[str]:
     from jsonschema import Draft202012Validator  # type: ignore[import-untyped]
 
@@ -292,6 +356,20 @@ def check_amended(schemas: dict[str, Json], amendments: Json) -> list[str]:
                 if unknown := _named(rule) - set(s["properties"]):
                     errors.append(f"{where}: all_of names unknown property {unknown}")
             errors += check_decimals(where, s, schemas)
+        for name in amendments.get("new_schemas", {}):
+            where = f"project contract new schema {name}"
+            try:
+                s = pc.schema(name)
+            except (KeyError, ValueError) as exc:
+                errors.append(f"{where}: amendment refused: {exc!r}")
+                continue
+            meta = Draft202012Validator(Draft202012Validator.META_SCHEMA)
+            errors += [f"{where}: invalid schema: {e.message}"
+                       for e in meta.iter_errors(s)]  # fmt: skip
+            if s.get("additionalProperties") is not False:
+                errors.append(f"{where}: not closed")
+            errors += check_decimals(where, s, schemas)
+            errors += check_times(where, s)
     finally:
         pc.AMENDMENTS = saved
     return errors
@@ -301,10 +379,11 @@ def run_checks(
     api: Json, schemas: dict[str, Json], examples: dict[str, Json],
     amendments: Json = None,
 ) -> list[str]:  # fmt: skip
-    errors = check_routes(api, schemas)
-    errors += check_amended(
-        schemas, pc.AMENDMENTS if amendments is None else amendments
-    )
+    amendments = pc.AMENDMENTS if amendments is None else amendments
+    api, errors = amended_api(api, amendments)
+    errors += check_routes(api, schemas)
+    errors += check_operations(api, amendments)
+    errors += check_amended(schemas, amendments)
     errors += check_decimals("openapi#/components", api["components"], schemas)
     errors += check_decimals("openapi#/paths", api["paths"], schemas)
     for name, schema in schemas.items():
@@ -425,7 +504,86 @@ def self_test(api: Json, schemas: dict[str, Json], examples: dict[str, Json]) ->
     def bad_rule(m: Json) -> None:
         m["schemas"]["experiment"]["all_of"][0]["if"] = {"type": "nonsense"}
 
+    def new_op(m: Json) -> Json:
+        return m["operations"]["/session/approval-classes"]["get"]
+
+    def new_schema(m: Json) -> Json:
+        return m["new_schemas"]["approval_classes"]
+
+    def dup_operation_id(m: Json) -> None:
+        new_op(m)["operationId"] = "readCapabilities"
+
+    def dup_new_operation_id(m: Json) -> None:
+        new_op(m)["operationId"] = "readSession"
+
+    def dup_path(m: Json) -> None:
+        m["operations"]["/capabilities"] = {
+            "get": copy.deepcopy(new_op(m)) | {"operationId": "readCapabilities2"}
+        }
+
+    def dup_schema(m: Json) -> None:
+        m["new_schemas"]["experiment"] = copy.deepcopy(new_schema(m))
+
+    def dup_component(m: Json) -> None:
+        m["new_schemas"]["Health"] = copy.deepcopy(new_schema(m))
+
+    def public_op(m: Json) -> None:
+        new_op(m)["security"] = []
+
+    def unknown_scheme(m: Json) -> None:
+        new_op(m)["security"] = [{"bearer": []}]
+
+    def no_problem(m: Json) -> None:
+        del new_op(m)["responses"]["default"]
+
+    def cacheable(m: Json) -> None:
+        del new_op(m)["responses"]["200"]["headers"]
+
+    def unknown_body(m: Json) -> None:
+        body = new_op(m)["responses"]["200"]["content"]["application/json"]
+        body["schema"] = {"$ref": "#/components/schemas/approval_class"}
+
+    def tenant_param(m: Json) -> None:
+        new_op(m)["parameters"] = [
+            {"name": "tenant_id", "in": "query", "schema": {"type": "string"}}
+        ]
+
+    def new_mutation(m: Json) -> None:
+        item = m["operations"]["/session/approval-classes"]
+        item["post"] = copy.deepcopy(item["get"]) | {"operationId": "grantClasses"}
+
+    def new_number(m: Json) -> None:
+        new_schema(m)["properties"]["cost"] = {"type": "string"}
+
+    def new_open(m: Json) -> None:
+        new_schema(m)["additionalProperties"] = True
+
+    def new_naive_at(m: Json) -> None:
+        new_schema(m)["properties"]["evaluated_at"] = {"type": "string"}
+
+    def new_invalid(m: Json) -> None:
+        new_schema(m)["properties"]["advisory"] = {"type": "nonsense"}
+
     amended_cases = {
+        "operation duplicate operationId": (dup_operation_id, "amendment refused"),
+        "operation duplicate new operationId": (dup_new_operation_id, "refused"),
+        "operation duplicate path": (dup_path, "amendment refused"),
+        "new schema existing name": (dup_schema, "amendment refused"),
+        "new schema existing component": (dup_component, "amendment refused"),
+        "operation without session": (public_op, "no session security"),
+        "operation unknown scheme": (unknown_scheme, "no session security"),
+        "operation without Problem": (no_problem, "not a Problem response"),
+        "operation cacheable": (cacheable, "lacks Cache-Control: no-store"),
+        "operation unknown body": (unknown_body, "unknown response schema"),
+        "operation tenant parameter": (tenant_param, "tenant parameter"),
+        "new mutating operation": (new_mutation, "missing required Idempotency-Key"),
+        "new schema string money": (
+            new_number,
+            "new schema approval_classes/cost: money/quantity not a decimal",
+        ),
+        "new schema open": (new_open, "not closed"),
+        "new schema naive _at": (new_naive_at, "evaluated_at: not a Timestamp"),
+        "new schema invalid": (new_invalid, "invalid schema"),
         "amended number money": (amended_money, "fee: money/quantity not a decimal"),
         "all_of unknown property": (unknown_rule, "all_of names unknown property"),
         "enum_add duplicate": (duplicate_state, "amendment refused"),
@@ -473,7 +631,9 @@ def main(argv: list[str]) -> int:
         f"{'FAIL' if errors else 'PASS'}: {len(api['paths'])} paths, {ops} mutating "
         f"operations, {len(schemas)} schemas, {len(examples)} examples, project "
         f"contract {pc.AMENDMENTS['version']} ({len(pc.AMENDMENTS['schemas'])} "
-        "amended schemas)"
+        f"amended schemas, {len(pc.AMENDMENTS.get('new_schemas', {}))} new schemas, "
+        f"{sum(map(len, pc.AMENDMENTS.get('operations', {}).values()))} new "
+        "operations)"
     )
     return 1 if errors else 0
 

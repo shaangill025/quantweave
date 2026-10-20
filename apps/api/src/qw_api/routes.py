@@ -1,4 +1,5 @@
-"""T010 routes: liveness, session (login, me, logout, step-up) and memberships.
+"""T010 routes: liveness, session (login, me, logout, step-up) and memberships, and
+the caller's approval classes (contract 0.7.0 readApprovalClasses).
 
 Path ids resolve inside the session tenant only, so another tenant's id is 404
 (C-07, A-10). Bodies forbid unknown fields, so a client `tenant_id` is a 400.
@@ -21,6 +22,9 @@ from fastapi import APIRouter, Depends, Header, Query, Request, Response
 from pydantic import BaseModel, ConfigDict, Field
 from qw_adapters import tenancy
 from qw_adapters.tenancy import Conn, MembershipRole, SessionPrincipal, TenantTx
+from qw_domain.improvement import ApprovalClass
+from qw_domain.instants import format_instant
+from qw_domain.release import Edition, authority_scope
 
 from qw_api import security as sec
 from qw_api.app import ApiError, Settings, correlation_id
@@ -143,6 +147,59 @@ def login(
 @router.get("/session", response_model=SessionView)
 def me(principal: Annotated[Principal, Depends(sec.current_principal)]) -> SessionView:
     return _view(principal.session, principal.token)
+
+
+# Operations served per class; none is today (adoptStrategy, promoteExperiment and
+# rollbackRelease are not served), so every class names operation_not_served.
+SERVED: dict[ApprovalClass, tuple[str, ...]] = {c: () for c in ApprovalClass}
+
+
+@router.get("/session/approval-classes")
+def approval_classes(
+    request: Request, principal: Annotated[Principal, Depends(sec.current_principal)]
+) -> Response:
+    """Advisory only, never a grant: nothing is issued or written, and every action
+    re-derives its own role, step-up, scope and object checks. Held only from real
+    backing data: user_strategy_adoption from the session's tenant_owner role. No
+    installation operator or maintainer role has a table, assignment or session
+    field, so those classes are never held (and a self-hosted maintainer_release
+    would also need explicit installation configuration, which does not exist).
+    No identity is served."""
+    settings: Settings = request.app.state.settings
+    with principal.tx() as tx:
+        row = tx.conn.execute("SELECT clock_timestamp()").fetchone()
+    assert row is not None
+    now, at = row[0], principal.session.step_up_at
+    expires = None if at is None else at + settings.step_up_window
+    satisfied = expires is not None and at <= now <= expires  # as require_step_up
+    owner = principal.session.role is MembershipRole.TENANT_OWNER
+    classes = []
+    for cls in ApprovalClass:
+        if cls is ApprovalClass.USER_STRATEGY_ADOPTION:
+            held, reasons = owner, [] if owner else ["role_not_assigned"]
+        else:
+            held, reasons = False, ["role_not_served"]
+            if (
+                cls is ApprovalClass.MAINTAINER_RELEASE
+                and settings.deployment is Edition.SELF_HOSTED
+            ):
+                reasons.append("self_hosted_release_not_configured")
+        reasons += [] if satisfied else ["step_up_required"]
+        reasons += [] if SERVED[cls] else ["operation_not_served"]
+        classes.append({
+            "class": cls.value,
+            "authority_scope": authority_scope(cls, settings.deployment).value,
+            "held": held,
+            "step_up": {"required": True, "satisfied": satisfied,
+                        "expires_at": expires and format_instant(expires)},
+            "served_operations": list(SERVED[cls]), "reasons": reasons,
+        })  # fmt: skip
+    body = {
+        "deployment": settings.deployment.value, "evaluated_at": format_instant(now),
+        "advisory": True, "classes": classes,
+        "coverage": {"status": "complete", "reasons": []},
+    }  # fmt: skip
+    return Response(json.dumps(body).encode(), 200, media_type="application/json")
 
 
 def _audit(
