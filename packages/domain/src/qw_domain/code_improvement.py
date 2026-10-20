@@ -4,18 +4,23 @@ content-addressed `Snapshot` is bound by a `Manifest`; `check` is a name-list st
 gate (protected by default, then denylist and Python rules), bypassable defence in
 depth; `evaluate` runs the protected tests via the T007 port and binds every digest;
 `package`/`route_for_review` hand evidence to human review, granting nothing.
-LIMITATIONS: the test summary comes from a process the candidate shares; the staged
-digest covers the candidate tree, not the interpreter or rootfs; no persistence, so
-a stored `Evaluation` must be `evaluate`'s own output.
+Increment 2: the stager also attests the rootfs tree digest (checked against the
+profile's pin before anything runs), and the in-sandbox harness reports the
+interpreter and the counts in one line signed with a per-stage key the candidate's
+process never holds. LIMITATIONS: the counts still come from the candidate's process,
+so a pass is unverified (`in_process_test_summary`); no persistence, so a stored
+`Evaluation` must be `evaluate`'s own output.
 """
 
 import ast
 import fnmatch
 import hashlib
+import hmac
+import json
 import re
 import sys
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from decimal import Decimal
 from enum import StrEnum
@@ -32,9 +37,10 @@ MAX_FILES, MAX_FILE_BYTES, MAX_TOTAL_BYTES, MAX_PATH = 20, 64 * 1024, 256 * 1024
 _SEGMENT = re.compile(r"[A-Za-z0-9_.-]+", re.ASCII)
 _SHA = re.compile(r"[0-9a-f]{64}", re.ASCII)
 _COOKIE = re.compile(r"^[ \t\f]*#.*?coding[:=]", re.MULTILINE)
-_COUNT = re.compile(
-    r"\b(\d+) (passed|failed|errors?|skipped|xfailed|xpassed|deselected)\b"
-)
+HARNESS = "qw-harness/1"  # the signed line of qw_adapters/sandbox_harness.py
+COUNTS = ("passed", "failed", "errors", "skipped", "xfailed", "xpassed")
+_REPORTS = frozenset({"ok", "missing", "multiple", "malformed", "token_mismatch"})
+_VERSION = re.compile(r"[0-9]+\.[0-9]+", re.ASCII)
 CODE = im.Target.APPLICATION_CODE
 
 
@@ -62,6 +68,9 @@ class Snapshot:
 
     def __post_init__(self) -> None:
         tree = {_path(p): _sha(s, "file_digest") for p, s in dict(self.files).items()}
+        dirs = {p.rsplit("/", k)[0] for p in tree for k in range(1, p.count("/") + 1)}
+        if clash := sorted(dirs & set(tree)):  # a file where another needs a directory
+            raise CodeError("path_conflict", clash[0])
         object.__setattr__(self, "files", MappingProxyType(dict(sorted(tree.items()))))
 
     @property
@@ -408,6 +417,10 @@ def check(c: CodeCandidate, policy: CodePolicy) -> tuple[str, ...]:
             out += _python(p, ch.content)
     if total > policy.max_total_bytes:
         out.append(f"patch_too_large:{total}>{policy.max_total_bytes}")
+    try:
+        applied(c.base, c.patch)
+    except CodeError as e:  # e.g. a file where the base has a package directory
+        out.append(e.code)
     return tuple(out)
 
 
@@ -424,8 +437,15 @@ class Profile:
     argv: tuple[str, ...]  # the protected test command; never from the candidate
     limits: sb.SandboxLimits
     expected_passed: int  # the protected suite's test count
+    rootfs_digest: str  # the pinned rootfs tree sha256 (tools/candidate_rootfs.json)
+    interpreter: tuple[str, str]  # guest path and major.minor, e.g. "3.13"
 
     def __post_init__(self) -> None:
+        _sha(self.rootfs_digest, "rootfs_digest")
+        exe, ver = tuple(self.interpreter)
+        if not exe.startswith("/") or not _VERSION.fullmatch(ver):
+            raise CodeError("interpreter", safe_repr(self.interpreter))
+        object.__setattr__(self, "interpreter", (exe, ver))
         try:
             sb.SandboxRequest("profile-check", tuple(self.argv), self.limits)
         except sb.SandboxError as e:
@@ -437,9 +457,10 @@ class Profile:
     @property
     def digest(self) -> str:
         lim = [getattr(self.limits, n) for n in sb.CEILINGS]
-        return digest(["qw.code.profile/1", self.profile_id, self.base.digest,
+        return digest(["qw.code.profile/2", self.profile_id, self.base.digest,
                        self.policy.digest, list(self.argv), lim,
-                       self.expected_passed])  # fmt: skip
+                       self.expected_passed, self.rootfs_digest,
+                       list(self.interpreter)])  # fmt: skip
 
 
 def check_protocol(p: im.Protocol, profile: Profile) -> None:
@@ -454,8 +475,22 @@ def check_protocol(p: im.Protocol, profile: Profile) -> None:
         raise CodeError("profile_mismatch", p.experiment_id)
 
 
-class Stager(Port):  # builds base + patch; returns the written tree's digest and runner
-    def stage(self, base: Snapshot, patch: Patch) -> tuple[str, sb.SandboxRunner]: ...
+@dataclass(frozen=True, slots=True)
+class Staged:
+    tree_digest: str  # of the tree as written, read back
+    rootfs_digest: str  # of the rootfs the runner mounts, computed at staging
+    runner: sb.SandboxRunner  # mounts the tree read-only and feeds the key
+    channel_key: bytes = field(repr=False)  # per stage; only the harness parent
+
+    def __post_init__(self) -> None:
+        _sha(self.tree_digest, "tree_digest")
+        _sha(self.rootfs_digest, "rootfs_digest")
+        if type(self.channel_key) is not bytes or len(self.channel_key) < 16:
+            raise CodeError("channel_key", "at least 16 bytes")
+
+
+class Stager(Port):  # builds base + patch beside the rootfs; attests both
+    def stage(self, base: Snapshot, patch: Patch) -> Staged: ...
 
 
 class Outcome(StrEnum):
@@ -478,12 +513,15 @@ class Evaluation:
     exit_code: int | None = None
     result_digest: str | None = None
     runtime: str = ""
+    rootfs_digest: str | None = None
+    interpreter: str | None = None  # "path version", from the signed harness line
 
     def __post_init__(self) -> None:
         ran = self.result_digest is not None
         ok = {
             Outcome.PASSED: not self.reasons and not self.findings and ran
-            and self.status == sb.RunStatus.EXITED.value and self.exit_code == 0,
+            and self.status == sb.RunStatus.EXITED.value and self.exit_code == 0
+            and self.rootfs_digest is not None and self.interpreter is not None,
             Outcome.FAILED: bool(self.reasons) and ran,
             Outcome.BLOCKED: bool(self.reasons) and self.exit_code is None,
             Outcome.REFUSED: bool(self.findings) and not ran,
@@ -493,23 +531,59 @@ class Evaluation:
 
     @property
     def digest(self) -> str:
-        return digest(["qw.code.evaluation/1", self.candidate_digest,
+        return digest(["qw.code.evaluation/2", self.candidate_digest,
                        self.profile_digest, self.outcome.value,
                        list(self.reasons), list(self.findings), self.tree_digest,
                        self.run_id, self.status, self.exit_code, self.result_digest,
-                       self.runtime])  # fmt: skip
+                       self.runtime, self.rootfs_digest,
+                       self.interpreter])  # fmt: skip
 
 
-def _summary(r: sb.SandboxResult, expected: int) -> list[str]:
-    if r.stdout.truncated:
-        return ["summary:truncated"]
-    counts: dict[str, int] = {}
-    for n, word in _COUNT.findall(r.stdout.head.decode("utf-8", "replace")):
-        counts[word] = counts.get(word, 0) + int(n)
-    out = [f"summary:{w}" for w in sorted(counts) if w != "passed"]
-    if (got := counts.get("passed", 0)) != expected:
-        out.append(f"summary:passed={got}!={expected}")
-    return out
+def _authentic(out: sb.StreamCapture, key: bytes) -> list[str]:
+    """Bodies of the stdout lines carrying a valid MAC under the stage key."""
+    bodies = []
+    for line in out.head.decode("utf-8", "replace").splitlines():
+        tag, _, rest = line.partition(" ")
+        body, _, mac = rest.rpartition(" ")
+        want = hmac.new(key, body.encode(), hashlib.sha256).hexdigest()
+        if tag == HARNESS and hmac.compare_digest(mac.encode(), want.encode()):
+            bodies.append(body)
+    return bodies
+
+
+def harness_report(out: sb.StreamCapture, key: bytes,
+                   profile: Profile) -> tuple[list[str], str | None]:  # fmt: skip
+    """Reasons the signed harness line refuses a pass, and the attested interpreter.
+    Unsigned, wrongly signed or repeated lines never count."""
+    if out.truncated:
+        return ["summary:truncated"], None
+    if len(bodies := _authentic(out, key)) != 1:
+        return [f"summary:signed_lines={len(bodies)}"], None
+    try:
+        b = json.loads(bodies[0])
+        exe, ver, report = b["executable"], b["version"], b["report"]
+        counts = b["counts"]
+        ok = isinstance(exe, str) and isinstance(ver, str) and report in _REPORTS
+        ok = ok and type(b["child_exit"]) is int and type(b["nondumpable"]) is bool
+        ok = ok and set(counts) == set(COUNTS)
+        ok = ok and all(type(counts[k]) is int and counts[k] >= 0 for k in COUNTS)
+    except (ValueError, TypeError, KeyError):
+        ok = False
+    if not ok:
+        return ["summary:malformed"], None
+    why: list[str] = []
+    if (exe, ".".join(ver.split(".")[:2])) != profile.interpreter:
+        why.append("interpreter_mismatch")
+    if not b["nondumpable"]:
+        why.append("harness_dumpable")
+    if report != "ok":
+        why.append(f"summary:report_{report}")
+    if b["child_exit"] != 0:
+        why.append(f"summary:child_exit={b['child_exit']}")
+    why += [f"summary:{w}" for w in COUNTS[1:] if counts[w]]
+    if counts["passed"] != profile.expected_passed:
+        why.append(f"summary:passed={counts['passed']}!={profile.expected_passed}")
+    return why, f"{exe} {ver}"
 
 
 def evaluate(c: CodeCandidate, profile: Profile, stager: Stager,
@@ -524,13 +598,17 @@ def evaluate(c: CodeCandidate, profile: Profile, stager: Stager,
     if found:
         return Evaluation(*head, Outcome.REFUSED, (), found)
     tree = applied(c.base, c.patch).digest
-    staged, runner = stager.stage(c.base, c.patch)
-    if staged != tree:
+    st = stager.stage(c.base, c.patch)
+    if st.tree_digest != tree:
         return Evaluation(*head, Outcome.BLOCKED, ("image_mismatch",), (), tree)
+    if st.rootfs_digest != profile.rootfs_digest:  # nothing runs on another rootfs
+        return Evaluation(*head, Outcome.BLOCKED, ("rootfs_mismatch",), (), tree,
+                          rootfs_digest=st.rootfs_digest)  # fmt: skip
     run_id = f"code-{c.digest[:24]}-a{attempt}"
     req = sb.SandboxRequest(run_id, profile.argv, profile.limits)
-    r = sb.execute(runner, req)
+    r = sb.execute(st.runner, req)
     reasons: list[str] = []
+    why, interp = harness_report(r.stdout, st.channel_key, profile)
     if r.status is sb.RunStatus.BLOCKED:
         reasons.append(f"sandbox_blocked:{r.reason}")
     elif r.run_id != run_id:
@@ -542,12 +620,13 @@ def evaluate(c: CodeCandidate, profile: Profile, stager: Stager,
     elif r.exit_code != 0:
         reasons.append(f"tests_failed:exit={r.exit_code}")
     else:
-        reasons += _summary(r, profile.expected_passed)
+        reasons += why
     outcome = Outcome.FAILED if reasons else Outcome.PASSED
     if r.status is sb.RunStatus.BLOCKED:
         outcome = Outcome.BLOCKED
     return Evaluation(*head, outcome, tuple(reasons), (), tree, run_id, r.status.value,
-                      r.exit_code, r.digest(), r.runtime)  # fmt: skip
+                      r.exit_code, r.digest(), r.runtime, st.rootfs_digest,
+                      interp)  # fmt: skip
 
 
 _BUCKETS = (  # finding prefix -> the T044 application_code hard control it counts
@@ -624,6 +703,11 @@ def package(p: im.Protocol, profile: Profile, c: CodeCandidate, e: Evaluation,
         c.digest, profile.digest, check(c, profile.policy)
     ):  # fmt: skip
         raise CodeError("evaluation_unbound", cand.candidate_id)
+    if e.outcome is Outcome.PASSED:  # the pass ran on the pinned rootfs and interpreter
+        exe, _, ver = (e.interpreter or "").rpartition(" ")
+        got = (e.rootfs_digest, exe, ".".join(ver.split(".")[:2]))
+        if got != (profile.rootfs_digest, *profile.interpreter):
+            raise CodeError("evaluation_unbound", cand.candidate_id)
     return EvidenceBundle(p.experiment_id, cand.candidate_id, cand.content_hash,
                           p.content_hash, e.digest, e.outcome,
                           MappingProxyType(metrics(e)))  # fmt: skip
