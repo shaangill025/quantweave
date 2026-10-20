@@ -20,8 +20,11 @@ access recorded), R029, R065, R084.
   accesses never bound to a trial. Only a completed promotion trial on the first
   holdout access yields a T027 `EvidenceRecord`; later ones are `holdout_reused`.
   Construction replays every entry (forged grants fail).
-LIMITATIONS: no persistence; roles are caller-asserted; times must come from the
-server clock; no multiple-testing adjustment is computed yet.
+- `checkpoint(n)` digests the first n entries (`entry_wire`), so a store can require
+  a later ledger to extend an earlier one (T044).
+LIMITATIONS: persisted only as T044 holdout reads and checkpoints; roles are
+caller-asserted; times must come from the server clock; no multiple-testing
+adjustment is computed yet.
 Stdlib only.
 """
 
@@ -37,7 +40,7 @@ from types import MappingProxyType
 from qw_domain.decimals import safe_repr
 from qw_domain.filings import AsOfView
 from qw_domain.identity import InstrumentId
-from qw_domain.instants import ensure_aware_utc
+from qw_domain.instants import ensure_aware_utc, format_instant
 from qw_domain.research_data import (
     DatasetManifest,
     EvidenceClass,
@@ -46,6 +49,7 @@ from qw_domain.research_data import (
     ResearchRights,
     Window,
     check_id,
+    digest,
     require_research_use,
 )
 from qw_domain.strategy_gate import EvidenceRecord
@@ -168,6 +172,15 @@ class Access:
         if type(self.window) is not Window or type(self.candidate) is not Candidate:
             raise ResearchError("access", "a Window and a Candidate are required")
 
+    def to_wire(self) -> list[object]:
+        c, ins = self.candidate, self.instruments
+        return [self.access_id, self.plan_id, self.trial_id,
+                [c.family, c.material_hash, c.config_hash], self.split.value,
+                self.window.to_wire(),
+                None if ins is None else sorted(i.to_wire() for i in ins),
+                self.actor_id, self.role.value, format_instant(self.at),
+                self.granted, list(self.reasons), self.seq]  # fmt: skip
+
 
 @dataclass(frozen=True, slots=True)
 class Trial:
@@ -209,6 +222,24 @@ class Trial:
 
 
 type Entry = SplitPlan | Access | Trial
+
+
+def entry_wire(e: Entry) -> list[object]:
+    """The canonical form of one ledger entry (all fields; the plan's dataset by
+    its content hash)."""
+    if isinstance(e, SplitPlan):
+        return ["plan", e.plan_id, e.dataset_hash, e.protocol_hash,
+                [w.to_wire() for w in (e.train, e.development, e.promotion)],
+                str(e.embargo.total_seconds()),
+                sorted(i.to_wire() for i in e.holdout_instruments),
+                e.max_promotion_accesses, e.approved_by,
+                format_instant(e.registered_at)]  # fmt: skip
+    if isinstance(e, Access):
+        return ["access", *e.to_wire()]
+    return ["trial", e.trial_id, e.plan_id, e.family, e.hypothesis, e.material_hash,
+            e.config_hash, e.dataset_hash, e.protocol_hash, e.split.value,
+            e.outcome.value, e.metrics_wire(), e.access_id,
+            format_instant(e.recorded_at)]  # fmt: skip
 
 
 @dataclass(slots=True)
@@ -341,6 +372,12 @@ class TrialLedger:
         if (a := self._state.accesses.get(access_id)) is None:
             raise ResearchError("unknown_access", safe_repr(access_id))
         return a
+
+    def checkpoint(self, n: int) -> str:
+        """Digest of the first `n` entries (1 <= n <= len(entries))."""
+        if type(n) is not int or not 1 <= n <= len(self.entries):
+            raise ResearchError("checkpoint", f"{safe_repr(n)} is out of range")
+        return digest([entry_wire(e) for e in self.entries[:n]])
 
     def accesses(self) -> tuple[Access, ...]:
         return tuple(self._state.accesses.values())
