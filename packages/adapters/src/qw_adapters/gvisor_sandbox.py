@@ -3,14 +3,16 @@ R076). runsc is a host tool, not a dependency: `QW_SANDBOX_RUNSC` (or PATH), the
 immutable rootfs `QW_SANDBOX_ROOTFS`, `QW_SANDBOX_PLATFORM` (systrap or ptrace).
 
 A foreground `runsc --network=none run` of an OCI bundle (exit code = candidate's):
-read-only root; only proc/tmpfs mounts (no host path, socket or key); read-only /dev
-and /dev/shm; /tmp the one capped noexec scratch dir; uid 65534, no capabilities, a
-fixed env; guest RLIMIT_CPU/NPROC. runsc joins an existing cgroup without setting its
-limits, so the adapter creates the run's cgroup (v1 controller dirs, or one v2 dir
-whose parents delegate cpu, memory and pids), writes and verifies memory (+swap), pids
-and CPU quota, and reads OOM kills, pids events and CPU usage after the run. Probe
-failures return `blocked` (no fallback); every cleanup step runs and any failure makes
-the result an error. Needs host root.
+read-only root; proc/tmpfs mounts plus only the read-only noexec binds a caller names
+(T049: the staged tree; no socket or key), each onto a directory the rootfs already
+has, since runsc would otherwise create it in the host rootfs; read-only /dev and
+/dev/shm; /tmp the one capped noexec scratch dir; uid 65534, no capabilities, a fixed
+env; optional bounded stdin; guest RLIMIT_CPU/NPROC. runsc joins an existing cgroup
+without setting its limits, so the adapter creates the run's cgroup (v1 controller
+dirs, or one v2 dir whose parents delegate cpu, memory and pids), writes and verifies
+memory (+swap), pids and CPU quota, and reads OOM kills, pids events and CPU usage
+after the run. Probe failures return `blocked` (no fallback); every cleanup step runs
+and any failure makes the result an error. Needs host root.
 """
 
 import hashlib
@@ -22,6 +24,7 @@ import subprocess
 import tempfile
 import threading
 import uuid
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import IO, Any
@@ -49,7 +52,16 @@ def _tmpfs(dest: str, *opts: str) -> dict[str, Any]:
     return {"destination": dest, "type": "tmpfs", "source": "tmpfs", "options": opts}
 
 
-def oci_config(request: SandboxRequest, rootfs: Path, cgroup: str) -> dict[str, Any]:
+Bind = tuple[Path, str]  # host directory -> guest path, always read-only
+
+
+def _bind(host: Path, dest: str) -> dict[str, Any]:
+    opts = ("rbind", "ro", "nosuid", "nodev", "noexec")
+    return {"destination": dest, "type": "bind", "source": str(host), "options": opts}
+
+
+def oci_config(request: SandboxRequest, rootfs: Path, cgroup: str,
+               binds: Sequence[Bind] = ()) -> dict[str, Any]:  # fmt: skip
     lim = request.limits
     rlimits = [
         {"type": "RLIMIT_CPU", "soft": lim.cpu_seconds, "hard": lim.cpu_seconds + 1},
@@ -66,6 +78,7 @@ def oci_config(request: SandboxRequest, rootfs: Path, cgroup: str) -> dict[str, 
         _tmpfs("/dev", "ro", "mode=755"),
         _tmpfs("/dev/shm", "ro", "size=4k"),
         _tmpfs("/tmp", "mode=1777", f"size={lim.scratch_bytes}"),
+        *(_bind(host, dest) for host, dest in binds),
     ]
     linux = {"namespaces": [{"type": t} for t in _NAMESPACES], "cgroupsPath": cgroup}
     return {
@@ -242,8 +255,17 @@ class _Drainer(threading.Thread):
 
 
 class GVisorRunner:
-    def __init__(self, config: GVisorConfig) -> None:
-        self.config = config
+    """`binds` are read-only host directories; `stdin` is written to the guest's
+    standard input and closed (T049: the per-stage channel key)."""
+
+    def __init__(self, config: GVisorConfig, binds: Sequence[Bind] = (),
+                 stdin: bytes = b"") -> None:  # fmt: skip
+        self.config, self.binds, self.stdin = config, tuple(binds), stdin
+        for h, d in self.binds:
+            if not h.is_absolute() or not d.startswith("/") or ".." in d.split("/"):
+                raise ValueError(f"binds: absolute paths only: {h} -> {d}")
+        if len(stdin) > 4096:
+            raise ValueError("stdin: at most 4096 bytes")
 
     def _control(self, *args: str) -> subprocess.CompletedProcess[bytes]:
         return subprocess.run(
@@ -303,6 +325,12 @@ class GVisorRunner:
             return sb.blocked(request.run_id, gate.reason, gate.runtime)
         c, lim = self.config, request.limits
         assert c.rootfs is not None  # the probe checked it
+        for _, dest in self.binds:  # never let runsc create a mountpoint on the host
+            here = c.rootfs
+            for part in dest.strip("/").split("/"):
+                here = here.joinpath(part)
+                if here.is_symlink() or not here.is_dir():
+                    return sb.blocked(request.run_id, f"no_mountpoint: {dest}")
         c.state_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
         cid = f"qw-{request.run_id}-{uuid.uuid4().hex[:12]}"
         cgroup = f"/{c.cgroup_parent}/{cid}"
@@ -316,19 +344,23 @@ class GVisorRunner:
         counters: tuple[int | None, ...] = (None, None, None)
         timed_out = started = False
         try:
-            config = oci_config(request, c.rootfs, cgroup)
+            config = oci_config(request, c.rootfs, cgroup, self.binds)
             bundle.joinpath("config.json").write_text(json.dumps(config))
             setup_cgroups(c, cid, lim, made)
             proc = subprocess.Popen(
                 runsc_argv(c, "run", "--pid-file", str(pid_file), "--bundle",
                            str(bundle), cid),
-                stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE, env=HOST_ENV, close_fds=True,
+                stdin=subprocess.PIPE if self.stdin else subprocess.DEVNULL,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=HOST_ENV,
+                close_fds=True,
             )  # fmt: skip
             assert proc.stdout is not None and proc.stderr is not None
             drains = [_Drainer(s, lim.output_bytes) for s in (proc.stdout, proc.stderr)]
             for d in drains:
                 d.start()
+            if proc.stdin is not None:  # small: fits the pipe buffer, never blocks
+                proc.stdin.write(self.stdin)
+                proc.stdin.close()
             try:
                 exit_status = proc.wait(timeout=_ceil_s(lim.wall_millis))
             except subprocess.TimeoutExpired:

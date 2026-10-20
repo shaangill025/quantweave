@@ -9,6 +9,8 @@ AT039 (tenant scope refused), AT086/AT092 (protected controls not mutable), AT07
 
 import ast
 import hashlib
+import hmac
+import json
 from dataclasses import fields, replace
 from datetime import timedelta
 from decimal import Decimal
@@ -38,7 +40,7 @@ WEAK_TEST = TEST_SRC.replace(b"== 5", b"== -1")
 CONTENT = {FIX: BUGGY, TEST: TEST_SRC, RISK: b"MAX_LOSS = 1\n"}
 AT = T0 + timedelta(minutes=5)
 INSTALL = "install-synth"
-ARGV = ("/usr/bin/python3", "-m", "pytest", "-q", "-p", "no:cacheprovider", "/work")
+ARGV = ("/usr/local/bin/python3", "-I", "-S", "-B", "/mnt/harness.py", "t.py")
 
 
 def sha(b: bytes) -> str:
@@ -47,7 +49,22 @@ def sha(b: bytes) -> str:
 
 BASE = ci.Snapshot({p: sha(b) for p, b in CONTENT.items()})
 LIMITS = sb.SandboxLimits(wall_millis=60_000)
-PROFILE = ci.Profile("profile-synth", BASE, ci.CodePolicy(), ARGV, LIMITS, 1)
+ROOTFS = "f" * 64  # SYNTHETIC rootfs pin
+PY = ("/usr/local/bin/python3", "3.13")
+PROFILE = ci.Profile("profile-synth", BASE, ci.CodePolicy(), ARGV, LIMITS, 1, ROOTFS,
+                     PY)  # fmt: skip
+KEY = b"SYNTHETIC-stage-key-0123456789ab"
+
+
+def signed(key: bytes = KEY, **over: Any) -> str:
+    """A harness line (format of qw_adapters/sandbox_harness.py), written by hand."""
+    counts = {"passed": 1, "failed": 0, "errors": 0, "skipped": 0, "xfailed": 0,
+              "xpassed": 0} | over.pop("counts", {})  # fmt: skip
+    body = {"executable": PY[0], "version": "3.13.16", "implementation": "cpython",
+            "nondumpable": True, "child_exit": 0, "report": "ok",
+            "counts": counts} | over  # fmt: skip
+    text = json.dumps(body, sort_keys=True, separators=(",", ":"))
+    return f"qw-harness/1 {text} {hmac.new(key, text.encode(), 'sha256').hexdigest()}\n"
 
 
 def mod(path: str, new: bytes) -> ci.FileChange:
@@ -78,7 +95,7 @@ def stream(text: str) -> sb.StreamCapture:
 
 
 class Runner:  # SYNTHETIC SandboxRunner: replays one configured result
-    def __init__(self, out: str = "1 passed in 0.01s\n", code: int = 0, *,
+    def __init__(self, out: str = signed(), code: int = 0, *,
                  gate: bool = True, status: Run = Run.EXITED, hit: Hit = Hit.NONE,
                  run_id: str = "") -> None:  # fmt: skip
         self.out, self.code, self.gate, self.status = out, code, gate, status
@@ -96,15 +113,16 @@ class Runner:  # SYNTHETIC SandboxRunner: replays one configured result
 
 
 class Stager:  # SYNTHETIC: writes the bytes and hashes what it wrote
-    def __init__(self, runner: Runner, tamper: bool = False) -> None:
-        self.runner, self.tamper = runner, tamper
+    def __init__(self, runner: Runner, tamper: bool = False,
+                 rootfs: str = ROOTFS) -> None:  # fmt: skip
+        self.runner, self.tamper, self.rootfs = runner, tamper, rootfs
 
-    def stage(self, base: ci.Snapshot, patch: ci.Patch) -> tuple[str, Runner]:
+    def stage(self, base: ci.Snapshot, patch: ci.Patch) -> ci.Staged:
         tree = CONTENT | {ch.path: ch.content for ch in patch.changes}
         if self.tamper:
             tree[TEST] = b"def test_add() -> None:\n    pass\n"
         written = {p: sha(b) for p, b in tree.items() if b is not None}
-        return ci.Snapshot(written).digest, self.runner
+        return ci.Staged(ci.Snapshot(written).digest, self.rootfs, self.runner, KEY)
 
 
 def evaluate(c: ci.CodeCandidate, runner: Runner | None = None,
@@ -324,6 +342,9 @@ def test_evaluation_runs_the_protected_tests_bound_to_the_candidate() -> None:
     assert (e.candidate_digest, e.profile_digest) == (REPAIR.digest, PROFILE.digest)
     assert e.tree_digest == ci.Snapshot({**BASE.files, FIX: sha(FIXED)}).digest
     assert e.result_digest == runner.run(req).digest()
+    assert (e.rootfs_digest, e.interpreter) == (ROOTFS, PY[0] + " 3.13.16")
+    with pytest.raises(ci.CodeError, match="evaluation_inconsistent"):
+        replace(e, interpreter=None)  # a pass always names its attested interpreter
     assert evaluate(REPAIR, Runner(), attempt=2).run_id == req.run_id[:-1] + "2"
     assert evaluate(REPAIR).digest == e.digest  # deterministic
 
@@ -333,11 +354,25 @@ def test_evaluation_runs_the_protected_tests_bound_to_the_candidate() -> None:
     [
         (Runner(gate=False), Out.BLOCKED, "sandbox_blocked:no_runsc"),
         (Runner("1 failed in 0.1s\n", 1), Out.FAILED, "tests_failed:exit=1"),
-        (Runner("1 passed, 1 skipped\n"), Out.FAILED, "summary:skipped"),
-        (Runner("1 passed, 1 xfailed\n"), Out.FAILED, "summary:xfailed"),
-        (Runner("1 passed, 1 deselected\n"), Out.FAILED, "summary:deselected"),
-        (Runner("2 passed in 0.1s\n"), Out.FAILED, "summary:passed=2!=1"),
-        (Runner("no summary\n"), Out.FAILED, "summary:passed=0!=1"),
+        (Runner(signed(counts={"skipped": 1})), Out.FAILED, "summary:skipped"),
+        (Runner(signed(counts={"xfailed": 1})), Out.FAILED, "summary:xfailed"),
+        (Runner(signed(counts={"errors": 1})), Out.FAILED, "summary:errors"),
+        (Runner(signed(counts={"passed": 2})), Out.FAILED, "summary:passed=2!=1"),
+        (Runner("1 passed in 0.01s\n"), Out.FAILED, "summary:signed_lines=0"),
+        (Runner(signed(b"SYNTHETIC-forger-key-0123456789")), Out.FAILED,
+         "summary:signed_lines=0"),
+        (Runner(signed() + signed()), Out.FAILED, "summary:signed_lines=2"),
+        (Runner(signed().replace('"passed":1', '"passed":9')), Out.FAILED,
+         "summary:signed_lines=0"),
+        (Runner(signed(report="token_mismatch")), Out.FAILED,
+         "summary:report_token_mismatch"),
+        (Runner(signed(child_exit=1)), Out.FAILED, "summary:child_exit=1"),
+        (Runner(signed(nondumpable=False)), Out.FAILED, "harness_dumpable"),
+        (Runner(signed(version="3.12.9")), Out.FAILED, "interpreter_mismatch"),
+        (Runner(signed(executable="/tmp/python3")), Out.FAILED,
+         "interpreter_mismatch"),
+        (Runner(signed(counts={"passed": "1"})), Out.FAILED, "summary:malformed"),
+        (Runner(signed(report="fine")), Out.FAILED, "summary:malformed"),
         (Runner(status=Run.LIMIT, hit=Hit.WALL_TIME), Out.FAILED,
          "limit_exceeded:wall_time"),
         (Runner(status=Run.ERROR), Out.FAILED, "runtime_error"),
@@ -355,6 +390,17 @@ def test_tampered_image_and_contained_candidates_never_pass() -> None:
     e = ci.evaluate(REPAIR, PROFILE, Stager(runner, tamper=True))
     assert e.outcome is Out.BLOCKED and e.reasons == ("image_mismatch",)
     assert runner.requests == []  # a tree other than base + patch never runs
+    e = ci.evaluate(REPAIR, PROFILE, Stager(runner, rootfs="a" * 64))
+    assert (e.outcome, e.reasons, e.rootfs_digest) == (
+        Out.BLOCKED, ("rootfs_mismatch",), "a" * 64)  # fmt: skip
+    assert runner.requests == []  # nothing runs on an unpinned rootfs
+    for bad in (dict(rootfs_digest="x"), dict(interpreter=("python3", "3.13")),
+                dict(interpreter=(PY[0], "3"))):  # fmt: skip
+        with pytest.raises(ci.CodeError):
+            replace(PROFILE, **bad)
+    with pytest.raises(ci.CodeError, match="channel_key"):
+        ci.Staged("a" * 64, ROOTFS, runner, b"short")
+    assert replace(PROFILE, rootfs_digest="a" * 64).digest != PROFILE.digest
     spin = code(mod(FIX, b"while True:\n    pass\n"))  # statically clean; contained
     assert findings(spin) == ()
     hit = Runner(status=Run.LIMIT, hit=Hit.CPU_TIME)
@@ -458,6 +504,24 @@ def test_package_refuses_unbound_evidence() -> None:
     with pytest.raises(ci.CodeError, match="candidate_unbound"):
         ci.package(code_proto(), PROFILE, REPAIR, evaluate(REPAIR),
                    replace(c, artifact_hash="a" * 64))  # fmt: skip
+    ok = evaluate(REPAIR)
+    for forged in (replace(ok, rootfs_digest="a" * 64),
+                   replace(ok, interpreter="/x/py 3.13.1"),
+                   replace(ok, interpreter=PY[0] + " 3.12.9")):  # fmt: skip
+        with pytest.raises(ci.CodeError, match="evaluation_unbound"):  # not the pin
+            ci.package(code_proto(), PROFILE, REPAIR, forged, c)
+
+
+def test_truncated_output_conflicting_paths_and_key_repr() -> None:
+    one = signed().encode()
+    cut = sb.StreamCapture(one, len(one) + 1, sha(one + b"x"))  # a valid line, cut
+    assert ci.harness_report(cut, KEY, PROFILE) == (["summary:truncated"], None)
+    assert ci.harness_report(stream(signed()), KEY, PROFILE) == ([], PY[0] + " 3.13.16")
+    with pytest.raises(ci.CodeError, match="path_conflict"):
+        ci.Snapshot({"a/b.py": "a" * 64, "a": "b" * 64})
+    assert "path_conflict" in findings(code(add(SRC[:-1])))  # a file over a package
+    staged = ci.Staged("a" * 64, ROOTFS, Runner(), KEY)
+    assert KEY.hex() not in repr(staged) and repr(KEY) not in repr(staged)
 
 
 class SyntheticGenerator:  # deterministic SYNTHETIC double; no model call

@@ -426,3 +426,79 @@ def test_review_round1_time_budget_lineage_and_verdict_rules() -> None:
         assess(registry(), promo_ledger(GOOD), claimed={"net_return": 0.02})
     with pytest.raises(im.ImprovementError, match="duplicate"):
         registry().record_verdict(ok).record_verdict(ok)
+
+
+SU = ("evidence:synthetic_only", "unavailable:parent_optimizer_version")
+
+
+def test_record_derives_honest_states_and_reasons() -> None:
+    reg, pl = registry(proto(sandbox_profile_id="sbx-synth")), plan()
+    b = scheduled(reg)
+    with pytest.raises(im.ImprovementError, match="contract_field_unavailable"):
+        im.record(registry(), EXP, "cand-1", pl, b)  # no sandbox profile: refused
+    first = im.record(reg, EXP, "cand-1", pl, book())
+    assert (first.state, first.reasons) == (im.RecordState.PROPOSED, SU)
+    assert first.requires_human_promotion and first.verdict_id is None
+    assert (first.candidate_version, first.candidate_hash) == ("cand-1", ART)
+    assert first.protocol_id == reg.protocol(EXP).content_hash
+    assert first.data_snapshot_ids == (pl.dataset.dataset_id,)
+    auth = im.record(reg, EXP, "cand-1", pl, b, im.Scheduled(EXP, "bud-exp-1"))
+    assert auth.state is im.RecordState.AUTHORIZED and auth.may_follow(first)
+    with pytest.raises(im.ImprovementError, match="reservation_unverified"):
+        im.record(reg, EXP, "cand-1", pl, book(), im.Scheduled(EXP, "bud-exp-1"))
+    later = im.record(reg, EXP, "cand-1", pl, b, im.Deferred(EXP, "queued_behind"))
+    assert later.reasons == ("deferred:queued_behind", *SU)
+    run = im.Assessment(promo_ledger(GOOD), ASSESSOR, AT + timedelta(days=1), "v-1")
+    done = im.record(reg, EXP, "cand-1", pl, b, im.Scheduled(EXP, "bud-exp-1"), run)
+    assert (done.state, done.decision) == (
+        im.RecordState.AWAITING_REVIEW, im.Decision.ACCEPT_FOR_REVIEW)  # fmt: skip
+    assert done.reasons == (SU[0], "none:evaluation_receipt_ids", SU[1])
+    assert done.parent_optimizer_version is None  # not the producer's version
+    assert done.may_follow(auth) and not first.may_follow(done)
+    assert not done.may_follow(done)  # nothing follows a decision
+    assert not replace(auth, candidate_version="cand-9").may_follow(first)
+    assert not first.may_follow(auth)  # never back
+    bad = replace(run, ledger=promo_ledger(GOOD | {"lookahead_violations": Decimal(1)}))
+    rej = im.record(reg, EXP, "cand-1", pl, b, None, bad)
+    assert rej.state is im.RecordState.REJECTED
+    assert "rejected:hard:lookahead_violations" in rej.reasons
+    thin = im.record(reg, EXP, "cand-1", pl, b, None,
+                     replace(run, ledger=ledger()))  # fmt: skip
+    assert thin.state is im.RecordState.FAILED
+    assert "insufficient:no_qualifying_trial" in thin.reasons
+    blocked = im.record(reg, EXP, "cand-1", pl, book(), None, run)
+    assert blocked.state is im.RecordState.PROPOSED
+    assert "blocked:budget_not_reserved" in blocked.reasons
+    for t in im.SANDBOX_TARGETS:  # T007: representable, never past proposed
+        p = proto(target=t, sandbox_profile_id="sbx-synth")
+        r = im.ExperimentRegistry(TENANT).register(p).register_candidate(
+            cand(target=t))  # fmt: skip
+        got = im.record(r, EXP, "cand-1", pl, book(), im.Deferred(
+            EXP, "sandbox_unqualified"), run)  # fmt: skip
+        assert got.state is im.RecordState.PROPOSED and got.decision is (
+            im.Decision.BLOCKED)  # fmt: skip
+        assert "blocked:sandbox_unqualified" in got.reasons
+        optimizer = t is im.Target.RECURSIVE_OPTIMIZER  # its lineage: the parent
+        assert got.parent_optimizer_version == ("strat-v0" if optimizer else None)
+        sandbox: list[dict[str, object]] = [{"state": im.RecordState.AUTHORIZED},
+                                            {"reasons": ()}]  # fmt: skip
+        for forged in sandbox:
+            with pytest.raises(im.ImprovementError, match="record_inconsistent"):
+                replace(got, **forged)  # type: ignore[arg-type]
+    decided: list[dict[str, object]] = [
+        {"state": im.RecordState.REJECTED}, {"reasons": ("evidence:synthetic_only",)},
+        {"decision": None}, {"reasons": ("b", "a")},
+        {"parent_optimizer_version": "opt-v0"}]  # fmt: skip
+    for forged in decided:
+        with pytest.raises(im.ImprovementError):
+            replace(done, **forged)  # type: ignore[arg-type]
+    many = [f"evidence:r{i:02}" for i in range(65 - len(done.reasons))]
+    for extra in (many, ["evidence:" + "x" * 151]):  # served length stays <= 300
+        with pytest.raises(im.ImprovementError, match="reasons"):
+            replace(done, reasons=tuple(sorted([*done.reasons, *extra])))
+    ok = replace(done, reasons=tuple(sorted([*done.reasons, "evidence:" + "x" * 150])))
+    assert max(len(f"{r}/{'e' * 128}") for r in ok.reasons) <= 300
+    with pytest.raises(im.ImprovementError, match="hypothesis"):
+        replace(done, hypothesis="h" * 4001)
+    with pytest.raises(im.ImprovementError, match="test_access_changed"):
+        im.record(reg, EXP, "cand-1", plan(max_promotion_accesses=2), b)
