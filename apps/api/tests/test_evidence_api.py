@@ -12,6 +12,7 @@ relative to it (`clock_relative`): no expectation depends on the calendar date."
 from __future__ import annotations
 
 import importlib.util
+import json
 import sys
 import uuid
 from datetime import UTC, datetime, timedelta
@@ -242,8 +243,9 @@ def test_a_tampered_store_is_a_crash_not_an_answer(world: Any, app_conn: Any) ->
     login(world.client, "alice")
     for path in ("/api/v1/evidence/p-release", "/api/v1/claims/c-1"):
         got = world.client.get(path)
-        assert_problem(got, 500, "internal_error")
-        assert "999" not in got.text
+        body = assert_problem(got, 500, "internal_error")
+        del body["correlation_id"]  # random hex: may contain "999" by chance
+        assert "999" not in json.dumps(body)
 
 
 @pytest.mark.db
