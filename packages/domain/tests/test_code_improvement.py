@@ -250,7 +250,7 @@ def test_forbidden_paths_are_refused(reason: str, path: str) -> None:
          "frame_introspection:f_globals"),
         (b"def f():\n    '1 passed'\nhelp(f)\n", "forbidden_call:help"),
         (b"def g():\n    yield 1\nmatch g():\n    case object(gi_frame=f):\n"
-         b"        pass\n", "match_statement"),
+         b"        pass\n", "node_not_allowed:Match:L3"),
         (b"from typing import get_type_hints\n", "name_not_allowed:get_type_hints"),
         (b"def f(x: 'chr(95)') -> None:\n    pass\n", "string_annotation"),
         (b"def f() -> 'chr(95)':\n    pass\n", "string_annotation"),
@@ -418,7 +418,8 @@ def test_metrics_count_hard_controls_per_file() -> None:
     keys = add(SRC + "keys/k.py", b"import requests\nimport os\nimport socket\n")
     bad = code(mod(TEST, WEAK_TEST), add("uv.lock", b"x"), keys)
     got = ci.metrics(evaluate(bad))
-    want = [1, 1, 2, 1]  # keys/k.py; keys/k.py; uv.lock + keys/k.py; the test file
+    want = [1, 2, 2, 1]  # keys/k.py; keys/k.py + the test file's qw_domain import;
+    # uv.lock + keys/k.py; the test file
     assert got == {**{h: Decimal(n) for h, n in zip(hard, want, strict=True)},
                    "tests_passed": D0}  # fmt: skip
 
