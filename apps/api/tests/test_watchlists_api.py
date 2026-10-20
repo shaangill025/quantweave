@@ -153,7 +153,8 @@ def test_tenancy_cursors_and_bad_input(world: Any) -> None:
     first = world.client.get(URL, params={"limit": 1}).json()["next_cursor"]
     assert_problem(world.client.get("/api/v1/policies", params={"cursor": first}),
                    400, "invalid_cursor")  # fmt: skip
-    for bad in ("x", first[:-2] + "AA"):
+    forged = first[:-2] + ("AA" if first[-2:] != "AA" else "BB")
+    for bad in ("x", forged):
         assert_problem(world.client.get(URL, params={"cursor": bad}), 400,
                        "invalid_cursor")  # fmt: skip
     login(world.client, "bob")  # same tenant, another principal

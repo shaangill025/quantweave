@@ -108,7 +108,9 @@ def test_strategies_conform_and_are_never_action_eligible(
     login(world.client, "carol")  # tenant B sees the same installation registry
     assert world.client.get("/api/v1/strategies?limit=4").json()["items"] == first[
         "items"]  # fmt: skip
-    for bad in ("x" * 30, first["next_cursor"][:-2] + "AA"):
+    cursor = first["next_cursor"]
+    forged = cursor[:-2] + ("AA" if cursor[-2:] != "AA" else "BB")
+    for bad in ("x" * 30, forged):
         assert_problem(world.client.get(f"/api/v1/strategies?cursor={bad}"), 400,
                        "invalid_cursor")  # fmt: skip
     assert_problem(world.client.get("/api/v1/strategies/STR-NONE"), 404, "not_found")

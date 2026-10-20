@@ -118,7 +118,9 @@ def test_simulations_are_listed_tenant_scoped_and_marked_simulated(
     nxt = world.client.get(f"/api/v1/simulations?limit=1&cursor={first['next_cursor']}")
     assert [i["id"] for i in nxt.json()["items"]] == ["SIM-2"]
     assert nxt.json()["next_cursor"] is None
-    for bad in ("x" * 30, first["next_cursor"][:-2] + "AA"):
+    cursor = first["next_cursor"]
+    forged = cursor[:-2] + ("AA" if cursor[-2:] != "AA" else "BB")
+    for bad in ("x" * 30, forged):
         assert_problem(world.client.get(f"/api/v1/simulations?cursor={bad}"), 400,
                        "invalid_cursor")  # fmt: skip
     login(world.client, "carol")  # tenant B
