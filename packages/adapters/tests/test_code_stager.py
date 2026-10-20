@@ -482,3 +482,41 @@ os._exit(0)
     assert reasons == [], (reasons, r)  # forged: BUGGY would fail both tests
     assert "in_process_test_summary" in ci.LIMITATIONS
     assert json.loads(r.stdout.head.split(b" ")[1])["counts"]["passed"] == 2
+
+
+IMPORT_PROBE = """
+import importlib.util, os, sys
+sys.stderr.write("QW-PATH " + repr(sys.path) + "\\n")
+for root, dirs, files in os.walk("/mnt"):
+    sys.stderr.write("QW-WALK " + root + " " + repr(sorted(files)) + "\\n")
+for m in ("qw_domain", "qw_domain.old", "qw_domain.returns", "qw_domain.sandbox",
+          "qw_adapters", "qw_adapters.gvisor_sandbox", "qw_api", "qw_worker"):
+    try:
+        s = importlib.util.find_spec(m)
+        where = "none" if s is None else str(
+            s.origin or list(s.submodule_search_locations or []))
+    except ImportError as e:
+        where = "error:" + type(e).__name__
+    sys.stderr.write(f"QW-SPEC {m} {where}\\n")
+"""
+
+
+@pytest.mark.gvisor
+def test_in_repo_imports_inside_the_stage_and_their_refusal(real: GVisorStager) -> None:
+    """What a staged candidate can import (probe staged past the gate on purpose),
+    and that the gate refuses an in-repo or relative import before staging."""
+    r, reasons = hostile(real, IMPORT_PROBE + FIXED.decode(), "t049-imports")
+    err = r.stderr.head.decode()
+    spec = dict(ln.split(" ", 2)[1:] for ln in err.splitlines() if ln[:8] == "QW-SPEC ")
+    assert reasons == [], r
+    assert spec["qw_domain.old"] == "/mnt/tree/" + GONE  # the staged base is importable
+    assert spec["qw_domain.returns"] == "/mnt/tree/" + FIX
+    for m in ("qw_domain.sandbox", "qw_adapters", "qw_adapters.gvisor_sandbox",
+              "qw_api", "qw_worker"):  # fmt: skip
+        assert spec[m] in ("none", "error:ModuleNotFoundError"), (m, spec)
+    before = len(real.stages)
+    for body in (b"from qw_adapters.gvisor_sandbox import Path\n",
+                 b"from . import old\n", b"from qw_domain.old import X\n"):  # fmt: skip
+        e = ci.evaluate(code(fix(body + FIXED)), profile(), real)
+        assert e.outcome is ci.Outcome.REFUSED and e.findings, e
+    assert len(real.stages) == before  # refused before staging; nothing ran

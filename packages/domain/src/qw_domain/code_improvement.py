@@ -1,8 +1,9 @@
 """Sandboxed code improvement (T049 increment 1; spec §11, §12; R028, R030, R033, R038,
 R039, R076, R086, R092, R099). Domain only, stdlib only. A whole-file `Patch` on a
-content-addressed `Snapshot` is bound by a `Manifest`; `check` is a name-list static
-gate (protected by default, then denylist and Python rules), bypassable defence in
-depth; `evaluate` runs the protected tests via the T007 port and binds every digest;
+content-addressed `Snapshot` is bound by a `Manifest`; `check` is a static gate
+(protected by default, then denylist and Python rules: a closed AST node-type allowlist
+with shape rules, then the name lists), bypassable defence in depth; `evaluate` runs
+the protected tests via the T007 port and binds every digest;
 `package`/`route_for_review` hand evidence to human review, granting nothing.
 Increment 2: the stager also attests the rootfs tree digest (checked against the
 profile's pin before anything runs), and the in-sandbox harness reports the
@@ -16,10 +17,12 @@ import ast
 import fnmatch
 import hashlib
 import hmac
+import io
 import json
 import re
 import sys
-from collections.abc import Mapping
+import tokenize
+from collections.abc import Iterator, Mapping
 from dataclasses import dataclass, field
 from datetime import datetime
 from decimal import Decimal
@@ -239,6 +242,10 @@ _FROM_NAMES = {  # importable only as `from X import name`, and only these names
     "enum": _words("Enum IntEnum StrEnum auto unique"),
 }  # fmt: skip
 _FROM_ONLY = frozenset(_FROM_NAMES)
+# The closed set of modules a candidate may import from. No `qw_*` module: no genuine
+# candidate needs one, and any in-repo module (adapters, API, worker, or a domain
+# module that does IO or is the gate) reaches the host or the gate. Never a prefix.
+IMPORTABLE = _STDLIB_OK | _FROM_ONLY
 _MODULE_NAMES = frozenset(sys.stdlib_module_names) | _words(
     "os sys builtins inspect codecs"
 )
@@ -249,11 +256,52 @@ _DANGER_ATTRS = _words(  # module attributes refused on any object
 _RUNNERS = _words("pytest _pytest hypothesis")  # test-runner imports: test gaming
 _DENY_CALLS = _words(
     "eval exec compile __import__ open breakpoint exit quit setattr delattr getattr "
-    "globals locals vars input print help license copyright credits dir"
+    "globals locals vars input print help license copyright credits dir hasattr"
 )
+_BY_STRING = _words("format format_map")  # str.format fields read attributes by name
 _FRAME = re.compile(r"(gi|cr|ag|f|tb|co)_")  # generator/frame/traceback/code reach
 _DENY_NAMES = frozenset({"SystemExit", "KeyboardInterrupt", "BaseException"})
 _DUNDER_OK = frozenset({"__init__", "__post_init__", "__name__", "__all__"})
+# First layer: the closed set of AST node types a candidate may contain, matched by
+# exact class, so a node class not named here (a refused one, a subclass or one a later
+# Python adds) is refused. Evidence: the genuine test candidates (the seeded repair
+# `return a + b`, `x = 1`, a contained busy loop) and what the five IMPROVABLE modules
+# use; anything neither needs is refused (Import, Lambda, Yield, Await, async, Global,
+# Nonlocal, Delete, DictComp, Slice, Match and patterns, TryStar, type params/aliases,
+# bitwise operators, deprecated and abstract classes).
+ALLOWED_NODES: frozenset[type[ast.AST]] = frozenset({
+    ast.Module,  # the parse root; `ast.parse` in exec mode yields nothing else
+    ast.Expr, ast.Pass,  # docstrings and bare calls; empty bodies (the busy loop)
+    ast.ImportFrom, ast.alias,  # the only import form; layer 2 limits its modules
+    ast.FunctionDef, ast.arguments, ast.arg, ast.Return,  # the repair is a function
+    ast.ClassDef,  # dataclasses and StrEnums; no keywords, Name bases, not `type`
+    ast.Assign, ast.AnnAssign, ast.AugAssign,  # bindings; mutation rules in layer 2
+    ast.NamedExpr,  # walrus, used by option_pricing; binds a plain local name
+    ast.Name, ast.Load, ast.Store,  # every name passes the layer-2 name lists
+    ast.Attribute,  # layer 2 refuses dunder, frame, module and by-string attributes
+    ast.Call, ast.keyword,  # no `*` or `**` unpacking: arguments stay literal
+    ast.Constant,  # literals; strings with `__` refused, never as an annotation
+    ast.Subscript,  # indexing and generic annotations such as `tuple[int, ...]`
+    ast.Tuple, ast.List, ast.Dict, ast.Set,  # displays
+    ast.Starred,  # unpacking in targets and displays only, never in a call
+    ast.ListComp, ast.SetComp, ast.GeneratorExp, ast.comprehension,  # gi_ refused
+    ast.JoinedStr, ast.FormattedValue,  # f-strings in error messages (4 of 5
+    # IMPROVABLE modules); parts are ordinary walked expressions, no lookup by string
+    ast.If, ast.IfExp, ast.For, ast.While, ast.Break, ast.Continue,  # control flow
+    ast.Raise, ast.Assert, ast.Try, ast.ExceptHandler,  # validation and errors
+    ast.With, ast.withitem,  # decimal.localcontext precision blocks
+    ast.BinOp, ast.UnaryOp, ast.BoolOp, ast.Compare,  # pure arithmetic and logic
+    ast.Add, ast.Sub, ast.Mult, ast.Div, ast.FloorDiv, ast.Mod, ast.Pow,  # numeric
+    ast.BitOr,  # `X | None` unions (also an int/set `|`; operand dunders only)
+    ast.USub, ast.Not, ast.And, ast.Or,
+    ast.Eq, ast.NotEq, ast.Lt, ast.LtE, ast.Gt, ast.GtE, ast.Is, ast.IsNot,
+    ast.In, ast.NotIn,  # membership, e.g. `x in {1, 2}`
+})  # fmt: skip
+_DECORATORS = frozenset({"dataclass", "property"})  # all the IMPROVABLE modules use
+_ENUMS = frozenset({"Enum", "IntEnum", "StrEnum"})  # usable only as class bases
+_NOTE_NODES = frozenset({ast.Name, ast.Attribute, ast.Subscript, ast.Tuple, ast.List,
+                         ast.BinOp, ast.BitOr, ast.Load, ast.Constant})  # fmt: skip
+_NOTE_OK = (None, ...)  # `X | None`, `tuple[int, ...]`; never a string
 
 
 @dataclass(frozen=True, slots=True)
@@ -284,18 +332,81 @@ class CodePolicy:
                        self.max_total_bytes])  # fmt: skip
 
 
+def _lines(tree: ast.AST) -> Iterator[tuple[ast.AST, int]]:
+    """Each node with its line (inherited when it has none); iterative, no recursion."""
+    stack = [(tree, 0)]
+    while stack:
+        n, line = stack.pop()
+        line = int(getattr(n, "lineno", line))
+        yield n, line
+        stack.extend((c, line) for c in reversed(list(ast.iter_child_nodes(n))))
+
+
+def _notes(n: ast.AST) -> list[ast.expr]:
+    if isinstance(n, ast.arg | ast.AnnAssign):
+        return [n.annotation] if n.annotation is not None else []
+    return [n.returns] if isinstance(n, ast.FunctionDef) and n.returns else []
+
+
+def _decorator_ok(d: ast.expr) -> bool:
+    if isinstance(d, ast.Call):  # dataclass(frozen=True, slots=True) and the like
+        return (isinstance(d.func, ast.Name) and d.func.id == "dataclass"
+                and not d.args and all(isinstance(k.value, ast.Constant)
+                                       for k in d.keywords))  # fmt: skip
+    return isinstance(d, ast.Name) and d.id in _DECORATORS
+
+
+def node_findings(tree: ast.AST) -> list[str]:
+    """Layer 1: the node-type allowlist, then shape rules on allowed nodes."""
+    nodes = list(_lines(tree))
+    enums = {a.asname or a.name for n, _ in nodes if isinstance(n, ast.ImportFrom)
+             and n.module == "enum" for a in n.names if a.name in _ENUMS}  # fmt: skip
+    bases = {id(b) for n, _ in nodes if isinstance(n, ast.ClassDef) for b in n.bases}
+    notes = {id(x) for n, _ in nodes for a in _notes(n) for x in ast.walk(a)}
+    out: list[str] = []
+    for n, line in nodes:
+        at, kind = f"L{line}", type(n)
+        if kind not in ALLOWED_NODES:  # fail closed: unknown and future types too
+            out.append(f"node_not_allowed:{kind.__name__}:{at}")
+            continue
+        value = n.value if isinstance(n, ast.Constant) else None
+        if id(n) in notes and isinstance(value, str):
+            out.append(f"string_annotation:{at}")  # evaluated by get_type_hints & co.
+        elif id(n) in notes and (kind not in _NOTE_NODES or value not in _NOTE_OK):
+            out.append(f"annotation_node:{kind.__name__}:{at}")  # types, not code
+        if isinstance(n, ast.ClassDef):
+            out += [f"class_keyword:{k.arg}:{at}" for k in n.keywords]  # metaclass=
+            if any(not isinstance(b, ast.Name) or b.id == "type" for b in n.bases):
+                out.append(f"class_base:{at}")  # computed bases or a metaclass
+        if isinstance(n, ast.FunctionDef | ast.ClassDef) and not all(
+                map(_decorator_ok, n.decorator_list)):  # fmt: skip
+            out.append(f"decorator_not_allowed:{at}")
+        if isinstance(n, ast.Call) and any(isinstance(a, ast.Starred) for a in n.args):
+            out.append(f"starred_call:{at}")
+        if isinstance(n, ast.Call) and any(k.arg is None for k in n.keywords):
+            out.append(f"keyword_unpacking:{at}")  # `**{name: v}` sets by string
+        if isinstance(n, ast.Name) and n.id in enums and id(n) not in bases:
+            out.append(f"enum_functional_api:{at}")  # any form, keyword or aliased
+    return out
+
+
 def _python(path: str, data: bytes) -> list[str]:
     try:
         text = data.decode("utf-8")
+        encoding = tokenize.detect_encoding(io.BytesIO(data).readline)[0]
     except UnicodeDecodeError:
         return [f"not_utf8:{path}"]
-    if _COOKIE.search("\n".join(text.splitlines()[:2])):
-        return [f"encoding_declaration:{path}"]  # the interpreter would honour it
-    try:
-        tree = ast.parse(text, filename=path)
-    except (SyntaxError, ValueError):
-        return [f"syntax_error:{path}"]
-    out: list[str] = []
+    except SyntaxError:  # an unknown or inconsistent declared encoding
+        encoding = "?"
+    if encoding != "utf-8" or _COOKIE.search("\n".join(text.splitlines()[:2])):
+        return [f"encoding_declaration:{path}"]  # a cookie or BOM it would honour
+    try:  # parse the bytes the interpreter reads; any other decoding fails closed
+        tree = ast.parse(data, filename=path)
+        if ast.dump(tree) != ast.dump(ast.parse(text, filename=path)):
+            return [f"source_mismatch:{path}"]
+    except (SyntaxError, ValueError, RecursionError, MemoryError):
+        return [f"syntax_error:{path}"]  # includes source too deep to parse
+    out = node_findings(tree)
     imported: set[str] = set()
     for n in ast.walk(tree):
         mods: list[str] = []
@@ -305,6 +416,8 @@ def _python(path: str, data: bytes) -> list[str]:
             out += [f"forbidden_import:{m}" for m in mods if m in _FROM_ONLY]
         elif isinstance(n, ast.ImportFrom):
             mods = [n.module or ""] if n.level == 0 else []
+            if n.level:  # `from . import risk` would reach the candidate's package
+                out.append("relative_import")
             imported |= {a.asname or a.name for a in n.names}
             for a in n.names:  # never a module, a private name or everything
                 if a.name == "*":
@@ -313,11 +426,13 @@ def _python(path: str, data: bytes) -> list[str]:
                     out.append(f"module_import:{a.name}")
                 elif a.name not in _FROM_NAMES.get(n.module or "", {a.name}):
                     out.append(f"name_not_allowed:{a.name}")  # e.g. get_type_hints
-        for m in mods:
-            root, ok = m.split(".")[0], m in _STDLIB_OK | _FROM_ONLY
-            if root in sys.stdlib_module_names | _RUNNERS and not ok:
+        for m in (m for m in mods if m not in IMPORTABLE):
+            root = m.split(".")[0]
+            if root in sys.stdlib_module_names | _RUNNERS:
                 out.append(f"forbidden_import:{root}")
-            elif not ok and not root.startswith("qw_"):
+            elif root.startswith("qw"):  # in-repo code: never importable
+                out.append(f"forbidden_import:{m}")
+            else:
                 out.append(f"unauthorized_dependency:{root}")
         if isinstance(n, ast.Attribute) and (n.attr in _DANGER_ATTRS or (
             _root(n) in imported and (n.attr.startswith("_") or (
@@ -333,19 +448,8 @@ def _python(path: str, data: bytes) -> list[str]:
             n.attr not in _DUNDER_OK
         ):  # fmt: skip
             out.append(f"dunder_access:{n.attr}")
-        if isinstance(n, ast.Match):  # class patterns read attributes by name
-            out.append("match_statement")
-        notes = [n.annotation] if isinstance(n, ast.arg | ast.AnnAssign) else []
-        if isinstance(n, ast.FunctionDef | ast.AsyncFunctionDef):
-            notes = [n.returns]
-        if any(isinstance(c, ast.Constant) and isinstance(c.value, str)
-               for a in notes if a is not None for c in ast.walk(a)):  # fmt: skip
-            out.append("string_annotation")  # evaluated by get_type_hints and friends
-        fn = n.func if isinstance(n, ast.Call) else None
-        if isinstance(fn, ast.Name) and fn.id in _FROM_NAMES["enum"] and any(
-            isinstance(a, ast.Constant) for a in n.args  # type: ignore[attr-defined]
-        ):  # fmt: skip
-            out.append("enum_functional_api")
+        if isinstance(n, ast.Attribute) and n.attr in _BY_STRING:
+            out.append(f"string_attribute_lookup:{n.attr}")
         if isinstance(n, ast.Attribute) and _FRAME.match(n.attr):
             out.append(f"frame_introspection:{n.attr}")
         if isinstance(n, ast.Constant) and isinstance(n.value, str) and "__" in n.value:
