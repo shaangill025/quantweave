@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Project contract 0.6.0 (T008 A-01): the docs/spec/contracts 0.1.0 schemas with the
+"""Project contract 0.7.0 (T008 A-01): the docs/spec/contracts 0.1.0 schemas with the
 amendments of contracts/amendments.json applied (all owner decisions: see `versions`
 there). docs/spec is never edited; this derives the amended schemas in memory.
 
@@ -9,6 +9,13 @@ there). docs/spec is never edited; this derives the amended schemas in memory.
 - `active_nullable`: the `state == active` if/then rules also accept null there.
 - `enum_add`: values appended to a property's enum; a value already there is refused.
 - `all_of`: rules appended to the schema's `allOf` (created when absent).
+- `new_schemas`: whole schemas the spec lacks, written like the schema files (refs to
+  `common.schema.json`, `#/$defs/Coverage` added); a name the contract already has
+  (schema file, openapi component or amended schema) is refused.
+- `operations`: openapi path items the spec lacks; `openapi()` adds them, and the
+  new schemas as components, to a copy of openapi.yaml. A path already in the
+  contract, a missing operationId or one already used is refused. Each call starts
+  again from the unmodified base, so applying twice gives the same document.
 - `page(name)`: the C-02 page `{items, next_cursor, coverage}` of an item schema.
 - `request(name)`: an openapi.yaml request component; `requests.<name>.optional` adds
   properties that are not required. Its `./schemas/` refs become the bare file names
@@ -41,7 +48,19 @@ def _null(prop: dict[str, Any]) -> dict[str, Any]:
     return {"anyOf": [prop, {"type": "null"}]}
 
 
+def _new_schema(name: str) -> dict[str, Any]:
+    taken = (SPEC / f"{name}.schema.json").exists() or name in AMENDMENTS["schemas"]
+    if taken or name in _openapi()["components"]["schemas"] or name == "Coverage":
+        raise ValueError(f"{name}: schema name already in the contract")
+    s: dict[str, Any] = copy.deepcopy(AMENDMENTS["new_schemas"][name])
+    s.setdefault("$defs", {})["Coverage"] = copy.deepcopy(AMENDMENTS["Coverage"])
+    s["title"] = f"{s['title']} (project contract {AMENDMENTS['version']})"
+    return s
+
+
 def schema(name: str) -> dict[str, Any]:
+    if name in AMENDMENTS.get("new_schemas", {}):
+        return _new_schema(name)
     s, a = _load(name), AMENDMENTS["schemas"].get(name, {})
     common = _load("common")["$defs"]
     s.setdefault("$defs", {})["Coverage"] = AMENDMENTS["Coverage"]
@@ -89,6 +108,47 @@ def _local(node: Any) -> Any:
     return [_local(v) for v in node] if isinstance(node, list) else node
 
 
+def _spec_refs(node: Any) -> Any:
+    """A project schema's refs in openapi.yaml form (the inverse of `_local`)."""
+    if isinstance(node, dict):
+        out = {k: _spec_refs(v) for k, v in node.items() if k != "$defs"}
+        ref = node.get("$ref")
+        if isinstance(ref, str) and ref.startswith("common.schema.json"):
+            out["$ref"] = f"./schemas/{ref}"
+        elif ref == "#/$defs/Coverage":
+            out["$ref"] = "#/components/schemas/Coverage"
+        elif isinstance(ref, str) and ref.startswith("#/$defs/"):
+            out["$ref"] = f"#/components/schemas/{ref.rsplit('/', 1)[1]}"
+        return out
+    return [_spec_refs(v) for v in node] if isinstance(node, list) else node
+
+
+METHODS = frozenset({"get", "put", "post", "delete", "patch", "head", "options"})
+
+
+def openapi(base: dict[str, Any] | None = None) -> dict[str, Any]:
+    """openapi.yaml (or `base`) with `operations` and `new_schemas` applied, a copy."""
+    api = copy.deepcopy(_openapi() if base is None else base)
+    used = {op.get("operationId") for item in api["paths"].values()
+            for m, op in item.items() if m in METHODS}  # fmt: skip
+    for path, item in AMENDMENTS.get("operations", {}).items():
+        if path in api["paths"]:
+            raise ValueError(f"{path}: path already in the contract")
+        for method, op in item.items():
+            op_id = op.get("operationId") if method in METHODS else None
+            if not isinstance(op_id, str) or not op_id or op_id in used:
+                raise ValueError(f"{method} {path}: operationId missing or used")
+            used.add(op_id)
+        api["paths"][path] = copy.deepcopy(item)
+    components = api["components"]["schemas"]
+    for name in AMENDMENTS.get("new_schemas", {}):
+        s = schema(name)  # refuses a name the contract already has
+        for key, sub in {**s["$defs"], name: s}.items():
+            if components.setdefault(key, _spec_refs(sub)) != _spec_refs(sub):
+                raise ValueError(f"{key}: component already in the contract")
+    return api
+
+
 def request(name: str) -> dict[str, Any]:
     s: dict[str, Any] = _local(_openapi()["components"]["schemas"][name])
     for key, prop in AMENDMENTS["requests"].get(name, {}).get("optional", {}).items():
@@ -117,6 +177,12 @@ if __name__ == "__main__":
     for name in AMENDMENTS["schemas"]:
         print(name, json.dumps(AMENDMENTS["schemas"][name], sort_keys=True))
         schema(name)  # raises on an amendment that names a missing property
+    for name in AMENDMENTS.get("new_schemas", {}):
+        print(name, "new schema")
+        schema(name)  # raises on a name the contract already has
+    for path in AMENDMENTS.get("operations", {}):
+        print(path, "new operations", sorted(AMENDMENTS["operations"][path]))
+    openapi()  # raises on a duplicate path or operationId
     for name in AMENDMENTS["requests"]:
         print(name, json.dumps(AMENDMENTS["requests"][name], sort_keys=True))
         request(name)  # raises on a missing request or an existing property
