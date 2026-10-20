@@ -271,6 +271,7 @@ def create_app(
     rights: RightsProvider = rights_store.load,
 ) -> FastAPI:
     from qw_api.capabilities import router as capabilities
+    from qw_api.experiments import router as experiments
     from qw_api.feedback import router as feedback
     from qw_api.jobs import router as jobs
     from qw_api.notifications import router as notifications
@@ -295,6 +296,7 @@ def create_app(
     app.state.rights = rights
     app.include_router(router)
     app.include_router(capabilities)
+    app.include_router(experiments)
     app.include_router(feedback)
     app.include_router(jobs)
     app.include_router(notifications)
