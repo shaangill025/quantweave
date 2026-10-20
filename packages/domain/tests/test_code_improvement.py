@@ -422,6 +422,8 @@ def test_metrics_count_hard_controls_per_file() -> None:
     # uv.lock + keys/k.py; the test file
     assert got == {**{h: Decimal(n) for h, n in zip(hard, want, strict=True)},
                    "tests_passed": D0}  # fmt: skip
+    rel = add(SRC + "rel/r.py", b"from . import returns\n")  # refused, and counted
+    assert ci.metrics(evaluate(code(rel)))["host_writes"] == Decimal(1)
 
 
 def code_proto(**kw: object) -> im.Protocol:

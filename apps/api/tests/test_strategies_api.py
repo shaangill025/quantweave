@@ -17,6 +17,13 @@ import psycopg
 import pytest
 from qw_adapters import strategy_store as ss
 
+
+def tamper(cursor: str) -> str:
+    """A cursor whose first character differs from the real one. The first
+    base64url character is always 6 signed bits; the last one may be padding."""
+    return ("B" if cursor[0] != "B" else "C") + cursor[1:]
+
+
 ROOT = Path(__file__).parents[3]
 
 
@@ -108,7 +115,7 @@ def test_strategies_conform_and_are_never_action_eligible(
     login(world.client, "carol")  # tenant B sees the same installation registry
     assert world.client.get("/api/v1/strategies?limit=4").json()["items"] == first[
         "items"]  # fmt: skip
-    for bad in ("x" * 30, first["next_cursor"][:-2] + "AA"):
+    for bad in ("x" * 30, tamper(first["next_cursor"])):
         assert_problem(world.client.get(f"/api/v1/strategies?cursor={bad}"), 400,
                        "invalid_cursor")  # fmt: skip
     assert_problem(world.client.get("/api/v1/strategies/STR-NONE"), 404, "not_found")

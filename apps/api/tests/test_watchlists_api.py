@@ -24,6 +24,12 @@ from jsonschema import (  # type: ignore[import-untyped]
 ROOT = Path(__file__).parents[3]
 
 
+def tamper(cursor: str) -> str:
+    """A cursor whose first character differs from the real one. The first
+    base64url character is always 6 signed bits; the last one may be padding."""
+    return ("B" if cursor[0] != "B" else "C") + cursor[1:]
+
+
 def _module(name: str, path: Path) -> Any:
     spec = importlib.util.spec_from_file_location(name, path)
     assert spec is not None and spec.loader is not None
@@ -153,7 +159,7 @@ def test_tenancy_cursors_and_bad_input(world: Any) -> None:
     first = world.client.get(URL, params={"limit": 1}).json()["next_cursor"]
     assert_problem(world.client.get("/api/v1/policies", params={"cursor": first}),
                    400, "invalid_cursor")  # fmt: skip
-    for bad in ("x", first[:-2] + "AA"):
+    for bad in ("x", tamper(first)):
         assert_problem(world.client.get(URL, params={"cursor": bad}), 400,
                        "invalid_cursor")  # fmt: skip
     login(world.client, "bob")  # same tenant, another principal
