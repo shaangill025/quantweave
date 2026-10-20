@@ -26,11 +26,17 @@ R030, R032, R033, R035, R037, R084, R092, R099). Domain only, stdlib only.
   evidence or blocked; it never promotes, installs or adopts anything.
 - Code and optimizer targets need the T007 sandbox, which is not qualified: they are
   representable, but scheduling and assessment fail closed (`sandbox_unqualified`).
-LIMITATIONS: no persistence; times and actor ids are caller-asserted; evidence uses
+- `record` derives the `experiment` schema view that experiment_store persists:
+  proposed, authorized, then awaiting_review, rejected or failed from an `assess`
+  it runs itself; code and optimizer stay proposed. What the schema cannot carry is
+  a `<kind>:<detail>` reason (for example `blocked:sandbox_unqualified`).
+LIMITATIONS: only `record` output is persisted (protocols, candidates and verdicts
+are not); times and actor ids are caller-asserted; evidence uses
 are checked against the store only when a candidate is first registered;
 `record_verdict` checks hashes and assessor identity but cannot re-run `assess`.
 """
 
+import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field, fields
 from datetime import datetime, timedelta
@@ -681,3 +687,182 @@ def assess(
     if reasons:
         return verdict(Decision.REJECT, *reasons)
     return verdict(Decision.ACCEPT_FOR_REVIEW)
+
+
+class RecordState(StrEnum):  # the experiment.schema.json states derivable here
+    PROPOSED = "proposed"  # registered; no verified reservation, or blocked
+    AUTHORIZED = "authorized"  # its frozen budget terms are reserved
+    AWAITING_REVIEW = "awaiting_review"  # accept-for-review; a human decides
+    REJECTED = "rejected"
+    FAILED = "failed"  # insufficient evidence: never a pass, never zero
+
+
+_DECIDED = MappingProxyType({
+    Decision.ACCEPT_FOR_REVIEW: RecordState.AWAITING_REVIEW,
+    Decision.REJECT: RecordState.REJECTED, Decision.INSUFFICIENT: RecordState.FAILED,
+})  # fmt: skip
+_RANK = MappingProxyType({RecordState.PROPOSED: 0, RecordState.AUTHORIZED: 1})
+_MOVING = frozenset({"state", "verdict_id", "decision", "reasons"})
+# <kind>:<detail>; served as <kind>:<id>/<detail>, at most 300 with a 128-char id
+_REASON = re.compile(r"[a-z]{1,12}:[A-Za-z0-9_.:-]{1,150}")
+
+
+@dataclass(frozen=True, slots=True)
+class ExperimentRecord:
+    """One experiment in the `experiment` schema's terms, derived by `record`.
+    `reasons` are `<kind>:<detail>` codes the schema cannot carry (blocked,
+    deferred, insufficient, rejected, evidence, none); a reader must show them."""
+
+    experiment_id: str
+    target: Target
+    scope: Scope
+    scope_id: str
+    state: RecordState
+    baseline_version: str
+    candidate_version: str
+    hypothesis: str
+    protocol_id: str  # the frozen protocol's content hash
+    protected_assessor_version: str
+    data_snapshot_ids: tuple[str, ...]  # the T032 plan's dataset
+    budget_reservation_id: str
+    sandbox_profile_id: str
+    candidate_hash: str  # the candidate's artifact hash
+    parent_optimizer_version: str | None  # optimizer target only: its lineage
+    verdict_id: str | None
+    decision: Decision | None
+    reasons: tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        for n in ("experiment_id", "scope_id", "baseline_version", "candidate_version",
+                  "protected_assessor_version", "budget_reservation_id",
+                  "sandbox_profile_id"):  # fmt: skip
+            _id(getattr(self, n), n)
+        if self.parent_optimizer_version is not None:
+            _id(self.parent_optimizer_version, "parent_optimizer_version")
+        _sha(self.protocol_id, "protocol_id")
+        _sha(self.candidate_hash, "candidate_hash")
+        types = (("target", Target), ("scope", Scope), ("state", RecordState))
+        if not all(type(getattr(self, n)) is t for n, t in types):
+            raise TypeError("typed target, scope and state are required")
+        h = self.hypothesis
+        if not isinstance(h, str) or not h.strip() or len(h) > 4000 or "\x00" in h:
+            raise ImprovementError("hypothesis", "1 to 4000 characters, no NUL")
+        object.__setattr__(self, "data_snapshot_ids", tuple(self.data_snapshot_ids))
+        for d in self.data_snapshot_ids:
+            _id(d, "data_snapshot_id")
+        lim = tuple(self.reasons)
+        object.__setattr__(self, "reasons", lim)
+        if len(lim) > 64 or lim != tuple(sorted(set(lim))) or not all(
+            isinstance(x, str) and _REASON.fullmatch(x) for x in lim
+        ):  # fmt: skip
+            raise ImprovementError("reasons", "at most 64 sorted kind:detail codes")
+        if len(self.data_snapshot_ids) > 64:
+            raise ImprovementError("data_snapshot_ids", "at most 64")
+        if (self.verdict_id is None) != (self.decision is None):
+            raise ImprovementError("verdict", "a verdict id goes with its decision")
+        if self.verdict_id is not None:
+            _id(self.verdict_id, "verdict_id")
+            if type(self.decision) is not Decision:
+                raise TypeError("decision must be a Decision")
+        if self.decision is not None and self.decision in _DECIDED:
+            ok = self.state is _DECIDED[self.decision] and (
+                "none:evaluation_receipt_ids" in lim
+            )  # fmt: skip
+        else:  # unassessed or blocked: nothing past authorization
+            ok = self.state in _RANK and (self.decision is None or any(
+                x.startswith("blocked:") for x in lim))  # fmt: skip
+        optimizer = self.target is Target.RECURSIVE_OPTIMIZER
+        ok = ok and optimizer == (self.parent_optimizer_version is not None) and (
+            optimizer or "unavailable:parent_optimizer_version" in lim)  # fmt: skip
+        if self.target in SANDBOX_TARGETS:  # T007: never past proposed
+            ok = ok and self.state is RecordState.PROPOSED and (
+                "blocked:sandbox_unqualified" in lim
+            )  # fmt: skip
+        if not ok:
+            raise ImprovementError("record_inconsistent", self.experiment_id)
+
+    @property
+    def requires_human_promotion(self) -> bool:
+        return True  # experiment.schema.json const; nothing here promotes
+
+    def may_follow(self, prev: "ExperimentRecord") -> bool:
+        """A later revision: the same experiment and candidate, a state that never
+        goes back, and nothing after a decision."""
+        same = all(getattr(self, f.name) == getattr(prev, f.name)
+                   for f in fields(self) if f.name not in _MOVING)  # fmt: skip
+        return same and prev.state in _RANK and (
+            self.state not in _RANK or _RANK[self.state] >= _RANK[prev.state]
+        )  # fmt: skip
+
+    def wire(self) -> dict[str, object]:
+        """Plain values: enums as their values, tuples as lists."""
+        out: dict[str, object] = {}
+        for f in fields(self):
+            v = getattr(self, f.name)
+            out[f.name] = list(v) if isinstance(v, tuple) else (
+                v.value if isinstance(v, StrEnum) else v)  # fmt: skip
+        return out
+
+
+@dataclass(frozen=True, slots=True)
+class Assessment:  # what `assess` needs beyond the registry, plan and book
+    ledger: TrialLedger
+    assessor: Party
+    at: datetime
+    verdict_id: str
+    claimed: Mapping[str, Decimal] | None = None
+
+
+def record(
+    registry: ExperimentRegistry, experiment_id: str, candidate_id: str,
+    plan: SplitPlan, book: BudgetBook, outcome: Scheduled | Deferred | None = None,
+    assessment: Assessment | None = None,
+) -> ExperimentRecord:  # fmt: skip
+    """The experiment's record. A verdict comes only from running `assess` here on
+    the caller's registry, ledger and book (which are not persisted)."""
+    p, c = registry.protocol(experiment_id), registry.candidate(candidate_id)
+    if c.experiment_id != experiment_id:
+        raise ImprovementError("candidate_experiment", candidate_id)
+    if plan.plan_id != p.plan_id or plan_digest(plan) != p.plan_digest:
+        raise ImprovementError("test_access_changed", p.plan_id)
+    if p.sandbox_profile_id is None:  # the schema requires one; never invented
+        raise ImprovementError("contract_field_unavailable", "sandbox_profile_id")
+    if outcome is not None and outcome.experiment_id != experiment_id:
+        raise ImprovementError("outcome_experiment", outcome.experiment_id)
+    lim: set[str] = set()
+    if p.target in SANDBOX_TARGETS:
+        lim.add("blocked:sandbox_unqualified")
+    optimizer = c.parent_id if p.target is Target.RECURSIVE_OPTIMIZER else None
+    if optimizer is None:  # owner decision pending; never the producer's version
+        lim.add("unavailable:parent_optimizer_version")
+    if plan.dataset.evidence_class is EvidenceClass.SYNTHETIC:
+        lim.add("evidence:synthetic_only")
+    reserved = False
+    if isinstance(outcome, Scheduled):
+        r = book.find(p.budget_reservation_id)
+        if book.scope_id != p.scope_id or r is None or not _bound(p, r):
+            raise ImprovementError("reservation_unverified", experiment_id)
+        reserved = True
+    elif isinstance(outcome, Deferred):
+        lim.add(f"deferred:{outcome.reason}")
+    v = None if assessment is None else assess(
+        registry, experiment_id, candidate_id, assessment.ledger, book,
+        assessment.assessor, assessment.at, assessment.verdict_id,
+        assessment.claimed)  # fmt: skip
+    state = RecordState.AUTHORIZED if reserved else RecordState.PROPOSED
+    if v is not None:
+        kind = {Decision.BLOCKED: "blocked", Decision.INSUFFICIENT: "insufficient",
+                Decision.REJECT: "rejected"}.get(v.decision)  # fmt: skip
+        lim.update(f"{kind}:{r}" for r in v.reasons if kind)
+        lim.update(f"evidence:{x}" for x in v.limitations)
+        if v.decision in _DECIDED:
+            state = _DECIDED[v.decision]
+            lim.add("none:evaluation_receipt_ids")  # T044 has no receipt store yet
+    if p.target in SANDBOX_TARGETS:
+        state = RecordState.PROPOSED
+    return ExperimentRecord(
+        experiment_id, p.target, p.scope, p.scope_id, state, p.baseline_version,
+        c.candidate_id, p.hypothesis, p.content_hash, p.assessor.version,
+        (plan.dataset.dataset_id,), p.budget_reservation_id, p.sandbox_profile_id,
+        c.artifact_hash, optimizer, None if v is None else v.verdict_id,
+        None if v is None else v.decision, tuple(sorted(lim)))  # fmt: skip
