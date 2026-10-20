@@ -1,11 +1,14 @@
-"""Improvement experiments (T044 increment 2; `0026_experiments.sql`).
+"""Improvement experiments (T044 increment 2; `0026_experiments.sql`, with the
+project contract 0.6.0 states and revisions of `0027_experiment_states.sql`).
 - `record` takes `qw_domain.improvement.record`'s inputs and calls it, so it can
   store nothing else (no record is accepted from the caller); as qw_worker (the
   only INSERT role). Equal to the latest revision it writes nothing, else it must
-  `may_follow` it. Tenant scope of this tenant only (`scope`).
+  `may_follow` it, and a verdict id never repeats in its chain (a re-assessment
+  is a new verdict). Tenant scope of this tenant only (`scope`).
 - Every read re-hashes each revision, checks the chain (1..n, previous hash, times),
-  rebuilds rows through the domain `ExperimentRecord` and `may_follow`, and checks
-  a reservation id names one experiment; any failure is `integrity`. Hash-only, no
+  rebuilds rows through the domain `ExperimentRecord` and `may_follow` (0.5.0 rows
+  stay readable), checks verdict ids are unique per chain and a reservation id
+  names one experiment; any failure is `integrity`. Hash-only, no
   C-20 signing (as pause_store): dropping a chain's latest rows is not detected.
 - Unknown and foreign ids read as None (forced RLS). Times are the DB clock; lock
   `experiment:<tenant>` (shared to read) comes last. Nothing here promotes."""
@@ -70,6 +73,11 @@ def _decode(row: dict[str, Any]) -> im.ExperimentRecord:
     }))  # fmt: skip
 
 
+def _new_verdict(rec: im.ExperimentRecord, chain: list[Revision]) -> bool:
+    return rec.verdict_id is None or rec.is_050 or all(
+        r.record.verdict_id != rec.verdict_id for r in chain)  # fmt: skip
+
+
 def _chains(tx: TenantTx, eid: str | None) -> dict[str, list[Revision]]:
     """Every chain (or `eid`'s), verified, oldest revision first."""
     where, args = ((" AND experiment_id = %s", (tx.tenant_id, eid)) if eid else
@@ -99,6 +107,7 @@ def _chains(tx: TenantTx, eid: str | None) -> dict[str, list[Revision]]:
                 and rec.scope_id == str(tx.tenant_id)
                 and (last is None or (at >= last.recorded_at
                                       and rec.may_follow(last.record)))
+                and _new_verdict(rec, chain)
                 and owner.setdefault(rec.budget_reservation_id,
                                      rec.experiment_id) == rec.experiment_id
                 and h == revision_hash(tx.tenant_id, rev, rec, at, prev)
@@ -145,7 +154,8 @@ def record(
     last = chain[-1] if chain else None
     if last is not None and last.record == rec:
         return last, False
-    if last is not None and not rec.may_follow(last.record):
+    if last is not None and not (rec.may_follow(last.record)
+                                 and _new_verdict(rec, chain)):  # fmt: skip
         raise ExperimentStoreError("transition", "not a later state of this record")
     row = tx.conn.execute("SELECT clock_timestamp()").fetchone()
     assert row is not None

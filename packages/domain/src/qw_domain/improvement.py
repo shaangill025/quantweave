@@ -26,10 +26,18 @@ R030, R032, R033, R035, R037, R084, R092, R099). Domain only, stdlib only.
   evidence or blocked; it never promotes, installs or adopts anything.
 - Code and optimizer targets need the T007 sandbox, which is not qualified: they are
   representable, but scheduling and assessment fail closed (`sandbox_unqualified`).
-- `record` derives the `experiment` schema view that experiment_store persists:
-  proposed, authorized, then awaiting_review, rejected or failed from an `assess`
-  it runs itself; code and optimizer stay proposed. What the schema cannot carry is
-  a `<kind>:<detail>` reason (for example `blocked:sandbox_unqualified`).
+- `record` derives the `experiment` schema view that experiment_store persists
+  (project contract 0.6.0): proposed, authorized, then from an `assess` it runs
+  itself awaiting_review, rejected, insufficient_evidence or blocked; code and
+  optimizer stay blocked. What the schema cannot carry is a `<kind>:<detail>`
+  reason (for example `blocked:sandbox_unqualified`). insufficient_evidence may be
+  re-assessed on the same frozen protocol under a new verdict id: `assess` admits
+  only the plan's first holdout read in the ledger it is given and never
+  re-reserves the budget, and a new plan is a new protocol, so a new experiment
+  (owner decision Q7). Ledgers are not persisted, so the single holdout read is
+  enforced against the caller's ledger only. 0.5.0 records
+  (`failed` for insufficient evidence; blocked verdicts and code targets as
+  proposed or authorized) stay readable and are never derived.
 LIMITATIONS: only `record` output is persisted (protocols, candidates and verdicts
 are not); times and actor ids are caller-asserted; evidence uses
 are checked against the store only when a candidate is first registered;
@@ -690,28 +698,49 @@ def assess(
 
 
 class RecordState(StrEnum):  # the experiment.schema.json states derivable here
-    PROPOSED = "proposed"  # registered; no verified reservation, or blocked
+    PROPOSED = "proposed"  # registered; no verified reservation
     AUTHORIZED = "authorized"  # its frozen budget terms are reserved
+    BLOCKED = "blocked"  # a closed gate (T007) or a blocked assessment
     AWAITING_REVIEW = "awaiting_review"  # accept-for-review; a human decides
     REJECTED = "rejected"
-    FAILED = "failed"  # insufficient evidence: never a pass, never zero
+    INSUFFICIENT_EVIDENCE = "insufficient_evidence"  # never a pass; re-assessable
+    FAILED = "failed"  # 0.5.0 records only (insufficient evidence); never derived
 
 
+_S = RecordState
 _DECIDED = MappingProxyType({
-    Decision.ACCEPT_FOR_REVIEW: RecordState.AWAITING_REVIEW,
-    Decision.REJECT: RecordState.REJECTED, Decision.INSUFFICIENT: RecordState.FAILED,
+    Decision.ACCEPT_FOR_REVIEW: _S.AWAITING_REVIEW, Decision.REJECT: _S.REJECTED,
+    Decision.INSUFFICIENT: _S.INSUFFICIENT_EVIDENCE, Decision.BLOCKED: _S.BLOCKED,
 })  # fmt: skip
-_RANK = MappingProxyType({RecordState.PROPOSED: 0, RecordState.AUTHORIZED: 1})
+_DECIDED_050 = MappingProxyType({
+    Decision.ACCEPT_FOR_REVIEW: _S.AWAITING_REVIEW, Decision.REJECT: _S.REJECTED,
+    Decision.INSUFFICIENT: _S.FAILED,
+})  # fmt: skip
+_UNDECIDED = frozenset({_S.PROPOSED, _S.AUTHORIZED})
+# Allowed revisions (0.6.0); awaiting_review, rejected and failed are final here.
+_NEXT = MappingProxyType({
+    _S.PROPOSED: frozenset({_S.PROPOSED, _S.AUTHORIZED, _S.BLOCKED}),
+    _S.AUTHORIZED: frozenset({_S.AUTHORIZED, _S.BLOCKED, _S.AWAITING_REVIEW,
+                             _S.REJECTED, _S.INSUFFICIENT_EVIDENCE}),
+    _S.BLOCKED: frozenset({_S.PROPOSED, _S.AUTHORIZED, _S.BLOCKED, _S.AWAITING_REVIEW,
+                          _S.REJECTED, _S.INSUFFICIENT_EVIDENCE}),
+    _S.INSUFFICIENT_EVIDENCE: frozenset({_S.INSUFFICIENT_EVIDENCE, _S.BLOCKED,
+                                        _S.AWAITING_REVIEW, _S.REJECTED}),
+})  # fmt: skip
 _MOVING = frozenset({"state", "verdict_id", "decision", "reasons"})
 # <kind>:<detail>; served as <kind>:<id>/<detail>, at most 300 with a 128-char id
 _REASON = re.compile(r"[a-z]{1,12}:[A-Za-z0-9_.:-]{1,150}")
+_NO_PARENT = "none:parent_optimizer_version"  # 0.6.0: known not to apply
+_NO_PARENT_050 = "unavailable:parent_optimizer_version"
 
 
 @dataclass(frozen=True, slots=True)
 class ExperimentRecord:
     """One experiment in the `experiment` schema's terms, derived by `record`.
     `reasons` are `<kind>:<detail>` codes the schema cannot carry (blocked,
-    deferred, insufficient, rejected, evidence, none); a reader must show them."""
+    deferred, insufficient, rejected, evidence, none); a reader must show them.
+    It is consistent under the 0.6.0 rules, or is a 0.5.0 record (stored before
+    0027; read only, `record` never derives one)."""
 
     experiment_id: str
     target: Target
@@ -764,34 +793,71 @@ class ExperimentRecord:
             _id(self.verdict_id, "verdict_id")
             if type(self.decision) is not Decision:
                 raise TypeError("decision must be a Decision")
-        if self.decision is not None and self.decision in _DECIDED:
-            ok = self.state is _DECIDED[self.decision] and (
+        optimizer = self.target is Target.RECURSIVE_OPTIMIZER
+        if optimizer != (self.parent_optimizer_version is not None) or not (
+            self._consistent(lim) or self._consistent_050(lim)
+        ):  # fmt: skip
+            raise ImprovementError("record_inconsistent", self.experiment_id)
+
+    def _consistent(self, lim: tuple[str, ...]) -> bool:
+        """0.6.0: the decision fixes the state; code and optimizer stay blocked."""
+        sandbox, d = self.target in SANDBOX_TARGETS, self.decision
+        if d is None:
+            ok = self.state in _UNDECIDED or (sandbox and self.state is _S.BLOCKED)
+        elif d is Decision.BLOCKED:
+            ok = self.state is _S.BLOCKED and any(x.startswith("blocked:") for x in lim)
+        else:
+            ok = self.state is _DECIDED[d] and "none:evaluation_receipt_ids" in lim
+        optimizer = self.target is Target.RECURSIVE_OPTIMIZER
+        ok = ok and _NO_PARENT_050 not in lim and optimizer != (_NO_PARENT in lim)
+        return ok and (not sandbox or (
+            self.state is _S.BLOCKED and "blocked:sandbox_unqualified" in lim
+        ))  # fmt: skip
+
+    def _consistent_050(self, lim: tuple[str, ...]) -> bool:
+        """The 0.5.0 rules (PR #126), verbatim, so rows stored then stay readable."""
+        if self.decision is not None and self.decision in _DECIDED_050:
+            ok = self.state is _DECIDED_050[self.decision] and (
                 "none:evaluation_receipt_ids" in lim
             )  # fmt: skip
         else:  # unassessed or blocked: nothing past authorization
-            ok = self.state in _RANK and (self.decision is None or any(
+            ok = self.state in _UNDECIDED and (self.decision is None or any(
                 x.startswith("blocked:") for x in lim))  # fmt: skip
         optimizer = self.target is Target.RECURSIVE_OPTIMIZER
-        ok = ok and optimizer == (self.parent_optimizer_version is not None) and (
-            optimizer or "unavailable:parent_optimizer_version" in lim)  # fmt: skip
+        ok = ok and _NO_PARENT not in lim and optimizer != (_NO_PARENT_050 in lim)
         if self.target in SANDBOX_TARGETS:  # T007: never past proposed
-            ok = ok and self.state is RecordState.PROPOSED and (
+            ok = ok and self.state is _S.PROPOSED and (
                 "blocked:sandbox_unqualified" in lim
             )  # fmt: skip
-        if not ok:
-            raise ImprovementError("record_inconsistent", self.experiment_id)
+        return ok
 
     @property
     def requires_human_promotion(self) -> bool:
         return True  # experiment.schema.json const; nothing here promotes
 
+    @property
+    def is_050(self) -> bool:
+        """A record stored under 0.5.0 (the two rule sets admit disjoint records)."""
+        return self._consistent_050(self.reasons)
+
     def may_follow(self, prev: "ExperimentRecord") -> bool:
-        """A later revision: the same experiment and candidate, a state that never
-        goes back, and nothing after a decision."""
+        """A later revision: the same experiment, protocol and candidate, a state
+        `_NEXT` allows after `prev` (nothing after awaiting_review, rejected or
+        failed), and a verdict, if any, under a new verdict id: a re-assessment
+        is a new verdict and the earlier one stays in the chain. A 0.5.0 record
+        follows only a 0.5.0 one, by the 0.5.0 rank (never back to proposed,
+        nothing after a decision)."""
         same = all(getattr(self, f.name) == getattr(prev, f.name)
                    for f in fields(self) if f.name not in _MOVING)  # fmt: skip
-        return same and prev.state in _RANK and (
-            self.state not in _RANK or _RANK[self.state] >= _RANK[prev.state]
+        if self.is_050:
+            return (
+                same
+                and prev.is_050
+                and prev.state in _UNDECIDED
+                and not (prev.state is _S.AUTHORIZED and self.state is _S.PROPOSED)
+            )
+        return same and self.state in _NEXT.get(prev.state, ()) and (
+            self.verdict_id is None or self.verdict_id != prev.verdict_id
         )  # fmt: skip
 
     def wire(self) -> dict[str, object]:
@@ -833,8 +899,8 @@ def record(
     if p.target in SANDBOX_TARGETS:
         lim.add("blocked:sandbox_unqualified")
     optimizer = c.parent_id if p.target is Target.RECURSIVE_OPTIMIZER else None
-    if optimizer is None:  # owner decision pending; never the producer's version
-        lim.add("unavailable:parent_optimizer_version")
+    if optimizer is None:  # 0.6.0: null and named; never the producer's version
+        lim.add(_NO_PARENT)
     if plan.dataset.evidence_class is EvidenceClass.SYNTHETIC:
         lim.add("evidence:synthetic_only")
     reserved = False
@@ -855,11 +921,11 @@ def record(
                 Decision.REJECT: "rejected"}.get(v.decision)  # fmt: skip
         lim.update(f"{kind}:{r}" for r in v.reasons if kind)
         lim.update(f"evidence:{x}" for x in v.limitations)
-        if v.decision in _DECIDED:
-            state = _DECIDED[v.decision]
+        state = _DECIDED[v.decision]  # blocked, never failed, for missing budget
+        if v.decision is not Decision.BLOCKED:
             lim.add("none:evaluation_receipt_ids")  # T044 has no receipt store yet
-    if p.target in SANDBOX_TARGETS:
-        state = RecordState.PROPOSED
+    if p.target in SANDBOX_TARGETS:  # T007 not qualified: blocked, never proposed
+        state = RecordState.BLOCKED
     return ExperimentRecord(
         experiment_id, p.target, p.scope, p.scope_id, state, p.baseline_version,
         c.candidate_id, p.hypothesis, p.content_hash, p.assessor.version,

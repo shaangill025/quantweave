@@ -1,7 +1,7 @@
 // Improvement and governance view (spec 13, spec 11; T055 increment 1). Read-only: the API
 // serves no promote, approve, install, adopt or rollback operation, so none is rendered, and
 // this view only sends GET requests. The server stays the authority for every approval.
-// Data: GET /capabilities (served) and GET /experiments (in the contract, not served yet).
+// Data: GET /capabilities and GET /experiments (project contract 0.6.0: each item names its reasons).
 import type { Loaded } from "./api";
 import { CoverageReasons, More, Resource, Retrieved, Tag, Unavailable, humanize, lookup } from "./labels";
 import { TARGETS, isCapabilities, isExperimentPage, type Capabilities, type Experiment, type Target } from "./reads";
@@ -25,9 +25,13 @@ const STATE: Record<string, string> = {
   proposed: "Proposed", authorized: "Authorized, not run", running: "Running", evaluating: "Under independent evaluation",
   awaiting_review: "Awaiting human review (pending)", rejected: "Rejected", approved: "Release approved, not installed",
   promoted: "Promoted", rolled_back: "Rolled back", failed: "Failed", cancelled: "Cancelled",
+  blocked: "Blocked: not run or not assessed; not a success",
+  insufficient_evidence: "Insufficient evidence: not a pass; may be re-assessed while its holdout read is unused",
 };
 /** States that need the sandbox, assessment or promotion gate to have opened first. */
 const GATED = new Set(["running", "evaluating", "awaiting_review", "approved", "promoted", "rolled_back"]);
+/** Stalled states: shown with their reasons, never as a success, and not relied on behind a closed gate. */
+const STALLED = new Set(["blocked", "insufficient_evidence"]);
 const SCOPE = { tenant: "private (tenant)", installation: "shared (installation)" };
 export const NOT_PROVEN = "Not proven";
 const NO_RECEIPT_READ = "no_contract_read:evaluation_receipt";
@@ -64,16 +68,19 @@ function GateText({ target, gate }: { target: Target; gate: Gate }) {
   );
 }
 
-/** A state past the gate is shown but never relied on while its (or a related) gate is closed or unknown. */
-const relied = (e: Experiment, gate: Gate) => !GATED.has(e.state) || gate.kind === "open" || gate.kind === "none";
+/** A gated or stalled state is shown but never relied on while its (or a related) gate is closed or unknown. */
+const relied = (e: Experiment, gate: Gate) =>
+  !(GATED.has(e.state) || STALLED.has(e.state)) || gate.kind === "open" || gate.kind === "none";
 function StateText({ e, gate }: { e: Experiment; gate: Gate }) {
   const label = lookup(STATE, e.state) ?? `Unknown state (${e.state})`;
   const gated = GATED.has(e.state);
+  const stalled = STALLED.has(e.state);
   return (
     <>
       <Tag>state: {e.state}</Tag> {label}
-      {!relied(e, gate) && <>. <strong>Not relied on:</strong> a capability gate it depends on is not open, so this state cannot be real here.</>}
-      {gated && relied(e, gate) && <>. As recorded by the server; unverified.</>}
+      {!relied(e, gate) && <>. <strong>Not relied on:</strong> a capability gate it depends on is not open{stalled ? "" : ", so this state cannot be real here"}.</>}
+      {(gated || stalled) && relied(e, gate) && <>. As recorded by the server; unverified.</>}
+      <CoverageReasons coverage={e.coverage} label={`Reasons for ${e.id}`} />
     </>
   );
 }
@@ -144,7 +151,7 @@ export function Improvement({ env }: ViewProps) {
                       <td>{SCOPE[e.scope]} {e.scope_id}</td>
                       <td><StateText e={e} gate={gates[e.target]} /></td>
                       <td>
-                        {e.baseline_version} to {e.candidate_version}; optimizer {e.parent_optimizer_version}; candidate hash{" "}
+                        {e.baseline_version} to {e.candidate_version}; optimizer {e.parent_optimizer_version ?? "none (not an optimizer experiment)"}; candidate hash{" "}
                         <code>{e.candidate_hash}</code>
                       </td>
                       <td>Protected assessor {e.protected_assessor_version}; protocol {e.protocol_id}; sandbox {e.sandbox_profile_id}</td>

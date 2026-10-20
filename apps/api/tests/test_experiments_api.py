@@ -2,7 +2,8 @@
 TestClient on a migrated PostgreSQL 16 database as qw_app (T010 harness), with
 experiments recorded by qw_worker through `experiment_store.record` (which runs
 `improvement.record`) over SYNTHETIC fixtures. Responses are validated against the
-contract `experiment` and `experimentPage` (project contract coverage)."""
+contract `experiment` and `experimentPage` (project contract 0.6.0: item coverage,
+nullable `parent_optimizer_version`, blocked and insufficient_evidence)."""
 
 from __future__ import annotations
 
@@ -20,6 +21,7 @@ from jsonschema import (  # type: ignore[import-untyped]
     FormatChecker,
 )
 from qw_adapters import experiment_store as es
+from qw_api import experiments as ex
 from qw_domain import improvement as im
 
 ROOT = Path(__file__).parents[3]
@@ -76,48 +78,42 @@ def tenant_of(w: Any, login_name: str) -> uuid.UUID:
 def test_reads_serve_the_contract_and_name_every_reason(
     world: Any, runtime_urls: dict[str, str]
 ) -> None:
-    a = world.tenant_a
-    put(runtime_urls, a, st.EXP, im.Target.STRATEGY, "decided")
+    a, e = world.tenant_a, st.EXP
+    put(runtime_urls, a, e, im.Target.STRATEGY, "decided")
     put(runtime_urls, a, "exp-a", im.Target.STRATEGY, "authorized")
     put(runtime_urls, a, "exp-code", OPT)
     login(world.client, "bob")
     page = world.client.get(URL).json()
     rd.page_conforms("experiment", page)
-    [code] = [valid(i) for i in page["items"]]  # the others are withheld
-    assert (code["id"], code["state"], code["target"]) == (
-        "exp-code",
-        "proposed",
-        "recursive_optimizer",
-    )
+    items = {i["id"]: valid(i) for i in page["items"]}  # 0.6.0: none withheld
+    assert list(items) == ["exp-a", "exp-code", e]
+    code = items["exp-code"]
+    assert (code["state"], code["target"]) == ("blocked", "recursive_optimizer")
     assert code["parent_optimizer_version"] == code["baseline_version"] == "opt-v0"
     assert code["scope_id"] == str(a) and code["sandbox_profile_id"] == "sbx-synth"
-    assert (
-        code["protocol_id"]
-        == st.reg_for(a, "exp-code", OPT, "bud-exp-code")
-        .protocol("exp-code")
-        .content_hash
-    )
-    e = st.EXP
-    assert page["coverage"] == {
-        "status": "partial",
-        "reasons": [
-            "evidence:exp-a/synthetic_only",
-            "unavailable:exp-a/parent_optimizer_version",
-            "withheld:exp-a/item",
-            "blocked:exp-code/sandbox_unqualified",
-            "evidence:exp-code/synthetic_only",
-            f"evidence:{e}/synthetic_only",
-            f"none:{e}/evaluation_receipt_ids",
-            f"unavailable:{e}/parent_optimizer_version",
-            f"withheld:{e}/item",
-        ],
+    reg = st.reg_for(a, "exp-code", OPT, "bud-exp-code")
+    assert code["protocol_id"] == reg.protocol("exp-code").content_hash
+    assert [items[k]["state"] for k in ("exp-a", e)] == [
+        "authorized",
+        "awaiting_review",
+    ]
+    own = {
+        "exp-a": [SYN, "none:parent_optimizer_version"],
+        "exp-code": ["blocked:sandbox_unqualified", SYN],
+        e: [SYN, "none:evaluation_receipt_ids", "none:parent_optimizer_version"],
     }
+    for k, why in own.items():
+        assert items[k]["coverage"] == {"status": "partial", "reasons": why}
+        assert rd.strict("experiment", items[k], why) == (
+            set() if k == "exp-code" else {"parent_optimizer_version"})  # fmt: skip
+    assert page["coverage"] == {"status": "partial", "reasons": [
+        f"{r.split(':', 1)[0]}:{k}/{r.split(':', 1)[1]}"
+        for k in items for r in own[k]]}  # fmt: skip
     assert all(len(r) <= 300 for r in page["coverage"]["reasons"])
-    for eid, why in (("exp-code", "blocked:sandbox_unqualified"), (e, SYN),
-                     ("exp-a", "unavailable:parent_optimizer_version")):  # fmt: skip
-        body = assert_problem(world.client.get(f"{URL}/{eid}"), 409,
-                              "coverage_required")  # fmt: skip
-        assert why in body["detail"]
+    for eid, item in items.items():  # readExperiment: 200 with the item coverage
+        response = world.client.get(f"{URL}/{eid}")
+        assert response.status_code == 200, response.text
+        assert valid(response.json()) == item
     assert_problem(world.client.get(f"{URL}/exp-none"), 404, "not_found")
     assert world.client.get(f"{URL}/bad%20id").status_code == 400
     for method, path in (("POST", URL), ("POST", f"{URL}/exp-a/promote"),
@@ -128,6 +124,31 @@ def test_reads_serve_the_contract_and_name_every_reason(
     assert count.fetchone() == (6,)  # nothing written by the API
 
 
+def test_amended_experiment_schema() -> None:
+    """0.6.0: coverage required, the new states, and a parent version that is a
+    string exactly for the optimizer; 0.5.0 records still conform as stored."""
+    t = uuid.uuid4()
+    reg = st.reg_for(t)
+    rec = im.record(reg, st.EXP, "cand-1", st.plan(), st.empty(t))
+    item = ex.wire(rec)
+
+    def errors(body: dict[str, Any]) -> list[str]:
+        return [e.message for e in EXPERIMENT.iter_errors(body)]
+
+    assert errors(item) == [] and item["parent_optimizer_version"] is None
+    for state in ("blocked", "insufficient_evidence", "failed"):
+        assert errors({**item, "state": state}) == []
+    opt = {**item, "target": "recursive_optimizer"}
+    assert errors(opt) != [] and errors({**opt, "parent_optimizer_version": "v0"}) == []
+    assert errors({**item, "parent_optimizer_version": "v0"}) != []
+    assert errors({k: v for k, v in item.items() if k != "coverage"}) != []
+    assert errors({**item, "state": "installed"}) != []
+    old = st.legacy(t)[2]  # stored under 0.5.0: failed, unavailable parent
+    assert errors(ex.wire(old)) == []
+    assert rd.strict("experiment", ex.wire(old), list(old.reasons)) == {
+        "parent_optimizer_version"}  # fmt: skip
+
+
 @pytest.mark.db
 def test_tenancy_and_cursors(world: Any, runtime_urls: dict[str, str]) -> None:
     for eid, target in (("exp-0", OPT), ("exp-1", im.Target.STRATEGY),
@@ -135,15 +156,16 @@ def test_tenancy_and_cursors(world: Any, runtime_urls: dict[str, str]) -> None:
         put(runtime_urls, world.tenant_a, eid, target)
     login(world.client, "alice")
     first = world.client.get(URL, params={"limit": 2}).json()
-    assert [i["id"] for i in first["items"]] == ["exp-0"]  # exp-1 withheld
-    assert "withheld:exp-1/item" in first["coverage"]["reasons"]
+    assert [i["id"] for i in first["items"]] == ["exp-0", "exp-1"]
+    assert first["items"][1]["parent_optimizer_version"] is None
     rest = world.client.get(URL, params={"limit": 2, "cursor": first["next_cursor"]})
     rd.page_conforms("experiment", rest.json())
     assert [valid(i)["id"] for i in rest.json()["items"]] == ["exp-2"]
     assert rest.json()["next_cursor"] is None
     cursor = first["next_cursor"]
     for bad_url, bad in (("/api/v1/watchlists", cursor), (URL, "x"),
-                         (URL, cursor[:-2] + "AA")):  # fmt: skip
+                         (URL, cursor[:-2] + ("AA" if cursor[-2:] != "AA"
+                                              else "BB"))):  # fmt: skip
         assert_problem(world.client.get(bad_url, params={"cursor": bad}), 400,
                        "invalid_cursor")  # fmt: skip
     login(world.client, "bob")  # same tenant, another principal
@@ -159,7 +181,7 @@ def test_tenancy_and_cursors(world: Any, runtime_urls: dict[str, str]) -> None:
 
 
 @pytest.mark.db
-def test_cursor_walks_past_pages_of_withheld_rows(
+def test_cursor_walks_one_experiment_per_page(
     world: Any, runtime_urls: dict[str, str]
 ) -> None:
     ids = ["exp-w0", "exp-w1", "exp-w2"]
@@ -173,12 +195,10 @@ def test_cursor_walks_past_pages_of_withheld_rows(
         assert response.status_code == 200, response.text
         page = response.json()
         rd.page_conforms("experiment", page)
-        assert page["items"] == []
-        own = [r for r in page["coverage"]["reasons"] if r.startswith("withheld:")]
-        assert len(own) == 1 and all(
-            r.split(":", 1)[1].startswith(own[0][9:-5] + "/")
-            for r in page["coverage"]["reasons"])  # fmt: skip
-        seen.append(own[0].removeprefix("withheld:").removesuffix("/item"))
+        [item] = page["items"]
+        assert all(r.split(":", 1)[1].startswith(f"{item['id']}/")
+                   for r in page["coverage"]["reasons"])  # fmt: skip
+        seen.append(valid(item)["id"])
         if (cursor := page["next_cursor"]) is None:
             break
     assert seen == ids and cursor is None

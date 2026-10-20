@@ -2,7 +2,8 @@
 // T055 increment 1: the read-only Improvement view. Every record below is SYNTHETIC. Capability
 // shapes follow apps/api/src/qw_api/capabilities.py and qw_domain.capabilities (code_improvement and
 // optimizer_recursion); experiments follow docs/spec/contracts experiment.schema.json and its
-// experiment_recursive.valid.json example, inside the project contract page with coverage.
+// experiment_recursive.valid.json example as amended by project contract 0.6.0 (item coverage, nullable
+// parent_optimizer_version, blocked and insufficient_evidence), inside the page with coverage.
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { cleanup, render, screen, within } from "@testing-library/react";
 import { App } from "./main";
@@ -31,23 +32,35 @@ const exp = (id: string, extra: object = {}) => ({
   protocol_id: "PROTO-SYN", protected_assessor_version: "ASSESSOR-V1", data_snapshot_ids: ["DATA-SYN"],
   budget_reservation_id: "BUD-SYN", sandbox_profile_id: "SANDBOX-UNQUALIFIED", candidate_hash: "a".repeat(64),
   evaluation_receipt_ids: [], parent_optimizer_version: "OPT-V0", next_cycle_run_id: null,
-  requires_human_promotion: true, release_receipt_id: null, ...extra,
+  requires_human_promotion: true, release_receipt_id: null,
+  coverage: { status: "partial", reasons: ["evidence:synthetic_only"] }, ...extra,
 });
+const NO_PARENT = { parent_optimizer_version: null,
+  coverage: { status: "partial", reasons: ["evidence:synthetic_only", "none:parent_optimizer_version"] } };
 // EXP-SYN-2 claims V1 was promoted and ran the next cycle: a gate-lifted claim while the gate is closed.
 const EXPS = { next_cursor: null, coverage: { status: "partial", reasons: ["synthetic:fixture"] }, items: [
   exp("EXP-SYN-1"),
   exp("EXP-SYN-2", { state: "promoted", baseline_version: "OPT-V1", candidate_version: "OPT-V2",
     parent_optimizer_version: "OPT-V1", evaluation_receipt_ids: ["EVAL-SYN-1"], release_receipt_id: "REL-SYN-1",
     next_cycle_run_id: "RUN-SYN-1" }),
-  exp("EXP-SYN-3", { target: "research", scope: "tenant", scope_id: "T-SYN", state: "awaiting_review" }),
+  exp("EXP-SYN-3", { target: "research", scope: "tenant", scope_id: "T-SYN", state: "awaiting_review", ...NO_PARENT }),
+] };
+// 0.6.0 stalled states, as apps/api serves them: blocked code target and insufficient research evidence.
+const STALLED = { ...EXPS, items: [
+  exp("EXP-SYN-4", { state: "blocked", coverage: { status: "partial",
+    reasons: ["blocked:sandbox_unqualified", "evidence:synthetic_only"] } }),
+  exp("EXP-SYN-5", { target: "research", scope: "tenant", scope_id: "T-SYN", state: "insufficient_evidence",
+    ...NO_PARENT, coverage: { status: "partial", reasons: ["insufficient:no_qualifying_trial",
+      "none:parent_optimizer_version"] } }),
 ] };
 const HANG = Symbol("hang");
-const routes = (opts: { enabled?: boolean; experiments?: boolean; capsDown?: boolean; capsHang?: boolean; omit?: string[] } = {}) => {
+const routes = (opts: { enabled?: boolean; experiments?: boolean; stalled?: boolean; capsDown?: boolean; capsHang?: boolean;
+  omit?: string[]; } = {}) => {
   const r: Record<string, unknown> = {};
   const c = caps(opts.enabled ?? false);
   if (!opts.capsDown) r["/api/v1/capabilities"] = { ...c, features: c.features.filter((f) => !opts.omit?.includes(f.id)) };
   if (opts.capsHang) r["/api/v1/capabilities"] = HANG;
-  if (opts.experiments) r["/api/v1/experiments?limit=200"] = EXPS;
+  if (opts.experiments) r["/api/v1/experiments?limit=200"] = opts.stalled ? STALLED : EXPS;
   return r;
 };
 const fetcher = (r: Record<string, unknown>) => vi.fn<Fetcher>((input) => {
@@ -206,9 +219,49 @@ describe("experiment page guard fails closed", () => {
     ["duplicate experiment id", { ...EXPS, items: [exp("E"), exp("E")] }],
     ["page without coverage", { ...EXPS, coverage: undefined }],
     ["missing lineage field", { ...EXPS, items: [{ ...exp("E"), parent_optimizer_version: undefined }] }],
+    ["item without coverage", { ...EXPS, items: [{ ...exp("E"), coverage: undefined }] }],
+    ["optimizer without a parent", { ...EXPS, items: [exp("E", NO_PARENT)] }],
+    ["parent on another target", { ...EXPS, items: [exp("E", { target: "research" })] }],
+    ["null parent not named", { ...EXPS, items: [exp("E", { ...NO_PARENT, target: "research", coverage: {
+      status: "partial", reasons: ["evidence:synthetic_only"] } })] }],
+    ["a set parent named as absent", { ...EXPS, items: [exp("E", { coverage: { status: "partial",
+      reasons: ["none:parent_optimizer_version"] } })] }],
+    ["complete coverage with reasons", { ...EXPS, items: [exp("E", { coverage: { status: "complete",
+      reasons: ["blocked:sandbox_unqualified"] } })] }],
   ];
   it.each(bad)("refuses %s", (_name, v) => {
     expect(isExperimentPage(EXPS)).toBe(true);
+    expect(isExperimentPage(STALLED)).toBe(true);
     expect(isExperimentPage(v)).toBe(false);
+  });
+});
+
+describe("stalled experiments (0.6.0)", () => {
+  it("reads blocked and insufficient evidence honestly, with reasons, and not relied on behind a closed gate", async () => {
+    await show(routes({ experiments: true, stalled: true }));
+    const all = await screen.findByRole("table", { name: /^Experiments/ });
+    const blocked = rowOf(all, /EXP-SYN-4/)?.textContent ?? "";
+    expect(blocked).toContain("[state: blocked] Blocked: not run or not assessed; not a success");
+    expect(blocked).toContain("Not relied on");
+    expect(blocked).not.toContain("cannot be real here");
+    expect(blocked).toContain("blocked:sandbox_unqualified");
+    const thin = rowOf(all, /EXP-SYN-5/)?.textContent ?? "";
+    expect(thin).toContain("Insufficient evidence: not a pass");
+    expect(thin).toContain("Not relied on");
+    expect(thin).toContain("insufficient:no_qualifying_trial");
+    expect(thin).toContain("optimizer none (not an optimizer experiment)");
+    for (const text of [blocked, thin]) expect(text.replaceAll("not a success", "")).not.toMatch(/accept|passed|success|approved/i);
+    expect(screen.getByRole("status", { name: "Recursion status" }).textContent).toContain("[Not proven]");
+  });
+
+  it("stays unverified, never a success, with every gate open", async () => {
+    await show(routes({ experiments: true, stalled: true, enabled: true }));
+    const all = await screen.findByRole("table", { name: /^Experiments/ });
+    for (const id of [/EXP-SYN-4/, /EXP-SYN-5/]) {
+      const text = rowOf(all, id)?.textContent ?? "";
+      expect(text).not.toContain("Not relied on");
+      expect(text).toContain("unverified");
+      expect(text).toMatch(/not a success|not a pass/);
+    }
   });
 });
