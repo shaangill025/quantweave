@@ -15,6 +15,9 @@ Artifact check only: it reads the designed contracts, not a running API.
    if its resolved target carries one of the reviewed decimal patterns.
 4. Every `*_at` timestamp in the contract examples is RFC 3339 with an explicit
    offset, in range, not `-00:00`, and parses as a real instant.
+5. Every project contract schema (contracts/amendments.json applied by
+   tools/project_contract.py) is a valid 2020-12 schema that keeps rule 3, and its
+   `all_of` rules name only properties the schema has.
 
 Known limits: money fields are found by name (a field called `pnl`, `nav` or
 `premium` is not checked); timestamps are checked only in examples and only under keys
@@ -35,6 +38,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+import project_contract as pc
 import yaml  # type: ignore[import-untyped]
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -260,10 +264,47 @@ def check_timestamps(name: str, node: Json, path: str = "") -> list[str]:
     return errors
 
 
+def _named(rule: Json) -> set[str]:
+    """Property names an if/then/else rule constrains."""
+    out: set[str] = set()
+    for key in ("if", "then", "else"):
+        out |= set(rule.get(key, {}).get("properties", {}))
+    return out
+
+
+def check_amended(schemas: dict[str, Json], amendments: Json) -> list[str]:
+    from jsonschema import Draft202012Validator  # type: ignore[import-untyped]
+
+    errors: list[str] = []
+    saved, pc.AMENDMENTS = pc.AMENDMENTS, amendments
+    try:
+        for name, amended in amendments["schemas"].items():
+            where = f"project contract {name}"
+            try:
+                s = pc.schema(name)
+            except (KeyError, ValueError) as exc:
+                errors.append(f"{where}: amendment refused: {exc!r}")
+                continue
+            meta = Draft202012Validator(Draft202012Validator.META_SCHEMA)
+            errors += [f"{where}: invalid schema: {e.message}"
+                       for e in meta.iter_errors(s)]  # fmt: skip
+            for rule in amended.get("all_of", []):
+                if unknown := _named(rule) - set(s["properties"]):
+                    errors.append(f"{where}: all_of names unknown property {unknown}")
+            errors += check_decimals(where, s, schemas)
+    finally:
+        pc.AMENDMENTS = saved
+    return errors
+
+
 def run_checks(
-    api: Json, schemas: dict[str, Json], examples: dict[str, Json]
-) -> list[str]:
+    api: Json, schemas: dict[str, Json], examples: dict[str, Json],
+    amendments: Json = None,
+) -> list[str]:  # fmt: skip
     errors = check_routes(api, schemas)
+    errors += check_amended(
+        schemas, pc.AMENDMENTS if amendments is None else amendments
+    )
     errors += check_decimals("openapi#/components", api["components"], schemas)
     errors += check_decimals("openapi#/paths", api["paths"], schemas)
     for name, schema in schemas.items():
@@ -274,7 +315,7 @@ def run_checks(
 
 
 def format_checker_enforces_datetime() -> bool:
-    from jsonschema import FormatChecker  # type: ignore[import-untyped]
+    from jsonschema import FormatChecker
 
     return not FormatChecker().conforms("2026-10-08T10:00:00", "date-time")
 
@@ -370,6 +411,26 @@ def self_test(api: Json, schemas: dict[str, Json], examples: dict[str, Json]) ->
         "integer quantity": (int_quantity, "quantity: money/quantity not a decimal"),
         "offset-less timestamp": (naive_ts, "timestamp without offset"),
     }
+
+    def amended_money(m: Json) -> None:
+        m["schemas"]["experiment"]["add"]["fee"] = {"type": "number"}
+
+    def unknown_rule(m: Json) -> None:
+        rule = m["schemas"]["experiment"]["all_of"][0]
+        rule["then"]["properties"] = {"parent_optimiser_version": {"type": "string"}}
+
+    def duplicate_state(m: Json) -> None:
+        m["schemas"]["experiment"]["enum_add"]["state"].append("failed")
+
+    def bad_rule(m: Json) -> None:
+        m["schemas"]["experiment"]["all_of"][0]["if"] = {"type": "nonsense"}
+
+    amended_cases = {
+        "amended number money": (amended_money, "fee: money/quantity not a decimal"),
+        "all_of unknown property": (unknown_rule, "all_of names unknown property"),
+        "enum_add duplicate": (duplicate_state, "amendment refused"),
+        "invalid amended schema": (bad_rule, "invalid schema"),
+    }
     failures = 0
     baseline = run_checks(api, schemas, examples)
     if baseline:
@@ -381,7 +442,14 @@ def self_test(api: Json, schemas: dict[str, Json], examples: dict[str, Json]) ->
         found = [m for m in run_checks(a, s, e) if expected in m]
         print(f"self-test {label}: {'detected' if found else 'MISSED'}")
         failures += not found
-    print(f"self-test: {len(cases) - failures}/{len(cases)} defects detected")
+    for label, (change, expected) in amended_cases.items():
+        m = copy.deepcopy(pc.AMENDMENTS)
+        change(m)
+        found = [x for x in run_checks(api, schemas, examples, m) if expected in x]
+        print(f"self-test {label}: {'detected' if found else 'MISSED'}")
+        failures += not found
+    total = len(cases) + len(amended_cases)
+    print(f"self-test: {total - failures}/{total} defects detected")
     return 1 if failures else 0
 
 
@@ -403,7 +471,9 @@ def main(argv: list[str]) -> int:
     ops = sum(m in MUTATING for item in api["paths"].values() for m in item)
     print(
         f"{'FAIL' if errors else 'PASS'}: {len(api['paths'])} paths, {ops} mutating "
-        f"operations, {len(schemas)} schemas, {len(examples)} examples"
+        f"operations, {len(schemas)} schemas, {len(examples)} examples, project "
+        f"contract {pc.AMENDMENTS['version']} ({len(pc.AMENDMENTS['schemas'])} "
+        "amended schemas)"
     )
     return 1 if errors else 0
 

@@ -1,15 +1,16 @@
 {
-  "version": "0.5.0",
+  "version": "0.6.0",
   "base": "docs/spec/contracts 0.1.0",
   "versions": {
     "0.2.0": {"decision": "Owner decision 2026-10-14 (T008 A-01; docs/receipts/T053-api.md)"},
     "0.3.0": {"decision": "Owner decision 2026-10-15, confirming the proposal (docs/receipts/T036.md increment 4; docs/decisions/2026-10-15-owner-decisions.md)"},
     "0.4.0": {"decision": "Owner decision 2026-10-15, confirming the proposal (docs/receipts/T053-api.md reads increment 2; docs/decisions/2026-10-15-owner-decisions.md)"},
-    "0.5.0": {"decision": "Owner decision 2026-10-15 (docs/decisions/2026-10-15-owner-decisions.md)"}
+    "0.5.0": {"decision": "Owner decision 2026-10-15 (docs/decisions/2026-10-15-owner-decisions.md)"},
+    "0.6.0": {"decision": "Owner decisions 2026-10-20, 1 to 3 and 7 (the answer to Q7) (docs/decisions/2026-10-20-owner-decisions.md)"}
   },
   "about": "Project-owned contract (T008 A-01). docs/spec/contracts stays unchanged; tools/project_contract.py applies these amendments to its schemas and request bodies. Unnamed schemas are the spec's. Consumers (apps/api tests, apps/web/src/api.ts guards) enforce the rule below; a null receipt or qualification never makes a proposal actionable.",
-  "changes": "0.2.0: fields no store holds yet become nullable (account, account_snapshot, proposal); snapshot gains ledger_cash (trade-date journal cash, not available cash) and coverage; pages gain the C-02 coverage; the active-proposal rule accepts a null final-check receipt or qualification. 0.3.0: claim and evidence gain coverage (withheld text, invalid citations and limitations are named there); claim material becomes nullable (no store records materiality). 0.4.0: proposal gains coverage (readProposal returns one proposal, so its nulls are named on the item; list items carry it too); ledger_event lot_policy_id becomes nullable (the journal stores a lot-policy name such as economic_average_cost/1, which is not a contract id; it is served in economic_annotations). 0.5.0: the request WatchlistEntry (addWatchlistEntry, updateWatchlistEntry) gains an optional, nullable review_at (RFC 3339 with an offset, normalized to UTC; on update, omitting it keeps the stored value); needs stays server-derived and is refused in requests. If-Match on every route: a stale or malformed value is 412 Precondition Failed and a required but missing one is 428 Precondition Required; this replaces the 409 that the OpenAPI If-Match descriptions name.",
-  "rule": "A null in an amended field must be named in the response coverage.reasons as unavailable:<field>, unavailable:<id>/<field>, unknown:<field> or none:<id>/<field>.",
+  "changes": "0.2.0: fields no store holds yet become nullable (account, account_snapshot, proposal); snapshot gains ledger_cash (trade-date journal cash, not available cash) and coverage; pages gain the C-02 coverage; the active-proposal rule accepts a null final-check receipt or qualification. 0.3.0: claim and evidence gain coverage (withheld text, invalid citations and limitations are named there); claim material becomes nullable (no store records materiality). 0.4.0: proposal gains coverage (readProposal returns one proposal, so its nulls are named on the item; list items carry it too); ledger_event lot_policy_id becomes nullable (the journal stores a lot-policy name such as economic_average_cost/1, which is not a contract id; it is served in economic_annotations). 0.5.0: the request WatchlistEntry (addWatchlistEntry, updateWatchlistEntry) gains an optional, nullable review_at (RFC 3339 with an offset, normalized to UTC; on update, omitting it keeps the stored value); needs stays server-derived and is refused in requests. If-Match on every route: a stale or malformed value is 412 Precondition Failed and a required but missing one is 428 Precondition Required; this replaces the 409 that the OpenAPI If-Match descriptions name. 0.6.0: experiment gains coverage (readExperiment serves an incomplete or blocked record with its reasons instead of refusing it; list items carry it too); parent_optimizer_version is a string exactly when target is recursive_optimizer and null otherwise, named none:parent_optimizer_version; state gains blocked and insufficient_evidence (insufficient evidence is re-assessable while the plan's one holdout read is unused, checked against the ledger the assessor is given; failed is no longer derived for it).",
+  "rule": "A null in an amended field must be named in the response coverage.reasons as unavailable:<field>, unavailable:<id>/<field>, unknown:<field>, none:<field> or none:<id>/<field>. Item coverage reasons are <kind>:<detail>; page reasons are <kind>:<id>/<detail>.",
   "schemas": {
     "account": {
       "nullable": ["name", "broker", "account_type", "reporting_currency",
@@ -44,6 +45,16 @@
       "add": {"coverage": {"$ref": "#/$defs/Coverage"}}
     },
     "evidence": {
+      "add": {"coverage": {"$ref": "#/$defs/Coverage"}}
+    },
+    "experiment": {
+      "nullable": ["parent_optimizer_version"],
+      "enum_add": {"state": ["blocked", "insufficient_evidence"]},
+      "all_of": [{
+        "if": {"properties": {"target": {"const": "recursive_optimizer"}}},
+        "then": {"properties": {"parent_optimizer_version": {"type": "string"}}},
+        "else": {"properties": {"parent_optimizer_version": {"type": "null"}}}
+      }],
       "add": {"coverage": {"$ref": "#/$defs/Coverage"}}
     }
   },

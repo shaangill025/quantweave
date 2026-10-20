@@ -4,17 +4,17 @@ No create, cancel or promote operation is served: the worker records experiments
 
 Any member reads the session tenant's experiments (forced RLS); unknown and foreign
 ids are the same 404. Lists are C-02 keyset pages by id with the qw_api.reads HMAC
-cursor. Items are the contract `experiment`: `requires_human_promotion` true,
-`evaluation_receipt_ids` empty (no receipt store), `next_cycle_run_id` and
-`release_receipt_id` null (T051); states proposed, authorized, awaiting_review,
-rejected or failed. Stored `<kind>:<detail>` reasons the schema cannot carry (for
-example `blocked:sandbox_unqualified`, `evidence:synthetic_only`) are page
-`coverage.reasons` `<kind>:<id>/<detail>` (at most 300 characters). An experiment
-whose required `parent_optimizer_version` is unavailable (every target but the
-optimizer, pending an owner decision) is withheld from `items` and named
-`withheld:<id>/item`, never served with a null. readExperiment has no coverage, so an
-experiment with any reason is 409 `coverage_required` naming them, never a bare
-200. Revisions failing checks are 409 `integrity`."""
+cursor. Items are the project contract 0.6.0 `experiment`:
+`requires_human_promotion` true, `evaluation_receipt_ids` empty (no receipt store),
+`next_cycle_run_id` and `release_receipt_id` null (T051), `parent_optimizer_version`
+null except for the optimizer (named `none:parent_optimizer_version`). Each item
+carries its coverage: the stored `<kind>:<detail>` reasons the schema cannot carry
+(for example `blocked:sandbox_unqualified`, `evidence:synthetic_only`), `partial`
+when there is any. The page repeats them as `<kind>:<id>/<detail>` (at most 300
+characters). readExperiment serves a blocked or incomplete record with its reasons;
+records stored under 0.5.0 are served as stored (`failed`,
+`unavailable:parent_optimizer_version`). Revisions failing checks are 409
+`integrity`."""
 
 from __future__ import annotations
 
@@ -50,7 +50,9 @@ def wire(rec: ExperimentRecord) -> dict[str, Any]:
     return {"id": rec.experiment_id, **body, "evaluation_receipt_ids": [],
             "next_cycle_run_id": None,
             "requires_human_promotion": rec.requires_human_promotion,
-            "release_receipt_id": None}  # fmt: skip
+            "release_receipt_id": None, "coverage": {
+                "status": "partial" if rec.reasons else "complete",
+                "reasons": list(rec.reasons)}}  # fmt: skip
 
 
 def reasons(rec: ExperimentRecord) -> list[str]:
@@ -66,12 +68,7 @@ def list_experiments(
     with principal.tx() as tx:
         rows = _call(lambda: store.page(tx, limit + 1, after))
     shown, more = [r.record for r in rows[:limit]], len(rows) > limit
-    items = [wire(r) for r in shown if r.parent_optimizer_version is not None]
-    why: list[str] = []
-    for r in shown:
-        why += reasons(r)
-        if r.parent_optimizer_version is None:
-            why.append(f"withheld:{r.experiment_id}/item")
+    items, why = [wire(r) for r in shown], [x for r in shown for x in reasons(r)]
     return _page(request, principal, SORT, items, more, why,
                  shown[-1].experiment_id if more else None)  # fmt: skip
 
@@ -82,9 +79,5 @@ def read_experiment(principal: Reader, experiment_id: ExperimentId) -> Response:
         found = _call(lambda: store.load(tx, experiment_id))
     if found is None:
         raise ApiError(404, "not_found", "No such experiment.")
-    if found.record.reasons:
-        raise ApiError(409, "coverage_required", "This experiment has reasons the "
-                       "schema cannot carry; listExperiments names them in coverage: "
-                       + ", ".join(found.record.reasons))  # fmt: skip
     body = json.dumps(wire(found.record)).encode()
     return Response(body, 200, media_type="application/json")

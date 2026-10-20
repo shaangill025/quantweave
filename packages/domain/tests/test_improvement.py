@@ -428,7 +428,7 @@ def test_review_round1_time_budget_lineage_and_verdict_rules() -> None:
         registry().record_verdict(ok).record_verdict(ok)
 
 
-SU = ("evidence:synthetic_only", "unavailable:parent_optimizer_version")
+SU = ("evidence:synthetic_only", "none:parent_optimizer_version")
 
 
 def test_record_derives_honest_states_and_reasons() -> None:
@@ -464,24 +464,34 @@ def test_record_derives_honest_states_and_reasons() -> None:
     assert "rejected:hard:lookahead_violations" in rej.reasons
     thin = im.record(reg, EXP, "cand-1", pl, b, None,
                      replace(run, ledger=ledger()))  # fmt: skip
-    assert thin.state is im.RecordState.FAILED
+    assert thin.state is im.RecordState.INSUFFICIENT_EVIDENCE  # 0.6.0: not failed
     assert "insufficient:no_qualifying_trial" in thin.reasons
     blocked = im.record(reg, EXP, "cand-1", pl, book(), None, run)
-    assert blocked.state is im.RecordState.PROPOSED
+    assert (blocked.state, blocked.decision) == (im.RecordState.BLOCKED,
+                                                 im.Decision.BLOCKED)  # fmt: skip
     assert "blocked:budget_not_reserved" in blocked.reasons
-    for t in im.SANDBOX_TARGETS:  # T007: representable, never past proposed
+    for t in im.SANDBOX_TARGETS:  # T007: representable, always blocked
         p = proto(target=t, sandbox_profile_id="sbx-synth")
         r = im.ExperimentRegistry(TENANT).register(p).register_candidate(
             cand(target=t))  # fmt: skip
         got = im.record(r, EXP, "cand-1", pl, book(), im.Deferred(
             EXP, "sandbox_unqualified"), run)  # fmt: skip
-        assert got.state is im.RecordState.PROPOSED and got.decision is (
+        assert got.state is im.RecordState.BLOCKED and got.decision is (
             im.Decision.BLOCKED)  # fmt: skip
+        bare = im.record(r, EXP, "cand-1", pl, book())  # no verdict: still blocked
+        assert (bare.state, bare.decision) == (im.RecordState.BLOCKED, None)
         assert "blocked:sandbox_unqualified" in got.reasons
         optimizer = t is im.Target.RECURSIVE_OPTIMIZER  # its lineage: the parent
+        if optimizer:  # a set parent named as absent is contradictory
+            for x in ("none:parent_optimizer_version",
+                      "unavailable:parent_optimizer_version"):  # fmt: skip
+                with pytest.raises(im.ImprovementError, match="record_inconsistent"):
+                    replace(got, reasons=tuple(sorted({*got.reasons, x})))
         assert got.parent_optimizer_version == ("strat-v0" if optimizer else None)
         sandbox: list[dict[str, object]] = [{"state": im.RecordState.AUTHORIZED},
                                             {"reasons": ()}]  # fmt: skip
+        if not optimizer:  # an optimizer proposed record is a readable 0.5.0 one
+            sandbox.append({"state": im.RecordState.PROPOSED})
         for forged in sandbox:
             with pytest.raises(im.ImprovementError, match="record_inconsistent"):
                 replace(got, **forged)  # type: ignore[arg-type]
@@ -502,3 +512,172 @@ def test_record_derives_honest_states_and_reasons() -> None:
         replace(done, hypothesis="h" * 4001)
     with pytest.raises(im.ImprovementError, match="test_access_changed"):
         im.record(reg, EXP, "cand-1", plan(max_promotion_accesses=2), b)
+
+
+# --- project contract 0.6.0 (owner decisions 1-3 and Q7, 2026-10-20) ---
+St = im.RecordState
+# The doc's transition table, hand-written; same-state proposed and authorized
+# re-records (a changed deferral reason) stay allowed, as in 0.5.0.
+ALLOWED = {
+    St.PROPOSED: {St.PROPOSED, St.AUTHORIZED, St.BLOCKED},
+    St.AUTHORIZED: {St.AUTHORIZED, St.BLOCKED, St.AWAITING_REVIEW, St.REJECTED,
+                    St.INSUFFICIENT_EVIDENCE},
+    St.BLOCKED: {St.PROPOSED, St.AUTHORIZED, St.BLOCKED, St.AWAITING_REVIEW,
+                 St.REJECTED, St.INSUFFICIENT_EVIDENCE},
+    St.INSUFFICIENT_EVIDENCE: {St.INSUFFICIENT_EVIDENCE, St.BLOCKED,
+                               St.AWAITING_REVIEW, St.REJECTED},
+    St.AWAITING_REVIEW: set(), St.REJECTED: set(),
+}  # fmt: skip
+
+
+def states() -> dict[im.RecordState, im.ExperimentRecord]:
+    reg, pl = registry(proto(sandbox_profile_id="sbx-synth")), plan()
+    b = scheduled(reg)
+    run = im.Assessment(promo_ledger(GOOD), ASSESSOR, AT + timedelta(days=1), "v-1")
+    bad = promo_ledger(GOOD | {"lookahead_violations": Decimal(1)})
+    got = [
+        im.record(reg, EXP, "cand-1", pl, book()),
+        im.record(reg, EXP, "cand-1", pl, b, im.Scheduled(EXP, "bud-exp-1")),
+        im.record(reg, EXP, "cand-1", pl, book(), None, run),
+        im.record(reg, EXP, "cand-1", pl, b, None, run),
+        im.record(reg, EXP, "cand-1", pl, b, None, replace(run, ledger=bad)),
+        im.record(reg, EXP, "cand-1", pl, b, None, replace(run, ledger=ledger())),
+    ]
+    return {r.state: r for r in got}  # fmt: skip
+
+
+def test_states_follow_the_transition_table_with_new_verdict_ids() -> None:
+    recs = states()
+    assert set(recs) == set(ALLOWED)
+    for prev, a in recs.items():
+        for nxt, b in recs.items():
+            fresh = replace(b, verdict_id=f"v-{nxt.value}") if b.verdict_id else b
+            assert fresh.may_follow(a) is (nxt in ALLOWED[prev]), (prev, nxt)
+    thin = recs[St.INSUFFICIENT_EVIDENCE]
+    assert not thin.may_follow(thin)  # the same verdict id is not a re-assessment
+    assert replace(thin, verdict_id="v-2").may_follow(thin)
+    blocked = recs[St.BLOCKED]
+    assert not replace(recs[St.AWAITING_REVIEW]).may_follow(blocked)  # same v-1
+    assert recs[St.BLOCKED].decision is im.Decision.BLOCKED
+    assert "none:evaluation_receipt_ids" not in blocked.reasons
+    for forged in ({"decision": im.Decision.INSUFFICIENT},  # a blocked verdict's state
+                   {"reasons": ("evidence:synthetic_only",
+                                "none:parent_optimizer_version")},
+                   {"state": im.RecordState.AUTHORIZED}):  # fmt: skip
+        with pytest.raises(im.ImprovementError, match="record_inconsistent"):
+            replace(blocked, **forged)
+    with pytest.raises(im.ImprovementError, match="record_inconsistent"):
+        replace(thin, state=St.FAILED)  # 0.6.0 reasons with the 0.5.0 state
+
+
+def test_insufficient_evidence_is_reassessed_only_while_the_holdout_is_unused() -> None:
+    reg, pl = registry(proto(sandbox_profile_id="sbx-synth")), plan()
+    b = scheduled(reg)
+    at = AT + timedelta(days=1)
+    thin = im.record(reg, EXP, "cand-1", pl, b, None,
+                     im.Assessment(ledger(), ASSESSOR, at, "v-1"))  # fmt: skip
+    assert thin.reasons == (SU[0], "insufficient:no_qualifying_trial",
+                            "none:evaluation_receipt_ids", SU[1])  # fmt: skip
+    again = im.record(
+        reg,
+        EXP,
+        "cand-1",
+        pl,
+        b,
+        None,
+        im.Assessment(promo_ledger(GOOD), ASSESSOR, at, "v-2"),
+    )
+    assert again.state is St.AWAITING_REVIEW and again.may_follow(thin)
+    assert again.budget_reservation_id == thin.budget_reservation_id
+    # The first holdout read is consumed by a trial missing a metric: a second read
+    # with full metrics is holdout reuse, so it is never scored or accepted.
+    two = plan(max_promotion_accesses=2)
+    reg2 = registry(proto(sandbox_profile_id="sbx-synth",
+                          plan_digest=im.plan_digest(two)))  # fmt: skip
+    key = cand().trial_key
+    lg, _ = ask(ledger(two), 1, tl.Split.PROMOTION, PROMO, tl.Role.ASSESSOR,
+                candidate=key)  # fmt: skip
+    partial = {k: v for k, v in GOOD.items() if k != "unrecorded_trials"}
+    lg = lg.record(trial(1, tl.Split.PROMOTION, family=EXP, metrics=partial,
+                         material_hash=key.material_hash,
+                         config_hash=key.config_hash))  # fmt: skip
+    b2 = scheduled(reg2)
+    first = im.record(reg2, EXP, "cand-1", two, b2, None,
+                      im.Assessment(lg, ASSESSOR, at, "v-1"))  # fmt: skip
+    assert "insufficient:metric_missing:unrecorded_trials" in first.reasons
+    lg, _ = ask(lg, 2, tl.Split.PROMOTION, PROMO, tl.Role.ASSESSOR, candidate=key)
+    lg = lg.record(trial(2, tl.Split.PROMOTION, family=EXP, metrics=GOOD,
+                         material_hash=key.material_hash,
+                         config_hash=key.config_hash))  # fmt: skip
+    second = im.record(reg2, EXP, "cand-1", two, b2, None,
+                       im.Assessment(lg, ASSESSOR, at, "v-2"))  # fmt: skip
+    assert second.state is St.INSUFFICIENT_EVIDENCE and second.may_follow(first)
+    assert second.reasons == first.reasons  # the second read's metrics are unused
+
+
+def test_reassessment_never_resets_the_budget_or_changes_the_plan() -> None:
+    reg, pl = registry(proto(sandbox_profile_id="sbx-synth")), plan()
+    b = scheduled(reg)
+    at = AT + timedelta(days=1)
+    thin = im.record(reg, EXP, "cand-1", pl, b, None,
+                     im.Assessment(ledger(), ASSESSOR, at, "v-1"))  # fmt: skip
+    released = b.release("bud-exp-1")
+    late = im.record(
+        reg,
+        EXP,
+        "cand-1",
+        pl,
+        released,
+        None,
+        im.Assessment(promo_ledger(GOOD), ASSESSOR, at, "v-2"),
+    )
+    assert (late.state, late.decision) == (St.BLOCKED, im.Decision.BLOCKED)
+    assert "blocked:budget_not_reserved" in late.reasons and late.may_follow(thin)
+    _, out = im.schedule(reg, (EXP,), released, at)  # never re-reserved
+    assert out == (im.Deferred(EXP, "reservation_closed"),)
+    two = plan(max_promotion_accesses=2)  # more data needs a new plan ...
+    with pytest.raises(im.ImprovementError, match="test_access_changed"):
+        im.record(reg, EXP, "cand-1", two, b)
+    with pytest.raises(im.ImprovementError, match="protocol_frozen"):
+        reg.register(
+            proto(sandbox_profile_id="sbx-synth", plan_digest=im.plan_digest(two))
+        )  # ... a new experiment
+    moved = replace(thin, protocol_id="e" * 64, verdict_id="v-3")
+    assert not moved.may_follow(thin)
+
+
+def test_records_stored_under_0_5_0_stay_readable() -> None:
+    recs = states()
+    old = (SU[0], "unavailable:parent_optimizer_version")
+    legacy = [
+        replace(recs[St.INSUFFICIENT_EVIDENCE], state=St.FAILED, reasons=(
+            SU[0], "insufficient:no_qualifying_trial", "none:evaluation_receipt_ids",
+            "unavailable:parent_optimizer_version")),
+        replace(recs[St.PROPOSED], reasons=old),
+        replace(recs[St.BLOCKED], state=St.PROPOSED, reasons=(
+            "blocked:budget_not_reserved", *old)),
+    ]  # fmt: skip
+    failed, proposed, was_blocked = legacy
+    assert not any(
+        replace(recs[s], verdict_id="v-9").may_follow(failed)
+        for s in ALLOWED
+        if recs[s].verdict_id
+    )  # failed stays final
+    assert recs[St.AUTHORIZED].may_follow(proposed)
+    for new in recs.values():  # never a 0.5.0 record after a 0.6.0 one
+        assert not proposed.may_follow(new) and not failed.may_follow(new)
+    assert replace(recs[St.BLOCKED], verdict_id="v-2").may_follow(was_blocked)
+    for forged in ({"state": St.BLOCKED}, {"state": St.FAILED, "decision": None,
+                                           "verdict_id": None}):  # fmt: skip
+        with pytest.raises(im.ImprovementError, match="record_inconsistent"):
+            replace(proposed, **forged)
+    with pytest.raises(im.ImprovementError, match="record_inconsistent"):
+        replace(
+            failed,
+            reasons=tuple(
+                sorted(
+                    {*failed.reasons} - {"unavailable:parent_optimizer_version"}
+                    | {SU[1]}
+                )
+            ),
+        )  # mixed forms

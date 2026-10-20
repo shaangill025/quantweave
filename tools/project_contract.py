@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Project contract 0.5.0 (T008 A-01): the docs/spec/contracts 0.1.0 schemas with the
+"""Project contract 0.6.0 (T008 A-01): the docs/spec/contracts 0.1.0 schemas with the
 amendments of contracts/amendments.json applied (all owner decisions: see `versions`
 there). docs/spec is never edited; this derives the amended schemas in memory.
 
@@ -7,6 +7,8 @@ there). docs/spec is never edited; this derives the amended schemas in memory.
   common.schema.json first) also accepts null.
 - `add`: required properties appended to a closed schema.
 - `active_nullable`: the `state == active` if/then rules also accept null there.
+- `enum_add`: values appended to a property's enum; a value already there is refused.
+- `all_of`: rules appended to the schema's `allOf` (created when absent).
 - `page(name)`: the C-02 page `{items, next_cursor, coverage}` of an item schema.
 - `request(name)`: an openapi.yaml request component; `requests.<name>.optional` adds
   properties that are not required. Its `./schemas/` refs become the bare file names
@@ -51,6 +53,13 @@ def schema(name: str) -> dict[str, Any]:
                 props[p] = copy.deepcopy(common[props[p]["$ref"].rsplit("/", 1)[1]])
             props = props[p]["properties"]
         props[leaf] = _null(props[leaf])
+    for key, values in a.get("enum_add", {}).items():
+        enum = s["properties"][key]["enum"]
+        if set(values) & set(enum) or len(set(values)) != len(values):
+            raise ValueError(f"{name}.{key}: enum value already present")
+        enum.extend(values)
+    if "all_of" in a:
+        s.setdefault("allOf", []).extend(copy.deepcopy(a["all_of"]))
     for key, prop in a.get("add", {}).items():
         s["properties"][key] = prop
         s["required"].append(key)

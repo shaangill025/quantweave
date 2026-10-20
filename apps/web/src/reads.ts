@@ -2,7 +2,7 @@
 // /strategies, /strategies/{id}, /accounts/{id}/ledger and /proposals/{id} (openapi.yaml 1.0.0
 // as amended by project contract 0.4.0, owner-confirmed: proposal coverage, nullable lot_policy_id).
 // Each refuses a payload the views could not show honestly; decimals stay strings.
-import { checks as c, isProposal, pageOf, proposalPage, type Coverage, type Guard, type Page, type Proposal } from "./api";
+import { checks as c, isProposal, pageOf, proposalPage, reasonFor, type Coverage, type Guard, type Page, type Proposal } from "./api";
 import type { DecimalString as Dec } from "./wire";
 
 const { str, id, dec, instant, oneOf, nullable: n, arr, obj, coverage } = c;
@@ -72,31 +72,38 @@ export const isProposalDetail = ((v: unknown) => {
   return own !== undefined && coverage(own) && proposalPage({ items: [v], next_cursor: null, coverage: own });
 }) as Guard<Proposal & { coverage: Coverage }>;
 
-// listExperiments (openapi.yaml 1.0.0, experiment.schema.json; experimentPage with the project
-// contract page coverage). Designed in the contract; apps/api does not serve it yet (T055), so the
-// Improvement view shows its not_found plainly. The schema carries ids and lineage fields only:
-// no scorecard, verdict, budget amount, approval or installation record.
+// listExperiments (openapi.yaml 1.0.0, experiment.schema.json as amended by project contract 0.6.0:
+// item coverage, states blocked and insufficient_evidence, parent_optimizer_version null except for
+// the optimizer). A build that does not serve it shows its not_found plainly. The schema carries ids
+// and lineage fields only: no scorecard, verdict, budget amount, approval or installation record.
 export const TARGETS = ["personal_adaptation", "research", "strategy", "evaluator", "application_code", "recursive_optimizer"] as const;
 export type Target = (typeof TARGETS)[number];
 export const EXPERIMENT_STATES = ["proposed", "authorized", "running", "evaluating", "awaiting_review", "rejected",
-  "approved", "promoted", "rolled_back", "failed", "cancelled"] as const;
+  "approved", "promoted", "rolled_back", "failed", "cancelled", "blocked", "insufficient_evidence"] as const;
 export interface Experiment {
   id: string; target: Target; scope: "tenant" | "installation"; scope_id: string;
   state: (typeof EXPERIMENT_STATES)[number]; baseline_version: string; candidate_version: string; hypothesis: string;
   protocol_id: string; protected_assessor_version: string; data_snapshot_ids: string[]; budget_reservation_id: string;
-  sandbox_profile_id: string; candidate_hash: string; evaluation_receipt_ids: string[]; parent_optimizer_version: string;
-  next_cycle_run_id: string | null; requires_human_promotion: true; release_receipt_id: string | null;
+  sandbox_profile_id: string; candidate_hash: string; evaluation_receipt_ids: string[];
+  parent_optimizer_version: string | null; next_cycle_run_id: string | null; requires_human_promotion: true;
+  release_receipt_id: string | null; coverage: Coverage;
 }
 const isExperiment = obj({
   id, target: oneOf(...TARGETS), scope: oneOf("tenant", "installation"), scope_id: id,
   state: oneOf(...EXPERIMENT_STATES), baseline_version: id, candidate_version: id, hypothesis: str, protocol_id: id,
   protected_assessor_version: id, data_snapshot_ids: arr(id), budget_reservation_id: id, sandbox_profile_id: id,
-  candidate_hash: hash, evaluation_receipt_ids: arr(id), parent_optimizer_version: id, next_cycle_run_id: n(str),
-  requires_human_promotion: (v) => v === true, release_receipt_id: n(str),
+  candidate_hash: hash, evaluation_receipt_ids: arr(id), parent_optimizer_version: n(id), next_cycle_run_id: n(str),
+  requires_human_promotion: (v) => v === true, release_receipt_id: n(str), coverage: (v) => v !== undefined && coverage(v),
 }) as Guard<Experiment>;
+/** Only the optimizer has a parent optimizer, and the item's coverage names the parent exactly when it
+ * is null; coverage is complete exactly when it gives no reason. */
+const consistent = (e: Experiment) =>
+  (e.target === "recursive_optimizer") === (e.parent_optimizer_version !== null) &&
+  (e.parent_optimizer_version === null) === (reasonFor(e.coverage.reasons, e.id, "parent_optimizer_version") !== undefined) &&
+  (e.coverage.status === "complete") === (e.coverage.reasons.length === 0);
 /** Experiment ids are unique within a page, so lineage links cannot be ambiguous. */
 export const isExperimentPage = ((v: unknown) => {
-  if (!covered(pageOf(isExperiment))(v)) return false;
+  if (!covered(pageOf(isExperiment))(v) || !v.items.every(consistent)) return false;
   const ids = v.items.map((e) => e.id);
   return new Set(ids).size === ids.length;
 }) as Guard<Page<Experiment> & { coverage: Coverage }>;

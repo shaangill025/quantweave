@@ -1,12 +1,13 @@
-"""0026 and qw_adapters.experiment_store: qw_worker records through
+"""0026, 0027 and qw_adapters.experiment_store: qw_worker records through
 `improvement.record`, qw_app reads, the superuser `conn` observes or tampers. The
 SYNTHETIC test_improvement fixtures are scoped to a real tenant id."""
 
 from __future__ import annotations
 
+import shutil
 import uuid
 from dataclasses import replace
-from datetime import timedelta
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from typing import Any
 
@@ -14,11 +15,12 @@ import psycopg
 import pytest
 from qw_adapters import experiment_store as es
 from qw_adapters import tenancy as tn
+from qw_adapters.migrations import MIGRATIONS_DIR, migrate
 from qw_domain import improvement as im
 from qw_domain import trial_ledger as tl
 from qw_domain.budget import BudgetBook
 from test_improvement import ASSESSOR, AT, CAPS, EXP, GOOD, cand, promo_ledger, proto
-from test_trial_ledger import plan
+from test_trial_ledger import ledger, plan
 
 pytestmark = pytest.mark.db
 Conn = psycopg.Connection[Any]
@@ -178,15 +180,30 @@ def test_each_database_rule_refuses_a_raw_insert(
         copy(*new[:2], "'other'", *new[3:]),  # scope id is not the tenant
         copy(*new, decided="'v-x', 'reject'"),  # a decision without its state
         copy(*new, state="'rejected'"),  # a decided state without a decision
-        copy(*new, target="'application_code'"),  # code past proposed
+        copy(*new, target="'application_code'"),  # code not blocked
+        copy(*new, state="'proposed'", target="'application_code'"),  # 0.5.0 form
         copy(*new, state="'proposed'", target="'recursive_optimizer'"),  # no lineage
+        copy(*new, state="'blocked'"),  # blocked with no gate or blocked verdict
+        copy(*new, state="'failed'", decided="'v-x', 'insufficient_evidence'"),
+        copy(*new, state="'failed'"),  # 0.6.0 never stores failed
+        copy(*new, decided="'v-x', 'insufficient_evidence'"),  # not its state
     ]
     for sql in cases:
         with pytest.raises(psycopg.errors.CheckViolation):
             conn.execute(sql)
-    put(worker_conn, a, reg, booked(reg), None, run(a))  # a decision ...
-    with pytest.raises(psycopg.errors.CheckViolation):
-        conn.execute(copy(*nxt))  # ... and nothing follows it
+    thin = replace(run(a), ledger=tl.TrialLedger(str(a), ledger().entries))
+    put(worker_conn, a, reg, booked(reg), None, thin)  # insufficient_evidence
+    for sql in (
+        copy(*nxt),  # the same verdict id again
+        copy(*nxt, state="'authorized'", decided="NULL, NULL"),
+    ):  # back
+        with pytest.raises(psycopg.errors.CheckViolation):
+            conn.execute(sql)
+    put(worker_conn, a, reg, booked(reg), None, replace(run(a), verdict_id="v-2"))
+    with pytest.raises(psycopg.errors.CheckViolation):  # a decision ...
+        conn.execute(copy(*nxt, decided="'v-3', decision"))  # ... nothing follows
+    with pytest.raises(psycopg.errors.CheckViolation):  # not even another decision
+        conn.execute(copy(*nxt, state="'rejected'", decided="'v-3', 'reject'"))
 
 
 def test_tampered_or_missing_revisions_are_integrity(
@@ -223,3 +240,112 @@ def test_tampered_or_missing_revisions_are_integrity(
             "INSERT INTO app.experiment_revision SELECT * FROM public.keep",
         )
     assert call(app_conn, a, "load", EXP).record == expected
+
+
+def test_reassessment_appends_a_new_verdict_and_never_resets_the_budget(
+    worker_conn: Conn, app_conn: Conn, tenants: tuple[uuid.UUID, uuid.UUID]
+) -> None:
+    a, _ = tenants
+    reg, b = reg_for(a), None
+    b = booked(reg)
+    thin = replace(run(a), ledger=tl.TrialLedger(str(a), ledger().entries))
+    first, _ = put(worker_conn, a, reg, b, im.Scheduled(EXP, "bud-exp-1"))
+    ie, _ = put(worker_conn, a, reg, b, None, thin)
+    assert ie.record.state is im.RecordState.INSUFFICIENT_EVIDENCE
+    with pytest.raises(es.ExperimentStoreError, match="transition"):  # same id
+        put(worker_conn, a, reg, b, None, replace(run(a), verdict_id="v-1"))
+    lost = b.release("bud-exp-1")  # a re-assessment never re-reserves
+    blocked, _ = put(worker_conn, a, reg, lost, None, replace(run(a), verdict_id="v-2"))
+    assert blocked.record.state is im.RecordState.BLOCKED
+    assert "blocked:budget_not_reserved" in blocked.record.reasons
+    with pytest.raises(es.ExperimentStoreError, match="transition"):  # v-1 again
+        put(worker_conn, a, reg, b, None, replace(run(a), verdict_id="v-1"))
+    done, _ = put(worker_conn, a, reg, b, None, replace(run(a), verdict_id="v-3"))
+    assert done.record.state is im.RecordState.AWAITING_REVIEW
+    assert done.revision == 4 and done.record.budget_reservation_id == (
+        first.record.budget_reservation_id)  # fmt: skip
+    assert call(app_conn, a, "load", EXP) == done
+
+
+GOLDEN_050 = "1270a372d23a5d526b85845e6bffdbe2eb37de5a5bb22c1f48429d0b3b6b02f9"
+
+
+def legacy(t: uuid.UUID, eid: str = EXP, target: im.Target = im.Target.STRATEGY,
+           bud: str = "bud-exp-1") -> list[im.ExperimentRecord]:  # fmt: skip
+    """0.5.0 (PR #126) records of one experiment, as 0026 stored them."""
+    reg = reg_for(t, eid, target, bud)
+    first = im.record(reg, eid, "cand-1", plan(), empty(t))
+    if target is OPT:  # 0.5.0: code and optimizer stayed proposed
+        return [replace(first, state=im.RecordState.PROPOSED)]
+    old = tuple(sorted({*first.reasons} - {"none:parent_optimizer_version"} | {
+        "unavailable:parent_optimizer_version"}))  # fmt: skip
+    auth = replace(first, state=im.RecordState.AUTHORIZED, reasons=old)
+    failed = replace(auth, state=im.RecordState.FAILED, verdict_id="v-1",
+                     decision=im.Decision.INSUFFICIENT, reasons=tuple(sorted({
+                         *old, "insufficient:no_qualifying_trial",
+                         "none:evaluation_receipt_ids"})))  # fmt: skip
+    return [replace(first, reasons=old), auth, failed]
+
+
+def raw_put(conn: Conn, t: uuid.UUID, n: int, rec: im.ExperimentRecord,
+            prev: str | None) -> str:  # fmt: skip
+    """Insert `rec` as revision `n` with a correct hash (as the owner)."""
+    row = conn.execute("SELECT clock_timestamp()").fetchone()
+    assert row is not None
+    h = es.revision_hash(t, n, rec, row[0], prev)
+    values = {**rec.wire(), "tenant_id": t, "revision": n, "recorded_at": row[0],
+              "previous_hash": prev, "event_hash": h}  # fmt: skip
+    conn.execute(f"INSERT INTO app.experiment_revision ({', '.join(values)}) "
+                 f"VALUES ({', '.join(['%s'] * len(values))})",
+                 tuple(values.values()))  # fmt: skip
+    return h
+
+
+def test_a_0_5_0_row_after_a_0_6_0_row_is_integrity(
+    worker_conn: Conn, app_conn: Conn, conn: Conn,
+    tenants: tuple[uuid.UUID, uuid.UUID],
+) -> None:  # fmt: skip
+    a, _ = tenants
+    first, _ = put(worker_conn, a, reg_for(a), empty(a))  # 0.6.0 proposed
+    old = legacy(a)[1]  # 0.5.0 authorized: the database rules alone accept it
+    raw_put(conn, a, 2, old, first.digest)
+    for fn, args in (("load", (EXP,)), ("page", (5, None))):
+        with pytest.raises(es.ExperimentStoreError, match="integrity"):
+            call(app_conn, a, fn, *args)
+
+
+def test_0026_rows_stay_readable_after_0027(conn: Conn, tmp_path: Any) -> None:
+    old = tmp_path / "sql"
+    old.mkdir()
+    for f in sorted(MIGRATIONS_DIR.glob("0*.sql")):
+        if f.name < "0027":
+            shutil.copy(f, old / f.name)
+    migrate(conn, old)
+    with tn.provision_tenant(conn) as tx:
+        a = tx.tenant_id
+    stored = {EXP: legacy(a), "exp-0": legacy(a, "exp-0", OPT, "bud-0")}
+    for chain in stored.values():
+        prev = None
+        for n, rec in enumerate(chain, 1):
+            prev = raw_put(conn, a, n, rec, prev)
+    assert migrate(conn) == [27]
+    got = call(conn, a, "page", 5, None)
+    assert [r.record for r in got] == [stored["exp-0"][0], stored[EXP][2]]
+    assert got[1].record.state is im.RecordState.FAILED  # served as stored
+    golden = uuid.UUID("00000000-0000-4000-8000-000000000001")
+    fixed = replace(stored[EXP][2], experiment_id="exp-golden",
+                    scope_id=str(golden), hypothesis="SYNTHETIC golden",
+                    protocol_id="ab" * 32, candidate_hash="cd" * 32,
+                    data_snapshot_ids=("ds-syn",), budget_reservation_id="bud-golden",
+                    protected_assessor_version="assessor-v1")  # fmt: skip
+    at = datetime(2026, 10, 20, 12, tzinfo=UTC)  # pinned under 0.5.0 (base a6c5283)
+    assert es.revision_hash(golden, 2, fixed, at,
+                            "ef" * 32) == GOLDEN_050  # fmt: skip
+    with pytest.raises(es.ExperimentStoreError, match="transition"):  # failed: final
+        put(conn, a, reg_for(a), booked(reg_for(a)), None, run(a))
+    reg0 = reg_for(a, "exp-0", OPT, "bud-0")
+    nxt, wrote = put(conn, a, reg0, empty(a), eid="exp-0")  # proposed -> blocked
+    assert wrote and nxt.revision == 2 and nxt.record.state is im.RecordState.BLOCKED
+    with pytest.raises(psycopg.errors.CheckViolation):  # new rows: 0.6.0 only
+        conn.execute(copy("'exp-n'", "tenant_id", "scope_id", "1", "'bud-n'", "NULL",
+                          state="'proposed'"))  # fmt: skip
