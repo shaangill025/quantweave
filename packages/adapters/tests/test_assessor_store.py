@@ -163,8 +163,8 @@ def test_the_stored_protocol_and_lineage_are_frozen(wa: Pair, a: uuid.UUID) -> N
         put(wa, a, relabel, booked(reg))
 
 
-# A strategy rejection's adjustment as the adjustment guard requires (the copied row's chain count),
-# so raw copies that score a receipt reach the rule they probe.
+# A strategy rejection's adjustment as the adjustment guard requires (the copied
+# row's chain count), so raw copies that score a receipt reach the rule they probe.
 ADJ = (
     "jsonb_build_object('chain_trials', chain_trials::text, 'z_widened', '2', "
     "'baseline.bl-hold.excess_lower_widened', '-0.001')"
