@@ -17,10 +17,15 @@ id and no qw_app privilege (0029); tenant adoptions stay in `strategy_store`.
   them to re-encode, checks seq 1..n, then replays all events; any
   failure, including a key revoked before an install it signed, is `integrity`.
   Unknown deployment and release ids read alike: None, or `not_found`.
-LIMITATIONS: verdicts are the caller's registry (T044 N3): the assessor store
-holds tenant-scope protocols only, and an installation-scope release cannot cite
-one. Keys, adoptions (step-up reuse across acts) and step-up receipts are the
-caller's. Hash-only, no C-20 signing: dropping the latest events is not detected.
+- Owner decisions 23 and 33: a deployment's `SoloMaintainer` opt-in, each
+  install's `self_approved` and each release's `verdict_source` are stored and
+  hashed; a NULL (a row recorded before those columns) reads as no opt-in, not
+  self-approved and caller-supplied, under its original hash.
+LIMITATIONS: verdicts are the caller's registry (T044 N3, marked caller-supplied
+per decision 33): the assessor store holds tenant-scope protocols only, and an
+installation-scope release cannot cite one. Keys, adoptions (step-up reuse across
+acts) and step-up receipts are the caller's. Hash-only, no C-20 signing: dropping
+the latest events is not detected.
 Nothing here deploys, contacts a network or touches broker state."""
 
 from __future__ import annotations
@@ -79,9 +84,11 @@ def _insert(conn: Conn, table: str, values: Row) -> None:
         raise ReleaseStoreError("database", type(exc).__name__) from None
 
 
-def _deployment_wire(d: rl.Deployment) -> list[object]:
-    return [d.deployment_id, d.edition.value, sorted(d.operators), sorted(d.tenants),
-            d.initial_schema, d.allows_test_keys]  # fmt: skip
+def _deployment_wire(d: rl.Deployment, legacy: bool = False) -> list[object]:
+    base: list[object] = [d.deployment_id, d.edition.value, sorted(d.operators),
+                          sorted(d.tenants), d.initial_schema,
+                          d.allows_test_keys]  # fmt: skip
+    return base if legacy else [*base, d.solo is not None]  # decision 23 is hashed
 
 
 def _deployment(conn: Conn, deployment_id: str) -> rl.Deployment | None:
@@ -93,10 +100,18 @@ def _deployment(conn: Conn, deployment_id: str) -> rl.Deployment | None:
     if any(list(r[k]) != sorted(set(r[k])) for k in ("operators", "tenants")):
         raise ReleaseStoreError("integrity", "release_deployment members")
     try:
-        d = rl.Deployment(r["deployment_id"], rl.Edition(r["edition"]),
-                          frozenset(r["operators"]), frozenset(r["tenants"]),
-                          r["initial_schema"], r["allows_test_keys"])  # fmt: skip
-        ok = r["event_hash"] == _hash("release_deployment", _deployment_wire(d),
+        ed, ops = rl.Edition(r["edition"]), frozenset(r["operators"])
+        d = rl.Deployment(
+            r["deployment_id"],
+            ed,
+            ops,
+            frozenset(r["tenants"]),
+            r["initial_schema"],
+            r["allows_test_keys"],
+            rl.SoloMaintainer(ed, ops) if r["solo_maintainer"] else None,
+        )
+        wire = _deployment_wire(d, legacy=r["solo_maintainer"] is None)
+        ok = r["event_hash"] == _hash("release_deployment", wire,
                                       ensure_aware_utc(r["recorded_at"]))  # fmt: skip
     except (ValueError, TypeError) as exc:
         raise ReleaseStoreError("integrity", type(exc).__name__) from None
@@ -123,13 +138,15 @@ def record_deployment(conn: Conn, d: rl.Deployment) -> None:
             "operators": sorted(d.operators), "tenants": sorted(d.tenants),
             "initial_schema": d.initial_schema,
             "allows_test_keys": d.allows_test_keys, "recorded_at": at,
+            "solo_maintainer": d.solo is not None,
             "event_hash": _hash("release_deployment", _deployment_wire(d), at),
         })  # fmt: skip
 
 
-def _release_wire(sr: rl.SignedRelease) -> list[object]:
-    return [sr.manifest.wire(), sr.manifest_hash, sr.key_id, sr.algorithm,
-            sr.signature]  # fmt: skip
+def _release_wire(sr: rl.SignedRelease, legacy: bool = False) -> list[object]:
+    base: list[object] = [sr.manifest.wire(), sr.manifest_hash, sr.key_id,
+                          sr.algorithm, sr.signature]  # fmt: skip
+    return base if legacy else [*base, sr.verdict_source.value]  # decision 33
 
 
 def _manifest(w: Mapping[str, Any]) -> rl.ReleaseManifest:
@@ -154,12 +171,15 @@ def _release(conn: Conn, release_id: str) -> rl.SignedRelease | None:
     r = rows[0]
     try:
         m = _manifest(r["body"])
+        src = r["verdict_source"]  # NULL: recorded before decision 33's mark
         sr = rl.SignedRelease(m, r["manifest_hash"], r["key_id"], r["algorithm"],
-                              r["signature"])  # fmt: skip
+                              r["signature"],
+                              rl.VerdictSource(src or "caller_supplied"))  # fmt: skip
         ok = (  # 0029 CHECKs bind the other columns to the body
             sr.manifest_hash == m.manifest_hash
             and ensure_aware_utc(r["approved_at"]) == m.approval.approved_at
-            and r["event_hash"] == _hash("signed_release", _release_wire(sr),
+            and r["event_hash"] == _hash("signed_release",
+                                         _release_wire(sr, legacy=src is None),
                                          ensure_aware_utc(r["recorded_at"]))
         )  # fmt: skip
     except (ValueError, TypeError, KeyError) as exc:  # domain errors included
@@ -206,6 +226,7 @@ def record_release(conn: Conn, registry: im.ExperimentRegistry,
             "max_schema": c.max_schema, "writes_schema": c.writes_schema,
             "key_id": sr.key_id, "algorithm": sr.algorithm,
             "signature": sr.signature, "body": Jsonb(m.wire()), "recorded_at": at,
+            "verdict_source": sr.verdict_source.value,
             "event_hash": _hash("signed_release", _release_wire(sr), at),
         })  # fmt: skip
     return True
@@ -217,8 +238,16 @@ def _lock(conn: Conn, deployment_id: str, shared: bool) -> None:
                  (f"release:{deployment_id}",))  # fmt: skip
 
 
-def _event_values(deployment_id: str, seq: int, e: rl.Event, schema: int) -> Row:
-    v: Row = {"deployment_id": deployment_id, "seq": seq, "event_id": e.event_id,
+def _event_values(deployment_id: str, seq: int, e: rl.Event, schema: int,
+                  legacy: bool = False) -> Row:  # fmt: skip
+    v: Row = (
+        {}
+        if legacy
+        else {  # decision 23 is hashed
+            "self_approved": isinstance(e, rl.Install) and e.self_approved
+        }
+    )
+    v |= {"deployment_id": deployment_id, "seq": seq, "event_id": e.event_id,
               "to_release_id": None, "reasons": [], "operator_id": e.operator_id,
               "step_up_receipt_id": e.step_up_receipt_id,
               "schema_after": schema}  # fmt: skip
@@ -256,8 +285,8 @@ def _ledger(conn: Conn, deployment_id: str, keys: Keys) -> rl.DeploymentLedger |
 
     builds: dict[str, Callable[[Row, datetime], rl.Event]] = {
         "install": lambda r, at: rl.Install(r["event_id"], rel(r["release_id"]),
-                                            r["operator_id"],
-                                            r["step_up_receipt_id"], at),
+                                            r["operator_id"], r["step_up_receipt_id"],
+                                            at, r["self_approved"] is True),
         "rollback": lambda r, at: rl.Rollback(
             r["event_id"], r["component"], r["release_id"], r["to_release_id"],
             r["operator_id"], r["step_up_receipt_id"], at),
@@ -270,7 +299,8 @@ def _ledger(conn: Conn, deployment_id: str, keys: Keys) -> rl.DeploymentLedger |
         for n, r in enumerate(rows, 1):
             at = ensure_aware_utc(r["at"])
             e = builds[r["kind"]](r, at)
-            v = _event_values(deployment_id, n, e, r["schema_after"])
+            v = _event_values(deployment_id, n, e, r["schema_after"],
+                              r["self_approved"] is None)  # fmt: skip
             if {k: r[k] for k in v} != v or r["event_hash"] != _hash(
                 "deployment_event", _event_body(v), at
             ):  # fmt: skip

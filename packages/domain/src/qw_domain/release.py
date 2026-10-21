@@ -23,8 +23,12 @@ R030, R034, R039, R051, R076, R087, R092, R096, R099). Domain only, stdlib only.
   Nothing is rewritten or downgraded, and no tenant is moved to another version.
 LIMITATIONS: `Signer`/`Verifier` are protocols; only a test HMAC signer exists (in the
 tests). Production needs an asymmetric scheme (Ed25519) from a reviewed dependency,
-so operators hold public keys only (R096). No persistence; times, actor ids and
-step-up receipts are caller-asserted. Verdicts are trusted as recorded (T044 N3).
+so operators hold public keys only (R096). Times, actor ids and step-up receipts
+are caller-asserted here (the store uses the database clock). Verdicts are trusted
+as recorded (T044 N3); owner decision 33 records them marked `caller_supplied`
+until an installation-scope assessor store replaces the mark. Owner decision 23:
+a self-hosted, one-operator deployment may opt in to `SoloMaintainer`; its
+signer-installs are recorded `self_approved`.
 """
 
 from collections.abc import Collection, Mapping
@@ -259,6 +263,14 @@ def prepare_release(
     )  # fmt: skip
 
 
+class VerdictSource(StrEnum):
+    """Owner decision 33: where a release's T044 verdict came from. Until an
+    installation-scope assessor store exists, only the caller's registry (re-checked
+    by `prepare_release`); that store will add the value that replaces this mark."""
+
+    CALLER_SUPPLIED = "caller_supplied"
+
+
 @dataclass(frozen=True, slots=True)
 class SignedRelease:
     manifest: ReleaseManifest
@@ -266,6 +278,7 @@ class SignedRelease:
     key_id: str
     algorithm: str
     signature: str
+    verdict_source: VerdictSource = VerdictSource.CALLER_SUPPLIED  # not signed
 
     @property
     def signature_reference(self) -> str:
@@ -369,6 +382,24 @@ def release_receipt(sr: SignedRelease, receipt_id: str) -> PromotionReceipt:
 
 
 @dataclass(frozen=True, slots=True)
+class SoloMaintainer:
+    """Owner decision 23, mirroring retention's `SoloRelease` (decision 31): the
+    explicit opt-in to installs by the release's own signer. `edition` and
+    `operators` are the deployment's facts; only a self-hosted install with exactly
+    one configured operator can enable it, and each such install is self-approved."""
+
+    edition: Edition
+    operators: frozenset[str]
+
+    def __post_init__(self) -> None:
+        ops = self.operators
+        if (self.edition is not Edition.SELF_HOSTED
+                or not isinstance(ops, frozenset) or len(ops) != 1):  # fmt: skip
+            raise ReleaseError("solo_maintainer_refused", "self-hosted, one operator")
+        _id(next(iter(ops)), "operator_id")
+
+
+@dataclass(frozen=True, slots=True)
 class Deployment:
     deployment_id: str
     edition: Edition
@@ -376,6 +407,7 @@ class Deployment:
     tenants: frozenset[str]
     initial_schema: int
     allows_test_keys: bool = False
+    solo: SoloMaintainer | None = None  # decision 23: None keeps the separation
 
 
 @dataclass(frozen=True, slots=True)
@@ -385,6 +417,7 @@ class Install:
     operator_id: str
     step_up_receipt_id: str
     at: datetime
+    self_approved: bool = False  # decision 23: the signer installed; must match
 
 
 @dataclass(frozen=True, slots=True)
@@ -434,6 +467,11 @@ class DeploymentLedger:
         _id(d.deployment_id, "deployment_id")
         if not isinstance(d.edition, Edition) or type(d.initial_schema) is not int:
             raise TypeError("typed edition and schema are required")
+        if d.solo is not None and (
+            type(d.solo) is not SoloMaintainer
+            or (d.solo.edition, d.solo.operators) != (d.edition, d.operators)
+        ):
+            raise ReleaseError("solo_maintainer_refused", "the deployment's facts")
         self.deployment = d
         self.keys: Mapping[str, TrustedKey] = MappingProxyType(dict(keys))
         self.entries = tuple(entries)
@@ -467,8 +505,11 @@ class DeploymentLedger:
                 raise ReleaseError("step_up_reused", e.event_id)
             if at < m.approval.approved_at:
                 raise ReleaseError("time_order", "install precedes the approval")
-            if e.operator_id == m.approval.principal_id:  # orchestrator decision
+            solo = e.operator_id == m.approval.principal_id
+            if solo and self.deployment.solo is None:  # decision 23: opt-in only
                 raise ReleaseError("separation_of_duties", e.operator_id)
+            if e.self_approved is not solo:
+                raise ReleaseError("self_approved_mismatch", f"self-approved: {solo}")
             if why := verify_release(e.release, self.keys, at,
                                      self.deployment.allows_test_keys):  # fmt: skip
                 raise ReleaseError("unverified", ",".join(why))
@@ -548,7 +589,9 @@ class DeploymentLedger:
     ) -> "DeploymentLedger":  # fmt: skip
         """Operator install. It never adopts anything for any tenant."""
         _id(event_id, "event_id")
-        return self._append(Install(event_id, sr, operator_id, step_up, at), strategies)
+        solo = operator_id == sr.manifest.approval.principal_id
+        return self._append(Install(event_id, sr, operator_id, step_up, at, solo),
+                            strategies)  # fmt: skip
 
     def install_receipt(self, release_id: str, receipt_id: str) -> PromotionReceipt:
         i = self.install_of(release_id)
@@ -612,6 +655,7 @@ class TenantStrategy:
     version: str | None
     adoption_hash: str | None
     reasons: tuple[str, ...]
+    verdict_source: VerdictSource | None = None  # decision 33: of the bound release
 
 
 def _adoption_steps(strategies: Strategies) -> frozenset[str]:
@@ -655,7 +699,8 @@ def strategy_state(
     rid = _bound_release(ledger, strategy_id, r.version, r.manifest_hash)
     why = ["adopted_version_not_installed"] if rid is None else ledger.runnable(rid, at)
     state = TenantState.PAUSED if why else TenantState.ACTIVE
-    return TenantStrategy(state, r.version, r.receipt_hash, tuple(why))
+    src = None if rid is None else ledger.install_of(rid).release.verdict_source
+    return TenantStrategy(state, r.version, r.receipt_hash, tuple(why), src)
 
 
 def adopt_release(
