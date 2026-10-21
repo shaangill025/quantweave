@@ -1,8 +1,9 @@
 """`qw-bootstrap`: one-time, operator-run setup of a self-hosted installation's first
 tenant, owner and local credential (T010). It is not an HTTP route. The runtime
-database URL comes from QW_DATABASE_URL in the operator's environment and the
-password from stdin, so neither appears in argv; a second run is refused by the
-database (installation_bootstrap marker).
+database URL comes from QW_DATABASE_URL in the operator's environment (exactly a
+qw_app member: owner decision 17, a qw_worker, qw_assessor or mixed login is refused
+before anything is written) and the password from stdin, so neither appears in argv;
+a second run is refused by the database (installation_bootstrap marker).
 """
 
 import argparse
@@ -32,7 +33,7 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     hasher = LocalPasswordAuthenticator().hasher
     try:
-        with tenancy.runtime_connection(conninfo) as conn:
+        with tenancy.runtime_connection(conninfo, role="qw_app") as conn:
             tenancy.bootstrap_installation(
                 conn, args.display_name, args.login, hasher.hash(password)
             )

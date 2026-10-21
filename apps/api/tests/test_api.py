@@ -567,6 +567,40 @@ def test_bootstrap_runs_once_and_its_owner_can_log_in(
 
 
 @pytest.mark.db
+def test_bootstrap_refuses_a_login_that_is_not_exactly_qw_app(
+    runtime_urls: dict[str, str], conn: Conn, database_url: str,
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+) -> None:  # fmt: skip
+    """Owner decision 17: the API boot declares role="qw_app", so a qw_worker,
+    qw_assessor or mixed login is refused at startup and bootstraps nothing."""
+    from psycopg import sql
+    from psycopg.conninfo import make_conninfo
+    from qw_api.bootstrap import main
+
+    mixed = f"qwtest_mixed_{uuid.uuid4().hex[:12]}"
+    conn.execute(sql.SQL("CREATE ROLE {} LOGIN NOBYPASSRLS IN ROLE qw_app, qw_worker"
+                         ).format(sql.Identifier(mixed)))  # fmt: skip
+    try:
+        argv = ["--login", "root", "--display-name", "SYNTHETIC Root"]
+        wrong = [runtime_urls["qw_worker"], runtime_urls["qw_assessor"],
+                 make_conninfo(database_url, user=mixed)]  # fmt: skip
+        for url in wrong:
+            monkeypatch.setenv("QW_DATABASE_URL", url)
+            monkeypatch.setattr("sys.stdin", io.StringIO(PASSWORD + "\n"))
+            assert main(argv) == 1
+            assert "refused: " in capsys.readouterr().err
+        bootstrapped = "SELECT count(*) FROM app.installation_bootstrap"
+        assert conn.execute(bootstrapped).fetchone() == (0,)
+        monkeypatch.setenv("QW_DATABASE_URL", runtime_urls["qw_app"])
+        monkeypatch.setattr("sys.stdin", io.StringIO(PASSWORD + "\n"))
+        assert main(argv) == 0
+    finally:
+        terminate = "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE "
+        conn.execute(sql.SQL(terminate + "usename = {}").format(sql.Literal(mixed)))
+        conn.execute(sql.SQL("DROP ROLE {}").format(sql.Identifier(mixed)))
+
+
+@pytest.mark.db
 def test_idempotency_keys_do_not_cross_sessions(world: World) -> None:
     key = "SYNTHETIC-key-0002"
     login(world.client, "alice")

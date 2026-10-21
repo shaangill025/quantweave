@@ -1,8 +1,10 @@
 """`qw-worker` / `python -m qw_worker`: run the worker loop in the foreground (no
 daemonisation; a process supervisor owns restarts). The runtime database URL comes
-from QW_DATABASE_URL (a qw_worker member, checked by `runtime_connection`); settings
-from `settings_from_env`. No publish target is passed, so the outbox relay is off
-and events stay pending: a real transport needs explicit owner authorisation.
+from QW_DATABASE_URL and must be exactly a qw_worker member (owner decision 17:
+`runtime_connection(..., role="qw_worker")` refuses a qw_app, qw_assessor or mixed
+login at startup); settings from `settings_from_env`. No publish target is passed,
+so the outbox relay is off and events stay pending: a real transport needs explicit
+owner authorisation.
 """
 
 import logging
@@ -27,7 +29,7 @@ def main() -> int:
         print(f"invalid worker settings: {exc}", file=sys.stderr)
         return 2
     try:
-        with tenancy.runtime_connection(conninfo) as conn:
+        with tenancy.runtime_connection(conninfo, role="qw_worker") as conn:
             worker = Worker(conn, settings, publish=None)  # relay off (above)
             install_signal_handlers(worker)
             worker.run()

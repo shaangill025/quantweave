@@ -536,6 +536,45 @@ def test_entry_point_wires_no_publisher_and_rejects_overflowing_env(
     assert len(started) == 1
 
 
+@pytest.mark.db
+def test_entry_point_refuses_a_login_that_is_not_exactly_qw_worker(
+    runtime_urls: dict[str, str], conn: Conn, database_url: str,
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+) -> None:  # fmt: skip
+    """Owner decision 17: the worker declares role="qw_worker", so a qw_app,
+    qw_assessor or mixed login is refused at startup, before any tick."""
+    from psycopg import sql
+    from psycopg.conninfo import make_conninfo
+
+    started: list[Worker] = []
+
+    def fake_run(self: Worker, max_ticks: int | None = None) -> int:
+        started.append(self)
+        return 0
+
+    monkeypatch.setattr(loop.Worker, "run", fake_run)
+    monkeypatch.setattr(entry, "install_signal_handlers", lambda worker: None)
+    monkeypatch.setenv("QW_WORKER_NAME", "synthetic-main")
+    mixed = f"qwtest_mixed_{uuid.uuid4().hex[:12]}"
+    conn.execute(sql.SQL("CREATE ROLE {} LOGIN NOBYPASSRLS IN ROLE qw_app, qw_worker"
+                         ).format(sql.Identifier(mixed)))  # fmt: skip
+    try:
+        wrong = [runtime_urls["qw_app"], runtime_urls["qw_assessor"],
+                 make_conninfo(database_url, user=mixed)]  # fmt: skip
+        for url in wrong:
+            monkeypatch.setenv("QW_DATABASE_URL", url)
+            assert entry.main() == 1
+            assert "refused: " in capsys.readouterr().err
+        assert started == []
+        monkeypatch.setenv("QW_DATABASE_URL", runtime_urls["qw_worker"])
+        assert entry.main() == 0
+        assert len(started) == 1
+    finally:
+        terminate = "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE "
+        conn.execute(sql.SQL(terminate + "usename = {}").format(sql.Literal(mixed)))
+        conn.execute(sql.SQL("DROP ROLE {}").format(sql.Identifier(mixed)))
+
+
 def test_settings_validate_and_env_overrides() -> None:
     assert SETTINGS.idempotency_retention == timedelta(hours=48)
     for bad in ({"idempotency_retention": timedelta(hours=23)},
