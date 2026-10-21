@@ -322,3 +322,21 @@ only; decision 25 settles how they meet the contract checker.
     needed' targets. Not 'Expire': it would break rollback history and
     reconciliation."
     Implemented by: T058.
+
+## Fifth quiz (2026-10-21)
+
+35. **How Bonferroni on promotion is built (decision 29).**
+    Question: "Decision 29 chose Bonferroni on promotion, but the assessor has no
+    significance level to divide: it only checks scorecard thresholds such as
+    'confidence-interval lower bound ≥ 0', and the confidence level is fixed earlier
+    in the evaluation plan. How should Bonferroni be built?"
+    Selected label: "Widen the excess CI (Recommended)".
+    Option text as presented: "Every promotion must pass 'excess over baseline, CI
+    lower bound ≥ 0'. The assessor recomputes that bound at a Bonferroni-widened z:
+    z' = Φ⁻¹(1 − α / (2·chain_trials)), with α taken from the plan's frozen z. The
+    backtest records the standard error so this can be recomputed, and a tested
+    inverse-normal function is added. Why: it is literally 'alpha / chain_trials'
+    applied to the one test that decides 'better than what we have', using data the
+    backtest already computes. Not 'Report only': decision 29 asked that the count
+    change verdicts."
+    Implemented by: T044, with T033 (the backtest records the standard error).
