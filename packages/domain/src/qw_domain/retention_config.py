@@ -12,13 +12,19 @@ them with a JSON document (`parse`). Validation fails closed, raising
   7 days, the redelivery bound of migration 0006);
 - a rule that shortens a declared `Obligation` (counsel or provider terms): a
   shorter age expiry, any expiry when the obligation is indefinite, or deletion on
-  request. The fixed rules of `retention.Rule` (protected tombstone ledger, no age
-  expiry for financial records) still apply.
+  request. The fixed rules of `retention.Rule` and `Policy` (owner decision 21 of
+  2026-10-21) still apply: the financial journal is never deletable on request and
+  never expires by age (`financial_append_only`, `financial_no_expiry`); the
+  tombstone period (default 7 years) is adjustable, but only as `retain` and only
+  above the backup period (`tombstone_outlives_backups`).
 A `PurgeHold` (an installation-wide legal hold on a purge window) suspends that
 purge entirely: `purge_window` returns None and the worker skips it. Tenant-scoped
 `retention.LegalHold`s cover the data classes; purge windows have no tenant scope.
 LIMITATION: holds placed in this file are not persisted events; a persisted,
-audited hold store comes with the T058 persistence increment.
+audited hold store comes with the T058 persistence increment. The operator places
+a purge hold by writing it here (decision 22 lets the operator place one), but
+removing it from the file is a release by one party: decision 22's two-party,
+step-up release cannot be enforced for file-held purge holds until that store.
 """
 
 import json

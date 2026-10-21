@@ -24,24 +24,27 @@ D = timedelta(days=1)
 TENANT = "tenant-synth-a"
 SEVEN_YEARS = 2557 * D  # 7 x 365 days + at most 2 leap days in any 7 years
 
-# (on request, age expiry, owner-chosen?) per class, written from the receipt table.
+# (on request, age expiry, authority) per class, written from the receipt table and
+# owner decisions 9 (2026-10-15), 20 and 21 (2026-10-21).
+D9, D20, D21, IMPL = ("owner-decision-9", "owner-decision-20", "owner-decision-21",
+                      "implementer-default")  # fmt: skip
 EXPECTED = {
-    C.SECURITY: (OR.DELETE, None, False),
-    C.REFERENCE: (OR.RETAIN, None, False),
-    C.FINANCIAL: (OR.RETAIN, None, False),
-    C.POLICY: (OR.DELETE, None, False),
-    C.AUDIT: (OR.RETAIN, SEVEN_YEARS, True),
-    C.RESEARCH: (OR.DELETE, None, False),
-    C.MARKET: (OR.DELETE, None, False),
-    C.EVIDENCE: (OR.DELETE, None, False),
-    C.RELEASE: (OR.RETAIN, None, False),
-    C.IMPROVEMENT: (OR.DELETE, None, False),
-    C.SIMULATION: (OR.DELETE, None, False),
-    C.OPERATIONS: (OR.DELETE, None, False),
-    C.PRIVACY: (OR.UNCONFIGURED, None, False),  # the tombstone ledger: protected
-    C.PROVIDER_PAYLOAD: (OR.DELETE, 48 * H, False),
-    C.LOG: (OR.DELETE, 30 * D, False),
-    C.BACKUP: (OR.RETAIN, 30 * D, True),
+    C.SECURITY: (OR.DELETE, None, D20),
+    C.REFERENCE: (OR.RETAIN, None, IMPL),  # not named in decision 20's question
+    C.FINANCIAL: (OR.RETAIN, None, D21),
+    C.POLICY: (OR.DELETE, None, D20),
+    C.AUDIT: (OR.RETAIN, SEVEN_YEARS, D9),
+    C.RESEARCH: (OR.DELETE, None, D20),
+    C.MARKET: (OR.DELETE, None, D20),
+    C.EVIDENCE: (OR.DELETE, None, D20),
+    C.RELEASE: (OR.RETAIN, None, IMPL),  # not named in decision 20's question
+    C.IMPROVEMENT: (OR.DELETE, None, D20),
+    C.SIMULATION: (OR.DELETE, None, D20),
+    C.OPERATIONS: (OR.DELETE, None, D20),
+    C.PRIVACY: (OR.RETAIN, SEVEN_YEARS, D21),  # tombstones: 7 years, as audit
+    C.PROVIDER_PAYLOAD: (OR.DELETE, 48 * H, D20),
+    C.LOG: (OR.DELETE, 30 * D, D20),
+    C.BACKUP: (OR.RETAIN, 30 * D, D9),
 }
 
 
@@ -64,15 +67,13 @@ def test_each_default_value() -> None:
     pol = cfg.policy
     assert (pol.policy_id, pol.version) == (rt.DEFAULT_POLICY_ID, 1)
     assert set(pol.rules) == set(C)
-    for cls, (on, after, owner) in EXPECTED.items():
+    for cls, (on, after, auth) in EXPECTED.items():
         r = pol.rule(cls)
-        assert (r.on_request, r.expire_after) == (on, after), cls
-        if cls is not C.PRIVACY:
-            want = "owner-decision-9" if owner else "implementer-default"
-            assert r.authority_id == want, cls
+        assert (r.on_request, r.expire_after, r.authority_id) == (on, after, auth), cls
     assert rt.AUDIT_RETENTION == SEVEN_YEARS and rt.BACKUP_RETENTION == 30 * D
-    mine = {c for c, (_, _, owner) in EXPECTED.items() if not owner}
-    assert frozenset(mine - {C.PRIVACY}) == rt.IMPLEMENTER_DEFAULTS
+    assert rt.TOMBSTONE_RETENTION == SEVEN_YEARS
+    mine = {c for c, (_, _, auth) in EXPECTED.items() if auth == IMPL}
+    assert frozenset(mine) == rt.IMPLEMENTER_DEFAULTS
     assert dict(cfg.windows) == {W.IDEMPOTENCY: 48 * H, W.OUTBOX: 7 * D,
                                  W.INBOX: 30 * D}  # fmt: skip
     assert dict(rc.WINDOW_FLOORS) == {W.IDEMPOTENCY: 24 * H, W.OUTBOX: D,
@@ -127,7 +128,9 @@ def test_legal_hold_beats_expiry_and_request_under_the_defaults() -> None:
     store = rt.Retention()
     scope = frozenset({C.AUDIT, C.RESEARCH})
     store.holds.place(rt.LegalHold("hold-1", TENANT, scope, frozenset(),
-                                   "litigation", "counsel-1", T0))  # fmt: skip
+                                   "litigation", "counsel-1", T0,
+                                   rt.HoldRole.OPERATOR,
+                                   "operator-synth-1"))  # fmt: skip
     items = [item("a-1", C.AUDIT), item("l-1", C.LOG)]
     at = T0 + SEVEN_YEARS + D
     p = store.submit(rt.ExpirySweep("sw-1", TENANT, at), items)
@@ -140,8 +143,12 @@ def test_legal_hold_beats_expiry_and_request_under_the_defaults() -> None:
     assert acts(store.submit(req, [item("s-1", C.RESEARCH)])) == {
         "s-1": (rt.Action.HELD, "legal_hold:hold-1")
     }
+    approvals = (
+        rt.Approval(rt.HoldRole.TENANT_OWNER, "owner-synth-1", "stepup-1"),
+        rt.Approval(rt.HoldRole.OPERATOR, "operator-synth-1", "stepup-2"),
+    )
     store.holds.release(rt.HoldRelease("hold-1", TENANT, "counsel-1", "case_closed",
-                                       at + H))  # fmt: skip
+                                       at + H, approvals))  # fmt: skip
     assert store.execute("sw-1", at + 2 * H).complete
     assert len(store.execute("del-1", at + 2 * H).deleted) == 1
 
@@ -212,6 +219,14 @@ LOG_RULE = {"on_request": "delete", "authority_id": "owner-1", "basis": "synthet
      "financial_no_expiry"),
     (doc(classes={"privacy": {"on_request": "delete", "authority_id": "o-1",
                               "basis": "b-1"}}), "tombstone_ledger_protected"),
+    (doc(classes={"financial": {"on_request": "delete", "authority_id": "o-1",
+                                "basis": "b-1"}}), "financial_append_only"),
+    (doc(classes={"privacy": {"on_request": "retain", "expire_after": "30d",
+                              "authority_id": "o-1", "basis": "b-1"}}),
+     "tombstone_outlives_backups"),
+    (doc(classes={"backup": {"on_request": "retain", "expire_after": "2557d",
+                             "authority_id": "o-1", "basis": "b-1"}}),
+     "tombstone_outlives_backups"),  # backups may not outlive the 7-year tombstones
     (doc(classes={"log": {"on_request": "delete"}}), "authority"),
     (doc(obligations=[AUDIT_10Y]), "obligation"),  # default audit is 7 years
     (doc(obligations=[{**AUDIT_10Y, "min_retain": None}]), "obligation"),
@@ -276,3 +291,16 @@ def test_an_obligation_is_met_exactly_at_its_minimum() -> None:
         assert err.value.code == "obligation"
     for enough in (30 * D, 30 * D + timedelta(microseconds=1), 31 * D):
         owed.check(rule(enough))
+
+
+def test_tombstone_period_is_adjustable_config_above_the_backup_period() -> None:
+    """Owner decision 21 sets 7 years; like audit (decision 9, held as
+    configuration) the operator may change it, but never to a period that a
+    backup copy of the deleted data could outlive, nor to deletion on request."""
+    tomb = {"on_request": "retain", "authority_id": "owner-1", "basis": "synthetic-1"}
+    longer = rc.parse(doc(classes={"privacy": {**tomb, "expire_after": "3653d"}}))
+    assert longer.policy.rule(C.PRIVACY).expire_after == 3653 * D
+    least = rc.parse(doc(classes={"privacy": {**tomb, "expire_after": "31d"}}))
+    assert least.policy.rule(C.PRIVACY).expire_after == 31 * D
+    fin = rc.parse(doc(classes={"financial": {**tomb}}))
+    assert fin.policy.rule(C.FINANCIAL).on_request is OR.RETAIN
