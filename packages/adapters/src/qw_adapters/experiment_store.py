@@ -2,13 +2,19 @@
 project contract 0.6.0 states and revisions of `0027_experiment_states.sql`, and
 the assessor store of `0028_assessor_ledger.sql`).
 - `record` takes `qw_domain.improvement.record`'s inputs and calls `derive`, so it
-  can store nothing else (no record is accepted from the caller); as qw_worker (the
-  only INSERT role), on the stored protocol and lineage and a ledger that
-  `assessor_store` admits (Q7 across ledgers); each verdict is stored as an
-  evaluation receipt before its revision. Equal to the latest revision
-  it writes nothing, else it must `may_follow` it, and a verdict id never repeats
-  in its chain (a re-assessment is a new verdict). Tenant scope of this tenant only
-  (`scope`). The budget book is still the caller's.
+  can store nothing else (no record is accepted from the caller), on the stored
+  protocol and lineage and a ledger that `assessor_store` admits (Q7 across
+  ledgers). Owner decision 17: two transactions on two connections, one after the
+  other, so the `experiment:<tenant>` lock is never held by both. (1) As qw_assessor
+  it binds, derives, checks the transition and stores the verdict's evaluation
+  receipt, then commits. (2) As qw_worker (the only revision INSERT role) it
+  re-checks the chain under its own lock and appends the revision. If (2) fails,
+  the committed receipt stays without a revision: fail-closed, its scored holdout
+  read counts as spent (`holdout_used` for any other verdict), and only the
+  identical retry (same verdict and ledger checkpoint) completes it. Equal to the
+  latest revision it writes nothing, else it must `may_follow` it, and a verdict id
+  never repeats in its chain (a re-assessment is a new verdict). Tenant scope of
+  this tenant only (`scope`). The budget book is still the caller's.
 - Every read re-hashes each revision, checks the chain (1..n, previous hash, times),
   rebuilds rows through the domain `ExperimentRecord` and `may_follow` (0.5.0 rows
   stay readable), checks verdict ids are unique per chain and a reservation id
@@ -21,6 +27,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import uuid
 from dataclasses import dataclass, fields
 from datetime import datetime
 from typing import Any
@@ -33,7 +40,7 @@ from qw_domain.trial_ledger import SplitPlan
 
 from qw_adapters import assessor_store as ast
 from qw_adapters.assessor_store import ExperimentStoreError
-from qw_adapters.tenancy import TenantTx
+from qw_adapters.tenancy import Conn, TenantTx, tenant_transaction
 
 __all__ = ["ExperimentStoreError", "Revision", "load", "page", "record",
            "revision_hash"]  # fmt: skip
@@ -135,36 +142,56 @@ def page(tx: TenantTx, limit: int, after: str | None) -> list[Revision]:
     return [c[-1] for e, c in chains if after is None or e > after][:limit]
 
 
+def _check_follows(rec: im.ExperimentRecord, chain: list[Revision]) -> bool:
+    """True when `rec` equals the latest revision (nothing to write); raises
+    `transition` unless it may follow it with a verdict id new to the chain."""
+    last = chain[-1] if chain else None
+    if last is not None and last.record == rec:
+        return True
+    if last is not None and not (rec.may_follow(last.record)
+                                 and _new_verdict(rec, chain)):  # fmt: skip
+        raise ExperimentStoreError("transition", "not a later state of this record")
+    return False
+
+
 def record(
-    tx: TenantTx, registry: im.ExperimentRegistry, experiment_id: str,
-    candidate_id: str, plan: SplitPlan, book: BudgetBook,
+    worker: Conn, assessor: Conn, tenant_id: uuid.UUID,
+    registry: im.ExperimentRegistry, experiment_id: str, candidate_id: str,
+    plan: SplitPlan, book: BudgetBook,
     outcome: im.Scheduled | im.Deferred | None = None,
     assessment: im.Assessment | None = None,
 ) -> tuple[Revision, bool]:  # fmt: skip
     """Derive the record (`improvement.record`) and append it as the experiment's
-    next revision; (revision, wrote). The protocol and lineage are stored before
-    the transition checks, so a caller must not commit the transaction after
-    catching `ExperimentStoreError` (rolling it back undoes them)."""
+    next revision; (revision, wrote). `assessor` (a qw_assessor login) and `worker`
+    (qw_worker) must be idle autocommit connections: each phase is its own
+    `tenant_transaction`, rolled back on any error."""
     if type(registry) is not im.ExperimentRegistry:
         raise TypeError("the domain registry is required, not a record")
     p = registry.protocol(experiment_id)
-    if p.scope is not im.Scope.TENANT or p.scope_id != str(tx.tenant_id):
+    if p.scope is not im.Scope.TENANT or p.scope_id != str(tenant_id):
         raise ExperimentStoreError("scope", "tenant-scope records of this tenant")
-    _lock(tx, shared=False)
-    chain = _chains(tx, experiment_id).get(experiment_id, [])
-    stored = ast.bind(tx, registry, experiment_id, candidate_id)
-    rec, verdict = im.derive(stored, experiment_id, candidate_id, plan, book,
-                             outcome, assessment)  # fmt: skip
+    with tenant_transaction(assessor, tenant_id) as atx:  # phase 1: qw_assessor
+        _lock(atx, shared=False)
+        chain = _chains(atx, experiment_id).get(experiment_id, [])
+        stored = ast.bind(atx, registry, experiment_id, candidate_id)
+        rec, verdict = im.derive(stored, experiment_id, candidate_id, plan, book,
+                                 outcome, assessment)  # fmt: skip
+        if _check_follows(rec, chain):
+            return chain[-1], False
+        if verdict is not None and assessment is not None:
+            ast.store_verdict(atx, stored.protocol(experiment_id), verdict,
+                              assessment.ledger)  # fmt: skip
+    with tenant_transaction(worker, tenant_id) as tx:  # phase 2: qw_worker
+        _lock(tx, shared=False)
+        chain = _chains(tx, experiment_id).get(experiment_id, [])
+        if _check_follows(rec, chain):
+            return chain[-1], False
+        return _append(tx, rec, chain), True
+
+
+def _append(tx: TenantTx, rec: im.ExperimentRecord,
+            chain: list[Revision]) -> Revision:  # fmt: skip
     last = chain[-1] if chain else None
-    if last is not None and last.record == rec:
-        return last, False
-    if last is not None and not (rec.may_follow(last.record)
-                                 and _new_verdict(rec, chain)):  # fmt: skip
-        raise ExperimentStoreError("transition", "not a later state of this record")
-    if verdict is not None and assessment is not None:
-        ast.admit(tx, stored.protocol(experiment_id), assessment.ledger)
-        ast.put_verdict(tx, stored.protocol(experiment_id), verdict,
-                        assessment.ledger)  # fmt: skip
     row = tx.conn.execute("SELECT clock_timestamp()").fetchone()
     assert row is not None
     at, n = ensure_aware_utc(row[0]), len(chain) + 1
@@ -186,4 +213,4 @@ def record(
     got = _chains(tx, rec.experiment_id)[rec.experiment_id][-1]
     if (got.revision, got.digest) != (n, digest):
         raise ExperimentStoreError("integrity", "the stored revision differs")
-    return got, True
+    return got
