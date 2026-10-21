@@ -66,6 +66,8 @@ WATCHLIST_TABLES = ("watchlist_revision",)  # 0022, test_watchlist_store
 # 0026, 0028: test_experiment_store, test_assessor_store
 EXPERIMENT_TABLES = ("experiment_revision", "assessor_protocol", "assessor_candidate",
                      "holdout_access", "evaluation_receipt")  # fmt: skip
+# 0029, test_release_store (installation scope: a qw_worker-only policy)
+RELEASE_TABLES = ("release_deployment", "signed_release", "deployment_event")
 
 
 def make_tenant(conn: Conn, name: str) -> tuple[uuid.UUID, uuid.UUID]:
@@ -166,6 +168,7 @@ def test_tables_have_forced_rls_and_no_public_grants(conn: Conn) -> None:
         + PREFERENCE_TABLES
         + WATCHLIST_TABLES
         + EXPERIMENT_TABLES
+        + RELEASE_TABLES
     )
     for name, rls, forced, owner, acl in rows:
         assert (rls, forced, owner) == (True, True, "qw_migrate"), name

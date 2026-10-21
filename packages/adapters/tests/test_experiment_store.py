@@ -328,7 +328,7 @@ def test_0026_rows_stay_readable_after_0027(conn: Conn, tmp_path: Any) -> None:
         prev = None
         for n, rec in enumerate(chain, 1):
             prev = raw_put(conn, a, n, rec, prev)
-    assert migrate(conn) == [27, 28]
+    assert migrate(conn)[:2] == [27, 28]  # later migrations follow
     got = call(conn, a, "page", 5, None)
     assert [r.record for r in got] == [stored["exp-0"][0], stored[EXP][2]]
     assert got[1].record.state is im.RecordState.FAILED  # served as stored
