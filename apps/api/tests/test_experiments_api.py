@@ -1,9 +1,10 @@
 """`/api/v1/experiments` (listExperiments, readExperiment; T044 increment 2) through
 TestClient on a migrated PostgreSQL 16 database as qw_app (T010 harness), with
-experiments recorded by qw_worker through `experiment_store.record` (which runs
-`improvement.record`) over SYNTHETIC fixtures. Responses are validated against the
-contract `experiment` and `experimentPage` (project contract 0.6.0: item coverage,
-nullable `parent_optimizer_version`, blocked and insufficient_evidence)."""
+experiments recorded through `experiment_store.record` (which runs
+`improvement.record`; receipts as qw_assessor, revisions as qw_worker) over
+SYNTHETIC fixtures. Responses are validated against the contract `experiment` and
+`experimentPage` (project contract 0.6.0: item coverage, nullable
+`parent_optimizer_version`, blocked and insufficient_evidence)."""
 
 from __future__ import annotations
 
@@ -52,7 +53,11 @@ def put(urls: dict[str, str], t: uuid.UUID, eid: str, target: im.Target,
         stage: str = "proposed") -> None:  # fmt: skip
     """Record `eid` through the store as far as `stage`."""
     reg = st.reg_for(t, eid, target, f"bud-{eid}")
-    with psycopg.connect(urls["qw_worker"], autocommit=True) as c:
+    with (
+        psycopg.connect(urls["qw_worker"], autocommit=True) as w,
+        psycopg.connect(urls["qw_assessor"], autocommit=True) as a,
+    ):
+        c = (w, a)
         st.put(c, t, reg, st.empty(t), eid=eid)
         if stage != "proposed":
             st.put(c, t, reg, st.booked(reg, eid), im.Scheduled(eid, f"bud-{eid}"),

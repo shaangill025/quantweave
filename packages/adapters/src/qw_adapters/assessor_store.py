@@ -1,15 +1,20 @@
 """The T044 assessor store (`0028_assessor_ledger.sql`), used only by
-`experiment_store.record` as qw_worker under its `experiment:<tenant>` lock; no
-route reads it. `bind` stores the protocol and lineage once, then requires the
-caller's to hash the same (`protocol_frozen`, `lineage`) and rebuilds the registry
-from the stored rows. `admit` (owner decision Q7) refuses re-assessment once a
-receipt scored the holdout read (`holdout_used`) and a ledger that does not extend
-the last stored checkpoint or begin with the plan's stored reads (`ledger_diverged`).
-`put_verdict` appends new holdout reads, then the receipt naming the read it scored.
-Reads re-hash every row and rebuild protocols, candidates and verdicts through the
-domain (stored reads are compared with the ledger's `Access`); failures are
-`integrity`. LIMITATIONS: the ledger itself and the budget book are the caller's; a
-raw qw_worker INSERT that meets the database rules is not checked for provenance."""
+`experiment_store.record` in its assessor phase: a qw_assessor connection (owner
+decision 17, the assessor-role migration; qw_worker has no privilege here) under
+the `experiment:<tenant>` lock; no route reads it. `bind` stores the protocol and
+lineage once, then requires the caller's to hash the same (`protocol_frozen`,
+`lineage`) and rebuilds the registry from the stored rows. `store_verdict` accepts
+the identical receipt of an earlier attempt (a retry whose revision was not
+written), refuses another under the same verdict id (`verdict_conflict`), else
+runs `admit` and `put_verdict`. `admit` (owner decision Q7) refuses re-assessment
+once a receipt scored the holdout read (`holdout_used`) and a ledger that does not
+extend the last stored checkpoint or begin with the plan's stored reads
+(`ledger_diverged`). `put_verdict` appends new holdout reads, then the receipt
+naming the read it scored. Reads re-hash every row and rebuild protocols,
+candidates and verdicts through the domain (stored reads are compared with the
+ledger's `Access`); failures are `integrity`. LIMITATIONS: the ledger itself and
+the budget book are the caller's; a raw qw_assessor INSERT that meets the database
+rules is not checked for provenance."""
 
 from __future__ import annotations
 
@@ -230,13 +235,32 @@ def admit(tx: TenantTx, p: im.Protocol, ledger: tl.TrialLedger) -> None:
         )
 
 
+def _mark(p: im.Protocol, ledger: tl.TrialLedger) -> tuple[int | None, str | None]:
+    """The ledger checkpoint a receipt records: (entries, digest), or none."""
+    if not _frozen_plan(p, ledger):
+        return None, None
+    return len(ledger.entries), ledger.checkpoint(len(ledger.entries))
+
+
+def store_verdict(tx: TenantTx, p: im.Protocol, v: im.Verdict,
+                  ledger: tl.TrialLedger) -> None:  # fmt: skip
+    """Store `v`'s receipt once: an identical stored one (same verdict and ledger
+    checkpoint) is a retry and is kept as it is; a different one is refused."""
+    for got, _, n, d in receipts(tx, p.experiment_id):
+        if got.verdict_id == v.verdict_id:
+            if got == v and (n, d) == _mark(p, ledger):
+                return
+            raise ExperimentStoreError("verdict_conflict", v.verdict_id)
+    admit(tx, p, ledger)
+    put_verdict(tx, p, v, ledger)
+
+
 def put_verdict(tx: TenantTx, p: im.Protocol, v: im.Verdict,
                 ledger: tl.TrialLedger) -> None:  # fmt: skip
     """Append the ledger's new holdout reads, then the receipt (after `admit`)."""
-    n = d = seq = None
-    if _frozen_plan(p, ledger):
-        n = len(ledger.entries)
-        d = ledger.checkpoint(n)
+    seq = None
+    n, d = _mark(p, ledger)
+    if n is not None:
         reads, k = _holdout(p, ledger), len(_reads(tx, p.plan_id))
         for a in reads[k:]:
             body = a.to_wire()

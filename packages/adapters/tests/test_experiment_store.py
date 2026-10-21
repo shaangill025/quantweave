@@ -1,5 +1,6 @@
-"""0026, 0027 and qw_adapters.experiment_store: qw_worker records through
-`improvement.record`, qw_app reads, the superuser `conn` observes or tampers. The
+"""0026, 0027 and qw_adapters.experiment_store: `improvement.record` is derived and
+its receipt stored as qw_assessor, then the revision appended as qw_worker (owner
+decision 17); qw_app reads, the superuser `conn` observes or tampers. The
 SYNTHETIC test_improvement fixtures are scoped to a real tenant id."""
 
 from __future__ import annotations
@@ -50,10 +51,18 @@ def run(t: uuid.UUID, metrics: dict[str, Any] = GOOD) -> im.Assessment:
     return im.Assessment(lg, ASSESSOR, AT + timedelta(days=1), "v-1")
 
 
-def put(conn: Conn, t: uuid.UUID, reg: im.ExperimentRegistry, book: BudgetBook,
+Pair = tuple[Conn, Conn]  # (the qw_worker connection, the qw_assessor connection)
+
+
+def put(conns: Pair, t: uuid.UUID, reg: im.ExperimentRegistry, book: BudgetBook,
         *rest: Any, eid: str = EXP) -> tuple[es.Revision, bool]:  # fmt: skip
-    with tn.tenant_transaction(conn, t) as tx:
-        return es.record(tx, reg, eid, "cand-1", plan(), book, *rest)
+    worker, assessor = conns
+    return es.record(worker, assessor, t, reg, eid, "cand-1", plan(), book, *rest)
+
+
+@pytest.fixture
+def wa(worker_conn: Conn, assessor_conn: Conn) -> Pair:
+    return worker_conn, assessor_conn
 
 
 def call(conn: Conn, tenant: uuid.UUID, fn: str, *args: Any) -> Any:
@@ -71,25 +80,25 @@ def tenants(app_conn: Conn) -> tuple[uuid.UUID, uuid.UUID]:
 
 
 def test_revisions_only_move_forward_and_reads_verify(
-    worker_conn: Conn, app_conn: Conn, tenants: tuple[uuid.UUID, uuid.UUID]
+    wa: Pair, app_conn: Conn, tenants: tuple[uuid.UUID, uuid.UUID]
 ) -> None:
     a, _ = tenants
     reg = reg_for(a)
-    first, wrote = put(worker_conn, a, reg, empty(a))
+    first, wrote = put(wa, a, reg, empty(a))
     assert (first.revision, wrote) == (1, True)
-    assert put(worker_conn, a, reg, empty(a))[1] is False  # the same record
-    second, _ = put(worker_conn, a, reg, booked(reg), im.Scheduled(EXP, "bud-exp-1"))
+    assert put(wa, a, reg, empty(a))[1] is False  # the same record
+    second, _ = put(wa, a, reg, booked(reg), im.Scheduled(EXP, "bud-exp-1"))
     with pytest.raises(es.ExperimentStoreError, match="transition"):
-        put(worker_conn, a, reg, empty(a))  # never back
-    third, _ = put(worker_conn, a, reg, booked(reg), None, run(a))
+        put(wa, a, reg, empty(a))  # never back
+    third, _ = put(wa, a, reg, booked(reg), None, run(a))
     assert third.revision == 3 and third.recorded_at >= second.recorded_at
     with pytest.raises(es.ExperimentStoreError, match="transition"):  # final
-        put(worker_conn, a, reg, booked(reg), None, run(a, GOOD | {
+        put(wa, a, reg, booked(reg), None, run(a, GOOD | {
             "lookahead_violations": Decimal(1)}))  # fmt: skip
     got = call(app_conn, a, "load", EXP)
     assert got.record.state is im.RecordState.AWAITING_REVIEW
     assert got.record.verdict_id == "v-1" and got.record.requires_human_promotion
-    put(worker_conn, a, reg_for(a, "exp-0", OPT, "bud-0"), empty(a), eid="exp-0")
+    put(wa, a, reg_for(a, "exp-0", OPT, "bud-0"), empty(a), eid="exp-0")
     assert [r.record.experiment_id for r in call(app_conn, a, "page", 5, None)] == [
         "exp-0", EXP]  # fmt: skip
     assert [r.record for r in call(app_conn, a, "page", 5, "exp-0")] == [got.record]
@@ -97,11 +106,11 @@ def test_revisions_only_move_forward_and_reads_verify(
         "opt-v0")  # fmt: skip
     assert call(app_conn, a, "load", "exp-unknown") is None
     with pytest.raises(es.ExperimentStoreError, match="reservation"):
-        put(worker_conn, a, reg_for(a, "exp-z"), empty(a), eid="exp-z")
+        put(wa, a, reg_for(a, "exp-z"), empty(a), eid="exp-z")
 
 
 def test_only_derived_records_are_stored(
-    worker_conn: Conn, tenants: tuple[uuid.UUID, uuid.UUID]
+    wa: Pair, tenants: tuple[uuid.UUID, uuid.UUID]
 ) -> None:
     a, _ = tenants
     reg = reg_for(a)
@@ -112,33 +121,40 @@ def test_only_derived_records_are_stored(
         reasons=("none:evaluation_receipt_ids", "unavailable:parent_optimizer_version"),
     )
     for rec in (forged, stripped):  # hand-built: no assess ran on them
-        with tn.tenant_transaction(worker_conn, a) as tx, pytest.raises(TypeError):
-            es.record(tx, rec, EXP, "cand-1", plan(), booked(reg))  # type: ignore[arg-type]
-        with tn.tenant_transaction(worker_conn, a) as tx, pytest.raises(TypeError):
-            es.record(tx, rec)  # type: ignore[arg-type, call-arg]
-    stored, _ = put(worker_conn, a, reg, booked(reg), None, run(a))
+        with pytest.raises(TypeError):
+            es.record(*wa, a, rec, EXP, "cand-1", plan(),  # type: ignore[arg-type]
+                      booked(reg))  # fmt: skip
+        with pytest.raises(TypeError):
+            es.record(*wa, a, rec)  # type: ignore[arg-type, call-arg]
+    stored, _ = put(wa, a, reg, booked(reg), None, run(a))
     assert stored.record == real and "evidence:synthetic_only" in stored.record.reasons
 
 
 def test_tenant_isolation_roles_and_append_only(
-    worker_conn: Conn, app_conn: Conn, conn: Conn,
+    worker_conn: Conn, wa: Pair, app_conn: Conn, conn: Conn,
     tenants: tuple[uuid.UUID, uuid.UUID],
 ) -> None:  # fmt: skip
     a, b = tenants
-    put(worker_conn, a, reg_for(a), empty(a))
+    put(wa, a, reg_for(a), empty(a))
     assert call(app_conn, b, "load", EXP) is None  # foreign reads as unknown
     assert call(app_conn, b, "page", 5, None) == []
     with tn.tenant_transaction(app_conn, b) as tx:
         row = tx.conn.execute("SELECT count(*) FROM app.experiment_revision").fetchone()
         assert row == (0,)  # forced RLS, not only the store's filter
     with pytest.raises(es.ExperimentStoreError, match="scope"):
-        put(worker_conn, a, reg_for(b), empty(b))
+        put(wa, a, reg_for(b), empty(b))
     p = replace(reg_for(a).protocol(EXP), scope=im.Scope.INSTALLATION)
     shared = im.ExperimentRegistry(str(a)).register(p).register_candidate(cand())
     with pytest.raises(es.ExperimentStoreError, match="scope"):
-        put(worker_conn, a, shared, empty(a))
+        put(wa, a, shared, empty(a))
     with pytest.raises(es.ExperimentStoreError, match="database"):  # qw_app: read only
-        put(app_conn, a, reg_for(a, "exp-1", bud="bud-1"), empty(a), eid="exp-1")
+        put(
+            (app_conn, wa[1]),
+            a,
+            reg_for(a, "exp-1", bud="bud-1"),
+            empty(a),
+            eid="exp-1",
+        )
     with (
         pytest.raises(psycopg.errors.InsufficientPrivilege),
         tn.tenant_transaction(worker_conn, a) as tx,  # another tenant's row
@@ -165,11 +181,11 @@ def copy(eid: str, tenant: str, scope_id: str, rev: str, bud: str, prev: str,
 
 
 def test_each_database_rule_refuses_a_raw_insert(
-    worker_conn: Conn, conn: Conn, tenants: tuple[uuid.UUID, uuid.UUID]
+    wa: Pair, conn: Conn, tenants: tuple[uuid.UUID, uuid.UUID]
 ) -> None:
     a, _ = tenants
     reg = reg_for(a)
-    put(worker_conn, a, reg, booked(reg), im.Scheduled(EXP, "bud-exp-1"))
+    put(wa, a, reg, booked(reg), im.Scheduled(EXP, "bud-exp-1"))
     nxt = ("experiment_id", "tenant_id", "scope_id", "revision + 1",
            "budget_reservation_id", "event_hash")  # fmt: skip
     new = ("'exp-n'", "tenant_id", "scope_id", "1", "'bud-n'", "NULL")
@@ -192,14 +208,14 @@ def test_each_database_rule_refuses_a_raw_insert(
         with pytest.raises(psycopg.errors.CheckViolation):
             conn.execute(sql)
     thin = replace(run(a), ledger=tl.TrialLedger(str(a), ledger().entries))
-    put(worker_conn, a, reg, booked(reg), None, thin)  # insufficient_evidence
+    put(wa, a, reg, booked(reg), None, thin)  # insufficient_evidence
     for sql in (
         copy(*nxt),  # the same verdict id again
         copy(*nxt, state="'authorized'", decided="NULL, NULL"),
     ):  # back
         with pytest.raises(psycopg.errors.CheckViolation):
             conn.execute(sql)
-    put(worker_conn, a, reg, booked(reg), None, replace(run(a), verdict_id="v-2"))
+    put(wa, a, reg, booked(reg), None, replace(run(a), verdict_id="v-2"))
     with pytest.raises(psycopg.errors.CheckViolation):  # a decision ...
         conn.execute(copy(*nxt, decided="'v-3', decision"))  # ... nothing follows
     with pytest.raises(psycopg.errors.CheckViolation):  # not even another decision
@@ -207,13 +223,13 @@ def test_each_database_rule_refuses_a_raw_insert(
 
 
 def test_tampered_or_missing_revisions_are_integrity(
-    worker_conn: Conn, app_conn: Conn, conn: Conn,
+    wa: Pair, app_conn: Conn, conn: Conn,
     tenants: tuple[uuid.UUID, uuid.UUID],
 ) -> None:  # fmt: skip
     a, _ = tenants
     reg = reg_for(a)
-    put(worker_conn, a, reg, empty(a))
-    put(worker_conn, a, reg, booked(reg), im.Scheduled(EXP, "bud-exp-1"))
+    put(wa, a, reg, empty(a))
+    put(wa, a, reg, booked(reg), im.Scheduled(EXP, "bud-exp-1"))
     expected = call(app_conn, a, "load", EXP).record
     tampers = (
         "UPDATE app.experiment_revision SET hypothesis = 'SYNTHETIC forged'",
@@ -234,7 +250,7 @@ def test_tampered_or_missing_revisions_are_integrity(
             with pytest.raises(es.ExperimentStoreError, match="integrity"):
                 call(app_conn, a, fn, *args)
         with pytest.raises(es.ExperimentStoreError, match="integrity"):
-            put(worker_conn, a, reg, booked(reg), None, run(a))
+            put(wa, a, reg, booked(reg), None, run(a))
         raw(
             "DELETE FROM app.experiment_revision",
             "INSERT INTO app.experiment_revision SELECT * FROM public.keep",
@@ -243,24 +259,24 @@ def test_tampered_or_missing_revisions_are_integrity(
 
 
 def test_reassessment_appends_a_new_verdict_and_never_resets_the_budget(
-    worker_conn: Conn, app_conn: Conn, tenants: tuple[uuid.UUID, uuid.UUID]
+    wa: Pair, app_conn: Conn, tenants: tuple[uuid.UUID, uuid.UUID]
 ) -> None:
     a, _ = tenants
     reg, b = reg_for(a), None
     b = booked(reg)
     thin = replace(run(a), ledger=tl.TrialLedger(str(a), ledger().entries))
-    first, _ = put(worker_conn, a, reg, b, im.Scheduled(EXP, "bud-exp-1"))
-    ie, _ = put(worker_conn, a, reg, b, None, thin)
+    first, _ = put(wa, a, reg, b, im.Scheduled(EXP, "bud-exp-1"))
+    ie, _ = put(wa, a, reg, b, None, thin)
     assert ie.record.state is im.RecordState.INSUFFICIENT_EVIDENCE
     with pytest.raises(es.ExperimentStoreError, match="transition"):  # same id
-        put(worker_conn, a, reg, b, None, replace(run(a), verdict_id="v-1"))
+        put(wa, a, reg, b, None, replace(run(a), verdict_id="v-1"))
     lost = b.release("bud-exp-1")  # a re-assessment never re-reserves
-    blocked, _ = put(worker_conn, a, reg, lost, None, replace(run(a), verdict_id="v-2"))
+    blocked, _ = put(wa, a, reg, lost, None, replace(run(a), verdict_id="v-2"))
     assert blocked.record.state is im.RecordState.BLOCKED
     assert "blocked:budget_not_reserved" in blocked.record.reasons
     with pytest.raises(es.ExperimentStoreError, match="transition"):  # v-1 again
-        put(worker_conn, a, reg, b, None, replace(run(a), verdict_id="v-1"))
-    done, _ = put(worker_conn, a, reg, b, None, replace(run(a), verdict_id="v-3"))
+        put(wa, a, reg, b, None, replace(run(a), verdict_id="v-1"))
+    done, _ = put(wa, a, reg, b, None, replace(run(a), verdict_id="v-3"))
     assert done.record.state is im.RecordState.AWAITING_REVIEW
     assert done.revision == 4 and done.record.budget_reservation_id == (
         first.record.budget_reservation_id)  # fmt: skip
@@ -302,11 +318,11 @@ def raw_put(conn: Conn, t: uuid.UUID, n: int, rec: im.ExperimentRecord,
 
 
 def test_a_0_5_0_row_after_a_0_6_0_row_is_integrity(
-    worker_conn: Conn, app_conn: Conn, conn: Conn,
+    wa: Pair, app_conn: Conn, conn: Conn,
     tenants: tuple[uuid.UUID, uuid.UUID],
 ) -> None:  # fmt: skip
     a, _ = tenants
-    first, _ = put(worker_conn, a, reg_for(a), empty(a))  # 0.6.0 proposed
+    first, _ = put(wa, a, reg_for(a), empty(a))  # 0.6.0 proposed
     old = legacy(a)[1]  # 0.5.0 authorized: the database rules alone accept it
     raw_put(conn, a, 2, old, first.digest)
     for fn, args in (("load", (EXP,)), ("page", (5, None))):
@@ -342,9 +358,11 @@ def test_0026_rows_stay_readable_after_0027(conn: Conn, tmp_path: Any) -> None:
     assert es.revision_hash(golden, 2, fixed, at,
                             "ef" * 32) == GOLDEN_050  # fmt: skip
     with pytest.raises(es.ExperimentStoreError, match="transition"):  # failed: final
-        put(conn, a, reg_for(a), booked(reg_for(a)), None, run(a))
+        put((conn, conn), a, reg_for(a), booked(reg_for(a)), None, run(a))
     reg0 = reg_for(a, "exp-0", OPT, "bud-0")
-    nxt, wrote = put(conn, a, reg0, empty(a), eid="exp-0")  # proposed -> blocked
+    nxt, wrote = put(
+        (conn, conn), a, reg0, empty(a), eid="exp-0"
+    )  # proposed -> blocked
     assert wrote and nxt.revision == 2 and nxt.record.state is im.RecordState.BLOCKED
     with pytest.raises(psycopg.errors.CheckViolation):  # new rows: 0.6.0 only
         conn.execute(copy("'exp-n'", "tenant_id", "scope_id", "1", "'bud-n'", "NULL",

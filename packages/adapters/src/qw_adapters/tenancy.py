@@ -12,8 +12,9 @@ Session tokens: 32 bytes from `secrets`, base64url without padding (43 character
 The database stores sha256 over the token's ASCII text, never the token. Lookup
 sets the hex hash as `app.session_token_hash` and lets PostgreSQL match it, so no
 secret comparison happens in Python. Expiry and revocation are checked against the
-database clock. Connections must log in as a member of `qw_app` or `qw_worker`;
-`check_runtime_role` refuses superusers, BYPASSRLS roles and members of qw_migrate.
+database clock. Connections must log in as a member of `qw_app`, `qw_worker` or
+`qw_assessor` (owner decision 17); `check_runtime_role` refuses superusers,
+BYPASSRLS roles and members of qw_migrate.
 """
 
 from __future__ import annotations
@@ -28,6 +29,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from enum import StrEnum
+from typing import Literal
 
 import psycopg
 from psycopg import pq
@@ -422,25 +424,42 @@ def bootstrap_installation(
     return tx.tenant_id, user_id
 
 
+RuntimeRole = Literal["qw_app", "qw_worker", "qw_assessor"]
+_RUNTIME = ("qw_app", "qw_worker", "qw_assessor")
+_GROUPS = (*_RUNTIME, "qw_ingest", "qw_release")
+
+
 @contextmanager
-def runtime_connection(conninfo: str) -> Iterator[Conn]:
+def runtime_connection(
+    conninfo: str, role: RuntimeRole | None = None
+) -> Iterator[Conn]:
     """An autocommit connection that passed `check_runtime_role`."""
     with psycopg.connect(conninfo, autocommit=True) as conn:
-        check_runtime_role(conn)
+        check_runtime_role(conn, role)
         yield conn
 
 
-def check_runtime_role(conn: Conn) -> None:
+def check_runtime_role(conn: Conn, role: RuntimeRole | None = None) -> None:
     """Refuse a connection that could bypass row level security or is not a member
-    of qw_app or qw_worker."""
+    of qw_app, qw_worker or qw_assessor. Owner decision 17: a qw_assessor login
+    holds no other group of 0001, and a declared `role` must be the login's only
+    one, so a mixed login cannot be both the assessor and anything else."""
+    if role is not None and role not in _RUNTIME:
+        raise TenancyError(f"unknown runtime role {role!r}")
     row = conn.execute(
         "SELECT r.rolsuper, r.rolbypassrls, pg_has_role(r.oid, 'qw_migrate', 'MEMBER'),"
-        " pg_has_role(r.oid, 'qw_app', 'MEMBER') OR pg_has_role(r.oid, 'qw_worker',"
-        " 'MEMBER') FROM pg_catalog.pg_roles r WHERE r.rolname = current_user"
+        " ARRAY(SELECT g FROM unnest(%s::text[]) g WHERE pg_has_role(r.oid, g,"
+        " 'MEMBER')) FROM pg_catalog.pg_roles r WHERE r.rolname = current_user",
+        (list(_GROUPS),),
     ).fetchone()
     if row is None or row[0]:
         raise TenancyError("runtime connection is a superuser")
     if row[1] or row[2]:
         raise TenancyError("runtime connection can bypass RLS or owns the schema")
-    if not row[3]:
-        raise TenancyError("runtime connection is not a member of qw_app or qw_worker")
+    groups = set(row[3])
+    if not groups & set(_RUNTIME):
+        raise TenancyError("runtime connection is not a member of a runtime role")
+    if "qw_assessor" in groups and len(groups) > 1:
+        raise TenancyError("a qw_assessor login holds no other runtime role")
+    if role is not None and groups != {role}:
+        raise TenancyError(f"runtime connection is not exactly a member of {role}")
