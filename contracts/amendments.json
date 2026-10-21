@@ -1,5 +1,5 @@
 {
-  "version": "0.7.0",
+  "version": "0.8.0",
   "base": "docs/spec/contracts 0.1.0",
   "versions": {
     "0.2.0": {"decision": "Owner decision 2026-10-14 (T008 A-01; docs/receipts/T053-api.md)"},
@@ -7,10 +7,11 @@
     "0.4.0": {"decision": "Owner decision 2026-10-15, confirming the proposal (docs/receipts/T053-api.md reads increment 2; docs/decisions/2026-10-15-owner-decisions.md)"},
     "0.5.0": {"decision": "Owner decision 2026-10-15 (docs/decisions/2026-10-15-owner-decisions.md)"},
     "0.6.0": {"decision": "Owner decisions 2026-10-20, 1 to 3 and 7 (the answer to Q7) (docs/decisions/2026-10-20-owner-decisions.md)"},
-    "0.7.0": {"decision": "Owner decisions 2026-10-20, 5, 8, 10, 11 and 12 (answers to Q2, Q1, Q5, Q6 and Q8): the approval-classes read first, served only from real backing data (docs/decisions/2026-10-20-owner-decisions.md; shape: docs/decisions/2026-10-20-contract-0.6.0-read-proposals.md, Read C)"}
+    "0.7.0": {"decision": "Owner decisions 2026-10-20, 5, 8, 10, 11 and 12 (answers to Q2, Q1, Q5, Q6 and Q8): the approval-classes read first, served only from real backing data (docs/decisions/2026-10-20-owner-decisions.md; shape: docs/decisions/2026-10-20-contract-0.6.0-read-proposals.md, Read C)"},
+    "0.8.0": {"decision": "Owner decisions 2026-10-21, 14 (the session cookie is documented as the __Host-pi_session the server sets) and 15 (the undocumented session and membership routes are documented; the read listMemberships here, each mutation only after its own owner-approved mutations entry; proposals: docs/decisions/2026-10-21-contract-0.8.0-session-mutation-proposals.md) (docs/decisions/2026-10-21-owner-decisions.md)"}
   },
   "about": "Project-owned contract (T008 A-01). docs/spec/contracts stays unchanged; tools/project_contract.py applies these amendments to its schemas and request bodies, and adds the new operations (operations) and schemas (new_schemas), refusing a path, operationId or schema name the contract already has. Unnamed schemas are the spec's. Consumers (apps/api tests, apps/web/src/api.ts guards) enforce the rule below; a null receipt or qualification never makes a proposal actionable.",
-  "changes": "0.2.0: fields no store holds yet become nullable (account, account_snapshot, proposal); snapshot gains ledger_cash (trade-date journal cash, not available cash) and coverage; pages gain the C-02 coverage; the active-proposal rule accepts a null final-check receipt or qualification. 0.3.0: claim and evidence gain coverage (withheld text, invalid citations and limitations are named there); claim material becomes nullable (no store records materiality). 0.4.0: proposal gains coverage (readProposal returns one proposal, so its nulls are named on the item; list items carry it too); ledger_event lot_policy_id becomes nullable (the journal stores a lot-policy name such as economic_average_cost/1, which is not a contract id; it is served in economic_annotations). 0.5.0: the request WatchlistEntry (addWatchlistEntry, updateWatchlistEntry) gains an optional, nullable review_at (RFC 3339 with an offset, normalized to UTC; on update, omitting it keeps the stored value); needs stays server-derived and is refused in requests. If-Match on every route: a stale or malformed value is 412 Precondition Failed and a required but missing one is 428 Precondition Required; this replaces the 409 that the OpenAPI If-Match descriptions name. 0.6.0: experiment gains coverage (readExperiment serves an incomplete or blocked record with its reasons instead of refusing it; list items carry it too); parent_optimizer_version is a string exactly when target is recursive_optimizer and null otherwise, named none:parent_optimizer_version; state gains blocked and insufficient_evidence (insufficient evidence is re-assessable while the plan's one holdout read is unused, checked against the ledger the assessor is given; failed is no longer derived for it). 0.7.0: GET /session (readSession) is documented exactly as T010 serves it; readApprovalClasses (GET /session/approval-classes) serves the caller's three approval classes, advisory only and never a grant: every action re-derives its own checks, no token or receipt is issued and no identity is served. Both are Cache-Control: no-store (the API sends no-store on every response).",
+  "changes": "0.2.0: fields no store holds yet become nullable (account, account_snapshot, proposal); snapshot gains ledger_cash (trade-date journal cash, not available cash) and coverage; pages gain the C-02 coverage; the active-proposal rule accepts a null final-check receipt or qualification. 0.3.0: claim and evidence gain coverage (withheld text, invalid citations and limitations are named there); claim material becomes nullable (no store records materiality). 0.4.0: proposal gains coverage (readProposal returns one proposal, so its nulls are named on the item; list items carry it too); ledger_event lot_policy_id becomes nullable (the journal stores a lot-policy name such as economic_average_cost/1, which is not a contract id; it is served in economic_annotations). 0.5.0: the request WatchlistEntry (addWatchlistEntry, updateWatchlistEntry) gains an optional, nullable review_at (RFC 3339 with an offset, normalized to UTC; on update, omitting it keeps the stored value); needs stays server-derived and is refused in requests. If-Match on every route: a stale or malformed value is 412 Precondition Failed and a required but missing one is 428 Precondition Required; this replaces the 409 that the OpenAPI If-Match descriptions name. 0.6.0: experiment gains coverage (readExperiment serves an incomplete or blocked record with its reasons instead of refusing it; list items carry it too); parent_optimizer_version is a string exactly when target is recursive_optimizer and null otherwise, named none:parent_optimizer_version; state gains blocked and insufficient_evidence (insufficient evidence is re-assessable while the plan's one holdout read is unused, checked against the ledger the assessor is given; failed is no longer derived for it). 0.7.0: GET /session (readSession) is documented exactly as T010 serves it; readApprovalClasses (GET /session/approval-classes) serves the caller's three approval classes, advisory only and never a grant: every action re-derives its own checks, no token or receipt is issued and no identity is served. Both are Cache-Control: no-store (the API sends no-store on every response). 0.8.0: the sessionCookie scheme's cookie name is __Host-pi_session (security_schemes; the __Host- prefix makes browsers require Secure and Path=/ and refuse a Domain). listMemberships (GET /memberships) is documented exactly as T010 serves it: any member reads the session tenant's memberships by user id, a C-02 page of at most 200 with an opaque, HMAC-bound cursor that expires after an hour. mutations is the owner-approved allowlist for amended mutating operations; it is empty, so login, logout, step-up and role change stay undocumented until each entry is approved.",
   "rule": "A null in an amended field must be named in the response coverage.reasons as unavailable:<field>, unavailable:<id>/<field>, unknown:<field>, none:<field> or none:<id>/<field>. Item coverage reasons are <kind>:<detail>; page reasons are <kind>:<id>/<detail>.",
   "schemas": {
     "account": {
@@ -66,7 +67,34 @@
       }
     }
   },
+  "security_schemes": {
+    "sessionCookie": {"name": "__Host-pi_session"}
+  },
+  "mutations": [],
   "operations": {
+    "/memberships": {
+      "get": {
+        "operationId": "listMemberships",
+        "summary": "List the session tenant's memberships",
+        "description": "Any member (tenant_member or tenant_owner) reads the memberships of the session's tenant, ordered by user_id (T010). The tenant is derived from the session and never served or accepted. The cursor is opaque, bound to tenant, principal, route and sort order by the server key, and expires after an hour; an invalid, foreign or expired cursor is 400 invalid_cursor. Nothing is written except the authentication bookkeeping every authenticated request records.",
+        "security": [{"sessionCookie": []}],
+        "parameters": [
+          {"name": "cursor", "in": "query", "schema": {"type": "string", "maxLength": 128}},
+          {"name": "limit", "in": "query", "schema": {"type": "integer", "minimum": 1, "maximum": 200, "default": 50}, "description": "Server-bounded page size; tenant derived from session."}
+        ],
+        "responses": {
+          "200": {
+            "description": "Success.",
+            "headers": {"Cache-Control": {"schema": {"type": "string", "const": "no-store"}}},
+            "content": {"application/json": {"schema": {"$ref": "#/components/schemas/membershipPage"}}}
+          },
+          "default": {
+            "description": "Typed validation, authorization, conflict, capacity or dependency failure; never a synthetic success. 401 unauthenticated without a valid session; 400 invalid_request or invalid_cursor.",
+            "content": {"application/problem+json": {"schema": {"$ref": "#/components/schemas/Problem"}}}
+          }
+        }
+      }
+    },
     "/session": {
       "get": {
         "operationId": "readSession",
@@ -109,6 +137,32 @@
     }
   },
   "new_schemas": {
+    "membershipPage": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "title": "Membership page",
+      "description": "C-02 page of the session tenant's memberships by user_id. next_cursor is null on the last page. display_name is the user's stored display name (1 to 200 characters). version is the membership's If-Match version.",
+      "type": "object",
+      "properties": {
+        "items": {"type": "array", "maxItems": 200, "items": {"$ref": "#/$defs/Membership"}},
+        "next_cursor": {"type": ["string", "null"], "pattern": "^[A-Za-z0-9_-]{54}$"},
+        "coverage": {"$ref": "#/$defs/Coverage"}
+      },
+      "required": ["items", "next_cursor", "coverage"],
+      "additionalProperties": false,
+      "$defs": {
+        "Membership": {
+          "type": "object",
+          "properties": {
+            "user_id": {"type": "string", "format": "uuid"},
+            "role": {"type": "string", "enum": ["tenant_owner", "tenant_member"]},
+            "version": {"type": "integer", "minimum": 1},
+            "display_name": {"type": "string", "minLength": 1, "maxLength": 200}
+          },
+          "required": ["user_id", "role", "version", "display_name"],
+          "additionalProperties": false
+        }
+      }
+    },
     "session": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "title": "Session",
