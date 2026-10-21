@@ -151,3 +151,69 @@ and "your decision 9" (decision 20) is decision 9 of `2026-10-15-owner-decisions
     explicit, recorded opt-in keeps the audit honest. Not 'Always enforce': it blocks
     the solo pilot. Not 'Drop it': it weakens hosted."
     Implemented by: T051.
+
+## Session and membership mutations (second quiz, 2026-10-21)
+
+These four decisions answer the proposals in
+`docs/decisions/2026-10-21-contract-0.8.0-session-mutation-proposals.md`. An
+`Approves:` line names one operation that the selected label approves. The label
+"All four" covers the four operations the option text names, and nothing else. The
+`Approves:` lines are not part of the option text: they are the orchestrator's
+derivation, taking the method and path of each operationId the option text names
+from sections A to D of the proposals file. Decision 24 approves the operations
+only; decision 25 settles how they meet the contract checker.
+
+24. **Session and membership mutations.**
+    Question: "Which of the four undocumented session/membership mutations should be
+    documented in the contract (exact shapes in
+    docs/decisions/2026-10-21-contract-0.8.0-session-mutation-proposals.md)?"
+    Selected label: "All four (Recommended)".
+    Option text as presented: "Approve createSession (login), revokeSession
+    (logout), stepUpSession and changeMembershipRole. Why: the UI uses all four. They
+    touch no broker, money or order surface. Leaving them undocumented keeps them
+    outside the contract checker's security rules, the gap decision 15 meant to
+    close. Not 'only some': each one left out stays unreviewed."
+    Approves: `POST /session` (`createSession`)
+    Approves: `DELETE /session` (`revokeSession`)
+    Approves: `POST /session/step-up` (`stepUpSession`)
+    Approves: `PATCH /memberships/{user_id}` (`changeMembershipRole`)
+    Implemented by: a project-contract amendment (T010/T055), with decision 25.
+
+25. **Checker conflicts for those mutations.**
+    Question: "The proposed mutations conflict with the hardened checker: `password`
+    and `X-CSRF-Token` trip the sensitive-name rule, login has no
+    session/CSRF/idempotency, and logout returns 204 with no body. How should these
+    be resolved?"
+    Selected label: "Entries + narrow exemptions (Recommended)".
+    Option text as presented: "For `password` and `X-CSRF-Token`: per-operation
+    allowlist entries citing your approval. For login's `security: []` and missing
+    headers, and logout's 204: narrow checker exemptions that only work for an
+    operation explicitly listed and approved. Why: the checker stays strict for
+    everything else, and each exception is recorded. Not 'change the server': a 204
+    logout and an unauthenticated login are correct HTTP, and changing them breaks
+    the UI for no security gain. Not 'blanket exemption': it would weaken the checker
+    for future routes."
+    Implemented by: T055 (`tools/check_contracts.py` rules 2, 6 and 7).
+
+26. **`display_name` in the role-change response.**
+    Question: "The role-change response always sends `display_name: null`, while the
+    members list sends the stored name. What should happen?"
+    Selected label: "Fix the server (Recommended)".
+    Option text as presented: "Return the stored name, and reuse the list's item
+    schema. Why: a null that means 'not fetched' looks like 'no name' to the UI and
+    is an inconsistency, not a design. One schema for one object is simpler to
+    review. Not 'document null': that freezes a quirk into the contract."
+    Implemented by: T010 (`apps/api`), with decision 24.
+
+27. **Health probe and policy list.**
+    Question: "Two more served routes are outside the contract: the unauthenticated
+    liveness probe `GET /health/live`, and the policy list `GET /policies` (T019).
+    What should happen to them?"
+    Selected label: "Health out, policies in (Recommended)".
+    Option text as presented: "Keep `/health/live` outside the contract as an
+    infrastructure probe (no session, no data), and document `GET /policies` through
+    a T019 amendment. Why: the health check carries no user data and must work
+    without a login for container orchestration. The policy list is real API surface
+    that should get the same review as every other read. Not 'both in': the health
+    probe can't meet the session rules and doesn't need to."
+    Implemented by: T019 (contract amendment for `GET /policies`).
