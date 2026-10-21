@@ -47,6 +47,8 @@ URL = "/api/v1/experiments"
 EXPERIMENT = Draft202012Validator(rd.PC.schema("experiment"), registry=rd.REGISTRY,
                                   format_checker=FormatChecker())  # fmt: skip
 SYN, OPT = "evidence:synthetic_only", im.Target.RECURSIVE_OPTIMIZER
+AST = _module("qw_assessor_store_tests",
+              ROOT / "packages/adapters/tests/test_assessor_store.py")  # fmt: skip
 
 
 def put(urls: dict[str, str], t: uuid.UUID, eid: str, target: im.Target,
@@ -102,10 +104,15 @@ def test_reads_serve_the_contract_and_name_every_reason(
         "authorized",
         "awaiting_review",
     ]
-    own = {
-        "exp-a": [SYN, "none:parent_optimizer_version"],
-        "exp-code": ["blocked:sandbox_unqualified", SYN],
-        e: [SYN, "none:evaluation_receipt_ids", "none:parent_optimizer_version"],
+    own = {  # 0.11.0: no lineage link is named none:retest_of
+        "exp-a": [SYN, "none:parent_optimizer_version", "none:retest_of"],
+        "exp-code": ["blocked:sandbox_unqualified", SYN, "none:retest_of"],
+        e: [
+            SYN,
+            "none:evaluation_receipt_ids",
+            "none:parent_optimizer_version",
+            "none:retest_of",
+        ],
     }
     for k, why in own.items():
         assert items[k]["coverage"] == {"status": "partial", "reasons": why}
@@ -148,6 +155,11 @@ def test_amended_experiment_schema() -> None:
     assert errors({**item, "parent_optimizer_version": "v0"}) != []
     assert errors({k: v for k, v in item.items() if k != "coverage"}) != []
     assert errors({**item, "state": "installed"}) != []
+    assert item["retest_of"] is None and "none:retest_of" in item["coverage"]["reasons"]
+    assert errors({**item, "retest_of": "exp-0"}) == []  # 0.11.0: a nullable id
+    for bad in ("bad id", "", 7):
+        assert errors({**item, "retest_of": bad}) != [], bad
+    assert errors({k: v for k, v in item.items() if k != "retest_of"}) != []
     old = st.legacy(t)[2]  # stored under 0.5.0: failed, unavailable parent
     assert errors(ex.wire(old)) == []
     assert rd.strict("experiment", ex.wire(old), list(old.reasons)) == {
@@ -229,3 +241,33 @@ def test_tampered_rows_are_409_and_database_errors_500(
     for name, path in (("page", URL), ("load", f"{URL}/exp-code")):
         monkeypatch.setattr(es, name, broken)  # a database failure is never a 409
         assert_problem(world.client.get(path), 500, "internal_error")
+
+
+@pytest.mark.db
+def test_contract_0110_serves_the_lineage_link(
+    world: Any, runtime_urls: dict[str, str]
+) -> None:
+    """Owner decision 19: a retest names the experiment it re-tests, from the
+    revision's copy of its frozen protocol's link; otherwise null and named."""
+    a, e = world.tenant_a, st.EXP
+    put(runtime_urls, a, e, im.Target.STRATEGY, "authorized")
+    with (
+        psycopg.connect(runtime_urls["qw_worker"], autocommit=True) as w,
+        psycopg.connect(runtime_urls["qw_assessor"], autocommit=True) as s,
+    ):
+        AST.put_on((w, s), a, "exp-r", AST.other_plan("plan-e", AST.EARLY),
+                   retest_of=e)  # fmt: skip
+    login(world.client, "bob")
+    page = world.client.get(URL).json()
+    rd.page_conforms("experiment", page)
+    items = {i["id"]: valid(i) for i in page["items"]}
+    assert {k: i["retest_of"] for k, i in items.items()} == {e: None, "exp-r": e}
+    assert "none:retest_of" in items[e]["coverage"]["reasons"]
+    assert "none:retest_of" not in items["exp-r"]["coverage"]["reasons"]
+    assert f"none:{e}/retest_of" in page["coverage"]["reasons"]
+    assert not [r for r in page["coverage"]["reasons"] if "exp-r/retest_of" in r]
+    got = world.client.get(f"{URL}/exp-r")
+    assert got.status_code == 200 and valid(got.json()) == items["exp-r"]
+    login(world.client, "carol")  # another tenant sees neither end of the link
+    assert world.client.get(URL).json()["items"] == []
+    assert_problem(world.client.get(f"{URL}/exp-r"), 404, "not_found")

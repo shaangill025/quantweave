@@ -8,6 +8,7 @@ fixtures (test_improvement)."""
 from __future__ import annotations
 
 import importlib.util
+import json
 import sys
 import uuid
 from collections.abc import Callable, Iterator
@@ -923,3 +924,144 @@ def test_review_m1_no_protocol_spends_no_holdout_read(
         assert conn.execute(f"SELECT count(*) FROM app.{table}").fetchone() == (0,)
     done = assess(wa, a, promo_ledger(GOOD), "v-1")  # the read is still unused
     assert done.record.state is St.AWAITING_REVIEW
+
+
+# Project contract 0.11.0 (owner decision 19 follow-up): qw_app reads the link only
+# through the revision, never an assessor table (owner decision 17); migration 0034
+# holds each revision's copy equal to its stored protocol's `retest_of`.
+(MIGRATION,) = (Path(__file__).parents[1] / "src/qw_adapters/sql").glob(
+    "*_experiment_retest.sql"
+)  # its number is assigned at commit time
+
+
+def next_revision(retest: str) -> str:
+    """A raw next revision of exp-r with `retest` as its link (the 0026 guard's
+    chain rules met, so only the link differs from a valid row)."""
+    moved = {"revision": "revision + 1", "recorded_at": "clock_timestamp()",
+             "previous_hash": "event_hash", "event_hash": "repeat('c', 64)",
+             "retest_of": retest}  # fmt: skip
+    cols = [*es._COLUMNS, "tenant_id", "revision", "recorded_at", "previous_hash",
+            "event_hash"]  # fmt: skip
+    picked = ", ".join(moved.get(c, c) for c in cols)
+    return (f"INSERT INTO app.experiment_revision ({', '.join(cols)}) SELECT "
+            f"{picked} FROM app.experiment_revision WHERE experiment_id = 'exp-r' "
+            "ORDER BY revision DESC LIMIT 1")  # fmt: skip
+
+
+def test_contract_0110_the_revision_carries_the_protocols_link(
+    wa: Pair, worker_conn: Conn, app_conn: Conn, conn: Conn, a: uuid.UUID
+) -> None:
+    early = other_plan("plan-e", EARLY)
+    put_on(wa, a, "exp-r", early, retest_of=EXP)
+    with tn.tenant_transaction(app_conn, a) as tx:  # qw_app, as the API reads
+        got = {e: es.load(tx, e) for e in ("exp-r", EXP)}
+        assert {e: r.record.retest_of for e, r in got.items() if r} == {
+            "exp-r": EXP, EXP: None}  # fmt: skip
+        for sql in ("SELECT retest_of FROM app.assessor_protocol",
+                    "SELECT experiment_id FROM app.assessor_protocol"):  # fmt: skip
+            with pytest.raises(psycopg.errors.InsufficientPrivilege), \
+                    tx.conn.transaction():  # fmt: skip
+                tx.conn.execute(sql)
+    for wrong in ("NULL", "'exp-other'", f"'{EXP}x'"):  # dropped or another link
+        with (
+            pytest.raises(psycopg.errors.CheckViolation, match="retest_of"),
+            tn.tenant_transaction(worker_conn, a) as tx,
+        ):
+            tx.conn.execute(next_revision(wrong))
+    with tn.tenant_transaction(worker_conn, a) as tx:  # the control: only the link
+        tx.conn.execute(next_revision("retest_of"))
+    # The guard is an own-tenant oracle at most: as tenant b, a forged first
+    # revision of tenant a's linked experiment is refused the same way whether its
+    # link is the true one or not (b sees no protocol of a's under RLS).
+    with tn.provision_tenant(app_conn) as tx:
+        b = tx.tenant_id
+    row = conn.execute("SELECT to_jsonb(x) - 'recorded_at' FROM "
+                       "app.experiment_revision x WHERE experiment_id = 'exp-r' "
+                       "AND revision = 1").fetchone()  # fmt: skip
+    assert row is not None
+    seen = set()
+    for link in (EXP, "exp-false"):
+        forged = {**row[0], "retest_of": link, "event_hash": "d" * 64}
+        with (
+            pytest.raises(psycopg.Error) as err,
+            tn.tenant_transaction(worker_conn, b) as tx,
+        ):
+            tx.conn.execute(
+                "INSERT INTO app.experiment_revision SELECT * FROM "
+                "jsonb_populate_record(NULL::app.experiment_revision, %s::jsonb "
+                "|| jsonb_build_object('recorded_at', clock_timestamp()))",
+                (json.dumps(forged),))  # fmt: skip
+        seen.add((type(err.value), str(err.value).split("\n")[0]))
+    assert seen == {
+        (
+            psycopg.errors.CheckViolation,  # the same answer either way
+            "app.experiment_revision: retest_of is not the protocol's",
+        )
+    }
+
+
+def test_contract_0110_the_real_migration_refuses_a_revision_without_its_link(
+    wa: Pair, conn: Conn, pg_admin_url: str, a: uuid.UUID, tmp_path: Path
+) -> None:
+    """Through `migrate()` itself (as qw_migrate: NOBYPASSRLS, forced RLS, no
+    tenant set): a database migrated to the version before this one holds a linked
+    protocol whose revision has no copy. The migration must see it and refuse; it
+    leaves no policy or column behind, and runs once the row is gone (the control:
+    the unlinked experiment's revisions migrate with a null copy)."""
+    from qw_adapters.migrations import MIGRATIONS_DIR, MigrationError, migrate
+
+    put_on(wa, a, "exp-r", other_plan("plan-e", EARLY), retest_of=EXP)
+    dump = {}  # every tenant's rows; the old schema ignores the new column
+    for t in ("tenant", "assessor_protocol", "experiment_revision"):
+        row = conn.execute(f"SELECT coalesce(jsonb_agg(to_jsonb(x)), '[]') "
+                           f"FROM app.{t} x").fetchone()  # fmt: skip
+        assert row is not None
+        dump[t] = row[0]
+    before = tmp_path / "sql"
+    before.mkdir()
+    for f in sorted(MIGRATIONS_DIR.glob("*.sql")):
+        if f != MIGRATION:
+            (before / f.name).write_bytes(f.read_bytes())
+    name = f"qw_test_{uuid.uuid4().hex[:16]}"
+    with psycopg.connect(pg_admin_url, autocommit=True) as admin:
+        create = "CREATE DATABASE {} TEMPLATE template0 ENCODING 'UTF8' LOCALE 'C'"
+        admin.execute(pgsql.SQL(create).format(pgsql.Identifier(name)))
+    try:
+        with psycopg.connect(make_conninfo(pg_admin_url, dbname=name),
+                             autocommit=True) as old:  # fmt: skip
+            migrate(old, before)  # up to the version before this one
+            with old.transaction():  # the rows as they stood (triggers off)
+                old.execute("SET LOCAL session_replication_role = replica")
+                for t, rows in dump.items():
+                    old.execute(f"INSERT INTO app.{t} SELECT * FROM "
+                                f"jsonb_populate_recordset(NULL::app.{t}, %s)",
+                                (json.dumps(rows),))  # fmt: skip
+
+            def left() -> tuple[Any, ...]:
+                row = old.execute(
+                    "SELECT (SELECT count(*) FROM pg_policies WHERE schemaname = "
+                    "'app' AND 'qw_migrate' = ANY (roles) AND tablename IN "
+                    "('experiment_revision', 'assessor_protocol')), "
+                    "(SELECT count(*) FROM information_schema.columns WHERE "
+                    "table_name = 'experiment_revision' AND column_name = "
+                    "'retest_of')").fetchone()  # fmt: skip
+                assert row is not None
+                return tuple(row)
+
+            with pytest.raises(MigrationError, match="retest_of copy differs") as err:
+                migrate(old)  # exp-r's protocol links EXP; its revisions have no copy
+            assert isinstance(err.value.__cause__, psycopg.errors.CheckViolation)
+            assert left() == (0, 0)  # rolled back: no policy, no column
+            with old.transaction():
+                old.execute("SET LOCAL session_replication_role = replica")
+                old.execute("DELETE FROM app.experiment_revision "
+                            "WHERE experiment_id = 'exp-r'")  # fmt: skip
+            assert migrate(old) == [int(MIGRATION.name[:4])]
+            assert left() == (0, 1)  # the check's policies are dropped again
+            rows = old.execute("SELECT DISTINCT experiment_id, retest_of FROM "
+                               "app.experiment_revision").fetchall()  # fmt: skip
+            assert rows == [(EXP, None)]
+    finally:
+        with psycopg.connect(pg_admin_url, autocommit=True) as admin:
+            admin.execute(pgsql.SQL("DROP DATABASE {} WITH (FORCE)").format(
+                pgsql.Identifier(name)))  # fmt: skip

@@ -752,6 +752,29 @@ def test_decision_19_retest_of_is_a_frozen_link_to_another_experiment() -> None:
         reg.register(proto())  # the link is part of the frozen protocol
 
 
+def test_decision_19_the_record_carries_its_protocols_link_unchanged() -> None:
+    """Contract 0.11.0: the record copies the frozen protocol's `retest_of`; absent,
+    it stays out of the wire (stored revision hashes unchanged), and it can never
+    move between revisions of one experiment."""
+    pl, sbx = plan(), "sbx-synth"
+    plain = im.record(registry(proto(sandbox_profile_id=sbx)), EXP, "cand-1", pl,
+                      book())  # fmt: skip
+    assert plain.retest_of is None and "retest_of" not in plain.wire()
+    linked = registry(proto(sandbox_profile_id=sbx, retest_of="exp-synth-0"))
+    first = im.record(linked, EXP, "cand-1", pl, book())
+    assert first.retest_of == "exp-synth-0"
+    assert first.wire()["retest_of"] == "exp-synth-0"
+    assert first.protocol_id == linked.protocol(EXP).content_hash
+    later = im.record(linked, EXP, "cand-1", pl, scheduled(linked),
+                      im.Scheduled(EXP, "bud-exp-1"))  # fmt: skip
+    assert later.may_follow(first) and later.retest_of == first.retest_of
+    assert not replace(later, retest_of="exp-synth-9").may_follow(first)
+    assert not replace(later, retest_of=None).may_follow(first)
+    for bad in (EXP, "", "bad id"):  # never itself, always an id
+        with pytest.raises(im.ImprovementError, match="retest_of"):
+            replace(first, retest_of=bad)
+
+
 def test_decision_19_chain_trials_count_every_experiment_of_the_chain() -> None:
     def dev(n: int, family: str) -> tl.Trial:  # failed: counted, never discarded
         return trial(n, tl.Split.DEVELOPMENT, tl.Outcome.FAILED, family=family,
