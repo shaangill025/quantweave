@@ -5,6 +5,7 @@ SYNTHETIC fixtures and test-only HMAC keys (test_release); no real key or deploy
 
 from __future__ import annotations
 
+import shutil
 import threading
 import time
 from dataclasses import replace
@@ -14,8 +15,12 @@ from typing import Any
 import psycopg
 import pytest
 import test_release as tr
+from psycopg.types.json import Jsonb
 from qw_adapters import release_store as rs
+from qw_adapters.migrations import MIGRATIONS_DIR, migrate
 from qw_domain import release as rl
+from qw_domain.instants import format_instant
+from qw_domain.research_data import digest
 from test_improvement import proto
 
 COMP, KEY, KEYS, M1, M2, M3, NO, REL = (tr.COMP, tr.KEY, tr.KEYS, tr.M1, tr.M2,
@@ -30,7 +35,7 @@ DEP = rl.Deployment("deploy-synth", rl.Edition.SELF_HOSTED,
 RELEASE_COLUMNS = ("release_id, component, target, candidate_id, candidate_hash, "
                    "verdict_id, manifest_hash, approver_id, approved_at, min_schema, "
                    "max_schema, writes_schema, key_id, algorithm, signature, body, "
-                   "recorded_at, event_hash")  # fmt: skip
+                   "recorded_at, event_hash, verdict_source")  # fmt: skip
 TABLES = ("release_deployment", "signed_release", "deployment_event")
 STRAT = {"rel-1": M1, "rel-2": M2, "rel-3": M3}
 
@@ -129,7 +134,8 @@ def test_a_release_is_rederived_from_the_registry(worker_conn: Conn) -> None:
 def test_the_deployment_is_frozen(worker_conn: Conn, conn: Conn) -> None:
     rs.record_deployment(worker_conn, DEP)
     raw = ("INSERT INTO app.release_deployment SELECT 'deploy-{}', edition, '{}', "
-           "tenants, initial_schema, allows_test_keys, clock_timestamp(), event_hash "
+           "tenants, initial_schema, allows_test_keys, clock_timestamp(), event_hash, "
+           "solo_maintainer "
            "FROM app.release_deployment")  # fmt: skip
     for ops in ("{op-b,op-a}", "{op-a,op-a}"):  # review F4: sorted and unique
         with pytest.raises(psycopg.errors.CheckViolation):
@@ -175,7 +181,7 @@ def copy_event(src: str, **over: str) -> str:
     """An INSERT copying the latest event at `src` with the named columns replaced."""
     cols = ["deployment_id", "seq", "event_id", "kind", "component", "release_id",
             "to_release_id", "reasons", "operator_id", "step_up_receipt_id", "at",
-            "schema_after", "event_hash"]  # fmt: skip
+            "schema_after", "event_hash", "self_approved"]  # fmt: skip
     over = {"seq": "seq + 1", "event_id": "'ev-x'", "step_up_receipt_id": "'su-x'",
             "at": "clock_timestamp()"} | over  # fmt: skip
     return (f"INSERT INTO app.deployment_event ({', '.join(cols)}) SELECT "
@@ -306,6 +312,7 @@ def test_installation_scope_rls_append_only_and_verified_reads(
         ("signed_release", "body = jsonb_set(body, '{rollback_version_id}', '\"x\"')"),
         ("deployment_event", "operator_id = 'operator-other'"),
         ("deployment_event", "seq = 5"),
+        ("deployment_event", "self_approved = true"),  # the mark is hashed
     )
     for table, change in tampers:
         conn.execute(f"CREATE TABLE public.keep AS SELECT * FROM app.{table}")
@@ -356,3 +363,132 @@ def test_concurrent_acts_queue_on_the_deployment_lock(
     assert sorted(map(str, got.values())) == sorted({"rel-1", "rel-2"})
     lg = rs.load(worker_conn, DEP.deployment_id, KEYS)
     assert lg is not None and len(lg.entries) == 2
+
+
+ONE = frozenset({"maint-synth"})
+SOLO = rl.Deployment(
+    "deploy-solo",
+    rl.Edition.SELF_HOSTED,
+    ONE,
+    frozenset({USER_A}),
+    1,
+    True,
+    rl.SoloMaintainer(rl.Edition.SELF_HOSTED, ONE),
+)
+
+
+def test_decision_23_solo_installs_are_recorded_self_approved(
+    worker_conn: Conn, conn: Conn
+) -> None:
+    rs.record_deployment(worker_conn, SOLO)
+    setup(worker_conn, signed(), signed("rel-2", (1, 2, 2)))  # and DEP
+    rs.install(worker_conn, SOLO.deployment_id, KEYS, "ev-0", "rel-1", "maint-synth",
+               "stepup-op-0", strategies=NO)  # fmt: skip
+    install(worker_conn, "rel-1")
+    got = rs.load(worker_conn, SOLO.deployment_id, KEYS)
+    assert got is not None and got.deployment == SOLO
+    assert [e.self_approved for e in got.entries if isinstance(e, rl.Install)] == [True]
+    with pytest.raises(rs.ReleaseStoreError, match="deployment_frozen"):
+        rs.record_deployment(worker_conn, replace(SOLO, solo=None))
+    dep = ("INSERT INTO app.release_deployment SELECT 'deploy-x', {}, {}, tenants, "
+           "initial_schema, allows_test_keys, clock_timestamp(), event_hash, {} FROM "
+           "app.release_deployment WHERE deployment_id = 'deploy-solo'")  # fmt: skip
+    solo = "seq = 1 AND deployment_id = 'deploy-solo'"
+    dep_, two = "deployment_id = 'deploy-synth'", {"release_id": "'rel-2'",
+                                                   "schema_after": "2"}  # fmt: skip
+    for sql in (
+        dep.format("'hosted'", "operators", "true"),  # never hosted
+        dep.format("edition", "'{maint-synth,op-b}'", "true"),  # nor multi-operator
+        dep.format("edition", "operators", "NULL"),  # always stated
+        copy_event(solo, **two, self_approved="false"),  # the signer installs
+        copy_event(dep_, **two, self_approved="true"),  # not the signer
+        copy_event(dep_, **two, operator_id="'maint-synth'", self_approved="true"),
+        copy_event(dep_, **two, self_approved="NULL"),
+        copy_event(dep_, kind="'pause'", reasons="'{why}'", self_approved="true"),
+        copy_event(dep_, kind="'pause'", reasons="'{why}'", self_approved="NULL"),
+    ):
+        with pytest.raises(psycopg.errors.CheckViolation):
+            conn.execute(sql)
+    rs.record_deployment(worker_conn, replace(SOLO, deployment_id="deploy-two"))
+    with conn.transaction():  # the flag is hashed: turning it off is detected
+        conn.execute("SET LOCAL session_replication_role = replica")
+        conn.execute("UPDATE app.release_deployment SET solo_maintainer = false "
+                     "WHERE deployment_id = 'deploy-two'")  # fmt: skip
+    with pytest.raises(rs.ReleaseStoreError, match="integrity"):
+        rs.load(worker_conn, "deploy-two", KEYS)
+    conn.execute(dep.format("edition", "operators", "false"))  # controls
+    conn.execute(copy_event(solo, **two))  # copied: self-approved
+
+
+def test_decision_33_releases_are_marked_caller_supplied(
+    worker_conn: Conn, conn: Conn
+) -> None:
+    setup(worker_conn, signed())
+    install(worker_conn, "rel-1")
+    got = rs.load(worker_conn, DEP.deployment_id, KEYS)
+    assert got is not None
+    assert got.install_of("rel-1").release.verdict_source is (
+        rl.VerdictSource.CALLER_SUPPLIED)  # fmt: skip
+    bad = (
+        "INSERT INTO app.signed_release ({c}) SELECT {v} FROM app.signed_release"
+    ).format(
+        c=RELEASE_COLUMNS,
+        v=RELEASE_COLUMNS.replace("release_id, ", "'rel-v', ", 1)
+        .replace("body", 'body || \'{"release_id": "rel-v"}\'')
+        .replace("recorded_at", "clock_timestamp()"),
+    )
+    for source in ("NULL", "'assessor_store'"):  # until that store exists
+        with pytest.raises(psycopg.errors.CheckViolation):
+            conn.execute(bad.replace(", verdict_source FROM", f", {source} FROM"))
+    conn.execute(bad)  # the control
+
+
+def test_rows_from_before_the_marks_stay_readable(conn: Conn, tmp_path: Any) -> None:
+    old = tmp_path / "sql"
+    old.mkdir()
+    for f in sorted(MIGRATIONS_DIR.glob("0*.sql")):
+        if f.name < "0032":
+            shutil.copy(f, old / f.name)
+    migrate(conn, old)
+    sr, now = signed(), "SELECT clock_timestamp()"
+    row = conn.execute(now).fetchone()
+    assert row is not None
+    m, t = sr.manifest, row[0]
+
+    def put(table: str, row: dict[str, Any], body: object) -> None:
+        row["event_hash"] = digest([table, body, format_instant(t)])
+        conn.execute(
+            f"INSERT INTO app.{table} ({', '.join(row)}) VALUES "
+            f"({', '.join(['%s'] * len(row))})",
+            tuple(row.values()),
+        )
+
+    d = [DEP.deployment_id, "self_hosted", sorted(DEP.operators), sorted(DEP.tenants),
+         1, True]  # fmt: skip
+    put("release_deployment", dict(zip(["deployment_id", "edition", "operators",
+        "tenants", "initial_schema", "allows_test_keys"], d, strict=True)) | {
+        "recorded_at": t}, d)  # fmt: skip
+    a, c = m.approval, m.compatibility
+    put("signed_release", {
+        "release_id": m.release_id, "component": m.component, "target": "strategy",
+        "candidate_id": m.candidate_id, "candidate_hash": m.candidate_hash,
+        "verdict_id": m.verdict_id, "manifest_hash": sr.manifest_hash,
+        "approver_id": a.principal_id, "approved_at": a.approved_at,
+        "min_schema": c.min_schema, "max_schema": c.max_schema,
+        "writes_schema": c.writes_schema, "key_id": sr.key_id,
+        "algorithm": sr.algorithm, "signature": sr.signature,
+        "body": Jsonb(m.wire()), "recorded_at": t,
+    }, [m.wire(), sr.manifest_hash, sr.key_id, sr.algorithm, sr.signature])  # fmt: skip
+    ev = {"deployment_id": DEP.deployment_id, "seq": 1, "event_id": "ev-0",
+          "to_release_id": None, "reasons": [], "operator_id": "operator-synth",
+          "step_up_receipt_id": "stepup-op-0", "schema_after": 1, "kind": "install",
+          "component": m.component, "release_id": m.release_id}  # fmt: skip
+    put("deployment_event", ev | {"at": t}, [ev[k] for k in sorted(ev)])
+    assert migrate(conn)[:1] == [32]  # the marks arrive on existing rows
+    record(conn, signed("rel-2", (1, 2, 2)))
+    install(conn, "rel-2", 1)  # a new row after the legacy ones
+    got = rs.load(conn, DEP.deployment_id, KEYS)
+    assert got is not None and got.deployment.solo is None
+    assert [(e.self_approved, e.release.verdict_source) for e in got.entries
+            if isinstance(e, rl.Install)] == [(False, rl.VerdictSource.CALLER_SUPPLIED)
+                                              ] * 2  # fmt: skip

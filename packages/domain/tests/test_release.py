@@ -528,3 +528,58 @@ def test_review_manifest_types_and_two_rule_order() -> None:
         "sandbox_unqualified", "maintainer_release_not_required"]  # fmt: skip
     assert install_code(both) == "sandbox_unqualified"
     assert lg.entries == ()
+
+
+def test_decision_23_solo_maintainer_is_an_explicit_recorded_opt_in() -> None:
+    one = frozenset({"maint-synth"})
+    for edition, ops in (
+        (rl.Edition.HOSTED, one),
+        (rl.Edition.SELF_HOSTED, one | {"operator-synth"}),
+        (rl.Edition.SELF_HOSTED, set()),
+    ):
+        with pytest.raises(rl.ReleaseError, match="solo_maintainer_refused"):
+            rl.SoloMaintainer(edition, frozenset(ops))  # never hosted or multi-operator
+    solo = rl.SoloMaintainer(rl.Edition.SELF_HOSTED, one)
+    base = rl.Deployment("deploy-solo", rl.Edition.SELF_HOSTED, one,
+                         frozenset({USER_A}), 1, True)  # fmt: skip
+
+    def put(d: rl.Deployment, step: str = "stepup-op-0") -> rl.DeploymentLedger:
+        return rl.DeploymentLedger(d, KEYS).install(
+            "ev-0", signed(), "maint-synth", step, INST, strategies=NO
+        )
+
+    with pytest.raises(rl.ReleaseError, match="separation_of_duties"):
+        put(base)  # without the opt-in the separation is kept
+    two = replace(base, operators=one | {"operator-synth"}, solo=solo)
+    with pytest.raises(rl.ReleaseError, match="solo_maintainer_refused"):
+        rl.DeploymentLedger(two, KEYS)  # the opt-in must be the deployment's facts
+    with pytest.raises(rl.ReleaseError, match="solo_maintainer_refused"):
+        rl.DeploymentLedger(replace(base, solo=one), KEYS)  # type: ignore[arg-type]
+    lg = put(replace(base, solo=solo))
+    i = lg.entries[-1]
+    assert isinstance(i, rl.Install) and i.self_approved  # recorded as self-approved
+    with pytest.raises(rl.ReleaseError, match="step_up_reused"):
+        put(replace(base, solo=solo), "stepup-maint-rel-1")  # still two step-ups
+    n = installed(signed()).entries[0]
+    assert isinstance(n, rl.Install) and not n.self_approved
+    for d, forged in (
+        (lg.deployment, replace(i, self_approved=False)),
+        (n_dep := installed().deployment, replace(n, self_approved=True)),
+    ):
+        with pytest.raises(rl.ReleaseError, match="self_approved_mismatch"):
+            rl.DeploymentLedger(d, KEYS, (forged,))
+    assert n_dep.solo is None
+
+
+def test_decision_33_verdicts_are_marked_caller_supplied() -> None:
+    sr = signed()
+    assert sr.verdict_source is rl.VerdictSource.CALLER_SUPPLIED
+    lg = installed(sr)
+    s, _ = rl.adopt_release(lg, strategies(), USER_A, "rel-1", {},
+                            consent("stepup-user-a"), "p")  # fmt: skip
+    a, b = (rl.strategy_state(lg, s, u, SID, ADOPT) for u in (USER_A, USER_B))
+    assert (a.state, a.verdict_source) == (
+        rl.TenantState.ACTIVE,
+        rl.VerdictSource.CALLER_SUPPLIED,
+    )
+    assert (b.state, b.verdict_source) == (rl.TenantState.NOT_ADOPTED, None)
