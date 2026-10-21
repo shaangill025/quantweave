@@ -56,7 +56,15 @@ def request(rid: str = "del-1", classes: frozenset[rt.RetentionClass] | None = N
 def hold(hid: str = "hold-1", tenant: str = TENANT, ids: frozenset[str] = frozenset(),
          at: datetime = T0) -> rt.LegalHold:  # fmt: skip
     return rt.LegalHold(hid, tenant, frozenset({C.RESEARCH}), ids, "litigation",
-                        "counsel-1", at)  # fmt: skip
+                        "counsel-1", at, rt.HoldRole.TENANT_OWNER,
+                        "owner-synth-1")  # fmt: skip
+
+
+def both(tag: str = "1") -> tuple[rt.Approval, rt.Approval]:
+    """Owner decision 22: the tenant owner and the operator, each with step-up."""
+    return (rt.Approval(rt.HoldRole.TENANT_OWNER, "owner-synth-1", f"stepup-o-{tag}"),
+            rt.Approval(rt.HoldRole.OPERATOR, "operator-synth-1",
+                        f"stepup-x-{tag}"))  # fmt: skip
 
 
 def run(store: rt.Retention, req: rt.DeletionRequest, items: list[rt.Item],
@@ -94,8 +102,13 @@ def test_spec_baseline_fails_closed_on_every_class() -> None:
 def test_rule_invariants() -> None:
     cases: list[tuple[Callable[[], object], str]] = [
         (lambda: rule(C.PRIVACY), "tombstone_ledger_protected"),
-        (lambda: rule(C.PRIVACY, rt.OnRequest.RETAIN, D), "tombstone_ledger_protected"),
-        (lambda: rule(C.FINANCIAL, rt.OnRequest.DELETE, D), "financial_no_expiry"),
+        (
+            lambda: rule(C.PRIVACY, rt.OnRequest.UNCONFIGURED, D),
+            "tombstone_ledger_protected",
+        ),
+        (lambda: rule(C.FINANCIAL, rt.OnRequest.RETAIN, D), "financial_no_expiry"),
+        (lambda: rule(C.FINANCIAL, rt.OnRequest.DELETE), "financial_append_only"),
+        (lambda: rule(C.FINANCIAL, rt.OnRequest.DELETE, D), "financial_append_only"),
         (lambda: rule(C.RESEARCH, after=timedelta(0)), "period"),
         (lambda: rt.Rule(C.RESEARCH, rt.OnRequest.DELETE), "authority"),
         (lambda: rt.Rule(C.RESEARCH, expire_after=D, authority_id="o-1"), "authority"),
@@ -203,7 +216,8 @@ def test_legal_hold_suspends_deletion_and_release_is_recorded() -> None:
     assert [t.record_hash for t in run.deleted] == [item("r-2").record_hash]
     held = ((item("r-1").record_hash, "legal_hold:hold-1"),)
     assert run.suspended == held and not run.complete
-    rel = rt.HoldRelease("hold-1", TENANT, "counsel-1", "inquiry_closed", T0 + 5 * H)
+    rel = rt.HoldRelease("hold-1", TENANT, "counsel-1", "inquiry_closed", T0 + 5 * H,
+                         both())  # fmt: skip
     with pytest.raises(rt.RetentionError, match="time_order"):
         st_.holds.release(replace(rel, released_at=T0))
     st_.holds.release(rel)
@@ -238,7 +252,7 @@ def test_request_under_hold_is_kept_as_pending_delete() -> None:  # S1
     still = st_.execute(plan.job_id, T0 + 2 * H, CONFIGURED)
     pending = ((item("r-1").record_hash, "legal_hold:hold-1"),)
     assert still.deleted == () and still.suspended == pending and not still.complete
-    rel = rt.HoldRelease("hold-1", TENANT, "counsel-1", "closed", T0 + 3 * H)
+    rel = rt.HoldRelease("hold-1", TENANT, "counsel-1", "closed", T0 + 3 * H, both())
     st_.holds.release(rel)
     done = st_.execute(plan.job_id, T0 + 4 * H, CONFIGURED)
     assert done.complete and [t.record_hash for t in done.deleted] == [
@@ -413,3 +427,123 @@ def test_reproducibility_after_deletion() -> None:  # R052, R087
         cycle = [rt.Derived(TENANT, "n1", (), ("n2",)),
                  rt.Derived(TENANT, "n2", (), ("n1",))]  # fmt: skip
         rt.reproducibility(TENANT, cycle, live, ())
+
+
+SEVEN_YEARS = 2557 * D  # owner decision 21: tombstones kept 7 years, as audit
+
+
+def test_financial_journal_is_never_deletable_on_request() -> None:  # decision 21
+    with pytest.raises(rt.RetentionError) as exc:
+        policy(rule(C.FINANCIAL))  # delete on request, no expiry: once accepted
+    assert exc.value.code == "financial_append_only"
+    req = request(classes=frozenset({C.FINANCIAL}))
+    p = rt.plan(req, [item("j-1", C.FINANCIAL)], rt.owner_defaults(), rt.Holds())
+    assert acts(p) == {"j-1": (rt.Action.RETAIN, "retention_obligation")}
+    fin = rt.owner_defaults().rule(C.FINANCIAL)
+    assert (fin.on_request, fin.expire_after) == (rt.OnRequest.RETAIN, None)
+    assert fin.authority_id == "owner-decision-21"
+
+
+def test_tombstones_are_kept_seven_years_and_outlive_backups() -> None:  # decision 21
+    tomb = rt.owner_defaults().rule(C.PRIVACY)
+    assert (tomb.on_request, tomb.expire_after) == (rt.OnRequest.RETAIN, SEVEN_YEARS)
+    assert tomb.authority_id == "owner-decision-21"
+    bk = rule(C.BACKUP, rt.OnRequest.RETAIN, 30 * D)
+    for short in (30 * D, 30 * D - H):  # not longer than a backup copy lives
+        with pytest.raises(rt.RetentionError) as exc:
+            policy(bk, rule(C.PRIVACY, rt.OnRequest.RETAIN, short))
+        assert exc.value.code == "tombstone_outlives_backups"
+    with pytest.raises(rt.RetentionError) as exc:  # backups of unknown lifetime
+        policy(rule(C.PRIVACY, rt.OnRequest.RETAIN, SEVEN_YEARS))
+    assert exc.value.code == "tombstone_outlives_backups"
+    policy(bk, rule(C.PRIVACY, rt.OnRequest.RETAIN, 30 * D + H))
+    policy(rule(C.PRIVACY, rt.OnRequest.RETAIN))  # retained with no expiry: fine
+    with pytest.raises(rt.RetentionError) as exc:
+        rule(C.PRIVACY, rt.OnRequest.DELETE, SEVEN_YEARS)
+    assert exc.value.code == "tombstone_ledger_protected"
+    sweep = rt.ExpirySweep("sw-1", TENANT, T0 + SEVEN_YEARS + D)
+    p = rt.plan(sweep, [item("t-1", C.PRIVACY)], rt.owner_defaults(), rt.Holds())
+    assert acts(p) == {"t-1": (rt.Action.RETAIN, "tombstone_ledger")}  # no compaction
+
+
+def test_open_owner_decisions_no_longer_list_decided_items() -> None:
+    text = " ".join(rt.OWNER_DECISIONS)
+    for gone in (
+        "confirm or change the implementer defaults",
+        "deletion tombstones",
+        "become deletable on request",
+        "may place and release legal holds",
+    ):
+        assert gone not in text, gone
+    assert "financial journal's own retention period" in text
+    assert frozenset({C.REFERENCE, C.RELEASE}) == rt.IMPLEMENTER_DEFAULTS
+
+
+def test_hold_placement_names_one_of_the_two_roles() -> None:  # decision 22
+    holds = rt.Holds()
+    for role in rt.HoldRole:  # either role may place a hold, without step-up
+        holds.place(replace(hold(f"h-{role.value}"), placed_by=role))
+    assert set(rt.HoldRole) == {rt.HoldRole.TENANT_OWNER, rt.HoldRole.OPERATOR}
+    for bad, code in [
+        (replace(hold("h-x"), placed_by="member"), "hold_role"),  # type: ignore[arg-type]
+        (replace(hold("h-y"), principal_id=""), "principal_id"),
+    ]:
+        with pytest.raises(rt.RetentionError) as exc:
+            holds.place(bad)
+        assert exc.value.code == code
+
+
+def test_hold_release_needs_owner_and_operator_with_distinct_step_up() -> None:
+    holds = rt.Holds()
+    holds.place(hold("hold-1"))
+    holds.place(hold("hold-2"))
+    holds.place(hold("hold-3"))
+    o, x = both()
+    rel = rt.HoldRelease("hold-1", TENANT, "counsel-1", "closed", T0 + H, (o, x))
+    other = rt.Approval(rt.HoldRole.OPERATOR, "operator-synth-2", "stepup-x-9")
+    for approvals, code in [
+        ((), "release_approvals"),
+        ((o,), "release_approvals"),  # one party alone
+        ((x,), "release_approvals"),
+        ((o, o), "release_approvals"),  # the same role twice
+        ((x, other), "release_approvals"),  # two operators, no tenant owner
+        ((o, x, other), "release_approvals"),
+        ([o, x], "release_approvals"),  # not a tuple
+        ((o, "operator-synth-1"), "release_approvals"),
+        ((o, replace(x, principal_id="owner-synth-1")), "distinct_principals"),
+        ((o, replace(x, principal_id="OWNER-synth-1")), "distinct_principals"),
+        ((o, replace(x, step_up_receipt_id="stepup-o-1")), "step_up_reused"),
+        ((o, replace(x, step_up_receipt_id="STEPUP-O-1")), "step_up_reused"),
+    ]:
+        with pytest.raises(rt.RetentionError) as exc:
+            holds.release(replace(rel, approvals=approvals))  # type: ignore[arg-type]
+        assert exc.value.code == code, approvals
+    assert holds.history(TENANT)[-1].hold_id == "hold-3"  # nothing was released
+    holds.release(rel)
+    again = replace(rel, hold_id="hold-2", released_at=T0 + 2 * H)
+    for reused in ((o, replace(x, step_up_receipt_id="stepup-x-2")),
+                   (replace(o, step_up_receipt_id="stepup-o-2"), x),
+                   (o, replace(x, step_up_receipt_id="STEPUP-X-1"))):  # fmt: skip
+        with pytest.raises(rt.RetentionError) as exc:  # a receipt is used once
+            holds.release(replace(again, approvals=reused))
+        assert exc.value.code == "step_up_reused"
+    holds.release(replace(again, approvals=both("Z")))
+    third = replace(again, hold_id="hold-3", released_at=T0 + 3 * H)
+    with pytest.raises(rt.RetentionError) as exc:  # a case variant is no new one
+        fresh_x = replace(x, step_up_receipt_id="stepup-x-3")
+        holds.release(
+            replace(
+                third, approvals=(replace(o, step_up_receipt_id="stepup-o-z"), fresh_x)
+            )
+        )
+    assert exc.value.code == "step_up_reused"
+    holds.release(replace(third, approvals=both("3")))
+    assert holds.active(item("r-1"), T0 + 3 * H) is None
+    bad_approvals: list[Callable[[], object]] = [
+        lambda: rt.Approval("operator", "p-1", "s-1"),  # type: ignore[arg-type]
+        lambda: rt.Approval(rt.HoldRole.OPERATOR, "", "s-1"),
+        lambda: rt.Approval(rt.HoldRole.OPERATOR, "p-1", "bad receipt"),
+    ]
+    for bad in bad_approvals:
+        with pytest.raises(rt.RetentionError):
+            bad()

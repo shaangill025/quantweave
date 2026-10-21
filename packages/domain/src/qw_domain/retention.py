@@ -10,16 +10,27 @@ R052, R075, R077, R086, R087, R088). Domain, stdlib only, in memory.
   is reported as a reason code. Configured rules name an authority and a basis.
 - `owner_defaults` (increment 2, owner decision 9 of 2026-10-15: minimal defaults,
   legal hold, held as configuration) gives every class a rule: backups 30 days,
-  audit events (ids only) 7 years, everything else the implementer's minimal
-  choice in `IMPLEMENTER_DEFAULTS` that the owner may change. `Retention` applies it
-  unless a policy is passed; `retention_config` loads operator overrides.
-- Fixed rules, whatever the policy: the tombstone ledger (`privacy`) is never deleted
-  by a job; financial records never expire by age (deletion is an explicit workflow,
-  data dictionary `ledger_event`), and a request for them follows the policy rule.
+  audit events (ids only) 7 years; the implementer's minimal choices, confirmed by
+  owner decision 20 of 2026-10-21 (authority `owner-decision-20`) except `reference`
+  and `release`, which that question did not name (`IMPLEMENTER_DEFAULTS`); and
+  decision 21: the financial journal retained, tombstones 7 years. All stay
+  adjustable configuration (`retention_config`); counsel and provider terms may add
+  obligations (spec §12). `Retention` applies it unless a policy is passed.
+- Fixed rules, whatever the policy (decision 21): the financial journal is
+  append-only, never deleted on request and never expired by age until the owner
+  sets its period; the tombstone ledger (`privacy`) is retained, never deleted on
+  request, and its period must exceed the backup period, so a tombstone outlives
+  every backup copy it guards. No job compacts the ledger yet: an expired tombstone
+  is still kept (`tombstone_ledger`).
 - `plan` is a pure function of the trigger (a `DeletionRequest` or an `ExpirySweep`),
   the items, the policy and the holds as of the trigger time. Free text (the
   acknowledgement) never affects it. `Retention.submit` stores one plan per job id:
   a retry returns it unchanged, so trigger times are never reset.
+- Legal holds (decision 22): the tenant owner or the installation operator places
+  one; a release needs both, as two distinct principals, each with its own step-up
+  receipt never used before (`Approval`). The caller's auth layer verifies that a
+  principal holds the role and that the receipt is valid; the domain enforces the
+  combination. One person holding both roles cannot release a hold alone.
 - A delete intent under a legal hold is planned as `held`, not dropped. `execute`
   re-checks holds and the current policy (the stricter of plan and current wins) at
   its own time; a suspended intent stays pending until a later run deletes it. An
@@ -55,13 +66,13 @@ from qw_domain.sources import ID_PATTERN
 _CODE = re.compile(r"[a-z][a-z0-9_]{0,63}", re.ASCII)
 GENESIS = "0" * 64
 
-OWNER_DECISIONS = (  # still open after decision 9 (backups, audit, idempotency)
-    "confirm or change the implementer defaults (`IMPLEMENTER_DEFAULTS`); counsel "
-    "and provider terms may add obligations (spec §12)",
-    "whether financial journal records become deletable on request (default: "
-    "retained, append-only, §4 'while retained')",
-    "how long deletion tombstones themselves are kept",
-    "which roles may place and release legal holds",
+OWNER_DECISIONS = (  # still open after decisions 9 (2026-10-15) and 20-22 (10-21)
+    "the financial journal's own retention period (decision 21: retained, "
+    "append-only; only a period the owner sets later may expire it)",
+    "confirm `reference` and `release` (retained, no age expiry; not named in "
+    "decision 20's question)",
+    "whether one person holding both the tenant-owner and operator roles "
+    "(self-hosted) may release a legal hold; decision 22 requires two people",
     "mapping of spec §12 class names onto the data dictionary classes",
     "a keyed HMAC for record hashes and a keyed or signed ledger anchor",
 )
@@ -131,8 +142,12 @@ class Rule:
             raise TypeError("on_request must be OnRequest")
         configured = (self.on_request is not OnRequest.UNCONFIGURED
                       or self.expire_after is not None)  # fmt: skip
-        if self.cls is RetentionClass.PRIVACY and configured:
-            raise RetentionError("tombstone_ledger_protected", "owner decision")
+        if (self.cls is RetentionClass.PRIVACY and configured
+                and self.on_request is not OnRequest.RETAIN):  # fmt: skip
+            raise RetentionError("tombstone_ledger_protected", "owner decision 21")
+        if (self.cls is RetentionClass.FINANCIAL
+                and self.on_request is OnRequest.DELETE):  # fmt: skip
+            raise RetentionError("financial_append_only", "owner decision 21")
         if self.cls is RetentionClass.FINANCIAL and self.expire_after is not None:
             raise RetentionError("financial_no_expiry", "explicit workflow only")
         span = self.expire_after
@@ -159,6 +174,10 @@ class Policy:
             if type(r) is not Rule or r.cls is not cls:
                 raise RetentionError("rule_class", safe_repr(cls))
         object.__setattr__(self, "rules", MappingProxyType(dict(self.rules)))
+        tomb = self.rule(RetentionClass.PRIVACY).expire_after
+        kept = self.rule(RetentionClass.BACKUP).expire_after
+        if tomb is not None and (kept is None or tomb <= kept):
+            raise RetentionError("tombstone_outlives_backups", "owner decision 21")
 
     def rule(self, cls: RetentionClass) -> Rule:
         return self.rules.get(cls) or Rule(cls)
@@ -172,8 +191,11 @@ def spec_baseline(policy_id: str) -> Policy:
 DEFAULT_POLICY_ID = "retention-defaults"
 AUDIT_RETENTION = timedelta(days=7 * 365 + 2)  # 7 years: at most 2 leap days in 7
 BACKUP_RETENTION = timedelta(days=30)  # a deleted record's backup copy: 30 days
+TOMBSTONE_RETENTION = AUDIT_RETENTION  # owner decision 21: 7 years, as audit
 _OWNER, _IMPL = "owner-decision-9", "implementer-default"
 _BASIS = "owner-decisions-2026-10-15-9"
+_D20 = ("owner-decision-20", "owner-decisions-2026-10-21-20")
+_D21 = ("owner-decision-21", "owner-decisions-2026-10-21-21")
 _D, _R = OnRequest.DELETE, OnRequest.RETAIN
 # (on request, age expiry) for the classes the owner gave no number for: the
 # minimal choice that invents no legal period. Deletable classes drop personal
@@ -181,7 +203,7 @@ _D, _R = OnRequest.DELETE, OnRequest.RETAIN
 _IMPLEMENTER: Mapping[RetentionClass, tuple[OnRequest, timedelta | None]] = {
     RetentionClass.SECURITY: (_D, None),
     RetentionClass.REFERENCE: (_R, None),  # shared reference data, not personal
-    RetentionClass.FINANCIAL: (_R, None),  # append-only journal until owner policy
+    RetentionClass.FINANCIAL: (_R, None),  # append-only journal (decision 21)
     RetentionClass.POLICY: (_D, None),
     RetentionClass.RESEARCH: (_D, None),
     RetentionClass.MARKET: (_D, None),  # age limits come from rights/provider terms
@@ -193,18 +215,27 @@ _IMPLEMENTER: Mapping[RetentionClass, tuple[OnRequest, timedelta | None]] = {
     RetentionClass.PROVIDER_PAYLOAD: (_D, timedelta(hours=48)),  # transient (§12)
     RetentionClass.LOG: (_D, BACKUP_RETENTION),
 }
-IMPLEMENTER_DEFAULTS = frozenset(_IMPLEMENTER)
+# Implementer choices the owner has not confirmed: decision 20's question named
+# neither class. The others carry the authority of decision 20 or 21.
+IMPLEMENTER_DEFAULTS = frozenset({RetentionClass.REFERENCE, RetentionClass.RELEASE})
+
+
+def _source(c: RetentionClass) -> tuple[str, str]:
+    if c in IMPLEMENTER_DEFAULTS:
+        return _IMPL, _BASIS
+    return _D21 if c is RetentionClass.FINANCIAL else _D20
 
 
 def owner_defaults() -> Policy:
-    """Owner decision 9: minimal defaults. The tombstone ledger stays protected."""
-    rules = {c: Rule(c, on, after, _IMPL, _BASIS)
+    """Owner decisions 9, 20 and 21: minimal defaults; tombstones kept 7 years."""
+    rules = {c: Rule(c, on, after, *_source(c))
              for c, (on, after) in _IMPLEMENTER.items()}  # fmt: skip
     rules[RetentionClass.AUDIT] = Rule(RetentionClass.AUDIT, _R, AUDIT_RETENTION,
                                        _OWNER, _BASIS)  # fmt: skip
     rules[RetentionClass.BACKUP] = Rule(RetentionClass.BACKUP, _R, BACKUP_RETENTION,
                                         _OWNER, _BASIS)  # fmt: skip
-    rules[RetentionClass.PRIVACY] = Rule(RetentionClass.PRIVACY)
+    rules[RetentionClass.PRIVACY] = Rule(RetentionClass.PRIVACY, _R,
+                                         TOMBSTONE_RETENTION, *_D21)  # fmt: skip
     return Policy(DEFAULT_POLICY_ID, 1, rules)
 
 
@@ -231,6 +262,26 @@ class Item:
         return record_hash(self.tenant_id, self.cls, self.record_id)
 
 
+class HoldRole(StrEnum):  # owner decision 22: who may place and release holds
+    TENANT_OWNER = "tenant_owner"
+    OPERATOR = "operator"  # the installation operator
+
+
+@dataclass(frozen=True, slots=True)
+class Approval:
+    """One party to a hold release: a role, its principal and a step-up receipt."""
+
+    role: HoldRole
+    principal_id: str
+    step_up_receipt_id: str
+
+    def __post_init__(self) -> None:
+        if type(self.role) is not HoldRole:
+            raise RetentionError("hold_role", safe_repr(self.role))
+        _id(self.principal_id, "principal_id")
+        _id(self.step_up_receipt_id, "step_up")
+
+
 @dataclass(frozen=True, slots=True)
 class LegalHold:
     hold_id: str
@@ -240,6 +291,8 @@ class LegalHold:
     reason: str  # a code, not free text
     authority_id: str
     placed_at: datetime
+    placed_by: HoldRole  # either role may place a hold; no step-up needed
+    principal_id: str
 
     def covers(self, it: Item) -> bool:
         ids = self.record_ids
@@ -254,6 +307,7 @@ class HoldRelease:
     authority_id: str
     reason: str
     released_at: datetime
+    approvals: tuple[Approval, ...]  # the tenant owner and the operator
 
 
 def _event(tenant: str, auth: str, reason: str, at: datetime) -> datetime:
@@ -283,6 +337,9 @@ class Holds:
     def place(self, h: LegalHold) -> LegalHold:
         _id(h.hold_id, "hold_id")
         at = _event(h.tenant_id, h.authority_id, h.reason, h.placed_at)
+        if type(h.placed_by) is not HoldRole:
+            raise RetentionError("hold_role", safe_repr(h.placed_by))
+        _id(h.principal_id, "principal_id")
         if not h.classes or not all(type(c) is RetentionClass for c in h.classes):
             raise RetentionError("hold_scope", "name the classes held")
         for r in h.record_ids:
@@ -306,9 +363,25 @@ class Holds:
             raise RetentionError("released", safe_repr(r.hold_id))
         if at < h.placed_at:
             raise RetentionError("time_order", format_instant(at))
+        self._approve(r.approvals)
         r = replace(r, released_at=at)
         self._events.append(r)
         return r
+
+    def _approve(self, approvals: object) -> None:
+        """Owner decision 22: both roles, two principals, two unused receipts.
+        Ids compare case-insensitively, so a case variant is not a second one."""
+        if (type(approvals) is not tuple or len(approvals) != 2
+                or not all(type(a) is Approval for a in approvals)
+                or {a.role for a in approvals} != set(HoldRole)):  # fmt: skip
+            raise RetentionError("release_approvals", "tenant owner and operator")
+        if len({a.principal_id.casefold() for a in approvals}) != 2:
+            raise RetentionError("distinct_principals", "two people release a hold")
+        used = {a.step_up_receipt_id.casefold() for e in self._events
+                if isinstance(e, HoldRelease) for a in e.approvals}  # fmt: skip
+        mine = {a.step_up_receipt_id.casefold() for a in approvals}
+        if len(mine) != 2 or mine & used:
+            raise RetentionError("step_up_reused", "one fresh receipt per party")
 
     def active(self, it: Item, at: datetime) -> LegalHold | None:
         live = []
