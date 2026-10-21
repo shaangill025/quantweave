@@ -21,9 +21,11 @@ limited), §17, R040, R059, R065, R084.
 - Baselines (buy-and-hold of a declared series with the same costs, or a declared
   per-period cash rate) are compared period by period with an excess-return interval.
 - Claims are structured (metric, direction, baseline) and carry instrument, dataset,
-  window, costs, interval and the ledger's trial count. No multiple-testing
-  adjustment is named by the spec, so significance is never claimed; train/development
-  evidence is capped at `limited`.
+  window, costs, interval and the ledger's trial count. Significance is never
+  claimed here; train/development evidence is capped at `limited`. Each trial
+  records the standard error and z behind its intervals (`ci_std_error`, `ci_z`,
+  `baseline.<id>.excess_std_error`), so the assessor can recompute a bound at a
+  Bonferroni-widened z (owner decision 35).
 LIMITATIONS: one instrument per evaluation; price series are caller-supplied, not
 yet part of the hashed dataset or its rights gate; no shorting, borrow, partial
 fills, volume limits or corporate actions; times are caller-supplied.
@@ -418,14 +420,16 @@ def _metrics(ev: Evaluation) -> dict[str, Decimal]:
     for k, v in (("volatility", s.volatility), ("sharpe_like", s.sharpe_like)):
         if v is not None:
             m[k] = v
-    if s.interval is not None:
+    if s.interval is not None:  # decision 35: the se and z behind every bound
         m["ci_lower"], m["ci_upper"] = s.interval.lower, s.interval.upper
+        m["ci_std_error"], m["ci_z"] = s.interval.std_error, s.interval.z
     for b in ev.baselines:  # recorded so a forged baseline comparison is caught
         k = f"baseline.{b.baseline.baseline_id}."
         m[k + "net_mean"], m[k + "excess_mean"] = b.summary.mean, b.excess.mean
         m[k + "total_cost"] = _total_cost(b.periods)
         if (i := b.excess.interval) is not None:
             m[k + "excess_ci_lower"], m[k + "excess_ci_upper"] = i.lower, i.upper
+            m[k + "excess_std_error"] = i.std_error
     return m
 
 

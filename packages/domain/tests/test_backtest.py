@@ -362,3 +362,27 @@ def test_long_cash_rate_is_rounded_once_and_still_claims() -> None:
                         {"px-synth-1": PX})  # fmt: skip
     assert out.evaluation is not None
     assert claim_for(out.evaluation, lg).trial_count == 1
+
+
+def test_trials_record_the_standard_error_and_z_behind_each_interval() -> None:
+    # Owner decision 35: the assessor recomputes the excess lower bound at a widened
+    # z, so the backtest records the Newey-West standard error and z it used.
+    # Excess over buy and hold is 0, -0.002, -0.002 (hand-computed test above): mean
+    # -0.004/3, deviations 1/750, -1/1500, -1/1500; gamma_0 = 1/1125000,
+    # gamma_1 = -1/6750000; lag 1 weight 1/2: long-run 1/1350000; var(mean) =
+    # 1/4050000, so se^2 * 4050000 = 1.
+    lg, out = record(scripted(["1", "0", "1", "0", "0"]))
+    m, ev = lg.trials()[0].metrics, out.evaluation
+    assert ev is not None
+    hold = ev.baselines[0]
+    k = "baseline.bl-hold."
+    se = m[k + "excess_std_error"]
+    # (to 1e-26: the sums run at 40 digits, and the mean -0.004/3 is rounded)
+    assert abs(CTX.multiply(CTX.multiply(se, se), D(4050000)) - 1) < D("1e-26")
+    assert hold.excess.interval is not None and se == hold.excess.interval.std_error
+    assert m[k + "excess_ci_lower"] == CTX.subtract(
+        m[k + "excess_mean"], CTX.multiply(Z95, se))  # fmt: skip
+    assert m["ci_z"] == Z95 and m["ci_std_error"] == ev.summary.interval.std_error  # type: ignore[union-attr]
+    c = "baseline.bl-cash."  # the second baseline too, bound for bound
+    assert m[c + "excess_ci_lower"] == CTX.subtract(
+        m[c + "excess_mean"], CTX.multiply(Z95, m[c + "excess_std_error"]))  # fmt: skip

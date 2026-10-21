@@ -60,3 +60,54 @@ def test_rejects_float_and_bad_domain() -> None:
         dm.ln(D(0))
     with pytest.raises(ValueError, match="negative"):
         dm.sqrt(D(-1))
+
+
+# Owner decision 35: the inverse normal for the Bonferroni-widened z. Oracles are
+# standard normal quantiles (published tables; scipy.stats.norm.ppf agrees to 1e-15).
+@pytest.mark.parametrize(
+    ("p", "expected"),
+    [
+        ("0.5", "0"),
+        ("0.9", "1.2815515655446004"),
+        ("0.95", "1.6448536269514722"),
+        ("0.975", "1.959963984540054"),
+        ("0.99", "2.3263478740408408"),
+        ("0.995", "2.5758293035489004"),
+        ("0.999", "3.090232306167813"),
+        ("0.9999", "3.719016485455681"),  # first written ...709 (a recall slip);
+        # the round trip below fixes Phi at it to 1e-30
+        ("0.025", "-1.959963984540054"),
+        ("0.001", "-3.090232306167813"),
+    ],
+)
+def test_norm_ppf_matches_known_quantiles(p: str, expected: str) -> None:
+    assert abs(dm.norm_ppf(D(p)) - D(expected)) < D("1e-14")
+
+
+def test_norm_ppf_inverts_norm_cdf_over_a_grid() -> None:
+    grid = [D("1e-12"), D("1e-6"), D("0.001"), D("0.02425"), D("0.0243"),
+            *(D(k) / 20 for k in range(1, 20)), D("0.97575"), D("0.999999"),
+            1 - D("1e-12")]  # fmt: skip
+    for p in grid:  # both region boundaries of the starting approximation
+        x = dm.norm_ppf(p)
+        assert abs(dm.norm_cdf(x) - p) < D("1e-30"), p
+        assert abs(x + dm.norm_ppf(1 - p)) < D("1e-28"), p  # symmetric
+    z = D("1.959963984540054")
+    assert abs(dm.norm_ppf(dm.norm_cdf(z)) - z) < D("1e-30")  # two-sided
+
+
+@given(st.decimals(min_value=D("0.0001"), max_value=D("0.9999"), places=6))
+@PROFILE
+def test_norm_ppf_round_trips_and_is_monotone(p: Decimal) -> None:
+    x = dm.norm_ppf(p)
+    assert abs(dm.norm_cdf(x) - p) < D("1e-30")
+    assert dm.norm_ppf(p + D("0.00001")) > x
+
+
+def test_norm_ppf_refuses_outside_the_open_unit_interval() -> None:
+    for p in (D(0), D(1), D("-0.1"), D("1.1"), D("1e-60"), 1 - D("1e-60")):
+        with pytest.raises(ValueError, match="norm_ppf"):
+            dm.norm_ppf(p)
+    for bad in (0.5, D("NaN")):
+        with pytest.raises(TypeError):
+            dm.norm_ppf(bad)  # type: ignore[arg-type]
