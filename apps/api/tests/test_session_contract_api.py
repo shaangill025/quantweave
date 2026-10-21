@@ -61,9 +61,6 @@ PREFIX = "/api/v1"  # openapi.yaml `servers`
 # `GET /health` is authenticated component health; a probe cannot carry a session,
 # so it cannot meet rule 6 (exactly sessionCookie) and is not amended.
 NOT_API = {("get", "/health/live"), ("head", "/health/live")}
-# `GET /policies` (listPolicies, T008 C-18) is documented by its owning task T019
-# (owner decision 27, 2026-10-21); it is not a session or membership route.
-OUTSIDE_DECISION_15 = {("get", "/policies")}
 MUTATIONS = {
     ("post", "/session", "createSession"),
     ("delete", "/session", "revokeSession"),
@@ -147,11 +144,12 @@ def request_errors(path: str, method: str, body: Any) -> list[str]:
 
 def test_every_served_route_is_documented_or_explicitly_excluded() -> None:
     missing = served() - documented()
-    unexpected = missing - NOT_API - OUTSIDE_DECISION_15
+    unexpected = missing - NOT_API
     assert not unexpected, f"served but not in the merged contract: {unexpected}"
-    stale = (NOT_API | OUTSIDE_DECISION_15) - missing
+    stale = NOT_API - missing  # listPolicies is documented (owner decision 27)
     assert not stale, f"listed as undocumented but documented or unserved: {stale}"
-    assert {("get", "/session"), ("get", "/memberships")} <= served() & documented()
+    reads = {("get", "/session"), ("get", "/memberships"), ("get", "/policies")}
+    assert reads <= served() & documented()
     listed = {(e["method"], e["path"], e["operationId"]) for e in PC.AMENDMENTS[
         "mutations"]}  # fmt: skip
     assert listed == MUTATIONS
