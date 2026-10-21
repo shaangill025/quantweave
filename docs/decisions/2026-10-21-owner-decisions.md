@@ -370,3 +370,30 @@ only; decision 25 settles how they meet the contract checker.
     it never claimed to beat. Not 'Claim's only': a claim with no baseline would
     skip the check."
     Implemented by: T044.
+
+## Seventh quiz (2026-10-21)
+
+38. **Delay for a solo self-approved install (decision 23).**
+    Question: "Decision 23 lets a one-operator self-hosted install install a release
+    its own operator signed, with two separate step-up verifications. Should it also
+    wait, like decision 31's 24-hour gap for releasing a legal hold?"
+    Selected label: "No delay (Recommended)".
+    Option text as presented: "Keep two distinct step-ups and the 'self-approved'
+    record. Why: installing a release only changes which version runs, and rollback
+    stays available. Releasing a hold allows permanent deletion, which is why it got
+    a delay. A wait here would slow your own upgrades with no recoverability gain.
+    Not '24-hour wait': it treats a reversible act like an irreversible one."
+    Implemented by: T051 (already the behaviour of PR #149; no change).
+
+39. **Next focus after the recorded decisions.**
+    Question: "All recorded owner decisions are now implemented. What should the next
+    wave of work focus on?"
+    Selected label: "Assessor-run promotions (Recommended)".
+    Option text as presented: "Build the missing path where the assessor itself runs
+    a strategy promotion evaluation on the holdout (today only caller-recorded
+    promotion trials exist), plus the assessor DB URL wiring. Why: the Bonferroni
+    rule, holdout-window refusal and retest chain only protect anything once the
+    assessor produces promotion trials itself. It's the biggest remaining gap in the
+    independent-evaluator scope. Not 'UI': a UI over a path that can't yet run would
+    show nothing real."
+    Implemented by: T044 with T033 and T037.
