@@ -222,3 +222,103 @@ only; decision 25 settles how they meet the contract checker.
     that should get the same review as every other read. Not 'both in': the health
     probe can't meet the session rules and doesn't need to."
     Implemented by: T019 (contract amendment for `GET /policies`).
+
+## Third and fourth quizzes (2026-10-21)
+
+28. **Scope of the used-holdout-window refusal (decision 18).**
+    Question: "Decision 18 refuses a new plan over an already-scored holdout window.
+    Within what scope? (A 'baseline' is the version a candidate is compared
+    against.)"
+    Selected label: "Tenant + target (Recommended)".
+    Option text as presented: "Any plan for the same tenant and improvement target
+    that overlaps a scored window is refused, whatever its baseline. Why:
+    otherwise, once v1 is promoted on window W, a new plan using v1 as baseline can
+    score on W again. That is the same 'keep testing until one scores well'
+    loophole decision 18 closes. The cost: every baseline of a target must use a
+    fresh window, which needs more data. Not 'Tenant + target + baseline': it
+    leaves that successor gap open."
+    Implemented by: T044.
+
+29. **Multiple-testing adjustment for the retest chain (decision 19).**
+    Question: "Decision 19 counts trials across a whole retest chain, but the spec
+    names no multiple-testing adjustment to apply them to. Today the count is
+    stored and shown as a limitation, and verdicts don't change. What should
+    happen?"
+    Selected label: "Bonferroni on promotion (Recommended)".
+    Option text as presented: "Divide the promotion test's significance level by
+    the chain-wide trial count (alpha / chain_trials) before a candidate can be
+    accepted. Why: Bonferroni is conservative and simple to audit, and it makes the
+    chain count actually change verdicts, which is decision 19's purpose. With few
+    trials it barely tightens the threshold; with many it forces a real edge. Not
+    'Holm or BH': stronger, but they need the full set of p-values across the
+    chain, which isn't stored. Not 'Report only': repeated testing can still slip
+    through."
+    Implemented by: T044.
+
+30. **Tombstone retention floor (decision 21).**
+    Question: "Decision 21 kept deletion tombstones for 7 years, but an operator's
+    config can shorten that to just above the 30-day backup window. Should 7 years
+    be a hard minimum?"
+    Selected label: "7-year floor (Recommended)".
+    Option text as presented: "Config may lengthen but never shorten tombstones
+    below 2557 days. Why: tombstones prove a deletion happened, for audits and
+    disputes, so a shorter period weakens that proof. Unlike decision 20, decision
+    21 didn't say the value stays adjustable. Not 'Adjustable': an operator could
+    quietly cut audit evidence."
+    Implemented by: T058.
+
+31. **Legal hold release on a one-person install (decision 22).**
+    Question: "Releasing a legal hold needs both the tenant owner and the operator,
+    as two different people. On a one-person self-hosted install you hold both
+    roles and could never release a hold. Allow a solo release?"
+    Selected label: "Solo opt-in, delayed (Recommended)".
+    Option text as presented: "Mirror decision 23: a self-hosted install with a
+    single configured operator can explicitly enable 'solo hold release'. A release
+    then needs two separate step-ups at least 24 hours apart, and is recorded as
+    solo. Why: one person must not be locked out of their own data forever, while
+    the delay stops an impulsive or hijacked-session release. Not 'Never': it
+    bricks deletion for the personal pilot. Not 'Plain solo': one compromised
+    session could destroy held evidence."
+    Implemented by: T058.
+
+32. **Derived `Exempts:` lines in decision 25.**
+    Question: "To tie the two contract exceptions to your decision 25, I added two
+    derived lines to it: `Exempts: unauthenticated_login (createSession)` and
+    `Exempts: no_content (revokeSession)`, plus a sentence saying they're my
+    derivation. Your quoted text is unchanged. The checker now treats these lines as
+    your approval. Do you confirm them?"
+    Selected label: "Confirm (Recommended)".
+    Option text as presented: "The two lines match exactly what your option text
+    approved: login without a session, logout's empty 204, and nothing else. Why:
+    the checker needs a machine-readable line to pin each exception to its one
+    operation, and the reviewer confirmed neither can be reused elsewhere. Not
+    'Reject': the exceptions would have no approval, and contract 0.9.0 couldn't
+    document login or logout."
+    Implemented by: T055 (the lines are added to decision 25 by the contract 0.9.0
+    pull request).
+
+33. **Releases before an installation-scope assessor store.**
+    Question: "Releases are checked against the assessor's verdict as supplied by
+    the caller, because no installation-wide assessor store exists yet (only a
+    per-tenant one). Until one exists, what should happen to new releases?"
+    Selected label: "Record, marked (Recommended)".
+    Option text as presented: "Keep recording releases, re-checked against the
+    caller's registry, and mark them 'verdict caller-supplied'. Why: nothing can be
+    deployed yet anyway, since signing uses test-only keys until the T009
+    dependency choice. Blocking now only stops testing the release path. The mark
+    keeps it honest. Not 'Refuse': it blocks development for no safety gain
+    today."
+    Implemented by: T051.
+
+34. **Reference and release data retention.**
+    Question: "Reference data (shared lookups like securities) and release evidence
+    (signed releases, installs, rollbacks) are kept indefinitely and never deleted
+    on request. These are implementer defaults; decision 20 didn't cover them.
+    Confirm?"
+    Selected label: "Confirm (Recommended)".
+    Option text as presented: "Why: reference data isn't personal, and release
+    evidence is the audit trail of what code ran; deleting either breaks
+    reproducibility. Neither holds personal content that 'keep only as long as
+    needed' targets. Not 'Expire': it would break rollback history and
+    reconciliation."
+    Implemented by: T058.
