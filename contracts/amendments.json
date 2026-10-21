@@ -1,5 +1,5 @@
 {
-  "version": "0.8.0",
+  "version": "0.9.0",
   "base": "docs/spec/contracts 0.1.0",
   "versions": {
     "0.2.0": {"decision": "Owner decision 2026-10-14 (T008 A-01; docs/receipts/T053-api.md)"},
@@ -8,10 +8,11 @@
     "0.5.0": {"decision": "Owner decision 2026-10-15 (docs/decisions/2026-10-15-owner-decisions.md)"},
     "0.6.0": {"decision": "Owner decisions 2026-10-20, 1 to 3 and 7 (the answer to Q7) (docs/decisions/2026-10-20-owner-decisions.md)"},
     "0.7.0": {"decision": "Owner decisions 2026-10-20, 5, 8, 10, 11 and 12 (answers to Q2, Q1, Q5, Q6 and Q8): the approval-classes read first, served only from real backing data (docs/decisions/2026-10-20-owner-decisions.md; shape: docs/decisions/2026-10-20-contract-0.6.0-read-proposals.md, Read C)"},
-    "0.8.0": {"decision": "Owner decisions 2026-10-21, 14 (the session cookie is documented as the __Host-pi_session the server sets) and 15 (the undocumented session and membership routes are documented; the read listMemberships here, each mutation only after its own owner-approved mutations entry; proposals: docs/decisions/2026-10-21-contract-0.8.0-session-mutation-proposals.md) (docs/decisions/2026-10-21-owner-decisions.md)"}
+    "0.8.0": {"decision": "Owner decisions 2026-10-21, 14 (the session cookie is documented as the __Host-pi_session the server sets) and 15 (the undocumented session and membership routes are documented; the read listMemberships here, each mutation only after its own owner-approved mutations entry; proposals: docs/decisions/2026-10-21-contract-0.8.0-session-mutation-proposals.md) (docs/decisions/2026-10-21-owner-decisions.md)"},
+    "0.9.0": {"decision": "Owner decisions 2026-10-21, 24 (createSession, revokeSession, stepUpSession and changeMembershipRole documented), 25 (per-operation sensitive_fields entries for password and X-CSRF-Token; the unauthenticated_login and no_content exemptions, only for those listed, approved operations) and 26 (the role change returns the stored display_name and reuses the list's Membership item) (docs/decisions/2026-10-21-owner-decisions.md; shapes: docs/decisions/2026-10-21-contract-0.8.0-session-mutation-proposals.md)"}
   },
   "about": "Project-owned contract (T008 A-01). docs/spec/contracts stays unchanged; tools/project_contract.py applies these amendments to its schemas and request bodies, and adds the new operations (operations) and schemas (new_schemas), refusing a path, operationId or schema name the contract already has. Unnamed schemas are the spec's. Consumers (apps/api tests, apps/web/src/api.ts guards) enforce the rule below; a null receipt or qualification never makes a proposal actionable.",
-  "changes": "0.2.0: fields no store holds yet become nullable (account, account_snapshot, proposal); snapshot gains ledger_cash (trade-date journal cash, not available cash) and coverage; pages gain the C-02 coverage; the active-proposal rule accepts a null final-check receipt or qualification. 0.3.0: claim and evidence gain coverage (withheld text, invalid citations and limitations are named there); claim material becomes nullable (no store records materiality). 0.4.0: proposal gains coverage (readProposal returns one proposal, so its nulls are named on the item; list items carry it too); ledger_event lot_policy_id becomes nullable (the journal stores a lot-policy name such as economic_average_cost/1, which is not a contract id; it is served in economic_annotations). 0.5.0: the request WatchlistEntry (addWatchlistEntry, updateWatchlistEntry) gains an optional, nullable review_at (RFC 3339 with an offset, normalized to UTC; on update, omitting it keeps the stored value); needs stays server-derived and is refused in requests. If-Match on every route: a stale or malformed value is 412 Precondition Failed and a required but missing one is 428 Precondition Required; this replaces the 409 that the OpenAPI If-Match descriptions name. 0.6.0: experiment gains coverage (readExperiment serves an incomplete or blocked record with its reasons instead of refusing it; list items carry it too); parent_optimizer_version is a string exactly when target is recursive_optimizer and null otherwise, named none:parent_optimizer_version; state gains blocked and insufficient_evidence (insufficient evidence is re-assessable while the plan's one holdout read is unused, checked against the ledger the assessor is given; failed is no longer derived for it). 0.7.0: GET /session (readSession) is documented exactly as T010 serves it; readApprovalClasses (GET /session/approval-classes) serves the caller's three approval classes, advisory only and never a grant: every action re-derives its own checks, no token or receipt is issued and no identity is served. Both are Cache-Control: no-store (the API sends no-store on every response). 0.8.0: the sessionCookie scheme's cookie name is __Host-pi_session (security_schemes; the __Host- prefix makes browsers require Secure and Path=/ and refuse a Domain). listMemberships (GET /memberships) is documented exactly as T010 serves it: any member reads the session tenant's memberships by user id, a C-02 page of at most 200 with an opaque, HMAC-bound cursor that expires after an hour. mutations is the owner-approved allowlist for amended mutating operations; it is empty, so login, logout, step-up and role change stay undocumented until each entry is approved.",
+  "changes": "0.2.0: fields no store holds yet become nullable (account, account_snapshot, proposal); snapshot gains ledger_cash (trade-date journal cash, not available cash) and coverage; pages gain the C-02 coverage; the active-proposal rule accepts a null final-check receipt or qualification. 0.3.0: claim and evidence gain coverage (withheld text, invalid citations and limitations are named there); claim material becomes nullable (no store records materiality). 0.4.0: proposal gains coverage (readProposal returns one proposal, so its nulls are named on the item; list items carry it too); ledger_event lot_policy_id becomes nullable (the journal stores a lot-policy name such as economic_average_cost/1, which is not a contract id; it is served in economic_annotations). 0.5.0: the request WatchlistEntry (addWatchlistEntry, updateWatchlistEntry) gains an optional, nullable review_at (RFC 3339 with an offset, normalized to UTC; on update, omitting it keeps the stored value); needs stays server-derived and is refused in requests. If-Match on every route: a stale or malformed value is 412 Precondition Failed and a required but missing one is 428 Precondition Required; this replaces the 409 that the OpenAPI If-Match descriptions name. 0.6.0: experiment gains coverage (readExperiment serves an incomplete or blocked record with its reasons instead of refusing it; list items carry it too); parent_optimizer_version is a string exactly when target is recursive_optimizer and null otherwise, named none:parent_optimizer_version; state gains blocked and insufficient_evidence (insufficient evidence is re-assessable while the plan's one holdout read is unused, checked against the ledger the assessor is given; failed is no longer derived for it). 0.7.0: GET /session (readSession) is documented exactly as T010 serves it; readApprovalClasses (GET /session/approval-classes) serves the caller's three approval classes, advisory only and never a grant: every action re-derives its own checks, no token or receipt is issued and no identity is served. Both are Cache-Control: no-store (the API sends no-store on every response). 0.8.0: the sessionCookie scheme's cookie name is __Host-pi_session (security_schemes; the __Host- prefix makes browsers require Secure and Path=/ and refuse a Domain). listMemberships (GET /memberships) is documented exactly as T010 serves it: any member reads the session tenant's memberships by user id, a C-02 page of at most 200 with an opaque, HMAC-bound cursor that expires after an hour. mutations is the owner-approved allowlist for amended mutating operations; it is empty, so login, logout, step-up and role change stay undocumented until each entry is approved. 0.9.0: createSession (POST /session, login), revokeSession (DELETE /session, logout), stepUpSession (POST /session/step-up) and changeMembershipRole (PATCH /memberships/{user_id}) are documented exactly as T010 serves them, each with a mutations entry citing decision 24. Login is unauthenticated (security []; no CSRF token or Idempotency-Key exists before a session) and logout is 204 with no body, through the unauthenticated_login and no_content exemptions on those two entries only (decision 25). The role change returns the stored display_name, so it reuses the list's Membership item (decision 26).",
   "rule": "A null in an amended field must be named in the response coverage.reasons as unavailable:<field>, unavailable:<id>/<field>, unknown:<field>, none:<field> or none:<id>/<field>. Item coverage reasons are <kind>:<detail>; page reasons are <kind>:<id>/<detail>.",
   "schemas": {
     "account": {
@@ -70,7 +71,14 @@
   "security_schemes": {
     "sessionCookie": {"name": "__Host-pi_session"}
   },
-  "mutations": [],
+  "mutations": [
+    {"method": "post", "path": "/session", "operationId": "createSession", "decision": "2026-10-21#24",
+     "exemptions": [{"name": "unauthenticated_login", "decision": "2026-10-21#25"}]},
+    {"method": "delete", "path": "/session", "operationId": "revokeSession", "decision": "2026-10-21#24",
+     "exemptions": [{"name": "no_content", "decision": "2026-10-21#25"}]},
+    {"method": "post", "path": "/session/step-up", "operationId": "stepUpSession", "decision": "2026-10-21#24"},
+    {"method": "patch", "path": "/memberships/{user_id}", "operationId": "changeMembershipRole", "decision": "2026-10-21#24"}
+  ],
   "operations": {
     "/memberships": {
       "get": {
@@ -95,7 +103,92 @@
         }
       }
     },
+    "/session/step-up": {
+      "post": {
+        "operationId": "stepUpSession",
+        "summary": "Re-authenticate the caller's session (step-up)",
+        "description": "Verifies the caller's password again and records step_up_at on the session (T010); owner actions accept it for the step-up window (10 minutes by default). Throttled per address, then per account (429 too_many_attempts with Retry-After). The idempotency payload binds the session but not the password: a same-key retry on the same session replays the recorded step_up_at without verifying again.",
+        "security": [{"sessionCookie": []}],
+        "parameters": [{"name": "Idempotency-Key", "in": "header", "required": true, "schema": {"type": "string", "pattern": "^[A-Za-z0-9_-]{16,128}$"}, "description": "C-03: a same-key retry with the same payload replays the stored response; another payload, session or principal is 409 idempotency_key_reused; a malformed key is 400 invalid_idempotency_key."},
+          {"name": "X-CSRF-Token", "in": "header", "required": true, "schema": {"type": "string", "pattern": "^[a-f0-9]{64}$"}, "description": "The session's csrf_token (readSession); missing or wrong is 403 csrf_failed."}],
+        "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "additionalProperties": false, "required": ["password"], "properties": {"password": {"type": "string", "minLength": 1, "maxLength": 1024}}}}}},
+        "responses": {
+          "200": {
+            "description": "Success.",
+            "headers": {"Cache-Control": {"schema": {"type": "string", "const": "no-store"}}},
+            "content": {"application/json": {"schema": {"$ref": "#/components/schemas/step_up"}}}
+          },
+          "default": {
+            "description": "Typed validation, authorization, conflict, capacity or dependency failure; never a synthetic success. 403 reauthentication_failed, 401 unauthenticated, 403 csrf_failed or origin_rejected, 409 idempotency_key_reused, 429 too_many_attempts, 400 invalid_request or invalid_idempotency_key.",
+            "content": {"application/problem+json": {"schema": {"$ref": "#/components/schemas/Problem"}}}
+          }
+        }
+      }
+    },
+    "/memberships/{user_id}": {
+      "patch": {
+        "operationId": "changeMembershipRole",
+        "summary": "Change a membership's role",
+        "description": "Requires the tenant_owner role and a step-up within the window (401 step_up_required). The owners are locked, a demoted actor is 403 forbidden, promoting oneself is 403 self_promotion and removing the last owner is 409 last_owner. A foreign or unknown user_id is the same 404 not_found. Audited with the session actor. The response is the stored membership, the list's item (decision 26), with ETag \"N\".",
+        "security": [{"sessionCookie": []}],
+        "parameters": [
+          {"name": "user_id", "in": "path", "required": true, "schema": {"type": "string", "format": "uuid"}},
+          {"name": "Idempotency-Key", "in": "header", "required": true, "schema": {"type": "string", "pattern": "^[A-Za-z0-9_-]{16,128}$"}, "description": "C-03: a same-key retry with the same payload replays the stored response; another payload, session or principal is 409 idempotency_key_reused; a malformed key is 400 invalid_idempotency_key."},
+          {"name": "X-CSRF-Token", "in": "header", "required": true, "schema": {"type": "string", "pattern": "^[a-f0-9]{64}$"}, "description": "The session's csrf_token (readSession); missing or wrong is 403 csrf_failed."},
+          {"name": "If-Match", "in": "header", "required": true, "schema": {"type": "string"}, "description": "Exactly \"N\", the membership version: missing is 428 if_match_required, anything else or stale is 412 version_mismatch."}
+        ],
+        "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "additionalProperties": false, "required": ["role"], "properties": {"role": {"type": "string", "enum": ["tenant_owner", "tenant_member"]}}}}}},
+        "responses": {
+          "200": {
+            "description": "Success.",
+            "headers": {"Cache-Control": {"schema": {"type": "string", "const": "no-store"}}, "ETag": {"schema": {"type": "string", "pattern": "^\"[1-9][0-9]*\"$"}}},
+            "content": {"application/json": {"schema": {"$ref": "#/components/schemas/Membership"}}}
+          },
+          "default": {
+            "description": "Typed validation, authorization, conflict, capacity or dependency failure; never a synthetic success. 401 unauthenticated or step_up_required, 403 forbidden, self_promotion, csrf_failed or origin_rejected, 404 not_found, 409 last_owner or idempotency_key_reused, 412 version_mismatch, 428 if_match_required, 400 invalid_request or invalid_idempotency_key.",
+            "content": {"application/problem+json": {"schema": {"$ref": "#/components/schemas/Problem"}}}
+          }
+        }
+      }
+    },
     "/session": {
+      "post": {
+        "operationId": "createSession",
+        "summary": "Log in",
+        "description": "Unauthenticated (decision 25, unauthenticated_login): no session, CSRF token or Idempotency-Key exists before login; the Origin/Referer allowlist still applies. The per-address, then per-account, throttle runs first (429 too_many_attempts with Retry-After). A wrong password and an unknown login get the same 401 invalid_credentials. The new session token is only in the Set-Cookie __Host-pi_session (HttpOnly, Secure, SameSite=Strict, Path=/, no Domain); the body is the readSession view.",
+        "security": [],
+        "parameters": [],
+        "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "additionalProperties": false, "required": ["login", "password"], "properties": {"login": {"type": "string", "pattern": "^[a-z0-9][a-z0-9._@-]{0,127}$"}, "password": {"type": "string", "minLength": 1, "maxLength": 1024}}}}}},
+        "responses": {
+          "201": {
+            "description": "Created.",
+            "headers": {"Cache-Control": {"schema": {"type": "string", "const": "no-store"}}, "Set-Cookie": {"schema": {"type": "string"}, "description": "__Host-pi_session=<session token>; HttpOnly; Max-Age=<session TTL>; Path=/; SameSite=strict; Secure."}},
+            "content": {"application/json": {"schema": {"$ref": "#/components/schemas/session"}}}
+          },
+          "default": {
+            "description": "Typed validation, authorization, conflict, capacity or dependency failure; never a synthetic success. 401 invalid_credentials, 429 too_many_attempts, 403 origin_rejected, 413 payload_too_large, 400 invalid_request.",
+            "content": {"application/problem+json": {"schema": {"$ref": "#/components/schemas/Problem"}}}
+          }
+        }
+      },
+      "delete": {
+        "operationId": "revokeSession",
+        "summary": "Log out",
+        "description": "Revokes the caller's session and clears the cookie (decision 25, no_content). Audited. A retry after success is 401 unauthenticated: the session check runs before the idempotency replay.",
+        "security": [{"sessionCookie": []}],
+        "parameters": [{"name": "Idempotency-Key", "in": "header", "required": true, "schema": {"type": "string", "pattern": "^[A-Za-z0-9_-]{16,128}$"}, "description": "C-03: a same-key retry with the same payload replays the stored response; another payload, session or principal is 409 idempotency_key_reused; a malformed key is 400 invalid_idempotency_key."},
+          {"name": "X-CSRF-Token", "in": "header", "required": true, "schema": {"type": "string", "pattern": "^[a-f0-9]{64}$"}, "description": "The session's csrf_token (readSession); missing or wrong is 403 csrf_failed."}],
+        "responses": {
+          "204": {
+            "description": "Revoked; no body.",
+            "headers": {"Cache-Control": {"schema": {"type": "string", "const": "no-store"}}, "Set-Cookie": {"schema": {"type": "string"}, "description": "__Host-pi_session=\"\"; HttpOnly; Max-Age=0; Path=/; SameSite=strict; Secure (clears the cookie)."}}
+          },
+          "default": {
+            "description": "Typed validation, authorization, conflict, capacity or dependency failure; never a synthetic success. 401 unauthenticated, 403 csrf_failed or origin_rejected, 400 invalid_idempotency_key.",
+            "content": {"application/problem+json": {"schema": {"$ref": "#/components/schemas/Problem"}}}
+          }
+        }
+      },
       "get": {
         "operationId": "readSession",
         "summary": "Read the caller's own session",
@@ -137,6 +230,14 @@
     }
   },
   "new_schemas": {
+    "step_up": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "title": "Step-up",
+      "type": "object",
+      "properties": {"step_up_at": {"$ref": "common.schema.json#/$defs/Timestamp"}},
+      "required": ["step_up_at"],
+      "additionalProperties": false
+    },
     "membershipPage": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "title": "Membership page",
@@ -235,7 +336,12 @@
     }
   },
   "sensitive_fields": [
-    {"schema": "session", "field": "/properties/csrf_token", "decision": "Owner decision 2026-10-21 (csrf_token documented): decision 13, docs/decisions/2026-10-21-owner-decisions.md. The X-CSRF-Token value is served to the logged-in caller by GET /session (no-store); it is useful only with the HttpOnly session cookie (double-submit)."}
+    {"schema": "session", "field": "/properties/csrf_token", "decision": "Owner decision 2026-10-21 (csrf_token documented): decision 13, docs/decisions/2026-10-21-owner-decisions.md. The X-CSRF-Token value is served to the logged-in caller by GET /session (no-store); it is useful only with the HttpOnly session cookie (double-submit)."},
+    {"schema": "operation /session", "field": "/post/requestBody/content/application/json/schema/properties/password", "decision": "Owner decision 2026-10-21 decision 25 (per-operation entry for decision 24's createSession): the login password, request only; never stored or echoed (argon2id verifier)."},
+    {"schema": "operation /session/step-up", "field": "/post/requestBody/content/application/json/schema/properties/password", "decision": "Owner decision 2026-10-21 decision 25 (per-operation entry for decision 24's stepUpSession): the re-authentication password, request only; excluded from the idempotency payload."},
+    {"schema": "operation /session", "field": "/delete/parameters/1 parameter X-CSRF-Token", "decision": "Owner decision 2026-10-21 decision 25 (per-operation entry for decision 24's revokeSession): the rule-2 CSRF header (HMAC of the session token)."},
+    {"schema": "operation /session/step-up", "field": "/post/parameters/1 parameter X-CSRF-Token", "decision": "Owner decision 2026-10-21 decision 25 (per-operation entry for decision 24's stepUpSession): the rule-2 CSRF header (HMAC of the session token)."},
+    {"schema": "operation /memberships/{user_id}", "field": "/patch/parameters/2 parameter X-CSRF-Token", "decision": "Owner decision 2026-10-21 decision 25 (per-operation entry for decision 24's changeMembershipRole): the rule-2 CSRF header (HMAC of the session token)."}
   ],
   "page": {
     "add": {"coverage": {"$ref": "#/$defs/Coverage"}}

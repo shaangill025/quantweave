@@ -335,7 +335,8 @@ def test_role_change_needs_owner_and_recent_step_up(world: World) -> None:
     response = patch_role(world.client, bob, "tenant_owner")
     assert response.status_code == 200, response.text
     assert response.json() == {"user_id": str(bob), "role": "tenant_owner",
-                               "version": 2, "display_name": None}  # fmt: skip
+                               "version": 2,
+                               "display_name": "SYNTHETIC bob"}  # fmt: skip
     assert response.headers["etag"] == '"2"'
     [(tenant, actor, target, cid)] = audit(world, "membership.role_changed")
     assert (tenant, actor, target) == (world.tenant_a, world.users["alice"], bob)

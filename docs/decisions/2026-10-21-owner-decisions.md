@@ -193,6 +193,11 @@ only; decision 25 settles how they meet the contract checker.
     logout and an unauthenticated login are correct HTTP, and changing them breaks
     the UI for no security gain. Not 'blanket exemption': it would weaken the checker
     for future routes."
+    The two `Exempts:` lines below are the orchestrator's derivation from the
+    selected option ("For login's `security: []` and missing headers, and logout's
+    204"); the quoted question and option text above are unchanged.
+    Exempts: `unauthenticated_login` (`createSession`)
+    Exempts: `no_content` (`revokeSession`)
     Implemented by: T055 (`tools/check_contracts.py` rules 2, 6 and 7).
 
 26. **`display_name` in the role-change response.**

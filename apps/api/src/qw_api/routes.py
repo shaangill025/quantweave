@@ -63,7 +63,7 @@ class MemberView(BaseModel):
     user_id: uuid.UUID
     role: Role
     version: int
-    display_name: str | None = None
+    display_name: str  # stored, 1 to 200 characters (decision 26, 2026-10-21)
 
 
 class Coverage(BaseModel):
@@ -367,8 +367,12 @@ def change_role(
         updated = tenancy.set_member_role(tx, user_id, new_role, target.version)
         if updated is None:
             raise ApiError(412, "version_mismatch", "The membership has changed.")
+        name = tenancy.get_display_name(tx, user_id)
+        if name is None:  # the membership's foreign key makes this unreachable
+            raise ApiError(404, "not_found", "No such membership.")
         _audit(tx, request, "membership.role_changed", actor, user_id)
-        view = MemberView(user_id=user_id, role=new_role.value, version=updated.version)
+        view = MemberView(user_id=user_id, role=new_role.value,
+                          version=updated.version, display_name=name)  # fmt: skip
         return 200, view.model_dump_json().encode()
 
     payload = {"if_match": if_match, "body": body.model_dump(mode="json")}

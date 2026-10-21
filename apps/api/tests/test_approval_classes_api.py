@@ -322,7 +322,11 @@ def test_amendment_tooling_is_idempotent_and_fails_closed(
         for p in ("/session", "/session/approval-classes")
     }
     assert ops == {
-        "/session": {"get": "readSession"},
+        "/session": {  # 0.9.0 adds login and logout (owner decision 24)
+            "get": "readSession",
+            "post": "createSession",
+            "delete": "revokeSession",
+        },
         "/session/approval-classes": {"get": "readApprovalClasses"},
     }
     with pytest.raises(ValueError, match="path already in the contract"):
