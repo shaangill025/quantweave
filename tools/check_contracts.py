@@ -699,9 +699,11 @@ def check_operations(
     problem = {"$ref": "#/components/schemas/Problem"}
     prefix = "#/components/schemas/"
     for path, item in amendments.get("operations", {}).items():
+        merged = api["paths"].get(path, {})  # a spec path's own parameters too
         errors += _parameters(
-            api, f"project contract {path}", item.get("parameters", [])
-        )
+            api, f"project contract {path}",
+            item.get("parameters") or merged.get("parameters", []),
+        )  # fmt: skip
         for method, op in item.items():
             where = f"project contract {method.upper()} {path}"
             if method in PATH_FIELDS:
@@ -1170,6 +1172,7 @@ def self_test(api: Json, schemas: dict[str, Json], examples: dict[str, Json]) ->
         "allOf": [{"$ref": "common.schema.json#/$defs/Problem"}],
     }
     SC, real = ("security_schemes",), pc.AMENDMENTS["mutations"]
+    PI = ("new_schemas", "policyPage", "properties", "items", "items")
     mut = {"method": "post", "path": "/session/approval-classes",
            "operationId": "noteViewed", "decision": "2026-10-21#15"}  # fmt: skip
     held = (
@@ -1287,6 +1290,24 @@ def self_test(api: Json, schemas: dict[str, Json], examples: dict[str, Json]) ->
         ("3xx response key", RS, "302", ok2, "response key '302' refused"),
         ("1xx response key", RS, "100", ok2, "response key '100' refused"),
         ("204 response key", RS, "204", ok2, "response key '204' refused"),
+        ("path-level field on a spec path", ("operations", "/policies"), "summary",
+         "x", "path already in the contract with ['summary']"),
+        ("method already on the spec path", ("operations", "/policies"), "post",
+         get | {"operationId": "proposePolicy2"}, "path already in the contract with ['post']"),
+        ("new schema $ref: missing spec file", PI, "$ref", "policies.schema.json", "refused (only"),
+        ("new schema $ref: parent openapi.yaml", PI, "$ref", "../openapi.yaml", "refused (only"),
+        ("new schema $ref: absolute path", PI, "$ref", "/etc/passwd", "refused (only"),
+        ("new schema $ref: https URL", PI, "$ref", "https://example.com/policy.schema.json", "refused (only"),
+        ("new schema $ref: wrong-case spec file", PI, "$ref", "Policy.schema.json", "refused (only"),
+        ("new schema $ref: dangling policy fragment", PI, "$ref", "policy.schema.json#/properties/nope", "refused (only"),
+        ("new schema $ref: dangling common fragment", PI, "$ref", "common.schema.json#/$defs/Nope", "refused (only"),
+        ("new schema $ref: bare root ref", PI, "$ref", "#", "refused (only"),
+        ("new schema $ref: dangling local $defs", PI, "$ref", "#/$defs/Nope", "refused (only"),
+        ("new schema $ref: local non-$defs ref", PI, "$ref", "#/properties/items", "refused (only"),
+        ("all_of list $ref outside the contract", ("schemas", "experiment"),
+         "all_of", [{"$ref": "/etc/passwd"}], "refused (only"),
+        ("amended add $ref outside the contract", ("schemas", "claim", "add",
+         "coverage"), "$ref", "https://example.com/c.json", "refused (only"),
         ("cookie without __Host-", SC, "sessionCookie", {"name": "pi_session2"},
          "sessionCookie.name is not __Host-pi_session (decision 14)"),
         ("other __Host- cookie name", SC, "sessionCookie", {"name": "__Host-other"},
@@ -1416,6 +1437,14 @@ def self_test(api: Json, schemas: dict[str, Json], examples: dict[str, Json]) ->
             "type": "apiKey", "in": "header", "name": "X-Service-Key"}}}, GET,
             "security", [{"serviceKey": []}]), "no session security"),
     }  # fmt: skip
+
+    def spec_path_tenant(a: Json, m: Json) -> None:
+        a["paths"]["/policies"]["parameters"] = [q | {"name": "tenant_id"}]
+
+    api_cases["spec path-level tenant parameter"] = (
+        spec_path_tenant,
+        "project contract /policies: tenant parameter tenant_id",
+    )
     failures = 0
     baseline = guarded(run_checks, api, schemas, examples)
     if baseline:

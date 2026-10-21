@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Project contract 0.9.0 (T008 A-01): the docs/spec/contracts 0.1.0 schemas with the
+"""Project contract 0.10.0 (T008 A-01): the docs/spec/contracts 0.1.0 schemas with the
 amendments of contracts/amendments.json applied (all owner decisions: see `versions`
 there). docs/spec is never edited; this derives the amended schemas in memory.
 
@@ -13,9 +13,13 @@ there). docs/spec is never edited; this derives the amended schemas in memory.
   `common.schema.json`, `#/$defs/Coverage` added); a name the contract already has
   (schema file, openapi component or amended schema) is refused.
 - `operations`: openapi path items the spec lacks; `openapi()` adds them, and the
-  new schemas as components, to a copy of openapi.yaml. A path already in the
-  contract, a missing operationId or one already used is refused. Each call starts
-  again from the unmodified base, so applying twice gives the same document.
+  new schemas as components, to a copy of openapi.yaml. On a path the spec already
+  has, only new methods may be added (no path-level fields; the spec's own
+  operations stay as they are); a method already there, a missing operationId or
+  one already used is refused. Each call starts again from the unmodified base, so
+  applying twice gives the same document.
+- New schemas may reference the spec's schema files (`policy.schema.json`); a ref
+  to a file the spec does not have is refused.
 - `security_schemes`: only the `sessionCookie` apiKey-in-cookie scheme's `name`, and
   only to exactly `__Host-pi_session` (owner decision 14, 2026-10-21);
   `openapi()` applies it. Anything else, or a name already in place, is refused.
@@ -38,6 +42,7 @@ from __future__ import annotations
 import copy
 import functools
 import json
+import re
 from pathlib import Path
 from typing import Any
 
@@ -55,6 +60,50 @@ def _null(prop: dict[str, Any]) -> dict[str, Any]:
     return {"anyOf": [prop, {"type": "null"}]}
 
 
+def _resolves(doc: Any, fragment: str) -> bool:
+    """A JSON-pointer fragment (`/a/b`, `~0`/`~1` escapes; empty is the root)."""
+    if fragment and not fragment.startswith("/"):
+        return False
+    for part in fragment.split("/")[1:] if fragment else []:
+        part = part.replace("~1", "/").replace("~0", "~")
+        if isinstance(doc, dict) and part in doc:
+            doc = doc[part]
+        elif isinstance(doc, list) and part.isdigit() and int(part) < len(doc):
+            doc = doc[int(part)]
+        else:
+            return False
+    return True
+
+
+def _refs(node: Any, local: dict[str, Any], where: str) -> None:
+    """Every `$ref` an amendment schema holds is `#/$defs/...` in `local`,
+    `common.schema.json#...` or another existing spec `*.schema.json` file (exact
+    name), and its fragment resolves in the target; anything else is refused."""
+    if isinstance(node, dict):
+        if "$ref" in node:
+            ref = node["$ref"]
+            file, _, fragment = (
+                ref.partition("#") if isinstance(ref, str) else ("?", "", "")
+            )
+            if file:
+                ok = file in SPEC_FILES and _resolves(
+                    _load(file[: -len(".schema.json")]), fragment
+                )
+            else:
+                ok = fragment.startswith("/$defs/") and _resolves(local, fragment)
+            if not ok:
+                raise ValueError(
+                    f"{where}: $ref {ref!r} refused (only #/$defs/..., "
+                    "common.schema.json#... or an existing spec *.schema.json "
+                    "file, with a fragment that resolves)"
+                )
+        for sub in node.values():
+            _refs(sub, local, where)
+    elif isinstance(node, list):
+        for sub in node:
+            _refs(sub, local, where)
+
+
 def _new_schema(name: str) -> dict[str, Any]:
     taken = (SPEC / f"{name}.schema.json").exists() or name in AMENDMENTS["schemas"]
     if taken or name in _openapi()["components"]["schemas"] or name == "Coverage":
@@ -62,6 +111,7 @@ def _new_schema(name: str) -> dict[str, Any]:
     s: dict[str, Any] = copy.deepcopy(AMENDMENTS["new_schemas"][name])
     s.setdefault("$defs", {})["Coverage"] = copy.deepcopy(AMENDMENTS["Coverage"])
     s["title"] = f"{s['title']} (project contract {AMENDMENTS['version']})"
+    _refs(s, s, f"new schema {name}")
     return s
 
 
@@ -95,6 +145,7 @@ def schema(name: str) -> dict[str, Any]:
             if key in then:
                 then[key] = _null(then[key])
     s["title"] = f"{s['title']} (project contract {AMENDMENTS['version']})"
+    _refs(s, s, f"schema {name}")
     return s
 
 
@@ -120,7 +171,9 @@ def _spec_refs(node: Any) -> Any:
     if isinstance(node, dict):
         out = {k: _spec_refs(v) for k, v in node.items() if k != "$defs"}
         ref = node.get("$ref")
-        if isinstance(ref, str) and ref.startswith("common.schema.json"):
+        if isinstance(ref, str) and SCHEMA_FILE.match(ref):
+            if not (SPEC / ref.split("#")[0]).is_file():
+                raise ValueError(f"{ref}: no such spec schema file")
             out["$ref"] = f"./schemas/{ref}"
         elif ref == "#/$defs/Coverage":
             out["$ref"] = "#/components/schemas/Coverage"
@@ -131,6 +184,8 @@ def _spec_refs(node: Any) -> Any:
 
 
 METHODS = frozenset({"get", "put", "post", "delete", "patch", "head", "options"})
+SPEC_FILES = frozenset(p.name for p in SPEC.glob("*.schema.json"))
+SCHEMA_FILE = re.compile(r"[a-z_]+\.schema\.json(#|$)")  # a spec schema file ref
 SESSION_COOKIE_NAME = "__Host-pi_session"  # owner decision 14, 2026-10-21
 
 
@@ -140,14 +195,20 @@ def openapi(base: dict[str, Any] | None = None) -> dict[str, Any]:
     used = {op.get("operationId") for item in api["paths"].values()
             for m, op in item.items() if m in METHODS}  # fmt: skip
     for path, item in AMENDMENTS.get("operations", {}).items():
-        if path in api["paths"]:
-            raise ValueError(f"{path}: path already in the contract")
+        spec_item = api["paths"].get(path)
+        clash = (
+            set(item) & set(spec_item) or set(item) - METHODS if spec_item else set()
+        )
+        if clash:  # a spec path takes new methods only
+            raise ValueError(
+                f"{path}: path already in the contract with {sorted(clash)}"
+            )
         for method, op in item.items():
             op_id = op.get("operationId") if method in METHODS else None
             if not isinstance(op_id, str) or not op_id or op_id in used:
                 raise ValueError(f"{method} {path}: operationId missing or used")
             used.add(op_id)
-        api["paths"][path] = copy.deepcopy(item)
+        api["paths"].setdefault(path, {}).update(copy.deepcopy(item))
     schemes = api["components"].get("securitySchemes", {})
     for key, change in AMENDMENTS.get("security_schemes", {}).items():
         scheme, name = schemes.get(key), change.get("name")
@@ -178,12 +239,14 @@ def request(name: str) -> dict[str, Any]:
     for key, prop in AMENDMENTS["requests"].get(name, {}).get("optional", {}).items():
         if key in s["properties"]:
             raise ValueError(f"{name}.{key} is already in the request")
+        _refs(prop, s, f"request {name}.{key}")
         s["properties"][key] = prop
     s["title"] = f"{name} (project contract {AMENDMENTS['version']})"
     return s
 
 
 def page(name: str) -> dict[str, Any]:
+    _refs(AMENDMENTS["page"]["add"], {"$defs": {"Coverage": {}}}, "page")
     return {
         "type": "object",
         "$defs": {"Coverage": AMENDMENTS["Coverage"]},
