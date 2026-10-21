@@ -14,7 +14,10 @@ when there is any. The page repeats them as `<kind>:<id>/<detail>` (at most 300
 characters). readExperiment serves a blocked or incomplete record with its reasons;
 records stored under 0.5.0 are served as stored (`failed`,
 `unavailable:parent_optimizer_version`). Revisions failing checks are 409
-`integrity`."""
+`integrity`. Project contract 0.11.0 (owner decision 19): `retest_of` is the
+revision's copy of its frozen protocol's link, the same tenant's experiment it
+re-tests, or null, named `none:retest_of` (added here, never stored); qw_app reads
+no assessor table."""
 
 from __future__ import annotations
 
@@ -45,19 +48,26 @@ def _call[T](fn: Callable[[], T]) -> T:
         raise ApiError(409, "integrity", "Stored experiments failed checks.") from None
 
 
+def _why(rec: ExperimentRecord) -> list[str]:
+    """The stored reasons, and `none:retest_of` when there is no lineage link."""
+    return sorted({*rec.reasons, *(["none:retest_of"] if rec.retest_of is None
+                                   else [])})  # fmt: skip
+
+
 def wire(rec: ExperimentRecord) -> dict[str, Any]:
     body = {k: v for k, v in rec.wire().items() if k not in _INTERNAL}
-    return {"id": rec.experiment_id, **body, "evaluation_receipt_ids": [],
-            "next_cycle_run_id": None,
+    why = _why(rec)
+    return {"id": rec.experiment_id, **body, "retest_of": rec.retest_of,
+            "evaluation_receipt_ids": [], "next_cycle_run_id": None,
             "requires_human_promotion": rec.requires_human_promotion,
-            "release_receipt_id": None, "coverage": {
-                "status": "partial" if rec.reasons else "complete",
-                "reasons": list(rec.reasons)}}  # fmt: skip
+            "release_receipt_id": None,
+            "coverage": {"status": "partial" if why else "complete",
+                         "reasons": why}}  # fmt: skip
 
 
 def reasons(rec: ExperimentRecord) -> list[str]:
     return [f"{kind}:{rec.experiment_id}/{detail}"
-            for kind, detail in (r.split(":", 1) for r in rec.reasons)]  # fmt: skip
+            for kind, detail in (r.split(":", 1) for r in _why(rec))]  # fmt: skip
 
 
 @router.get("/experiments")

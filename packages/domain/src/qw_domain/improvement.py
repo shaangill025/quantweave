@@ -915,8 +915,17 @@ class ExperimentRecord:
     verdict_id: str | None
     decision: Decision | None
     reasons: tuple[str, ...]
+    # Owner decision 19: the frozen protocol's link, copied by `derive` (contract
+    # 0.11.0); out of the wire when absent, so stored revision hashes are unchanged.
+    retest_of: str | None = None
 
     def __post_init__(self) -> None:
+        if self.retest_of is not None:
+            _id(self.retest_of, "retest_of")
+            if self.retest_of == self.experiment_id:
+                raise ImprovementError(
+                    "retest_of", "an experiment never re-tests itself"
+                )
         for n in ("experiment_id", "scope_id", "baseline_version", "candidate_version",
                   "protected_assessor_version", "budget_reservation_id",
                   "sandbox_profile_id"):  # fmt: skip
@@ -1016,10 +1025,13 @@ class ExperimentRecord:
         )  # fmt: skip
 
     def wire(self) -> dict[str, object]:
-        """Plain values: enums as their values, tuples as lists."""
+        """Plain values: enums as their values, tuples as lists; `retest_of` only
+        when set."""
         out: dict[str, object] = {}
         for f in fields(self):
             v = getattr(self, f.name)
+            if f.name == "retest_of" and v is None:
+                continue
             out[f.name] = list(v) if isinstance(v, tuple) else (
                 v.value if isinstance(v, StrEnum) else v)  # fmt: skip
         return out
@@ -1106,4 +1118,5 @@ def derive(
         c.candidate_id, p.hypothesis, p.content_hash, p.assessor.version,
         (plan.dataset.dataset_id,), p.budget_reservation_id, p.sandbox_profile_id,
         c.artifact_hash, optimizer, None if v is None else v.verdict_id,
-        None if v is None else v.decision, tuple(sorted(lim))), v  # fmt: skip
+        None if v is None else v.decision, tuple(sorted(lim)),
+        p.retest_of), v  # fmt: skip
