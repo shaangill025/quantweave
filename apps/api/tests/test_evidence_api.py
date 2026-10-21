@@ -12,10 +12,13 @@ relative to it (`clock_relative`): no expectation depends on the calendar date."
 from __future__ import annotations
 
 import importlib.util
+import json
+import re
 import sys
 import uuid
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -44,6 +47,7 @@ ev = _module("qw_estore_tests",
 rs_tests = _module("qw_rstore_tests",
                    ROOT / "packages/adapters/tests/test_rights_store.py")  # fmt: skip
 research = importlib.import_module("qw_api.research")
+app_module = importlib.import_module("qw_api.app")
 PC = _module("qw_project_contract", ROOT / "tools/project_contract.py")
 pg_admin_url, database_url, conn = api.pg_admin_url, api.database_url, api.conn
 runtime_urls, app_conn, world = api.runtime_urls, api.app_conn, api.world
@@ -233,7 +237,16 @@ def test_claim_text_follows_display_rights_of_every_cited_source(
 
 
 @pytest.mark.db
-def test_a_tampered_store_is_a_crash_not_an_answer(world: Any, app_conn: Any) -> None:
+@pytest.mark.parametrize("seeded_cid", [None, "0999" * 8])
+def test_a_tampered_store_is_a_crash_not_an_answer(
+    world: Any, app_conn: Any, monkeypatch: pytest.MonkeyPatch, seeded_cid: str | None
+) -> None:
+    """The tampered value `999` appears in no field or header except the random
+    correlation id, which is 32 hex digits and may contain it by chance (seeded
+    here so that case is always exercised)."""
+    if seeded_cid is not None:
+        fixed = SimpleNamespace(token_hex=lambda n: seeded_cid)
+        monkeypatch.setattr(app_module, "secrets", fixed)
     ev.stored(app_conn, world.tenant_a)
     world.client.app.state.rights = lambda tx: ev.registry(str(world.tenant_a))
     world.db.execute("SET session_replication_role = replica")  # a tampering owner
@@ -242,8 +255,12 @@ def test_a_tampered_store_is_a_crash_not_an_answer(world: Any, app_conn: Any) ->
     login(world.client, "alice")
     for path in ("/api/v1/evidence/p-release", "/api/v1/claims/c-1"):
         got = world.client.get(path)
-        assert_problem(got, 500, "internal_error")
-        assert "999" not in got.text
+        body = assert_problem(got, 500, "internal_error")
+        cid = body.pop("correlation_id")
+        assert re.fullmatch(r"[0-9a-f]{32}", cid) and cid == (seeded_cid or cid)
+        assert "999" not in json.dumps(body)
+        assert not [v for k, v in got.headers.items()
+                    if k != "x-correlation-id" and "999" in v]  # fmt: skip
 
 
 @pytest.mark.db

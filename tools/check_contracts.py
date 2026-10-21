@@ -22,9 +22,23 @@ Artifact check only: it reads the designed contracts, not a running API.
 6. Every new operation (`operations`, merged into openapi.yaml by
    `project_contract.openapi`, which refuses a path, operationId or schema name the
    contract already has) passes rules 1 to 3 and the contract's conventions: session
-   security, a `default` Problem response, a 2xx JSON response naming a known
-   component, `Cache-Control: no-store` on that response (the API sends no-store on
-   every response) and no tenant parameter (the tenant comes from the session).
+   security (exactly `sessionCookie`); only the spec's response keys (200, 201, 202,
+   `default`); `default` exactly an `application/problem+json` Problem; every 2xx
+   exactly `application/json`, naming a known component that does not reach Problem
+   through `$ref` or allOf/oneOf/anyOf/if/then/else/not; `Cache-Control: no-store`
+   on each (the API sends no-store on every response); no `servers`; and no tenant
+   parameter (the tenant comes from the session; `$ref` and path-level parameters
+   resolved). Amendments add GET operations only: any other method is refused
+   outright, whatever its name, until an owner-approved mutation allowlist exists.
+   `check_shapes` runs first: every structural amendment key must be one a rule
+   reviews and every value the type the rules read, else the amendment is reported
+   and not applied. Any exception a rule still raises is reported as a crash.
+7. No name an amendment adds (property and patternProperties keys at any depth,
+   parameter and response header names, from every amendment source) looks like a
+   secret (token, secret, password, passwd, pwd, api key, private key, credential;
+   any case, `_` or `-`) unless `sensitive_fields` in amendments.json lists that
+   schema and JSON pointer with the decision that allows it; an unused or undecided
+   entry fails.
 
 Known limits: money fields are found by name (a field called `pnl`, `nav` or
 `premium` is not checked); timestamps are checked only in examples and only under keys
@@ -115,6 +129,32 @@ OFFSET_TS = re.compile(
     r"(\.\d{1,6})?(Z|\+([01]\d|2[0-3]):[0-5]\d|-(?!00:00)([01]\d|2[0-3]):[0-5]\d)$"
 )
 
+PATH_FIELDS = frozenset({"summary", "description", "servers", "parameters"})
+SESSION: list[dict[str, list[str]]] = [{"sessionCookie": []}]
+# The spec's six words plus passwd and pwd (owner decision 16, 2026-10-21); bearer
+# and jwt are not added (they overlap `token`).
+SECRET_NAME = re.compile(
+    r"token|secret|password|passwd|pwd|apikey|privatekey|credential"
+)
+# Every amendment key a rule reviews, with its type (`check_shapes`).
+TOP_KEYS: dict[str, type] = {
+    "version": str, "base": str, "versions": dict, "about": str, "changes": str,
+    "rule": str, "schemas": dict, "requests": dict, "operations": dict,
+    "new_schemas": dict, "sensitive_fields": list, "page": dict, "Coverage": dict,
+}  # fmt: skip
+# project_contract raises these on a malformed amendment: reported as a refusal.
+REFUSED = (KeyError, ValueError, TypeError, AttributeError, IndexError)
+OP_KEYS = frozenset({"operationId", "summary", "description", "security",
+                     "parameters", "requestBody", "responses"})  # fmt: skip
+PARAM_KEYS = frozenset({"name", "in", "required", "schema", "description"})
+HEADER_KEYS = frozenset({"schema", "description", "required"})
+RESPONSE_CODES = frozenset({"200", "201", "202", "default"})  # the spec's codes
+REQUIRED_KEYS = frozenset({"version", "schemas", "requests", "page", "Coverage"})
+SCHEMA_KEYS: dict[str, tuple[type, type | None]] = {
+    "nullable": (list, str), "active_nullable": (list, str), "add": (dict, dict),
+    "enum_add": (dict, list), "all_of": (list, dict),
+}  # fmt: skip
+
 Json = Any
 
 
@@ -154,7 +194,10 @@ def is_decimal(node: Json, schemas: dict[str, Json], depth: int = 0) -> bool:
     kind = node.get("type")
     if kind == "array":
         return is_decimal(node.get("items"), schemas, depth + 1)
-    if kind == "string" or (isinstance(kind, list) and set(kind) <= {"string", "null"}):
+    kinds = (
+        kind if isinstance(kind, list) and all(isinstance(k, str) for k in kind) else []
+    )
+    if kind == "string" or (kinds and set(kinds) <= {"string", "null"}):
         return node.get("pattern") in DECIMAL_PATTERNS
     return False
 
@@ -275,7 +318,9 @@ def _named(rule: Json) -> set[str]:
     """Property names an if/then/else rule constrains."""
     out: set[str] = set()
     for key in ("if", "then", "else"):
-        out |= set(rule.get(key, {}).get("properties", {}))
+        sub = rule.get(key)
+        props = sub.get("properties") if isinstance(sub, dict) else None
+        out |= set(props) if isinstance(props, dict) else set()
     return out
 
 
@@ -283,7 +328,8 @@ def check_times(where: str, node: Json, path: str = "") -> list[str]:
     errors: list[str] = []
     if isinstance(node, dict):
         stamp = {"$ref": "common.schema.json#/$defs/Timestamp"}
-        for key, sub in (node.get("properties") or {}).items():
+        props = node.get("properties")
+        for key, sub in (props if isinstance(props, dict) else {}).items():
             if key.endswith("_at") and sub not in (
                 stamp,
                 {"anyOf": [stamp, {"type": "null"}]},
@@ -301,38 +347,267 @@ def amended_api(api: Json, amendments: Json) -> tuple[Json, list[str]]:
     saved, pc.AMENDMENTS = pc.AMENDMENTS, amendments
     try:
         return pc.openapi(api), []
-    except (KeyError, ValueError) as exc:
+    except REFUSED as exc:
         return api, [f"project contract operations: amendment refused: {exc!r}"]
     finally:
         pc.AMENDMENTS = saved
 
 
-def check_operations(api: Json, amendments: Json) -> list[str]:
+def check_shapes(m: Json) -> list[str]:
+    """The amendment document's shape, before any rule reads it: a wrong type is
+    reported here, never raised later; a key no rule reviews is refused."""
+    w, errors = "project contract", []
+
+    def want(where: str, node: Json, kind: type, of: type | None = None) -> bool:
+        if not isinstance(node, kind):
+            errors.append(
+                f"{w} {where} is not {'a list' if kind is list else 'an object'}"
+            )
+            return False
+        items: Json = node.values() if isinstance(node, dict) else node
+        if of is not None and not all(isinstance(x, of) for x in items):
+            errors.append(f"{w} {where}: an entry is not {of.__name__}")
+        return True
+
+    def keys(node: Json, allowed: Any) -> None:
+        errors.extend(
+            f"{w}: unreviewed amendment key {k!r}" for k in node if k not in allowed
+        )
+
+    def each(key: str) -> Any:
+        return m[key].items() if isinstance(m.get(key), dict) else ()
+
+    if not want("amendments", m, dict):
+        return errors
+    keys(m, TOP_KEYS)
+    for key, kind in TOP_KEYS.items():
+        if key in m or key in REQUIRED_KEYS:
+            want(key, m.get(key), kind, dict if key == "sensitive_fields" else None)
+    for name, a in each("schemas"):
+        if want(f"schemas.{name}", a, dict):
+            keys(a, SCHEMA_KEYS)
+            for key in set(a) & set(SCHEMA_KEYS):
+                want(f"schemas.{name}.{key}", a[key], *SCHEMA_KEYS[key])
+    for name, r in each("requests"):
+        if want(f"requests.{name}", r, dict):
+            keys(r, {"optional"})
+            want(f"requests.{name}.optional", r.get("optional", {}), dict, dict)
+    for name, s in each("new_schemas"):
+        want(f"new_schemas.{name}", s, dict)
+    if isinstance(m.get("page"), dict):
+        keys(m["page"], {"add"})
+        want("page.add", m["page"].get("add", {}), dict, dict)
+    for path, item in each("operations"):
+        if not want(f"operations {path}", item, dict):
+            continue
+        keys(item, pc.METHODS | PATH_FIELDS)
+        want(f"{path} parameters", item.get("parameters", []), list, dict)
+        ops = [(f"{k.upper()} {path}", op) for k, op in item.items() if k in pc.METHODS]
+        for where, op in [(path, item), *ops]:
+            if (op is item or want(where, op, dict)) and "servers" in op:
+                errors.append(f"{w} {where}: servers refused")
+        for where, op in ops:
+            if not isinstance(op, dict):
+                continue
+            keys(op, OP_KEYS)
+            params = op.get("parameters", [])
+            if want(f"{where} parameters", params, list) and not all(
+                isinstance(x, dict) for x in params
+            ):
+                errors.append(f"{w} {where}: parameter is not an object")
+            lists = (item.get("parameters", []), params)
+            for param in [x for ps in lists if isinstance(ps, list) for x in ps]:
+                if isinstance(param, dict) and "$ref" in param:
+                    keys(param, {"$ref"})
+                elif isinstance(param, dict):
+                    keys(param, PARAM_KEYS)
+                    name = param.get("name")
+                    if param.get("in") not in {"query", "header", "path", "cookie"}:
+                        errors.append(f"{w} {where}: parameter {name} lacks a valid in")
+                        if _secret(name):  # rule 7 does not run on a refused shape
+                            errors.append(f"{w} {where}: parameter {name}: sensitive "
+                                          "field name")  # fmt: skip
+            want(f"{where} security", op.get("security", []), list, dict)
+            want(f"{where} requestBody", op.get("requestBody", {}), dict)
+            if not want(f"{where} responses", op.get("responses"), dict):
+                continue
+            for code, response in op["responses"].items():
+                if code not in RESPONSE_CODES:
+                    errors.append(f"{w} {where}: response key {code!r} refused")
+                if not isinstance(response, dict):
+                    errors.append(f"{w} {where}: response {code} is not an object")
+                    continue
+                keys(response, {"description", "headers", "content"})
+                for key, allowed in (("headers", HEADER_KEYS), ("content", {"schema"})):
+                    sub = response.get(key, {})
+                    if want(f"{where} {code} {key}", sub, dict, dict):
+                        for obj in sub.values():
+                            keys(obj, allowed)
+    return errors
+
+
+def _parameters(api: Json, where: str, params: Json) -> list[str]:
+    """Tenant-parameter rule over a parameters list, `$ref`s resolved."""
+    errors: list[str] = []
+    for param in params:
+        param = _resolve_param(api, param)
+        if not isinstance(param, dict) or "$ref" in param:
+            errors.append(f"{where}: unresolved parameter")
+        elif "tenant" in str(param.get("name", "")).lower():
+            errors.append(f"{where}: tenant parameter {param['name']}")
+    return errors
+
+
+def _resolve_param(api: Json, param: Json) -> Json:
+    prefix, known = "#/components/parameters/", api["components"].get("parameters", {})
+    for _ in range(8):
+        ref = param.get("$ref") if isinstance(param, dict) else None
+        if not isinstance(ref, str):
+            break
+        param = known.get(ref[len(prefix) :]) if ref.startswith(prefix) else None
+    return param
+
+
+def _wraps_problem(
+    api: Json, schemas: dict[str, Json], node: Json, seen: frozenset[str] = frozenset()
+) -> bool:
+    """`node` is Problem, or reaches it through `$ref` and allOf/oneOf/anyOf or
+    if/then/else/not at any depth (component and schema-file refs followed). A cycle or a ref that does not
+    resolve counts as Problem: it is refused, not followed."""
+    if not isinstance(node, dict):
+        return False
+    ref = node.get("$ref")
+    if isinstance(ref, str):
+        if ref.endswith("/Problem") or ref in seen or len(seen) > 16:
+            return True
+        target: Json = None
+        if ref.startswith("#/components/schemas/"):
+            target = api["components"]["schemas"].get(ref.rsplit("/", 1)[1])
+        else:
+            file, _, frag = ref.removeprefix("./schemas/").partition("#")
+            target = schemas.get(file) if file else None
+            for part in [x for x in frag.split("/") if x]:
+                target = target.get(part) if isinstance(target, dict) else None
+        if target is None or _wraps_problem(api, schemas, target, seen | {ref}):
+            return True
+    subs = [node.get(k) for k in ("allOf", "oneOf", "anyOf")]
+    subs += [[node.get(k)] for k in ("if", "then", "else", "not")]
+    return any(
+        _wraps_problem(api, schemas, sub, seen)
+        for alts in subs
+        if isinstance(alts, list)
+        for sub in alts
+    )
+
+
+def check_operations(
+    api: Json, schemas: dict[str, Json], amendments: Json
+) -> list[str]:
     errors: list[str] = []
     schemes = set(api["components"].get("securitySchemes", {}))
     problem = {"$ref": "#/components/schemas/Problem"}
+    prefix = "#/components/schemas/"
     for path, item in amendments.get("operations", {}).items():
+        errors += _parameters(
+            api, f"project contract {path}", item.get("parameters", [])
+        )
         for method, op in item.items():
             where = f"project contract {method.upper()} {path}"
+            if method in PATH_FIELDS:
+                continue
+            if method in MUTATING:
+                errors.append(f"{where}: mutating operation refused (amendments add "
+                              "GET only; no owner-approved mutation allowlist)")  # fmt: skip
+            elif method != "get":
+                errors.append(f"{where}: only GET operations may be amended")
             security = op.get("security", api.get("security"))
-            if not security or not all(req and set(req) <= schemes for req in security):
-                errors.append(f"{where}: no session security")
+            if security != SESSION or "sessionCookie" not in schemes:
+                errors.append(f"{where}: no session security (exactly sessionCookie)")
             responses = op.get("responses", {})
             media = responses.get("default", {}).get("content", {})
             if media.get("application/problem+json", {}).get("schema") != problem:
                 errors.append(f"{where}: default is not a Problem response")
+            if set(media) != {"application/problem+json"}:
+                errors.append(f"{where}: default content is not exactly "
+                              "application/problem+json")  # fmt: skip
             ok = sorted(k for k in responses if re.fullmatch(r"2\d\d", k))
-            body = responses[ok[0]] if ok else {}
-            ref = body.get("content", {}).get("application/json", {})
-            ref = ref.get("schema", {}).get("$ref", "")
-            if ref.rsplit("/", 1)[-1] not in api["components"]["schemas"]:
-                errors.append(f"{where}: unknown response schema {ref!r}")
-            cache = body.get("headers", {}).get("Cache-Control", {})
-            if cache.get("schema") != {"type": "string", "const": "no-store"}:
-                errors.append(f"{where}: success lacks Cache-Control: no-store")
-            for param in op.get("parameters", []):
-                if "tenant" in str(param.get("name", "")).lower():
-                    errors.append(f"{where}: tenant parameter {param['name']}")
+            if not ok:
+                errors.append(f"{where}: no 2xx response")
+            for code in ok:
+                body = responses[code]
+                if set(body.get("content", {})) != {"application/json"}:
+                    errors.append(
+                        f"{where} {code}: content is not exactly application/json"
+                    )
+                schema = body.get("content", {}).get("application/json", {})
+                schema = schema.get("schema")  # media objects: check_shapes
+                ref = schema.get("$ref") if isinstance(schema, dict) else None
+                ref = ref if isinstance(ref, str) else ""
+                name = ref[len(prefix) :] if ref.startswith(prefix) else ""
+                if name not in api["components"]["schemas"]:
+                    errors.append(f"{where} {code}: unknown response schema {ref!r}")
+                elif _wraps_problem(api, schemas, {"$ref": ref}):
+                    errors.append(f"{where} {code}: 2xx body is a Problem")
+                cache = body.get("headers", {}).get("Cache-Control", {})
+                if cache.get("schema") != {"type": "string", "const": "no-store"}:
+                    errors.append(f"{where}: success lacks Cache-Control: no-store")
+            errors += _parameters(api, where, op.get("parameters", []))
+    return errors
+
+
+def _secret(name: Json) -> bool:
+    return bool(SECRET_NAME.search(re.sub(r"[_\-]", "", str(name).lower())))
+
+
+def _secret_names(api: Json, node: Json, pointer: str = "") -> list[str]:
+    """Pointers of every name a client sees that looks like a secret, at any depth:
+    `properties` and `patternProperties` keys, parameter names (`$ref`s resolved)
+    and response header names."""
+    out: list[str] = []
+    if isinstance(node, dict):
+        for key in ("properties", "patternProperties", "headers"):
+            names = node.get(key)
+            if isinstance(names, dict):
+                out += [f"{pointer}/{key}/{n}" for n in names if _secret(n)]
+        param = _resolve_param(api, node) if "$ref" in node else node
+        name = param.get("name") if isinstance(param, dict) else None
+        if isinstance(name, str) and _secret(name):
+            out.append(f"{pointer} parameter {name}")
+        for key, sub in node.items():
+            out += _secret_names(api, sub, f"{pointer}/{key}")
+    elif isinstance(node, list):
+        for i, sub in enumerate(node):
+            out += _secret_names(api, sub, f"{pointer}/{i}")
+    return out
+
+
+def check_sensitive(api: Json, amendments: Json) -> list[str]:
+    """Every amendment source that adds a name (rule 7); `check_shapes` refuses an
+    amendment key that is not one of these or a reviewed non-name field."""
+    added: dict[str, Json] = {
+        **amendments.get("new_schemas", {}),
+        **{n: {"properties": a.get("add", {}), "allOf": a.get("all_of", [])}
+           for n, a in amendments["schemas"].items()},
+        **{f"request {n}": {"properties": r.get("optional", {})}
+           for n, r in amendments.get("requests", {}).items()},
+        **{f"operation {p}": item for p, item in amendments.get("operations", {}).items()},
+        "page": {"properties": amendments["page"].get("add", {})},
+        "Coverage": amendments["Coverage"],
+    }  # fmt: skip
+    found = {(n, ptr) for n, s in added.items() for ptr in _secret_names(api, s)}
+    allowed: set[tuple[str, str]] = set()
+    errors: list[str] = []
+    for entry in amendments.get("sensitive_fields", []):
+        key = (str(entry.get("schema")), str(entry.get("field")))
+        decision = entry.get("decision")
+        if not isinstance(decision, str) or not decision.strip():
+            errors.append(f"project contract sensitive_fields {key}: no decision")
+        elif key not in found:
+            errors.append(f"project contract sensitive_fields {key}: unused entry")
+        else:
+            allowed.add(key)
+    errors += [f"project contract {name}#{ptr}: sensitive field name"
+               for name, ptr in sorted(found - allowed)]  # fmt: skip
     return errors
 
 
@@ -346,7 +621,7 @@ def check_amended(schemas: dict[str, Json], amendments: Json) -> list[str]:
             where = f"project contract {name}"
             try:
                 s = pc.schema(name)
-            except (KeyError, ValueError) as exc:
+            except REFUSED as exc:
                 errors.append(f"{where}: amendment refused: {exc!r}")
                 continue
             meta = Draft202012Validator(Draft202012Validator.META_SCHEMA)
@@ -360,7 +635,7 @@ def check_amended(schemas: dict[str, Json], amendments: Json) -> list[str]:
             where = f"project contract new schema {name}"
             try:
                 s = pc.schema(name)
-            except (KeyError, ValueError) as exc:
+            except REFUSED as exc:
                 errors.append(f"{where}: amendment refused: {exc!r}")
                 continue
             meta = Draft202012Validator(Draft202012Validator.META_SCHEMA)
@@ -380,10 +655,13 @@ def run_checks(
     amendments: Json = None,
 ) -> list[str]:  # fmt: skip
     amendments = pc.AMENDMENTS if amendments is None else amendments
-    api, errors = amended_api(api, amendments)
+    errors = check_shapes(amendments)
+    if not errors:  # a malformed amendment is reported, never half-applied
+        api, errors = amended_api(api, amendments)
+        errors += check_operations(api, schemas, amendments)
+        errors += check_sensitive(api, amendments)
+        errors += check_amended(schemas, amendments)
     errors += check_routes(api, schemas)
-    errors += check_operations(api, amendments)
-    errors += check_amended(schemas, amendments)
     errors += check_decimals("openapi#/components", api["components"], schemas)
     errors += check_decimals("openapi#/paths", api["paths"], schemas)
     for name, schema in schemas.items():
@@ -391,6 +669,15 @@ def run_checks(
     for name, doc in examples.items():
         errors += check_timestamps(name, doc)
     return errors
+
+
+def guarded(fn: Any, *args: Any) -> list[str]:
+    """A check that raises on a malformed amended document is a refusal."""
+    try:
+        result: list[str] = fn(*args)
+    except Exception as exc:  # any crash is a reported refusal (exit nonzero)
+        return [f"checker crashed on malformed amendment: {type(exc).__name__}"]
+    return result
 
 
 def format_checker_enforces_datetime() -> bool:
@@ -564,7 +851,160 @@ def self_test(api: Json, schemas: dict[str, Json], examples: dict[str, Json]) ->
     def new_invalid(m: Json) -> None:
         new_schema(m)["properties"]["advisory"] = {"type": "nonsense"}
 
+    # Rule 6/7 hardening: (label, parent path, key, value, expected); each sets
+    # amendments[path...][key] = value on a copy.
+    OP = ("operations", "/session/approval-classes")
+    GET, NS = (*OP, "get"), ("new_schemas", "approval_classes")
+    RS, OK = (*OP, "get", "responses"), (*OP, "get", "responses", "200")
+    JS = (*OK, "content", "application/json")
+    get = pc.AMENDMENTS["operations"]["/session/approval-classes"]["get"]
+    s, csrf = (
+        {"type": "string"},
+        {"schema": "session", "field": "/properties/csrf_token"},
+    )
+    hdr = [
+        {"name": h, "in": "header", "required": True, "schema": s}
+        for h in ("Idempotency-Key", "X-CSRF-Token")
+    ]
+    q = {"in": "query", "schema": s}
+    prob = {"$ref": "#/components/schemas/Problem"}
+    ok2 = get["responses"]["200"] | {"content": {"application/json": {"schema": prob}}}
+    outcome = {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "title": "Outcome",
+        "additionalProperties": False,
+        "allOf": [{"$ref": "common.schema.json#/$defs/Problem"}],
+    }
+    held = (
+        "new_schemas",
+        "approval_classes",
+        "$defs",
+        "Held",
+        "properties",
+        "step_up",
+        "properties",
+    )
+    table = [
+        ("innocuous mutating operation", OP, "post", get | {"operationId": "noteViewed",
+         "parameters": hdr}, "mutating operation refused"),
+        ("amended HEAD operation", OP, "head", get | {"operationId": "headClasses"},
+         "only GET operations may be amended"),
+        ("path-level tenant parameter", OP, "parameters", [q | {"name": "tenant_id"}],
+         "tenant parameter tenant_id"),
+        ("path-level summary (no crash)", OP, "summary", "x", "amendment refused"),
+        ("dangling parameter $ref", GET, "parameters",
+         [{"$ref": "#/components/parameters/Missing"}], "unresolved parameter"),
+        ("2xx Problem body", JS, "schema", prob, "200: 2xx body is a Problem"),
+        ("second 2xx Problem body", RS, "202", ok2, "202: 2xx body is a Problem"),
+        ("wildcard 2XX response", RS, "2XX", ok2, "response key '2XX' refused"),
+        ("lower-case 2xx response", RS, "2xx", ok2, "response key '2xx' refused"),
+        ("2xx wraps Problem (new schema)", JS, "schema",
+         {"$ref": "#/components/schemas/outcome"}, "200: 2xx body is a Problem"),
+        ("session with scopes", GET, "security", [{"sessionCookie": ["admin"]}],
+         "no session security"),
+        ("anonymous alternative", GET, "security", [{"sessionCookie": []}, {}],
+         "no session security"),
+        ("path-level servers", OP, "servers", [{"url": "/x"}], "servers refused"),
+        ("operation servers", GET, "servers", [{"url": "/x"}], "servers refused"),
+        ("new schema secret field", (*NS, "properties"), "apiKey", s, "apiKey: sensi"),
+        ("nested secret field", held, "Refresh-Token", s, "Refresh-Token: sensi"),
+        ("amended add secret", ("schemas", "claim", "add"), "private_key", s,
+         "private_key: sensi"),
+        ("request optional secret", ("requests", "WatchlistEntry", "optional"),
+         "PASSWORD", s, "PASSWORD: sensi"),
+        ("page.add secret", ("page", "add"), "session_token", s,
+         "page#/properties/session_token: sensi"),
+        ("Coverage secret", ("Coverage", "properties"), "secretRef", s,
+         "Coverage#/properties/secretRef: sensi"),
+        ("operation parameter secret", GET, "parameters", [q | {"name": "api_key"}],
+         "parameter api_key: sensi"),
+        ("path-level parameter secret", OP, "parameters", [q | {"name": "X-Api-Key"}],
+         "parameter X-Api-Key: sensi"),
+        ("response header secret", (*OK, "headers"), "X-Refresh-Token", {"schema": s},
+         "headers/X-Refresh-Token: sensi"),
+        ("patternProperties secret", NS, "patternProperties", {"^secret_": s},
+         "patternProperties/^secret_: sensi"),
+        ("additionalProperties secret", (*NS, "properties"), "meta", {
+         "additionalProperties": {"properties": {"Password": s}}}, "Password: sensi"),
+        ("inline operation schema secret", GET, "requestBody", {"content": {
+         "application/json": {"schema": {"properties": {"client_secret": s}}}}},
+         "client_secret: sensi"),
+        ("csrf_token not allowlisted", (), "sensitive_fields", [],
+         "csrf_token: sensitive field"),
+        ("allowlist without decision", (), "sensitive_fields",
+         [csrf | {"decision": " "}], "no decision"),
+        ("allowlist unused entry", (), "sensitive_fields", [csrf | {"decision": "y"},
+         csrf | {"field": "/properties/x", "decision": "y"}], "unused entry"),
+        ("unreviewed amendment key", (), "extra", {}, "unreviewed amendment key"),
+        ("unreviewed schema amendment key", ("schemas", "claim"), "rename", {},
+         "unreviewed amendment key 'rename'"),
+        ("responses not an object", GET, "responses", [], "responses is not an object"),
+        ("response not an object", RS, "200", "ok", "response 200 is not an object"),
+        ("headers not an object", OK, "headers", [], "headers is not an object"),
+        ("content not an object", OK, "content", "json", "content is not an object"),
+        ("media schema not an object", JS, "schema", "x", "unknown response schema"),
+        ("body $ref not a string", JS, "schema", {"$ref": 7}, "unknown response"),
+        ("parameter not an object", GET, "parameters", ["tenant_id"],
+         "parameter is not an object"),
+        ("security not a list", GET, "security", {"sessionCookie": []},
+         "security is not a list"),
+        ("sensitive_fields null", (), "sensitive_fields", None, "is not a list"),
+        ("sensitive_fields string", (), "sensitive_fields", "csrf", "is not a list"),
+        ("add not an object", ("schemas", "claim"), "add", [], "add is not an object"),
+        ("nullable not a list", ("schemas", "claim"), "nullable", "x", "not a list"),
+        ("all_of boolean if", ("schemas", "experiment"), "all_of",
+         [{"if": True, "then": {"properties": {"ghost": {}}}}], "{'ghost'}"),
+        ("new schema not an object", ("new_schemas",), "session", [],
+         "new_schemas.session is not an object"),
+        ("new schema $defs not an object", NS, "$defs", [], "amendment refused"),
+        ("new schema properties a list", NS, "properties", [], "approval_classes"),
+        ("optional not an object", ("requests", "WatchlistEntry"), "optional", None,
+         "optional is not an object"),
+        ("operations not an object", (), "operations", [], "is not an object"),
+        ("page not an object", (), "page", None, "page is not an object"),
+        ("passwd field", (*NS, "properties"), "db_passwd", s, "db_passwd: sensi"),
+        ("pwd parameter", GET, "parameters", [q | {"name": "PWD"}], "PWD: sensi"),
+        ("unhashable type list", ("schemas", "account_snapshot", "add", "ledger_cash"),
+         "type", [[]], "invalid schema"),
+        ("operation x- key", GET, "x-internal", True, "unreviewed amendment key 'x-in"),
+        ("operation tags", GET, "tags", ["a"], "unreviewed amendment key 'tags'"),
+        ("operation callbacks", GET, "callbacks", {}, "unreviewed amendment key 'cal"),
+        ("response links", OK, "links", {}, "unreviewed amendment key 'links'"),
+        ("media examples", JS, "examples", {}, "unreviewed amendment key 'examples'"),
+        ("header x- key", (*OK, "headers", "Cache-Control"), "x-a", 1, "key 'x-a'"),
+        ("parameter x- key", GET, "parameters", [q | {"name": "p", "x-b": 1}],
+         "unreviewed amendment key 'x-b'"),
+        ("$ref parameter extra key", GET, "parameters", [{"$ref": "#/components/"
+         "parameters/X", "name": "p"}], "unreviewed amendment key 'name'"),
+        ("parameter without in", GET, "parameters", [{"name": "api_key", "schema": s}],
+         "parameter api_key lacks a valid in"),
+        ("parameter without in (name scanned)", GET, "parameters",
+         [{"name": "api_key", "schema": s}], "parameter api_key: sensi"),
+        ("parameter in body", GET, "parameters", [q | {"name": "p", "in": "body"}],
+         "parameter p lacks a valid in"),
+        ("2xx extra media type", (*OK, "content"), "text/html", {"schema": s},
+         "200: content is not exactly application/json"),
+        ("default extra media type", (*RS, "default", "content"), "application/json",
+         {"schema": prob}, "default content is not exactly application/problem+json"),
+        ("4xx response key", RS, "404", ok2, "response key '404' refused"),
+        ("3xx response key", RS, "302", ok2, "response key '302' refused"),
+        ("1xx response key", RS, "100", ok2, "response key '100' refused"),
+        ("204 response key", RS, "204", ok2, "response key '204' refused"),
+    ]  # fmt: skip
+
+    def setter(path: tuple[str, ...], key: str, value: Json) -> Any:
+        def change(m: Json) -> None:
+            node = m
+            for part in path:
+                node = node[part]
+            node[key] = copy.deepcopy(value)
+            if value == {"$ref": "#/components/schemas/outcome"}:
+                m["new_schemas"]["outcome"] = copy.deepcopy(outcome)
+
+        return change
+
     amended_cases = {
+        **{label: (setter(p, k, v), want) for label, p, k, v, want in table},
         "operation duplicate operationId": (dup_operation_id, "amendment refused"),
         "operation duplicate new operationId": (dup_new_operation_id, "refused"),
         "operation duplicate path": (dup_path, "amendment refused"),
@@ -589,24 +1029,82 @@ def self_test(api: Json, schemas: dict[str, Json], examples: dict[str, Json]) ->
         "enum_add duplicate": (duplicate_state, "amendment refused"),
         "invalid amended schema": (bad_rule, "invalid schema"),
     }
+
+    def api_case(add: Json, path: tuple[str, ...], key: str, value: Json) -> Any:
+        def change(a: Json, m: Json) -> None:
+            for kind, defs in add.items():
+                a["components"].setdefault(kind, {}).update(copy.deepcopy(defs))
+            setter(path, key, value)(m)
+
+        return change
+
+    pref, sref = "#/components/parameters/", "#/components/schemas/"
+    api_cases = {
+        "tenant parameter via $ref": (api_case(
+            {"parameters": {"T": q | {"name": "tenant_id"}}}, GET, "parameters",
+            [{"$ref": pref + "T"}]), "tenant parameter tenant_id"),
+        "$ref parameter secret": (api_case(
+            {"parameters": {"K": q | {"name": "access_token"}}}, GET, "parameters",
+            [{"$ref": pref + "K"}]), "parameter access_token: sensi"),
+        "$ref parameter without in": (api_case(
+            {"parameters": {"K": {"name": "api_key", "schema": s}}}, GET, "parameters",
+            [{"$ref": pref + "K"}]), "parameter api_key: sensi"),
+        "2xx alias of Problem": (api_case(
+            {"schemas": {"Outcome": prob}}, JS, "schema", {"$ref": sref + "Outcome"}),
+            "200: 2xx body is a Problem"),
+        "2xx allOf wraps Problem": (api_case(
+            {"schemas": {"W": {"allOf": [prob]}}}, JS, "schema", {"$ref": sref + "W"}),
+            "200: 2xx body is a Problem"),
+        "2xx oneOf/anyOf deep Problem": (api_case({"schemas": {
+            "Outer": {"oneOf": [{"properties": {}}, {"$ref": sref + "Mid"}]},
+            "Mid": {"anyOf": [{"allOf": [
+                {"$ref": "./schemas/common.schema.json#/$defs/Problem"}]}]}}},
+            JS, "schema", {"$ref": sref + "Outer"}), "200: 2xx body is a Problem"),
+        "2xx if/then Problem": (api_case({"schemas": {"C": {"if": {"type": "object"},
+            "then": prob}}}, JS, "schema", {"$ref": sref + "C"}), "2xx body is a Problem"),
+        "2xx else Problem": (api_case({"schemas": {"E": {"if": {}, "else": {"allOf": [
+            prob]}}}}, JS, "schema", {"$ref": sref + "E"}), "2xx body is a Problem"),
+        "2xx not Problem": (api_case({"schemas": {"N": {"not": prob}}}, JS, "schema",
+            {"$ref": sref + "N"}), "2xx body is a Problem"),
+        "another known scheme": (api_case({"securitySchemes": {"serviceKey": {
+            "type": "apiKey", "in": "header", "name": "X-Service-Key"}}}, GET,
+            "security", [{"serviceKey": []}]), "no session security"),
+    }  # fmt: skip
     failures = 0
-    baseline = run_checks(api, schemas, examples)
+    baseline = guarded(run_checks, api, schemas, examples)
     if baseline:
         print("self-test: unmodified contracts fail:", *baseline, sep="\n  ")
         failures += 1
     for label, (inject, expected) in cases.items():
         a, s, e = copy.deepcopy(api), copy.deepcopy(schemas), copy.deepcopy(examples)
         inject(a, s, e)
-        found = [m for m in run_checks(a, s, e) if expected in m]
+        found = [m for m in guarded(run_checks, a, s, e) if expected in m]
         print(f"self-test {label}: {'detected' if found else 'MISSED'}")
         failures += not found
     for label, (change, expected) in amended_cases.items():
         m = copy.deepcopy(pc.AMENDMENTS)
         change(m)
-        found = [x for x in run_checks(api, schemas, examples, m) if expected in x]
+        found = [
+            x for x in guarded(run_checks, api, schemas, examples, m) if expected in x
+        ]
         print(f"self-test {label}: {'detected' if found else 'MISSED'}")
         failures += not found
-    total = len(cases) + len(amended_cases)
+    for label, (both, expected) in api_cases.items():
+        a, m = copy.deepcopy(api), copy.deepcopy(pc.AMENDMENTS)
+        both(a, m)
+        found = [
+            x for x in guarded(run_checks, a, schemas, examples, m) if expected in x
+        ]
+        print(f"self-test {label}: {'detected' if found else 'MISSED'}")
+        failures += not found
+
+    def crash() -> list[str]:
+        raise TypeError("unhashable")
+
+    wrapped = guarded(crash) == ["checker crashed on malformed amendment: TypeError"]
+    print(f"self-test crash reported: {'detected' if wrapped else 'MISSED'}")
+    failures += not wrapped
+    total = len(cases) + len(amended_cases) + len(api_cases) + 1
     print(f"self-test: {total - failures}/{total} defects detected")
     return 1 if failures else 0
 
@@ -615,9 +1113,12 @@ def main(argv: list[str]) -> int:
     api, schemas, examples = load()
     if "--self-test" in argv:
         return self_test(api, schemas, examples)
-    errors = run_checks(api, schemas, examples)
+    errors = guarded(run_checks, api, schemas, examples)
     for err in errors:
         print("FAIL", err)
+    for entry in pc.AMENDMENTS.get("sensitive_fields", []):
+        print(f"INFO sensitive field allowed: {entry['schema']}#{entry['field']}:",
+              entry["decision"])  # fmt: skip
     enforced = format_checker_enforces_datetime()
     print(
         "INFO jsonschema format date-time enforced:",
