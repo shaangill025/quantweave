@@ -703,3 +703,41 @@ def test_stored_wire_forms_round_trip_with_unchanged_hashes() -> None:
     lg = promo_ledger(GOOD)
     assert lg.checkpoint(3) == digest([tl.entry_wire(e) for e in lg.entries])
     assert lg.checkpoint(1) == ledger().checkpoint(1) != lg.checkpoint(2)
+
+
+GOLDEN_PROTOCOL = "c8e22cf9a7f6eb41061d00db947f6707d294e65a9849fa6604bfad751582b1b3"
+
+
+def test_decision_19_retest_of_is_a_frozen_link_to_another_experiment() -> None:
+    assert proto().content_hash == GOLDEN_PROTOCOL  # pinned on base b5499fa
+    assert "retest_of" not in proto().wire()  # absent: earlier hashes unchanged
+    p = proto(retest_of="exp-synth-0")
+    assert p.wire()["retest_of"] == "exp-synth-0" and p.content_hash != GOLDEN_PROTOCOL
+    back = im.Protocol.from_wire(json.loads(json.dumps(p.wire())))
+    assert (back.retest_of, back.content_hash) == ("exp-synth-0", p.content_hash)
+    for bad in (EXP, "", "bad id"):  # never itself, always an id
+        with pytest.raises(im.ImprovementError, match="retest_of"):
+            proto(retest_of=bad)
+    reg = im.ExperimentRegistry(TENANT).register(p)
+    with pytest.raises(im.ImprovementError, match="protocol_frozen"):
+        reg.register(proto())  # the link is part of the frozen protocol
+
+
+def test_decision_19_chain_trials_count_every_experiment_of_the_chain() -> None:
+    def dev(n: int, family: str) -> tl.Trial:  # failed: counted, never discarded
+        return trial(n, tl.Split.DEVELOPMENT, tl.Outcome.FAILED, family=family,
+                     trial_id=f"trial-{n}", access_id=None)  # fmt: skip
+
+    lg = ledger()
+    for n, family in ((1, "exp-2"), (2, "exp-2"), (3, "exp-1")):
+        lg = lg.record(dev(n, family))
+    chain = ("exp-2", "exp-1", "exp-0")  # exp-2 re-tests exp-1, which re-tests exp-0
+    # per experiment, the larger of the ledger's and the stored count:
+    # exp-2 max(2, 0) + exp-1 max(1, 3) + exp-0 max(0, 2) = 2 + 3 + 2 = 7
+    assert im.chain_trials(lg, chain, {"exp-1": 3, "exp-0": 2}) == 7
+    assert im.chain_trials(lg, chain, {"exp-1": 0}) == 2 + 1 + 0
+    assert im.chain_trials(lg, chain[:1], {}) == 2  # no link: its own family only
+    for bad_chain, stored in ((("exp-2", "exp-2"), {}), ((), {}),
+                              (chain, {"exp-0": -1})):  # fmt: skip
+        with pytest.raises(im.ImprovementError, match="retest_chain"):
+            im.chain_trials(lg, bad_chain, stored)
