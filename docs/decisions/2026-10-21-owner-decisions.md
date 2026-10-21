@@ -340,3 +340,33 @@ only; decision 25 settles how they meet the contract checker.
     backtest already computes. Not 'Report only': decision 29 asked that the count
     change verdicts."
     Implemented by: T044, with T033 (the backtest records the standard error).
+
+## Sixth quiz (2026-10-21)
+
+36. **Which promotions the Bonferroni check covers (decision 35).**
+    Question: "Decision 35's widened confidence interval needs returns, a standard
+    error and a frozen z. Only strategy experiments have those. Research, evaluator
+    and personal-adaptation promotions are scored on fixture counts, with no return
+    series. Where should the Bonferroni check apply?"
+    Selected label: "Strategy only, flag rest (Recommended)".
+    Option text as presented: "Apply the widened excess-CI rule to strategy
+    promotions. For the count-based targets, keep recording chain_trials with a
+    'no_multiple_testing_adjustment' limitation that reviewers see. Why: literally
+    applying it everywhere would turn every research, evaluator and
+    personal-adaptation promotion into 'insufficient evidence' forever, which breaks
+    the mandatory six-target scope. Not 'Count-based Bonferroni too': those
+    scorecards have no significance level to divide, so that would be inventing a
+    statistic."
+    Implemented by: T044.
+
+37. **Which baseline must clear the widened bound.**
+    Question: "A strategy plan can declare several baselines (e.g. buy-and-hold and
+    the current strategy). Which must clear the widened excess-over-baseline bound?"
+    Selected label: "Claim's, else all (Recommended)".
+    Option text as presented: "Use the baseline the plan's claim names; if the claim
+    names none, every declared baseline must pass. Why: it tests exactly what the
+    plan said it would beat, and falls back to the strictest reading when that's
+    unstated. Not 'All always': it can reject a candidate for not beating a baseline
+    it never claimed to beat. Not 'Claim's only': a claim with no baseline would
+    skip the check."
+    Implemented by: T044.
