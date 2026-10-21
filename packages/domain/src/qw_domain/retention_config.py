@@ -15,8 +15,17 @@ them with a JSON document (`parse`). Validation fails closed, raising
   request. The fixed rules of `retention.Rule` and `Policy` (owner decision 21 of
   2026-10-21) still apply: the financial journal is never deletable on request and
   never expires by age (`financial_append_only`, `financial_no_expiry`); the
-  tombstone period (default 7 years) is adjustable, but only as `retain` and only
-  above the backup period (`tombstone_outlives_backups`).
+  tombstone period (7 years) may only be lengthened (decision 30,
+  `tombstone_floor`), only as `retain` and only above the backup period
+  (`tombstone_outlives_backups`).
+- `solo_hold_release` (owner decision 31) must be a JSON boolean (default false).
+  It is the operator's explicit opt-in, held here because the operator holds this
+  file, as decision 23 has the operator configure "solo maintainer". It does not
+  enable anything by itself: `solo_release` takes the edition and the configured
+  operators from the deployment record (never from this file) and refuses a hosted
+  or multi-operator install (`solo_release_refused`); the caller builds
+  `retention.Holds(solo=...)` from its result. Like purge holds, the flag is not
+  yet a persisted, audited event; each solo release is recorded as `solo`.
 A `PurgeHold` (an installation-wide legal hold on a purge window) suspends that
 purge entirely: `purge_window` returns None and the worker skips it. Tenant-scoped
 `retention.LegalHold`s cover the data classes; purge windows have no tenant scope.
@@ -36,6 +45,7 @@ from enum import StrEnum
 from types import MappingProxyType
 
 from qw_domain.decimals import safe_repr
+from qw_domain.release import Edition
 from qw_domain.retention import (
     DEFAULT_POLICY_ID,
     OnRequest,
@@ -43,6 +53,7 @@ from qw_domain.retention import (
     RetentionClass,
     RetentionError,
     Rule,
+    SoloRelease,
     owner_defaults,
 )
 from qw_domain.sources import ID_PATTERN
@@ -125,10 +136,13 @@ class RetentionConfig:
     windows: Mapping[Window, timedelta]
     obligations: tuple[Obligation, ...] = ()
     purge_holds: tuple[PurgeHold, ...] = ()
+    solo_hold_release: bool = False  # owner decision 31: the operator's opt-in
 
     def __post_init__(self) -> None:
         if type(self.policy) is not Policy:
             raise RetentionError("config", "a Policy")
+        if type(self.solo_hold_release) is not bool:
+            raise RetentionError("solo_hold_release", "a boolean")
         if set(self.windows) != set(Window):
             raise RetentionError("unknown_window", "every window, and only those")
         for w, span in self.windows.items():
@@ -153,6 +167,12 @@ class RetentionConfig:
     def purge_window(self, w: Window) -> timedelta | None:
         """The configured window, or None while a purge hold suspends it."""
         return None if w in self.held() else self.windows[w]
+
+    def solo_release(self, edition: Edition,
+                     operators: frozenset[str]) -> SoloRelease | None:  # fmt: skip
+        """None unless opted in; then the deployment must be self-hosted with one
+        configured operator, or this fails closed."""
+        return SoloRelease(edition, operators) if self.solo_hold_release else None
 
 
 def defaults() -> RetentionConfig:
@@ -256,7 +276,7 @@ def _hold(raw: object) -> PurgeHold:
 def parse(text: str) -> RetentionConfig:
     """An operator's JSON overrides on top of `defaults()`. Required: `policy_id`
     (not the defaults' id) and `version`; optional: `classes`, `windows`,
-    `obligations`, `purge_holds`."""
+    `obligations`, `purge_holds`, `solo_hold_release`."""
     if not isinstance(text, str) or len(text) > _MAX_TEXT:
         raise RetentionError("config", f"a JSON text of at most {_MAX_TEXT} chars")
     try:
@@ -265,7 +285,8 @@ def parse(text: str) -> RetentionConfig:
     except (json.JSONDecodeError, RecursionError):
         raise RetentionError("config", "malformed JSON") from None
     top = _obj(raw, {"policy_id", "version", "classes", "windows", "obligations",
-                     "purge_holds"}, frozenset({"policy_id", "version"}))  # fmt: skip
+                     "purge_holds", "solo_hold_release"},
+               frozenset({"policy_id", "version"}))  # fmt: skip
     if top["policy_id"] == DEFAULT_POLICY_ID:
         raise RetentionError("reserved_policy", "name the operator's own policy")
     base = defaults()
@@ -280,8 +301,12 @@ def parse(text: str) -> RetentionConfig:
     if type(version) is not int:
         raise RetentionError("version", "a positive int")
     policy = Policy(_id(top["policy_id"], "policy_id"), version, rules)
+    solo = top.get("solo_hold_release", False)
+    if type(solo) is not bool:
+        raise RetentionError("solo_hold_release", "a boolean")
     return RetentionConfig(
         policy, windows,
         tuple(_obligation(o) for o in _list(top.get("obligations", []))),
         tuple(_hold(h) for h in _list(top.get("purge_holds", []))),
+        solo,
     )  # fmt: skip

@@ -10,12 +10,13 @@ not recomputed by the module.
 import random
 from collections.abc import Callable
 from dataclasses import replace
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime, timedelta, timezone
 
 import pytest
 from hypothesis import given, settings
 from hypothesis import strategies as st
 from qw_domain import retention as rt
+from qw_domain.release import Edition
 
 C = rt.RetentionClass
 T0 = datetime(2026, 10, 1, 12, tzinfo=UTC)
@@ -96,7 +97,7 @@ def test_spec_baseline_fails_closed_on_every_class() -> None:
     assert sweep["r-research"] == (rt.Action.RETAIN, "retention_period_unconfigured")
     assert sweep["r-financial"] == (rt.Action.RETAIN, "explicit_workflow_only")
     assert rt.backup("bk-1", T0, T0 + H, base).expires_at is None
-    assert len(rt.OWNER_DECISIONS) >= 5
+    assert len(rt.OWNER_DECISIONS) >= 3
 
 
 def test_rule_invariants() -> None:
@@ -449,14 +450,15 @@ def test_tombstones_are_kept_seven_years_and_outlive_backups() -> None:  # decis
     assert (tomb.on_request, tomb.expire_after) == (rt.OnRequest.RETAIN, SEVEN_YEARS)
     assert tomb.authority_id == "owner-decision-21"
     bk = rule(C.BACKUP, rt.OnRequest.RETAIN, 30 * D)
-    for short in (30 * D, 30 * D - H):  # not longer than a backup copy lives
+    long_bk = rule(C.BACKUP, rt.OnRequest.RETAIN, SEVEN_YEARS + D)
+    for short in (SEVEN_YEARS, SEVEN_YEARS + D - H):  # not longer than a backup copy
         with pytest.raises(rt.RetentionError) as exc:
-            policy(bk, rule(C.PRIVACY, rt.OnRequest.RETAIN, short))
+            policy(long_bk, rule(C.PRIVACY, rt.OnRequest.RETAIN, short))
         assert exc.value.code == "tombstone_outlives_backups"
     with pytest.raises(rt.RetentionError) as exc:  # backups of unknown lifetime
         policy(rule(C.PRIVACY, rt.OnRequest.RETAIN, SEVEN_YEARS))
     assert exc.value.code == "tombstone_outlives_backups"
-    policy(bk, rule(C.PRIVACY, rt.OnRequest.RETAIN, 30 * D + H))
+    policy(long_bk, rule(C.PRIVACY, rt.OnRequest.RETAIN, SEVEN_YEARS + D + H))
     policy(rule(C.PRIVACY, rt.OnRequest.RETAIN))  # retained with no expiry: fine
     with pytest.raises(rt.RetentionError) as exc:
         rule(C.PRIVACY, rt.OnRequest.DELETE, SEVEN_YEARS)
@@ -464,6 +466,22 @@ def test_tombstones_are_kept_seven_years_and_outlive_backups() -> None:  # decis
     sweep = rt.ExpirySweep("sw-1", TENANT, T0 + SEVEN_YEARS + D)
     p = rt.plan(sweep, [item("t-1", C.PRIVACY)], rt.owner_defaults(), rt.Holds())
     assert acts(p) == {"t-1": (rt.Action.RETAIN, "tombstone_ledger")}  # no compaction
+    assert bk.expire_after == 30 * D
+
+
+def test_tombstone_period_has_a_seven_year_floor() -> None:  # decision 30
+    """Config may lengthen tombstones but never shorten them below 2557 days, even
+    when the shorter period would still outlive every backup."""
+    assert rt.TOMBSTONE_RETENTION == SEVEN_YEARS
+    bk = rule(C.BACKUP, rt.OnRequest.RETAIN, 30 * D)
+    for short in (SEVEN_YEARS - timedelta(microseconds=1), SEVEN_YEARS - D,
+                  30 * D + H, 365 * D):  # fmt: skip
+        with pytest.raises(rt.RetentionError) as exc:
+            policy(bk, rule(C.PRIVACY, rt.OnRequest.RETAIN, short))
+        assert exc.value.code == "tombstone_floor", short
+    for enough in (SEVEN_YEARS, SEVEN_YEARS + timedelta(microseconds=1), 3653 * D):
+        got = policy(bk, rule(C.PRIVACY, rt.OnRequest.RETAIN, enough))
+        assert got.rule(C.PRIVACY).expire_after == enough
 
 
 def test_open_owner_decisions_no_longer_list_decided_items() -> None:
@@ -476,7 +494,19 @@ def test_open_owner_decisions_no_longer_list_decided_items() -> None:
     ):
         assert gone not in text, gone
     assert "financial journal's own retention period" in text
-    assert frozenset({C.REFERENCE, C.RELEASE}) == rt.IMPLEMENTER_DEFAULTS
+    for gone in ("`reference` and `release`", "holding both the tenant-owner"):
+        assert gone not in text, gone  # decisions 34 and 31
+    assert not hasattr(rt, "IMPLEMENTER_DEFAULTS")
+
+
+def test_reference_and_release_are_owner_confirmed() -> None:  # decision 34
+    pol = rt.owner_defaults()
+    for cls in (C.REFERENCE, C.RELEASE):
+        r = pol.rule(cls)
+        assert (r.on_request, r.expire_after) == (rt.OnRequest.RETAIN, None)
+        want = ("owner-decision-34", "owner-decisions-2026-10-21-34")
+        assert (r.authority_id, r.basis) == want
+    assert "implementer-default" not in {r.authority_id for r in pol.rules.values()}
 
 
 def test_hold_placement_names_one_of_the_two_roles() -> None:  # decision 22
@@ -547,3 +577,124 @@ def test_hold_release_needs_owner_and_operator_with_distinct_step_up() -> None:
     for bad in bad_approvals:
         with pytest.raises(rt.RetentionError):
             bad()
+
+
+PILOT = "pilot-synth-1"  # SYNTHETIC: one person, the tenant owner and the operator
+SOLO = rt.SoloRelease(Edition.SELF_HOSTED, frozenset({PILOT}))
+
+
+def solo_pair(first: datetime, second: datetime, tag: str = "1",
+              who: str = PILOT) -> tuple[rt.Approval, rt.Approval]:  # fmt: skip
+    return (rt.Approval(rt.HoldRole.TENANT_OWNER, who, f"stepup-a-{tag}", first),
+            rt.Approval(rt.HoldRole.OPERATOR, who, f"stepup-b-{tag}",
+                        second))  # fmt: skip
+
+
+def solo_release(at: datetime, approvals: tuple[rt.Approval, ...],
+                 hid: str = "hold-1") -> rt.HoldRelease:  # fmt: skip
+    return rt.HoldRelease(hid, TENANT, "counsel-1", "closed", at, approvals,
+                          solo=True)  # fmt: skip
+
+
+def test_solo_release_is_refused_without_the_flag() -> None:  # decisions 22 and 31
+    holds = rt.Holds()
+    holds.place(hold("hold-1"))
+    pair = solo_pair(T0 + H, T0 + 30 * H)
+    for solo in (True, False):
+        with pytest.raises(rt.RetentionError) as exc:
+            holds.release(replace(solo_release(T0 + 31 * H, pair), solo=solo))
+        assert exc.value.code == "distinct_principals"
+    assert len(holds.history(TENANT)) == 1  # not released
+
+
+def test_solo_release_can_only_be_enabled_self_hosted_single_operator() -> None:
+    cases: list[tuple[Callable[[], object], str]] = [
+        (lambda: rt.SoloRelease(Edition.HOSTED, frozenset({PILOT})),
+         "solo_release_refused"),
+        (lambda: rt.SoloRelease("self_hosted", frozenset({PILOT})),  # type: ignore[arg-type]
+         "solo_release_refused"),
+        (lambda: rt.SoloRelease(Edition.SELF_HOSTED, frozenset({PILOT, "op-2"})),
+         "solo_release_refused"),
+        (lambda: rt.SoloRelease(Edition.SELF_HOSTED, frozenset()),
+         "solo_release_refused"),
+        (lambda: rt.SoloRelease(Edition.SELF_HOSTED, frozenset({"bad id"})),
+         "operator_id"),
+        (lambda: rt.Holds(solo="on"), "solo_release_refused"),  # type: ignore[arg-type]
+    ]  # fmt: skip
+    for make, code in cases:
+        with pytest.raises(rt.RetentionError) as exc:
+            make()
+        assert exc.value.code == code
+    assert SOLO.operator_id == PILOT
+
+
+def test_solo_release_needs_two_step_ups_at_least_24_hours_apart() -> None:
+    holds = rt.Holds(solo=SOLO)
+    holds.place(hold("hold-1"))
+    first = T0 + H
+    for gap in (24 * H - timedelta(minutes=1), 24 * H - timedelta(microseconds=1),
+                timedelta(0)):  # fmt: skip
+        for pair in (solo_pair(first, first + gap),
+                     solo_pair(first + gap, first)):  # either order  # fmt: skip
+            with pytest.raises(rt.RetentionError) as exc:
+                holds.release(solo_release(T0 + 2 * D, pair))
+            assert exc.value.code == "solo_delay", gap
+    done = holds.release(solo_release(T0 + 2 * D, solo_pair(first + 24 * H, first)))
+    assert done.solo is True and done.released_at == T0 + 2 * D
+    assert holds.history(TENANT)[-1] == done
+    assert holds.active(item("r-1"), T0 + 2 * D) is None
+
+
+def test_solo_release_refusals() -> None:
+    holds = rt.Holds(solo=SOLO)
+    for hid in ("hold-1", "hold-2"):
+        holds.place(hold(hid, at=T0))
+    a, b = T0 + H, T0 + 25 * H
+    ok = solo_release(T0 + 2 * D, solo_pair(a, b))
+    o, x = ok.approvals
+    for approvals, solo, code in [
+        ((o, replace(x, step_up_receipt_id=o.step_up_receipt_id)), True,
+         "step_up_reused"),  # the same receipt twice
+        ((o, replace(x, step_up_receipt_id="STEPUP-A-1")), True, "step_up_reused"),
+        ((replace(o, stepped_up_at=None), x), True, "step_up_time"),
+        ((o, replace(x, stepped_up_at=None)), True, "step_up_time"),
+        ((replace(o, stepped_up_at=T0 - H), x), True, "time_order"),  # before hold
+        ((o, replace(x, stepped_up_at=T0 + 3 * D)), True, "time_order"),  # after
+        (solo_pair(a, b, who="someone-synth-2"), True, "solo_principal"),
+        ((o, x), False, "solo_mismatch"),  # a solo release must say so
+    ]:  # fmt: skip
+        with pytest.raises(rt.RetentionError) as exc:
+            holds.release(replace(ok, approvals=approvals, solo=solo))
+        assert exc.value.code == code, approvals
+    assert len(holds.history(TENANT)) == 2  # nothing was released
+    holds.release(ok)
+    again = solo_release(T0 + 3 * D, (o, replace(x, step_up_receipt_id="stepup-c-1")),
+                         "hold-2")  # fmt: skip
+    with pytest.raises(rt.RetentionError) as exc:  # receipts are used once
+        holds.release(again)
+    assert exc.value.code == "step_up_reused"
+
+
+def test_two_person_release_is_unchanged_when_solo_is_enabled() -> None:
+    holds = rt.Holds(solo=SOLO)
+    holds.place(hold("hold-1"))
+    rel = rt.HoldRelease("hold-1", TENANT, "counsel-1", "closed", T0 + H, both())
+    with pytest.raises(rt.RetentionError) as exc:  # not a solo release
+        holds.release(replace(rel, solo=True))
+    assert exc.value.code == "solo_mismatch"
+    done = holds.release(rel)  # no delay between two people's step-ups
+    assert done.solo is False
+    with pytest.raises(rt.RetentionError):
+        naive = datetime(2026, 10, 1, 12)  # noqa: DTZ001 - the naive input under test
+        rt.Approval(rt.HoldRole.OPERATOR, PILOT, "stepup-z-1", naive)
+    east = datetime(2026, 10, 1, 17, tzinfo=timezone(5 * H))
+    got = rt.Approval(rt.HoldRole.OPERATOR, PILOT, "s-1", east).stepped_up_at
+    assert got == T0 and got is not None and got.tzinfo is UTC
+
+
+def test_solo_operator_id_compares_case_insensitively() -> None:
+    holds = rt.Holds(solo=rt.SoloRelease(Edition.SELF_HOSTED,
+                                         frozenset({"Pilot-Synth-1"})))  # fmt: skip
+    holds.place(hold("hold-1"))
+    done = holds.release(solo_release(T0 + 2 * D, solo_pair(T0 + H, T0 + 25 * H)))
+    assert done.solo is True

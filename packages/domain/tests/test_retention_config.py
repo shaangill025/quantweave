@@ -14,6 +14,7 @@ from datetime import UTC, datetime, timedelta
 import pytest
 from qw_domain import retention as rt
 from qw_domain import retention_config as rc
+from qw_domain.release import Edition
 
 C = rt.RetentionClass
 OR = rt.OnRequest
@@ -25,19 +26,19 @@ TENANT = "tenant-synth-a"
 SEVEN_YEARS = 2557 * D  # 7 x 365 days + at most 2 leap days in any 7 years
 
 # (on request, age expiry, authority) per class, written from the receipt table and
-# owner decisions 9 (2026-10-15), 20 and 21 (2026-10-21).
-D9, D20, D21, IMPL = ("owner-decision-9", "owner-decision-20", "owner-decision-21",
-                      "implementer-default")  # fmt: skip
+# owner decisions 9 (2026-10-15), 20, 21 and 34 (2026-10-21).
+D9, D20, D21, D34 = ("owner-decision-9", "owner-decision-20", "owner-decision-21",
+                     "owner-decision-34")  # fmt: skip
 EXPECTED = {
     C.SECURITY: (OR.DELETE, None, D20),
-    C.REFERENCE: (OR.RETAIN, None, IMPL),  # not named in decision 20's question
+    C.REFERENCE: (OR.RETAIN, None, D34),
     C.FINANCIAL: (OR.RETAIN, None, D21),
     C.POLICY: (OR.DELETE, None, D20),
     C.AUDIT: (OR.RETAIN, SEVEN_YEARS, D9),
     C.RESEARCH: (OR.DELETE, None, D20),
     C.MARKET: (OR.DELETE, None, D20),
     C.EVIDENCE: (OR.DELETE, None, D20),
-    C.RELEASE: (OR.RETAIN, None, IMPL),  # not named in decision 20's question
+    C.RELEASE: (OR.RETAIN, None, D34),
     C.IMPROVEMENT: (OR.DELETE, None, D20),
     C.SIMULATION: (OR.DELETE, None, D20),
     C.OPERATIONS: (OR.DELETE, None, D20),
@@ -72,14 +73,14 @@ def test_each_default_value() -> None:
         assert (r.on_request, r.expire_after, r.authority_id) == (on, after, auth), cls
     assert rt.AUDIT_RETENTION == SEVEN_YEARS and rt.BACKUP_RETENTION == 30 * D
     assert rt.TOMBSTONE_RETENTION == SEVEN_YEARS
-    mine = {c for c, (_, _, auth) in EXPECTED.items() if auth == IMPL}
-    assert frozenset(mine) == rt.IMPLEMENTER_DEFAULTS
     assert dict(cfg.windows) == {W.IDEMPOTENCY: 48 * H, W.OUTBOX: 7 * D,
                                  W.INBOX: 30 * D}  # fmt: skip
     assert dict(rc.WINDOW_FLOORS) == {W.IDEMPOTENCY: 24 * H, W.OUTBOX: D,
                                       W.INBOX: 7 * D}  # fmt: skip
     assert cfg.obligations == () and cfg.purge_holds == ()
     assert cfg.held() == frozenset()
+    assert cfg.solo_hold_release is False
+    assert cfg.solo_release(Edition.SELF_HOSTED, frozenset({"pilot-synth-1"})) is None
     assert {w: cfg.purge_window(w) for w in W} == dict(cfg.windows)
 
 
@@ -223,7 +224,13 @@ LOG_RULE = {"on_request": "delete", "authority_id": "owner-1", "basis": "synthet
                                 "basis": "b-1"}}), "financial_append_only"),
     (doc(classes={"privacy": {"on_request": "retain", "expire_after": "30d",
                               "authority_id": "o-1", "basis": "b-1"}}),
-     "tombstone_outlives_backups"),
+     "tombstone_floor"),
+    (doc(classes={"privacy": {"on_request": "retain", "expire_after": "2556d",
+                              "authority_id": "o-1", "basis": "b-1"}}),
+     "tombstone_floor"),  # decision 30: never below 2557 days
+    (doc(classes={"privacy": {"on_request": "retain", "expire_after": "61367h",
+                              "authority_id": "o-1", "basis": "b-1"}}),
+     "tombstone_floor"),  # 2557 days less one hour
     (doc(classes={"backup": {"on_request": "retain", "expire_after": "2557d",
                              "authority_id": "o-1", "basis": "b-1"}}),
      "tombstone_outlives_backups"),  # backups may not outlive the 7-year tombstones
@@ -252,6 +259,9 @@ LOG_RULE = {"on_request": "delete", "authority_id": "owner-1", "basis": "synthet
     ("[]", "config"),
     ("{not json", "config"),
     (doc(classes=[]), "config"),
+    (doc(solo_hold_release="true"), "solo_hold_release"),
+    (doc(solo_hold_release=1), "solo_hold_release"),
+    (doc(solo_hold_release=None), "solo_hold_release"),
     (doc(pad="x" * 70_000), "config"),
 ])  # fmt: skip
 def test_config_fails_closed(text: str, code: str) -> None:
@@ -293,14 +303,51 @@ def test_an_obligation_is_met_exactly_at_its_minimum() -> None:
         owed.check(rule(enough))
 
 
-def test_tombstone_period_is_adjustable_config_above_the_backup_period() -> None:
-    """Owner decision 21 sets 7 years; like audit (decision 9, held as
-    configuration) the operator may change it, but never to a period that a
-    backup copy of the deleted data could outlive, nor to deletion on request."""
+def test_tombstone_period_may_only_lengthen() -> None:
+    """Owner decision 30: config may lengthen tombstones but never shorten them
+    below 2557 days (decision 21's 7 years), nor below the backup period, nor make
+    them deletable on request."""
     tomb = {"on_request": "retain", "authority_id": "owner-1", "basis": "synthetic-1"}
     longer = rc.parse(doc(classes={"privacy": {**tomb, "expire_after": "3653d"}}))
     assert longer.policy.rule(C.PRIVACY).expire_after == 3653 * D
-    least = rc.parse(doc(classes={"privacy": {**tomb, "expire_after": "31d"}}))
-    assert least.policy.rule(C.PRIVACY).expire_after == 31 * D
+    least = rc.parse(doc(classes={"privacy": {**tomb, "expire_after": "2557d"}}))
+    assert least.policy.rule(C.PRIVACY).expire_after == SEVEN_YEARS
+    hours = rc.parse(doc(classes={"privacy": {**tomb, "expire_after": "61368h"}}))
+    assert hours.policy.rule(C.PRIVACY).expire_after == SEVEN_YEARS
     fin = rc.parse(doc(classes={"financial": {**tomb}}))
     assert fin.policy.rule(C.FINANCIAL).on_request is OR.RETAIN
+
+
+def test_solo_hold_release_flag() -> None:  # owner decision 31
+    """The operator's file opts in; the edition and the configured operators come
+    from the deployment, so the file alone cannot enable it on a hosted or
+    multi-operator install."""
+    pilot = frozenset({"pilot-synth-1"})
+    off = rc.parse(doc(solo_hold_release=False))
+    assert off.solo_hold_release is False
+    assert off.solo_release(Edition.SELF_HOSTED, pilot) is None
+    on = rc.parse(doc(solo_hold_release=True))
+    assert on.solo_hold_release is True
+    solo = on.solo_release(Edition.SELF_HOSTED, pilot)
+    assert solo == rt.SoloRelease(Edition.SELF_HOSTED, pilot)
+    for edition, ops in ((Edition.HOSTED, pilot),
+                         (Edition.SELF_HOSTED, pilot | {"op-synth-2"})):  # fmt: skip
+        with pytest.raises(rt.RetentionError) as err:
+            on.solo_release(edition, ops)
+        assert err.value.code == "solo_release_refused"
+    base = rc.defaults()
+    with pytest.raises(rt.RetentionError) as err:
+        rc.RetentionConfig(base.policy, base.windows,
+                           solo_hold_release=1)  # type: ignore[arg-type]  # fmt: skip
+    assert err.value.code == "solo_hold_release"
+    store = rt.Retention(holds=rt.Holds(solo=solo))
+    store.holds.place(rt.LegalHold("hold-1", TENANT, frozenset({C.RESEARCH}),
+                                   frozenset(), "litigation", "counsel-1", T0,
+                                   rt.HoldRole.OPERATOR, "pilot-synth-1"))  # fmt: skip
+    pair = (rt.Approval(rt.HoldRole.TENANT_OWNER, "pilot-synth-1", "stepup-1", T0 + H),
+            rt.Approval(rt.HoldRole.OPERATOR, "pilot-synth-1", "stepup-2",
+                        T0 + 25 * H))  # fmt: skip
+    rel = store.holds.release(rt.HoldRelease("hold-1", TENANT, "counsel-1",
+                                             "case_closed", T0 + 26 * H, pair,
+                                             solo=True))  # fmt: skip
+    assert rel.solo is True
