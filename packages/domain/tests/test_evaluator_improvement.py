@@ -302,7 +302,8 @@ def test_helpful_candidate_metrics_and_acceptance_for_review() -> None:
     }  # fmt: skip
     assert all(type(x) is Decimal for x in v.scores.values())
     assert v.decision is im.Decision.ACCEPT_FOR_REVIEW
-    assert v.limitations == ("synthetic_only",) and v.requires_human_promotion
+    assert v.limitations == ("synthetic_only", "no_multiple_testing_adjustment")  # 36
+    assert v.requires_human_promotion
 
 
 def test_regressions_and_tampering_candidates_are_rejected() -> None:

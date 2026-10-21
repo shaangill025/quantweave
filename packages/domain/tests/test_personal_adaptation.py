@@ -190,7 +190,8 @@ def test_helpful_candidate_is_accepted_for_review_on_the_fixture() -> None:
         "relevant_alerts_lost": Decimal(0), "explanation_mismatch_change": Decimal(-2),
     }  # fmt: skip
     assert v.decision is im.Decision.ACCEPT_FOR_REVIEW
-    assert v.limitations == ("synthetic_only",) and v.requires_human_promotion
+    assert v.limitations == ("synthetic_only", "no_multiple_testing_adjustment")  # 36
+    assert v.requires_human_promotion
     edge = (alert("b1", C.PROPOSAL, "prop-1", 0, True),
             alert("b2", C.PROPOSAL, "prop-1", 60, True))  # fmt: skip
     hour = pa.Adaptation(coalesce_minutes={C.PROPOSAL: 60})

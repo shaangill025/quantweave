@@ -27,8 +27,8 @@ from qw_adapters import tenancy as tn
 from qw_domain import improvement as im
 from qw_domain import trial_ledger as tl
 from qw_domain.research_data import Window
-from test_improvement import ASSESSOR, AT, GOOD, cand, promo_ledger
-from test_trial_ledger import DS, PROMO, T0, ledger, plan, trial
+from test_improvement import ASSESSOR, AT, EVAL, GOOD, cand, failed_dev, promo_ledger
+from test_trial_ledger import DS, PROMO, T0, evaluation, ledger, plan, trial
 
 _spec = importlib.util.spec_from_file_location(
     "qw_estore_tests", Path(__file__).with_name("test_experiment_store.py")
@@ -57,7 +57,8 @@ def lg(t: uuid.UUID, base: tl.TrialLedger) -> tl.TrialLedger:
 
 
 def run(t: uuid.UUID, base: tl.TrialLedger, vid: str) -> im.Assessment:
-    return im.Assessment(lg(t, base), ASSESSOR, AT + timedelta(days=1), vid)
+    return im.Assessment(lg(t, base), ASSESSOR, AT + timedelta(days=1), vid,
+                         evaluation=EVAL)  # fmt: skip
 
 
 @pytest.fixture
@@ -162,6 +163,14 @@ def test_the_stored_protocol_and_lineage_are_frozen(wa: Pair, a: uuid.UUID) -> N
         put(wa, a, relabel, booked(reg))
 
 
+# A strategy rejection's adjustment as the adjustment guard requires (the copied
+# row's chain count), so raw copies that score a receipt reach the rule they probe.
+ADJ = (
+    "jsonb_build_object('chain_trials', chain_trials::text, 'z_widened', '2', "
+    "'baseline.bl-hold.excess_lower_widened', '-0.001')"
+)
+
+
 def receipt_copy(conn: Conn, src: str = "scored_seq IS NOT NULL", **over: str) -> str:
     """An INSERT copying the `src` receipt with the named columns replaced."""
     over = {"verdict_id": "'v-x'", "recorded_at": "clock_timestamp()"} | over
@@ -222,7 +231,8 @@ def test_a_scored_receipt_must_match_its_read(
     reg = reg_for(a)
     put(wa, a, reg, st.empty(a), None, run(a, promo_ledger(GOOD), "v-1"))
     scored = {"scored_seq": "1", "trial_ids": "'{trial-1}'", "decision": "'reject'",
-              "reasons": "'{goal:x}'", "src": "verdict_id = 'v-1'"}  # fmt: skip
+              "reasons": "'{goal:x}'", "src": "verdict_id = 'v-1'",
+              "adjustment": ADJ}  # fmt: skip
     other = "(SELECT {} FROM app.assessor_{} WHERE experiment_id = 'exp-0')"
     cases = [
         scored | {"experiment_id": "'exp-0'",  # another experiment's read
@@ -353,7 +363,7 @@ def test_decision_17_only_qw_assessor_writes_and_reads_assessor_tables(
     assess(wa, a, promo_ledger(GOOD), "v-1")
     tn.check_runtime_role(assessor_conn)  # a runtime role, like qw_app and qw_worker
     every = privileges(conn, "qw_migrate", "SELECT")
-    assert len(every) == 13 + 9 + 10 + 25  # the four tables' columns
+    assert len(every) == 13 + 9 + 10 + 26  # the four tables' columns
     assert privileges(conn, "qw_assessor", "SELECT") == every
     assert privileges(conn, "qw_assessor", "INSERT") == every  # 0028's full lists
     assert held(conn, "qw_assessor") == {(t, "SELECT") for t in (
@@ -557,9 +567,10 @@ GOOD_R = {"net_return": Decimal("0.02"), "unsupported_material_facts": Decimal(0
 
 
 def other_plan(pid: str, promotion: Window | None = None) -> tl.SplitPlan:
+    bound = evaluation(pid).content_hash  # each plan freezes its own T033 protocol
     if promotion is None:  # the same windows as plan-synth-1
-        return plan(plan_id=pid)
-    return plan(plan_id=pid, promotion=promotion,
+        return plan(plan_id=pid, protocol_hash=bound)
+    return plan(plan_id=pid, promotion=promotion, protocol_hash=bound,
                 train=Window(datetime(2020, 1, 1, tzinfo=UTC),
                              datetime(2021, 1, 1, tzinfo=UTC)),
                 development=Window(datetime(2021, 2, 1, tzinfo=UTC),
@@ -588,7 +599,8 @@ def read_on(t: uuid.UUID, sp: tl.SplitPlan, eid: str,
     return lg.record(trial(1, tl.Split.PROMOTION, outcome, trial_id=f"trial-{eid}",
                            plan_id=sp.plan_id, access_id=f"acc-{eid}", family=eid,
                            material_hash=key.material_hash, metrics=metrics,
-                           config_hash=key.config_hash))  # fmt: skip
+                           config_hash=key.config_hash,
+                           protocol_hash=sp.protocol_hash))  # fmt: skip
 
 
 def put_on(wa: Pair, t: uuid.UUID, eid: str, sp: tl.SplitPlan, lg: Any = None,
@@ -597,7 +609,8 @@ def put_on(wa: Pair, t: uuid.UUID, eid: str, sp: tl.SplitPlan, lg: Any = None,
            target: im.Target = im.Target.STRATEGY) -> es.Revision:  # fmt: skip
     reg = reg_on(t, eid, sp, baseline, retest_of, target)
     run_ = None if lg is None else im.Assessment(lg, ASSESSOR, AT + timedelta(days=1),
-                                                 vid)  # fmt: skip
+                                                 vid, evaluation=evaluation(
+                                                     sp.plan_id))  # fmt: skip
     out = im.Scheduled(eid, f"bud-{eid}") if lg is None else None
     rev: es.Revision = es.record(*wa, t, reg, eid, "cand-1", sp, booked(reg, eid),
                                  out, run_)[0]  # fmt: skip
@@ -674,7 +687,7 @@ def test_decision_18_the_database_refuses_a_read_or_score_of_a_used_window(
     assess(wa, a, promo_ledger(GOOD), "v-1")  # plan-synth-1 scores PROMO
     score = receipt_copy(conn, src="experiment_id = 'exp-2'", scored_seq="1",
                          trial_ids="'{trial-exp-2}'", decision="'reject'",
-                         reasons="'{goal:x}'")  # fmt: skip
+                         reasons="'{goal:x}'", adjustment=ADJ)  # fmt: skip
     read = ("INSERT INTO app.holdout_access SELECT tenant_id, plan_id, 2, 'acc-9', "
             "trial_id, family, actor_id, jsonb_set(jsonb_set(body, '{0}', "
             "'\"acc-9\"'), '{12}', '2'), clock_timestamp(), event_hash FROM "
@@ -702,7 +715,7 @@ def test_decision_18_the_database_refuses_a_read_or_score_of_a_used_window(
     put_on(wa, a, "exp-e", disjoint, read_on(a, disjoint, "exp-e", tl.Outcome.FAILED))
     conn.execute(receipt_copy(conn, src="experiment_id = 'exp-e'", scored_seq="1",
                               trial_ids="'{trial-exp-e}'", decision="'reject'",
-                              reasons="'{goal:x}'"))  # fmt: skip
+                              reasons="'{goal:x}'", adjustment=ADJ))  # fmt: skip
     empty = ("INSERT INTO app.holdout_access SELECT tenant_id, plan_id, 2, 'acc-8', "
              "trial_id, family, actor_id, jsonb_set(jsonb_set(jsonb_set(body, '{0}', "
              "'\"acc-8\"'), '{12}', '2'), '{5}', jsonb_build_array(body -> 5 -> 0, "
@@ -720,7 +733,8 @@ def dev_trials(lg: tl.TrialLedger, plan_id: str, start: int,
     for n, family in enumerate(families, start):
         lg = lg.record(trial(n, tl.Split.DEVELOPMENT, tl.Outcome.FAILED,
                              family=family, trial_id=f"trial-d{n}", plan_id=plan_id,
-                             access_id=None))  # fmt: skip
+                             access_id=None,
+                             protocol_hash=lg.plan(plan_id).protocol_hash))  # fmt: skip
     return lg
 
 
@@ -795,3 +809,117 @@ def test_decision_19_the_database_holds_the_link_and_the_chain_count(
         with pytest.raises(psycopg.errors.CheckViolation):
             conn.execute(receipt_copy(conn, chain_trials=chain, **low))
     conn.execute(receipt_copy(conn, chain_trials="2", **low))  # the control
+
+
+# Owner decisions 35 to 37 through the store: the receipt keeps the adjustment (a
+# protected column), and the store's chain count is the k that widens z.
+def adjustment(conn: Conn, vid: str) -> dict[str, str] | None:
+    row = conn.execute("SELECT adjustment FROM app.evaluation_receipt WHERE "
+                       "verdict_id = %s", (vid,)).fetchone()  # fmt: skip
+    assert row is not None
+    got: dict[str, str] | None = row[0]
+    return got
+
+
+def test_decision_35_the_receipt_keeps_the_widened_bounds(
+    wa: Pair, assessor_conn: Conn, app_conn: Conn, conn: Conn, a: uuid.UUID
+) -> None:
+    done = assess(wa, a, promo_ledger(GOOD), "v-1")
+    assert done.record.state is St.AWAITING_REVIEW
+    with tn.tenant_transaction(assessor_conn, a) as tx:
+        (v, *_), = ast.receipts(tx, EXP)  # fmt: skip
+    # k = 1 (one trial in EXP): z' = z, bound 0.02 - 1.959964 * 0.002 = 0.016080072
+    assert v.adjustment["chain_trials"] == 1
+    bound = v.adjustment["baseline.bl-hold.excess_lower_widened"]
+    assert abs(bound - Decimal("0.016080072")) < Decimal("1e-9")
+    assert adjustment(conn, "v-1") == {k: str(x) for k, x in v.adjustment.items()}
+    with (
+        pytest.raises(psycopg.errors.InsufficientPrivilege),
+        tn.tenant_transaction(app_conn, a) as tx,
+    ):
+        tx.conn.execute("SELECT adjustment FROM app.evaluation_receipt")
+
+
+def test_decision_35_the_stored_chain_widens_a_retest(
+    wa: Pair, conn: Conn, a: uuid.UUID
+) -> None:
+    # EXP: 1 promotion + 9 failed development trials, family count 10 (it still
+    # clears: z' = Phi^-1(1 - 0.05 / 20) ~ 2.807, 0.02 - 0.0056 > 0).
+    assert assess(wa, a, failed_dev(promo_ledger(GOOD), 9), "v-1").record.state is (
+        St.AWAITING_REVIEW)  # fmt: skip
+    assert counts(conn, EXP) == [(10, 10)]
+    m = GOOD | {"baseline.bl-hold.excess_mean": Decimal("0.01"),
+                "baseline.bl-hold.excess_std_error": Decimal("0.004")}  # fmt: skip
+    # Unlinked, on its own plan: k = 1, z' = z: 0.01 - 0.0078399 = 0.0021601 >= 0.
+    mid = other_plan("plan-m", MID)
+    put_on(wa, a, "exp-m", mid)
+    alone = put_on(wa, a, "exp-m", mid, read_on(a, mid, "exp-m", metrics=m))
+    assert alone.record.state is St.AWAITING_REVIEW
+    # A retest of EXP: k = 1 + 10 = 11, alpha / (2 k) = 0.05 / 22 = 0.0022727;
+    # tables Phi(2.83) = 0.997673, Phi(2.84) = 0.997744 interpolate z' ~ 2.8376,
+    # so 0.01 - 2.8376 * 0.004 ~ -0.00135 < 0: rejected.
+    early = other_plan("plan-e", EARLY)
+    put_on(wa, a, "exp-r", early, retest_of=EXP)
+    linked = put_on(wa, a, "exp-r", early, read_on(a, early, "exp-r", metrics=m),
+                    retest_of=EXP)  # fmt: skip
+    assert linked.record.state is St.REJECTED
+    assert "rejected:bonferroni:baseline.bl-hold" in linked.record.reasons
+    got = adjustment(conn, "v-1") or {}  # EXP's
+    adj = {k: Decimal(x) for k, x in (adjustment_of(conn, "exp-r") or {}).items()}
+    assert got["chain_trials"] == "10" and adj["chain_trials"] == 11
+    assert Decimal("2.837") < adj["z_widened"] < Decimal("2.839")
+    assert abs(adj["baseline.bl-hold.excess_lower_widened"] + Decimal("0.00135")) < (
+        Decimal("0.00001"))  # fmt: skip
+    assert counts(conn, "exp-r") == [(1, 11)]
+
+
+def adjustment_of(conn: Conn, eid: str) -> dict[str, str] | None:
+    row = conn.execute("SELECT adjustment FROM app.evaluation_receipt WHERE "
+                       "experiment_id = %s", (eid,)).fetchone()  # fmt: skip
+    assert row is not None
+    got: dict[str, str] | None = row[0]
+    return got
+
+
+def test_decision_35_the_database_requires_a_consistent_adjustment(
+    wa: Pair, conn: Conn, a: uuid.UUID
+) -> None:
+    assess(wa, a, promo_ledger(GOOD), "v-1")  # EXP accepted, k = 1
+    t = other_plan("plan-t")  # a research experiment: no adjustment
+    put_on(wa, a, "exp-t", t, target=RESEARCH)
+    put_on(wa, a, "exp-t", t, read_on(a, t, "exp-t", metrics=GOOD_R), target=RESEARCH)
+    lower = "{baseline.bl-hold.excess_lower_widened}"
+    for over in (
+        {"adjustment": "NULL"},  # a strategy acceptance without its bounds
+        {"adjustment": f"jsonb_set(adjustment, '{lower}', '\"-0.001\"')"},  # < 0
+        {"adjustment": "jsonb_set(adjustment, '{chain_trials}', '\"2\"')"},  # not k
+        {"adjustment": "adjustment - 'z_widened'"},  # no z'
+        {
+            "adjustment": "adjustment - 'baseline.bl-hold.excess_lower_widened' - "
+            "'baseline.bl-cash.excess_lower_widened'"
+        },  # no bound
+    ):  # as the owner: only the database applies
+        with pytest.raises(psycopg.errors.CheckViolation, match="adjustment"):
+            conn.execute(receipt_copy(conn, src="verdict_id = 'v-1' AND "
+                                      f"experiment_id = '{EXP}'", **over))  # fmt: skip
+    with pytest.raises(psycopg.errors.UniqueViolation):  # the control: it passes the
+        conn.execute(receipt_copy(conn, src=f"experiment_id = '{EXP}'"))  # rules
+    with pytest.raises(psycopg.errors.CheckViolation, match="adjustment"):
+        conn.execute(receipt_copy(  # a count-based target carries none
+            conn, src="experiment_id = 'exp-t'", scored_seq="NULL", trial_ids="'{}'",
+            decision="'blocked'", reasons="'{blocked}'",
+            adjustment=f"(SELECT adjustment FROM app.evaluation_receipt "
+            f"WHERE experiment_id = '{EXP}')"))  # fmt: skip
+
+
+def test_review_m1_no_protocol_spends_no_holdout_read(
+    wa: Pair, conn: Conn, a: uuid.UUID
+) -> None:
+    reg = reg_for(a)
+    bare = replace(run(a, promo_ledger(GOOD), "v-1"), evaluation=None)
+    with pytest.raises(im.ImprovementError, match="evaluation_protocol_missing"):
+        put(wa, a, reg, booked(reg), None, bare)
+    for table in ("evaluation_receipt", "holdout_access"):  # nothing was stored
+        assert conn.execute(f"SELECT count(*) FROM app.{table}").fetchone() == (0,)
+    done = assess(wa, a, promo_ledger(GOOD), "v-1")  # the read is still unused
+    assert done.record.state is St.AWAITING_REVIEW

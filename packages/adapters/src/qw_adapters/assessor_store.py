@@ -15,8 +15,10 @@ re-assessment once a receipt scored the holdout read (`holdout_used`) and a ledg
 that does not extend the last stored checkpoint or begin with the plan's stored
 reads (`ledger_diverged`). `put_verdict` appends new holdout reads, then the
 receipt naming the read it scored, with its family's and its retest chain's trial
-counts. Reads re-hash every row and rebuild protocols, candidates and verdicts
-through the domain (stored reads are compared with the ledger's `Access`);
+counts and the verdict's Bonferroni adjustment (decisions 35 to 37; `chain_count`
+is the k `assess` widens z with). Reads re-hash every row and rebuild protocols,
+candidates and verdicts through the domain (stored reads are compared with the
+ledger's `Access`);
 failures are `integrity`. LIMITATIONS: the ledger itself and the budget book are
 the caller's; a raw qw_assessor INSERT that meets the database rules is not
 checked for provenance."""
@@ -219,7 +221,9 @@ def receipts(tx: TenantTx, eid: str) -> list[Receipt]:
                        {k: Decimal(x) for k, x in r["scores"].items()},
                        tuple(r["trial_ids"]), tuple(r["failed_trial_ids"]),
                        tuple(r["limitations"]),
-                       ensure_aware_utc(r["assessed_at"]))  # fmt: skip
+                       ensure_aware_utc(r["assessed_at"]),
+                       {k: Decimal(x) for k, x in
+                        (r["adjustment"] or {}).items()})  # fmt: skip
         extra = (r["scored_seq"], r["ledger_entries"], r["ledger_digest"])
         counted = (r["family_trials"], r["chain_trials"])  # None on 0028 rows
         tail = [] if counted == (None, None) else list(counted)
@@ -287,7 +291,7 @@ def store_verdict(tx: TenantTx, p: im.Protocol, v: im.Verdict,
     put_verdict(tx, p, v, ledger)
 
 
-def _chain_trials(tx: TenantTx, p: im.Protocol, ledger: tl.TrialLedger) -> int:
+def chain_count(tx: TenantTx, p: im.Protocol, ledger: tl.TrialLedger) -> int:
     """Decision 19: the retest chain's trials (`improvement.chain_trials`) over the
     stored links, each experiment's largest stored count and the ledger."""
     chain, cur = [p.experiment_id], p
@@ -323,7 +327,7 @@ def put_verdict(tx: TenantTx, p: im.Protocol, v: im.Verdict,
             seq = next(a.seq for a in reads if a.access_id == t.access_id)
     who, w = v.assessor, v.wire()
     family = ledger.trial_count(p.experiment_id)
-    chain = _chain_trials(tx, p, ledger)
+    chain = chain_count(tx, p, ledger)
     _insert(tx, "evaluation_receipt", {
         "experiment_id": v.experiment_id, "verdict_id": v.verdict_id,
         "candidate_id": v.candidate_id, "candidate_hash": v.candidate_hash,
@@ -335,4 +339,5 @@ def put_verdict(tx: TenantTx, p: im.Protocol, v: im.Verdict,
         "limitations": list(v.limitations), "assessed_at": v.assessed_at,
         "plan_id": p.plan_id, "scored_seq": seq, "ledger_entries": n,
         "ledger_digest": d, "family_trials": family, "chain_trials": chain,
+        "adjustment": Jsonb(w["adjustment"]) if "adjustment" in w else None,
     }, [w, p.plan_id, seq, n, d, family, chain])  # fmt: skip

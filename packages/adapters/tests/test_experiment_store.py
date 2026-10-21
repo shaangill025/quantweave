@@ -20,7 +20,17 @@ from qw_adapters.migrations import MIGRATIONS_DIR, migrate
 from qw_domain import improvement as im
 from qw_domain import trial_ledger as tl
 from qw_domain.budget import BudgetBook
-from test_improvement import ASSESSOR, AT, CAPS, EXP, GOOD, cand, promo_ledger, proto
+from test_improvement import (
+    ASSESSOR,
+    AT,
+    CAPS,
+    EVAL,
+    EXP,
+    GOOD,
+    cand,
+    promo_ledger,
+    proto,  # fmt: skip
+)
 from test_trial_ledger import ledger, plan
 
 pytestmark = pytest.mark.db
@@ -48,7 +58,7 @@ def booked(reg: im.ExperimentRegistry, eid: str = EXP) -> BudgetBook:
 
 def run(t: uuid.UUID, metrics: dict[str, Any] = GOOD) -> im.Assessment:
     lg = tl.TrialLedger(str(t), promo_ledger(metrics).entries)
-    return im.Assessment(lg, ASSESSOR, AT + timedelta(days=1), "v-1")
+    return im.Assessment(lg, ASSESSOR, AT + timedelta(days=1), "v-1", evaluation=EVAL)
 
 
 Pair = tuple[Conn, Conn]  # (the qw_worker connection, the qw_assessor connection)

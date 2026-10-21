@@ -174,8 +174,13 @@ def record(
         _lock(atx, shared=False)
         chain = _chains(atx, experiment_id).get(experiment_id, [])
         stored = ast.bind(atx, registry, experiment_id, candidate_id, plan)
+        k = (
+            None
+            if assessment is None
+            else ast.chain_count(atx, stored.protocol(experiment_id), assessment.ledger)
+        )  # decision 35
         rec, verdict = im.derive(stored, experiment_id, candidate_id, plan, book,
-                                 outcome, assessment)  # fmt: skip
+                                 outcome, assessment, chain_trials=k)  # fmt: skip
         if _check_follows(rec, chain):
             return chain[-1], False
         if verdict is not None and assessment is not None:

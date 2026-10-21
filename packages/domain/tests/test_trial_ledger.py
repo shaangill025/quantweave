@@ -9,6 +9,8 @@ from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 
 import pytest
+from qw_domain import backtest as bt
+from qw_domain.eval_stats import Z95
 from qw_domain.research_data import (
     Change,
     DatasetRefused,
@@ -35,11 +37,26 @@ from test_research_data import AS_OF, EVENTS, ORIGINAL, event, freeze, iid, righ
 TENANT = "tenant-synth-a"
 MAT, CFG = "a" * 64, "b" * 64
 CAND = Candidate("fam-momentum", MAT, CFG)
-PROTO_HASH = "e" * 64  # SYNTHETIC evaluation protocol hash frozen with the plan
 TRAIN = Window(datetime(2020, 1, 1, tzinfo=UTC), datetime(2022, 1, 1, tzinfo=UTC))
 DEV = Window(datetime(2022, 2, 1, tzinfo=UTC), datetime(2023, 6, 1, tzinfo=UTC))
 PROMO = Window(datetime(2023, 7, 1, tzinfo=UTC), datetime(2025, 12, 31, tzinfo=UTC))
 T0 = AS_OF + timedelta(days=1)
+
+
+def evaluation(plan_id: str = "plan-synth-1") -> bt.EvaluationProtocol:
+    """The SYNTHETIC T033 evaluation protocol frozen with a plan (as
+    test_backtest.protocol(); owner decision 35 needs its z at the assessor)."""
+    d = Decimal
+    return bt.EvaluationProtocol(
+        "proto-synth-1", plan_id,
+        bt.DeclaredClaim(bt.ClaimMetric.NET_MEAN, bt.Direction.POSITIVE, None),
+        bt.CostModel(d("0.001"), d("0.0005"), d("0.0005")), 1, 1, Z95,
+        (bt.Baseline("bl-hold", bt.BaselineKind.BUY_AND_HOLD, "px-synth-1", d(0)),
+         bt.Baseline("bl-cash", bt.BaselineKind.CASH, None, d(0))),
+        T0, "owner-synth")  # fmt: skip
+
+
+PROTO_HASH = evaluation().content_hash  # frozen with the plan at registration
 DS = freeze(
     facts=(ORIGINAL,),
     events=(
