@@ -123,6 +123,15 @@ def get_membership(tx: TenantTx, user_id: uuid.UUID) -> Membership | None:
     return Membership(tx.tenant_id, user_id, MembershipRole(row[0]), int(row[1]))
 
 
+def get_display_name(tx: TenantTx, user_id: uuid.UUID) -> str | None:
+    """The user's stored display name in this tenant; None for an unknown user."""
+    row = tx.conn.execute(
+        "SELECT display_name FROM app.app_user WHERE tenant_id = %s AND id = %s",
+        (tx.tenant_id, user_id),
+    ).fetchone()
+    return None if row is None else str(row[0])
+
+
 def append_audit_event(
     tx: TenantTx,
     action: str,

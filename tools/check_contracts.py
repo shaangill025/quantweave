@@ -9,7 +9,8 @@ Artifact check only: it reads the designed contracts, not a running API.
    place, rebalance, exercise, withdraw, transfer, ...), fails unless its (method,
    path, operationId) is in the reviewed ALLOWED_MUTATIONS list. The simulator order and user-reported execution
    report routes must also return `broker_submission`/`broker_confirmed` const false.
-2. Every mutating operation requires Idempotency-Key and X-CSRF-Token headers.
+2. Every mutating operation requires Idempotency-Key and X-CSRF-Token headers,
+   except an approved amended POST with the `unauthenticated_login` exemption.
 3. Every money/quantity-named property or parameter is a decimal string, and no schema
    (components, files or inline under paths) uses JSON `number`. A `$ref` counts only
    if its resolved target carries one of the reviewed decimal patterns.
@@ -31,12 +32,19 @@ Artifact check only: it reads the designed contracts, not a running API.
    resolved). Amendments add GET operations; a mutating one (POST, PUT, PATCH,
    DELETE) is refused unless `mutations` lists its method, path and operationId
    with an owner decision id (`YYYY-MM-DD#N`) whose section in
-   docs/decisions/YYYY-MM-DD-owner-decisions.md has a `Selected label:` line and a
-   line exactly ``Approves: `METHOD /path` (`operationId`)`` (one per line; a match
-   anywhere else, such as a question, option text or rejected option, does not
-   count); an entry that cites no such section, or matches no amended operation,
-   fails. The decisions file has no integrity check beyond owner review of its
-   diff. A listed mutation still passes rules 1 and 2 and every rule
+   docs/decisions/YYYY-MM-DD-owner-decisions.md has exactly one `Selected label:`
+   line and a whole line ``Approves: `METHOD /path` (`operationId`)`` in the
+   trailing directive block (`approvals`: after the label and the option text,
+   only directives until `Implemented by:`, all outside quoted text); an entry
+   that cites no such section, or matches no amended operation, fails. The
+   decisions file has no integrity check beyond owner review of its diff. An
+   approved entry's `exemptions` (owner decision 25) are the only relaxations,
+   each pinned to one operation and citing a decision with one `Selected label:`
+   and a line ``Exempts: `name` (`operationId`)`` in that block:
+   `unauthenticated_login` (only `POST /session`, createSession) needs `security:
+   []` on the operation and waives rule 2's headers; `no_content` (only `DELETE
+   /session`, revokeSession) allows its one 2xx to be a 204 without content (still
+   no-store). Neither applies to a read or any other operation. A listed mutation still passes rules 1 and 2 and every rule
    above, and one on the broker surface or with a trading verb is never amendable.
    Any other method is refused. `security_schemes` may change only the
    `sessionCookie` apiKey-in-cookie `name`, to exactly `__Host-pi_session`
@@ -158,9 +166,16 @@ TOP_KEYS: dict[str, type] = {
 }  # fmt: skip
 MUTATION_KEYS = ("method", "path", "operationId", "decision")
 DECISION_ID = re.compile(r"(\d{4}-\d{2}-\d{2})#([1-9]\d*)")
-APPROVES = re.compile(r"^[ \t]*Approves: `([A-Z]+) (/[^`\s]*)` \(`([A-Za-z0-9]+)`\)[ \t]*$",
-                      re.M)  # fmt: skip
-SELECTED = re.compile(r"^[ \t]*Selected label: \S", re.M)
+APPROVES = re.compile(r"Approves: `([A-Z]+) (/[^`\s]*)` \(`([A-Za-z0-9]+)`\)")
+EXEMPTS = re.compile(r"Exempts: `([a-z_]+)` \(`([A-Za-z0-9]+)`\)")
+QUOTED = ("Question:", "Option text as presented:")
+CLOSES = ('."', '?"', '!"')  # a quoted block ends at a sentence-final quote
+DIRECTIVES = ("Approves:", "Exempts:")
+# Owner decision 25: each exemption is pinned to the one operation it was made for.
+EXEMPTIONS = {
+    "unauthenticated_login": ("post", "/session", "createSession"),
+    "no_content": ("delete", "/session", "revokeSession"),
+}
 # project_contract raises these on a malformed amendment: reported as a refusal.
 REFUSED = (KeyError, ValueError, TypeError, AttributeError, IndexError)
 OP_KEYS = frozenset({"operationId", "summary", "description", "security",
@@ -265,7 +280,11 @@ def resolve(api: Json, schemas: dict[str, Json], ref: str) -> Json:
     return schemas.get(ref.split("/")[-1].split("#")[0], {})
 
 
-def check_routes(api: Json, schemas: dict[str, Json]) -> list[str]:
+def check_routes(
+    api: Json, schemas: dict[str, Json], login: frozenset[tuple[str, str]] = frozenset()
+) -> list[str]:
+    """Rules 1 and 2; `login` holds the (method, path) of approved mutations with
+    the unauthenticated_login exemption, which need no CSRF or idempotency header."""
     errors: list[str] = []
     for path, item in api["paths"].items():
         for method, op in item.items():
@@ -278,7 +297,7 @@ def check_routes(api: Json, schemas: dict[str, Json]) -> list[str]:
                 if p.get("in") == "header" and p.get("required")
             }
             for needed in ("Idempotency-Key", "X-CSRF-Token"):
-                if needed not in headers:
+                if needed not in headers and (method, path) not in login:
                     errors.append(f"{where}: missing required {needed}")
             op_id = str(op.get("operationId", ""))
             sensitive = (
@@ -413,11 +432,32 @@ def check_shapes(m: Json) -> list[str]:
                 errors.append(f"{w} security_schemes.{key}.name is not "
                               f"{pc.SESSION_COOKIE_NAME} (decision 14)")  # fmt: skip
     mutations = m.get("mutations") if isinstance(m.get("mutations"), list) else []
+    no_content: set[tuple[Json, Json]] = set()  # (path, operationId) of DELETEs
     for i, entry in enumerate(mutations):
         if not isinstance(entry, dict):
             continue  # reported above
-        keys(entry, MUTATION_KEYS)
-        want(f"mutations[{i}]", entry, dict, str)
+        keys(entry, (*MUTATION_KEYS, "exemptions"))
+        fields = {k: v for k, v in entry.items() if k != "exemptions"}
+        want(f"mutations[{i}]", fields, dict, str)
+        listed = entry.get("exemptions", [])
+        if want(f"mutations[{i}].exemptions", listed, list, dict):
+            names = [x.get("name") for x in listed if isinstance(x, dict)]
+            for x in [x for x in listed if isinstance(x, dict)]:
+                keys(x, ("name", "decision"))
+                name, where_ = x.get("name"), f"{w} mutations[{i}] exemption"
+                if name not in EXEMPTIONS:
+                    errors.append(f"{where_} {name!r} is not a reviewed exemption")
+                elif EXEMPTIONS[name] != tuple(entry.get(k) for k in MUTATION_KEYS[:3]):
+                    method, path, op_id = EXEMPTIONS[name]
+                    errors.append(f"{where_} {name} applies only to "
+                                  f"{method.upper()} {path} ({op_id})")  # fmt: skip
+                elif name == "no_content":
+                    no_content.add((entry.get("path"), entry.get("operationId")))
+                if not DECISION_ID.fullmatch(str(x.get("decision"))):
+                    errors.append(f"{where_} {name}: decision is not an owner "
+                                  "decision id (YYYY-MM-DD#N)")  # fmt: skip
+            if len(set(map(str, names))) != len(names):
+                errors.append(f"{w} mutations[{i}]: duplicate exemption")
         if missing := [k for k in MUTATION_KEYS if k not in entry]:
             errors.append(f"{w} mutations[{i}] lacks {missing}")
         elif entry["method"] not in MUTATING:
@@ -474,8 +514,10 @@ def check_shapes(m: Json) -> list[str]:
             want(f"{where} requestBody", op.get("requestBody", {}), dict)
             if not want(f"{where} responses", op.get("responses"), dict):
                 continue
+            listed_204 = where.startswith("DELETE ") and (
+                path, op.get("operationId")) in no_content  # fmt: skip
             for code, response in op["responses"].items():
-                if code not in RESPONSE_CODES:
+                if code not in RESPONSE_CODES and not (code == "204" and listed_204):
                     errors.append(f"{w} {where}: response key {code!r} refused")
                 if not isinstance(response, dict):
                     errors.append(f"{w} {where}: response {code} is not an object")
@@ -552,15 +594,64 @@ def _decision_section(decision: str) -> str | None:
     date, number = found.groups()
     file = ROOT / "docs" / "decisions" / f"{date}-owner-decisions.md"
     text = file.read_text(encoding="utf-8") if file.is_file() else ""
+    text = text.replace("\r\n", "\n")
     section = re.search(rf"^{number}\. \*\*.*?(?=^\d+\. \*\*|^#|\Z)", text, re.M | re.S)
     return section.group(0) if section else None
 
 
-def approved_mutations(amendments: Json) -> tuple[set[tuple[str, str, str]], list[str]]:
-    """`mutations` entries whose cited owner decision approves the operation on an
-    `Approves:` line, with a `Selected label:` line, and that match an amended
-    operation (rule 6); every other entry is an error."""
-    approved: set[tuple[str, str, str]] = set()
+def approvals(section: str) -> tuple[int, set[tuple[str, ...]], set[tuple[str, ...]]]:
+    """A decision section's `Selected label:` lines, and the operations it approves
+    and exempts, read only outside quoted text. A `Question:` or `Option text as
+    presented:` quote runs to the first line ending with `."`, `?"` or `!"` (one
+    left open runs to the end, so it fails closed). The directives are whole lines
+    ``Approves: `METHOD /path` (`operationId`)`` and ``Exempts: `name`
+    (`operationId`)``. They count only in one trailing block that starts after the
+    label and the option text and is closed by `Implemented by:`, with nothing but
+    directives (and blank lines) between its first line and `Implemented by:`.
+    Limit: quote ends are found by punctuation, so a quoted line that itself ends
+    with `."` closes the quote early; a directive after it still has to sit in
+    that closed, directive-only trailing block."""
+    labels, block = 0, list[str]()
+    quoted = options = done = broken = False
+    for line in section.replace("\r\n", "\n").split("\n")[1:]:
+        text = line.strip()
+        if quoted:
+            quoted = not text.endswith(CLOSES)
+        elif text.startswith(QUOTED):
+            rest = text.split(":", 1)[1].strip()
+            quoted = not (len(rest) > 1 and rest[0] == '"' and rest.endswith(CLOSES))
+            options = options or text.startswith(QUOTED[1])
+            broken = broken or (bool(block) and not done)
+        elif text.startswith("Selected label:"):
+            labels += 1
+            broken = broken or (bool(block) and not done)
+        elif text.startswith("Implemented by:"):
+            done = True
+        elif done:
+            continue
+        elif text.startswith(DIRECTIVES) and labels and options:
+            block.append(text)
+        elif block and text:
+            broken = True  # only directives between the first one and Implemented by
+    lines = block if done and not broken else []
+    approved = {m.groups() for t in lines if (m := APPROVES.fullmatch(t))}
+    exempts = {m.groups() for t in lines if (m := EXEMPTS.fullmatch(t))}
+    return labels, approved, exempts
+
+
+Key = tuple[str, str, str]
+
+
+def approved_mutations(
+    amendments: Json,
+) -> tuple[set[Key], dict[Key, set[str]], list[str]]:
+    """`mutations` entries whose cited owner decision has one `Selected label:`
+    line and approves the operation (`approvals`) and that match an amended
+    operation, with the exemptions of approved entries whose own decision has one
+    `Selected label:` line and exempts that operation on an `Exempts:` line
+    (rule 6); every other entry or exemption is an error."""
+    approved: set[Key] = set()
+    exempt: dict[Key, set[str]] = {}
     errors: list[str] = []
     ops = amendments.get("operations", {})
     for entry in amendments.get("mutations", []):
@@ -568,24 +659,42 @@ def approved_mutations(amendments: Json) -> tuple[set[tuple[str, str, str]], lis
         where = f"project contract mutations {method.upper()} {path} ({op_id})"
         op = ops.get(path, {}).get(method)
         section = _decision_section(decision)
+        labels, ok, _ = approvals(section or "")
         if not isinstance(op, dict) or op.get("operationId") != op_id:
             errors.append(f"{where}: unused mutations entry")
         elif section is None:
             errors.append(f"{where}: cites no owner decision ({decision})")
-        elif not SELECTED.search(section):
-            errors.append(f"{where}: decision {decision} has no Selected label line")
-        elif (method.upper(), path, op_id) not in APPROVES.findall(section):
+        elif labels != 1:
+            errors.append(f"{where}: decision {decision} has {labels} Selected label "
+                          "lines outside quoted text, not one")  # fmt: skip
+        elif (method.upper(), path, op_id) not in ok:
             errors.append(f"{where}: decision {decision} does not approve it on an "
                           f"`Approves: `{method.upper()} {path}` (`{op_id}`)` line")  # fmt: skip
         else:
             approved.add((method, path, op_id))
-    return approved, errors
+            for x in entry.get("exemptions", []):
+                cited = _decision_section(x["decision"])
+                marks, _, exempts = approvals(cited or "")
+                if cited is None:
+                    errors.append(f"{where}: exemption {x['name']} cites no owner "
+                                  f"decision ({x['decision']})")  # fmt: skip
+                elif marks != 1:
+                    errors.append(f"{where}: exemption {x['name']}: decision "
+                                  f"{x['decision']} has no single Selected label")  # fmt: skip
+                elif (x["name"], op_id) not in exempts:
+                    errors.append(f"{where}: exemption {x['name']}: decision "
+                                  f"{x['decision']} does not exempt it on an "
+                                  f"`Exempts: `{x['name']}` (`{op_id}`)` line")  # fmt: skip
+                else:
+                    exempt.setdefault((method, path, op_id), set()).add(x["name"])
+    return approved, exempt, errors
 
 
 def check_operations(
-    api: Json, schemas: dict[str, Json], amendments: Json
-) -> list[str]:
-    approved, errors = approved_mutations(amendments)
+    api: Json, schemas: dict[str, Json], amendments: Json,
+    approved: set[Key], exempt: dict[Key, set[str]],
+) -> list[str]:  # fmt: skip
+    errors: list[str] = []
     schemes = set(api["components"].get("securitySchemes", {}))
     problem = {"$ref": "#/components/schemas/Problem"}
     prefix = "#/components/schemas/"
@@ -610,8 +719,13 @@ def check_operations(
                               "amendable")  # fmt: skip
             elif method not in MUTATING and method != "get":
                 errors.append(f"{where}: only GET operations may be amended")
+            ex = exempt.get((method, path, op_id), set())
             security = op.get("security", api.get("security"))
-            if security != SESSION or "sessionCookie" not in schemes:
+            if "unauthenticated_login" in ex:
+                if op.get("security") != []:  # explicit, never inherited
+                    errors.append(f"{where}: unauthenticated_login exemption needs "
+                                  "security: [] on the operation")  # fmt: skip
+            elif security != SESSION or "sessionCookie" not in schemes:
                 errors.append(f"{where}: no session security (exactly sessionCookie)")
             responses = op.get("responses", {})
             media = responses.get("default", {}).get("content", {})
@@ -623,8 +737,19 @@ def check_operations(
             ok = sorted(k for k in responses if re.fullmatch(r"2\d\d", k))
             if not ok:
                 errors.append(f"{where}: no 2xx response")
+            if "no_content" in ex and ok != ["204"]:
+                errors.append(f"{where}: no_content exemption needs one 2xx, a 204")
             for code in ok:
                 body = responses[code]
+                cache = body.get("headers", {}).get("Cache-Control", {})
+                if cache.get("schema") != {"type": "string", "const": "no-store"}:
+                    errors.append(f"{where}: success lacks Cache-Control: no-store")
+                if code == "204":
+                    if "no_content" not in ex:
+                        errors.append(f"{where}: 204 needs the no_content exemption")
+                    if "content" in body:
+                        errors.append(f"{where}: 204 has content")
+                    continue
                 if set(body.get("content", {})) != {"application/json"}:
                     errors.append(
                         f"{where} {code}: content is not exactly application/json"
@@ -638,9 +763,6 @@ def check_operations(
                     errors.append(f"{where} {code}: unknown response schema {ref!r}")
                 elif _wraps_problem(api, schemas, {"$ref": ref}):
                     errors.append(f"{where} {code}: 2xx body is a Problem")
-                cache = body.get("headers", {}).get("Cache-Control", {})
-                if cache.get("schema") != {"type": "string", "const": "no-store"}:
-                    errors.append(f"{where}: success lacks Cache-Control: no-store")
             errors += _parameters(api, where, op.get("parameters", []))
     return errors
 
@@ -746,12 +868,16 @@ def run_checks(
 ) -> list[str]:  # fmt: skip
     amendments = pc.AMENDMENTS if amendments is None else amendments
     errors = check_shapes(amendments)
+    login: frozenset[tuple[str, str]] = frozenset()
     if not errors:  # a malformed amendment is reported, never half-applied
         api, errors = amended_api(api, amendments)
-        errors += check_operations(api, schemas, amendments)
+        approved, exempt, found = approved_mutations(amendments)
+        login = frozenset((m, p) for (m, p, _), names in exempt.items()
+                          if "unauthenticated_login" in names)  # fmt: skip
+        errors += found + check_operations(api, schemas, amendments, approved, exempt)
         errors += check_sensitive(api, amendments)
         errors += check_amended(schemas, amendments)
-    errors += check_routes(api, schemas)
+    errors += check_routes(api, schemas, login)
     errors += check_decimals("openapi#/components", api["components"], schemas)
     errors += check_decimals("openapi#/paths", api["paths"], schemas)
     for name, schema in schemas.items():
@@ -934,9 +1060,78 @@ def self_test(api: Json, schemas: dict[str, Json], examples: dict[str, Json]) ->
             item = m["operations"]["/session/approval-classes"]
             item["post"] = copy.deepcopy(item["get"]) | {"operationId": op_id}
             item["post"]["parameters"] = copy.deepcopy(hdr)
-            m["mutations"] = [mut | {"operationId": op_id, "decision": decision}]
+            m["mutations"].append(mut | {"operationId": op_id, "decision": decision})
 
         return change
+
+    def exemption(op_id: str, change: Any) -> Any:
+        def inject(m: Json) -> None:
+            (entry,) = [e for e in m["mutations"] if e["operationId"] == op_id]
+            change(entry, m)
+
+        return inject
+
+    def login_security(e: Json, m: Json) -> None:
+        m["operations"]["/session"]["post"]["security"] = copy.deepcopy(SESSION)
+
+    def delete_body(e: Json, m: Json) -> None:
+        m["operations"]["/session"]["delete"]["responses"]["204"]["content"] = {
+            "application/json": {"schema": {"$ref": "#/components/schemas/session"}}
+        }
+
+    def delete_200(e: Json, m: Json) -> None:
+        responses = m["operations"]["/session"]["delete"]["responses"]
+        responses["200"] = copy.deepcopy(
+            m["operations"]["/session"]["get"]["responses"]["200"]
+        )
+
+    login_x = {"name": "unauthenticated_login", "decision": "2026-10-21#25"}
+
+    def logout_csrf(e: Json, m: Json) -> None:  # no_content never waives rule 2
+        op = m["operations"]["/session"]["delete"]
+        op["parameters"] = [p for p in op["parameters"] if p["name"] != "X-CSRF-Token"]
+
+    exemption_cases = {
+        "login without its exemption": (exemption("createSession", lambda e, m: e.pop(
+            "exemptions")), "POST /session: missing required X-CSRF-Token"),
+        "login exemption not on an approved entry": (exemption("createSession",
+            lambda e, m: e.update(decision="2026-10-21#15")),
+            "POST /session: missing required Idempotency-Key"),
+        "login exemption citing a missing decision": (exemption("createSession",
+            lambda e, m: e.update(exemptions=[login_x | {"decision": "2026-10-21#99"}])),
+            "exemption unauthenticated_login cites no owner decision"),
+        "login exemption with session security": (exemption("createSession",
+            login_security), "needs security: [] on the operation"),
+        "logout without no_content": (exemption("revokeSession", lambda e, m: e.pop(
+            "exemptions")), "DELETE /session: response key '204' refused"),
+        "logout without its CSRF header": (exemption("revokeSession", logout_csrf),
+            "DELETE /session: missing required X-CSRF-Token"),
+        "no_content with a body": (exemption("revokeSession", delete_body),
+            "204 has content"),
+        "no_content with another 2xx": (exemption("revokeSession", delete_200),
+            "needs one 2xx, a 204"),
+        "exemption on the wrong method": (exemption("revokeSession", lambda e, m: e[
+            "exemptions"].append(login_x)), "unauthenticated_login applies only to POST"),
+        "exemption on step-up": (exemption("stepUpSession", lambda e, m: e.update(
+            exemptions=[login_x])),
+            "unauthenticated_login applies only to POST /session (createSession)"),
+        "exemption on another approved op": (exemption("changeMembershipRole",
+            lambda e, m: e.update(exemptions=[login_x | {"name": "no_content"}])),
+            "no_content applies only to DELETE /session (revokeSession)"),
+        "exemption citing a decision without the Exempts line": (exemption(
+            "createSession", lambda e, m: e.update(exemptions=[login_x | {
+                "decision": "2026-10-21#24"}])), "does not exempt it on an `Exempts:"),
+        "unreviewed exemption": (exemption("createSession", lambda e, m: e.update(
+            exemptions=[login_x | {"name": "no_csrf"}])), "not a reviewed exemption"),
+        "duplicate exemption": (exemption("createSession", lambda e, m: e.update(
+            exemptions=[login_x, login_x])), "duplicate exemption"),
+        "exemption decision not an id": (exemption("createSession", lambda e, m: e.update(
+            exemptions=[login_x | {"decision": "25"}])), "not an owner decision id"),
+        "exemption extra key": (exemption("createSession", lambda e, m: e.update(
+            exemptions=[login_x | {"scope": "all"}])), "unreviewed amendment key 'scope'"),
+        "exemptions not a list": (exemption("createSession", lambda e, m: e.update(
+            exemptions={})), "exemptions is not a list"),
+    }  # fmt: skip
 
     def new_number(m: Json) -> None:
         new_schema(m)["properties"]["cost"] = {"type": "string"}
@@ -974,7 +1169,7 @@ def self_test(api: Json, schemas: dict[str, Json], examples: dict[str, Json]) ->
         "additionalProperties": False,
         "allOf": [{"$ref": "common.schema.json#/$defs/Problem"}],
     }
-    SC = ("security_schemes",)
+    SC, real = ("security_schemes",), pc.AMENDMENTS["mutations"]
     mut = {"method": "post", "path": "/session/approval-classes",
            "operationId": "noteViewed", "decision": "2026-10-21#15"}  # fmt: skip
     held = (
@@ -1118,7 +1313,8 @@ def self_test(api: Json, schemas: dict[str, Json], examples: dict[str, Json]) ->
          "mutations[0]: an entry is not str"),
         ("mutation GET method", (), "mutations", [mut | {"method": "get"}],
          "not a mutating method"),
-        ("mutation entry unused", (), "mutations", [mut], "unused mutations entry"),
+        ("mutation entry unused", (), "mutations", [*real, mut],
+         "unused mutations entry"),
     ]  # fmt: skip
 
     def setter(path: tuple[str, ...], key: str, value: Json) -> Any:
@@ -1162,6 +1358,7 @@ def self_test(api: Json, schemas: dict[str, Json], examples: dict[str, Json]) ->
             listed_mutation("2026-10-21#15"),
             "mutating operation refused",
         ),
+        **exemption_cases,
         "trading-verb mutation": (
             listed_mutation("2026-10-21#15", "placeOrder"),
             "never amendable",
@@ -1247,27 +1444,58 @@ def self_test(api: Json, schemas: dict[str, Json], examples: dict[str, Json]) ->
         print(f"self-test {label}: {'detected' if found else 'MISSED'}")
         failures += not found
 
-    # Decision text (rule 6): each case is section 1 of a scratch decisions file.
-    op = "`POST /session/approval-classes` (`noteViewed`)"
-    label = '   Selected label: "Yes".\n'
+    # Decision text (rule 6): each case is section 1 of a scratch decisions file;
+    # section 2 approves the operation, so section 1 must not run into it.
+    named = "`POST /session/approval-classes` (`noteViewed`)"
+    label, a = '   Selected label: "Yes".\n', f"   Approves: {named}\n"
+    ask, done = '   Question: "Approve?"\n', "   Implemented by: x.\n"
+    o = """   Option text as presented: "Do it. Not 'no'."\n"""
+    opt = "   Option text as presented: "
     decision_cases = {
-        "approval only in a rejected option": (
-            f'{label}   Not "Approves: {op}": no.\n', "does not approve"),
+        "approval inside multi-line option text": (
+            f'{ask}{label}{opt}"Do it.\n{a}   Not \'no\'."\n{done}', "does not approve"),
+        "crafted negative label, Approves inside option text": (
+            f'{ask}   Selected label: "Reject".\n{opt}"Keep it out.\n{a}'
+            '   Not this."\n' f"{done}", "does not approve"),  # review residual R1
+        "quote with an inner quoted word": (
+            f'{ask}{label}{opt}"Do it.\n   He said "no"\n{a}   Not this."\n{done}',
+            "does not approve"),  # review: an inner quote must not end the block
+        "inner quote, then directives inside the quote": (
+            f'{ask}{label}{opt}"Do it.\n   He said "no"\n{a}   Implemented by: quoted."\n',
+            "does not approve"),  # only a sentence-final quote closes the block
+        "Approves after a U+2028 separator": (
+            f"{ask}{label}{o}   Note:\u2028Approves: {named}\n{done}",
+            "does not approve"),  # lines are split on \\n only, never splitlines()
+        "Approves line with trailing text": (
+            f"{ask}{label}{o}{a.rstrip()} and more\n{done}", "does not approve"),
+        "non-directive line in the directive block": (
+            f"{ask}{label}{o}{a}   Note: and more.\n{done}", "does not approve"),
+        "directive block without Implemented by": (
+            f"{ask}{label}{o}{a}", "does not approve"),
+        "label after the directive block": (
+            f"{ask}{o}{a}{label}{done}", "does not approve"),
         "approval only in the question": (
-            f'   Question: "Approves: {op}?"\n{label}', "does not approve"),
-        "approval only in option text": (
-            f'{label}   Option text as presented: "Approves: {op}".\n',
-            "does not approve"),
+            f'   Question: "Approve\n{a}   now?"\n{label}{o}{done}', "does not approve"),
+        "approval as one-line option text": (
+            f'{ask}{label}{opt}"Approves: {named}"\n{done}', "does not approve"),
         "Approves after other text on a line": (
-            f"{label}   Option text: Approves: {op}\n", "does not approve"),
+            f"{ask}{label}{o}   Note: Approves: {named}\n{done}", "does not approve"),
+        "Approves before the option text": (f"{ask}{label}{a}{o}{done}", "not approve"),
+        "Approves before the label": (f"{ask}{o}{a}{label}{done}", "does not approve"),
+        "Approves after Implemented by": (f"{ask}{label}{o}{done}{a}", "not approve"),
         "Approves line without Selected label": (
-            f"   Approves: {op}\n", "has no Selected label line"),
+            f"{ask}{o}{a}{done}", "0 Selected label lines"),
+        "crafted label inside the question": (
+            f'   Question: "Pick\n{label}   one?"\n{o}{a}{done}', "0 Selected label"),
+        "crafted label inside option text": (
+            f'{ask}{opt}"Pick.\n{label}   One."\n{a}{done}', "0 Selected label"),
+        "two Selected label lines": (f"{ask}{label}{label}{o}{a}{done}", "2 Selected"),
         "Approves line for another operation": (
-            f"{label}   Approves: `POST /session/approval-classes` (`other`)\n",
-            "does not approve"),
+            f"{ask}{label}{o}   Approves: `POST /session/approval-classes` (`other`)\n"
+            f"{done}", "does not approve"),
         "Approves line for another method": (
-            f"{label}   Approves: `PUT /session/approval-classes` (`noteViewed`)\n",
-            "does not approve"),
+            f"{ask}{label}{o}   Approves: `PUT /session/approval-classes` (`noteViewed`)"
+            f"\n{done}", "does not approve"),
     }  # fmt: skip
     global ROOT
     saved_root = ROOT
@@ -1275,7 +1503,9 @@ def self_test(api: Json, schemas: dict[str, Json], examples: dict[str, Json]) ->
         with tempfile.TemporaryDirectory() as tmp:
             folder = Path(tmp) / "docs" / "decisions"
             folder.mkdir(parents=True)
-            body = f"# SYNTHETIC\n\n1. **Case.**\n{text}2. **Next.**\n{label}"
+            body = (
+                f"# SYNTHETIC\n\n1. **Case.**\n{text}2. **Next.**\n{ask}{label}{o}{a}"
+            )
             (folder / "2026-10-21-owner-decisions.md").write_text(body)
             m = copy.deepcopy(pc.AMENDMENTS)
             listed_mutation("2026-10-21#1")(m)
@@ -1284,7 +1514,48 @@ def self_test(api: Json, schemas: dict[str, Json], examples: dict[str, Json]) ->
                 found = [
                     x
                     for x in guarded(run_checks, api, schemas, examples, m)
-                    if expected in x
+                    if expected in x and "(noteViewed)" in x  # not a real entry
+                ]
+            finally:
+                ROOT = saved_root
+        print(f"self-test {label_}: {'detected' if found else 'MISSED'}")
+        failures += not found
+
+    # Exemption text: createSession's exemption cites section 99, appended to a copy
+    # of the real decisions file (whose decision 24 still approves the entries).
+    real = (saved_root / "docs/decisions/2026-10-21-owner-decisions.md").read_text()
+    exempts = "   Exempts: `unauthenticated_login` (`createSession`)\n"
+    exempt_cases = {
+        "Exempts line naming another operation": (
+            f"{ask}{label}{o}{exempts.replace('createSession', 'revokeSession')}{done}",
+            "does not exempt"),
+        "Exempts line naming another exemption": (
+            f"{ask}{label}{o}{exempts.replace('unauthenticated_login', 'no_content')}"
+            f"{done}", "does not exempt"),
+        "Exempts inside option text": (
+            f'{ask}{label}{opt}"Yes.\n{exempts}   Done."\n{done}', "does not exempt"),
+        "Exempts after Implemented by": (
+            f"{ask}{label}{o}{done}{exempts}", "does not exempt"),
+        "Exempts with two Selected labels": (
+            f"{ask}{label}{label}{o}{exempts}{done}", "no single Selected label"),
+    }  # fmt: skip
+    for label_, (text, expected) in exempt_cases.items():
+        with tempfile.TemporaryDirectory() as tmp:
+            folder = Path(tmp) / "docs" / "decisions"
+            folder.mkdir(parents=True)
+            body = f"{real}\n## SYNTHETIC\n\n99. **Case.**\n{text}"
+            (folder / "2026-10-21-owner-decisions.md").write_text(body)
+            m = copy.deepcopy(pc.AMENDMENTS)
+            (entry,) = [
+                e for e in m["mutations"] if e["operationId"] == "createSession"
+            ]
+            entry["exemptions"] = [login_x | {"decision": "2026-10-21#99"}]
+            ROOT = Path(tmp)
+            try:
+                found = [
+                    x
+                    for x in guarded(run_checks, api, schemas, examples, m)
+                    if expected in x and "(createSession)" in x
                 ]
             finally:
                 ROOT = saved_root
@@ -1297,7 +1568,8 @@ def self_test(api: Json, schemas: dict[str, Json], examples: dict[str, Json]) ->
     wrapped = guarded(crash) == ["checker crashed on malformed amendment: TypeError"]
     print(f"self-test crash reported: {'detected' if wrapped else 'MISSED'}")
     failures += not wrapped
-    total = len(cases) + len(amended_cases) + len(api_cases) + len(decision_cases) + 1
+    total = len(cases) + len(amended_cases) + len(api_cases) + 1
+    total += len(decision_cases) + len(exempt_cases)
     print(f"self-test: {total - failures}/{total} defects detected")
     return 1 if failures else 0
 

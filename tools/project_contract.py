@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Project contract 0.8.0 (T008 A-01): the docs/spec/contracts 0.1.0 schemas with the
+"""Project contract 0.9.0 (T008 A-01): the docs/spec/contracts 0.1.0 schemas with the
 amendments of contracts/amendments.json applied (all owner decisions: see `versions`
 there). docs/spec is never edited; this derives the amended schemas in memory.
 
@@ -19,9 +19,10 @@ there). docs/spec is never edited; this derives the amended schemas in memory.
 - `security_schemes`: only the `sessionCookie` apiKey-in-cookie scheme's `name`, and
   only to exactly `__Host-pi_session` (owner decision 14, 2026-10-21);
   `openapi()` applies it. Anything else, or a name already in place, is refused.
-- `mutations`: the owner-approved allowlist of amended mutating operations, read by
-  tools/check_contracts.py rules 1, 2 and 6 only (`openapi()` merges operations the
-  same way whatever their method; the checker refuses an unlisted mutation).
+- `mutations`: the owner-approved allowlist of amended mutating operations, with
+  their decision-25 `exemptions`, read by tools/check_contracts.py rules 1, 2 and 6
+  only (`openapi()` merges operations the same way whatever their method; the
+  checker refuses an unlisted mutation).
 - `page(name)`: the C-02 page `{items, next_cursor, coverage}` of an item schema.
 - `request(name)`: an openapi.yaml request component; `requests.<name>.optional` adds
   properties that are not required. Its `./schemas/` refs become the bare file names
