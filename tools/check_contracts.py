@@ -28,13 +28,25 @@ Artifact check only: it reads the designed contracts, not a running API.
    through `$ref` or allOf/oneOf/anyOf/if/then/else/not; `Cache-Control: no-store`
    on each (the API sends no-store on every response); no `servers`; and no tenant
    parameter (the tenant comes from the session; `$ref` and path-level parameters
-   resolved). Amendments add GET operations only: any other method is refused
-   outright, whatever its name, until an owner-approved mutation allowlist exists.
+   resolved). Amendments add GET operations; a mutating one (POST, PUT, PATCH,
+   DELETE) is refused unless `mutations` lists its method, path and operationId
+   with an owner decision id (`YYYY-MM-DD#N`) whose section in
+   docs/decisions/YYYY-MM-DD-owner-decisions.md has a `Selected label:` line and a
+   line exactly ``Approves: `METHOD /path` (`operationId`)`` (one per line; a match
+   anywhere else, such as a question, option text or rejected option, does not
+   count); an entry that cites no such section, or matches no amended operation,
+   fails. The decisions file has no integrity check beyond owner review of its
+   diff. A listed mutation still passes rules 1 and 2 and every rule
+   above, and one on the broker surface or with a trading verb is never amendable.
+   Any other method is refused. `security_schemes` may change only the
+   `sessionCookie` apiKey-in-cookie `name`, to exactly `__Host-pi_session`
+   (owner decision 14).
    `check_shapes` runs first: every structural amendment key must be one a rule
    reviews and every value the type the rules read, else the amendment is reported
    and not applied. Any exception a rule still raises is reported as a crash.
 7. No name an amendment adds (property and patternProperties keys at any depth,
-   parameter and response header names, from every amendment source) looks like a
+   parameter and response header names, from every amendment source; the one
+   security scheme name allowed is fixed by rule 6) looks like a
    secret (token, secret, password, passwd, pwd, api key, private key, credential;
    any case, `_` or `-`) unless `sensitive_fields` in amendments.json lists that
    schema and JSON pointer with the decision that allows it; an unused or undecided
@@ -55,6 +67,7 @@ import copy
 import json
 import re
 import sys
+import tempfile
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -141,7 +154,13 @@ TOP_KEYS: dict[str, type] = {
     "version": str, "base": str, "versions": dict, "about": str, "changes": str,
     "rule": str, "schemas": dict, "requests": dict, "operations": dict,
     "new_schemas": dict, "sensitive_fields": list, "page": dict, "Coverage": dict,
+    "security_schemes": dict, "mutations": list,
 }  # fmt: skip
+MUTATION_KEYS = ("method", "path", "operationId", "decision")
+DECISION_ID = re.compile(r"(\d{4}-\d{2}-\d{2})#([1-9]\d*)")
+APPROVES = re.compile(r"^[ \t]*Approves: `([A-Z]+) (/[^`\s]*)` \(`([A-Za-z0-9]+)`\)[ \t]*$",
+                      re.M)  # fmt: skip
+SELECTED = re.compile(r"^[ \t]*Selected label: \S", re.M)
 # project_contract raises these on a malformed amendment: reported as a refusal.
 REFUSED = (KeyError, ValueError, TypeError, AttributeError, IndexError)
 OP_KEYS = frozenset({"operationId", "summary", "description", "security",
@@ -382,7 +401,31 @@ def check_shapes(m: Json) -> list[str]:
     keys(m, TOP_KEYS)
     for key, kind in TOP_KEYS.items():
         if key in m or key in REQUIRED_KEYS:
-            want(key, m.get(key), kind, dict if key == "sensitive_fields" else None)
+            listed = key in ("sensitive_fields", "mutations")
+            want(key, m.get(key), kind, dict if listed else None)
+    for key, change in each("security_schemes"):
+        if key != "sessionCookie":
+            errors.append(f"{w}: security scheme {key!r} refused (sessionCookie only)")
+        elif want(f"security_schemes.{key}", change, dict):
+            keys(change, {"name"})
+            name = change.get("name")
+            if name != pc.SESSION_COOKIE_NAME:
+                errors.append(f"{w} security_schemes.{key}.name is not "
+                              f"{pc.SESSION_COOKIE_NAME} (decision 14)")  # fmt: skip
+    mutations = m.get("mutations") if isinstance(m.get("mutations"), list) else []
+    for i, entry in enumerate(mutations):
+        if not isinstance(entry, dict):
+            continue  # reported above
+        keys(entry, MUTATION_KEYS)
+        want(f"mutations[{i}]", entry, dict, str)
+        if missing := [k for k in MUTATION_KEYS if k not in entry]:
+            errors.append(f"{w} mutations[{i}] lacks {missing}")
+        elif entry["method"] not in MUTATING:
+            errors.append(f"{w} mutations[{i}]: {entry['method']!r} is not a "
+                          "mutating method")  # fmt: skip
+        elif not DECISION_ID.fullmatch(str(entry["decision"])):
+            errors.append(f"{w} mutations[{i}]: decision is not an owner decision "
+                          "id (YYYY-MM-DD#N)")  # fmt: skip
     for name, a in each("schemas"):
         if want(f"schemas.{name}", a, dict):
             keys(a, SCHEMA_KEYS)
@@ -500,10 +543,49 @@ def _wraps_problem(
     )
 
 
+def _decision_section(decision: str) -> str | None:
+    """The text of owner decision `YYYY-MM-DD#N`: from its `N. **` line to the next
+    numbered decision or heading of that day's decisions file; None if absent."""
+    found = DECISION_ID.fullmatch(decision)
+    if found is None:
+        return None
+    date, number = found.groups()
+    file = ROOT / "docs" / "decisions" / f"{date}-owner-decisions.md"
+    text = file.read_text(encoding="utf-8") if file.is_file() else ""
+    section = re.search(rf"^{number}\. \*\*.*?(?=^\d+\. \*\*|^#|\Z)", text, re.M | re.S)
+    return section.group(0) if section else None
+
+
+def approved_mutations(amendments: Json) -> tuple[set[tuple[str, str, str]], list[str]]:
+    """`mutations` entries whose cited owner decision approves the operation on an
+    `Approves:` line, with a `Selected label:` line, and that match an amended
+    operation (rule 6); every other entry is an error."""
+    approved: set[tuple[str, str, str]] = set()
+    errors: list[str] = []
+    ops = amendments.get("operations", {})
+    for entry in amendments.get("mutations", []):
+        method, path, op_id, decision = (entry[k] for k in MUTATION_KEYS)
+        where = f"project contract mutations {method.upper()} {path} ({op_id})"
+        op = ops.get(path, {}).get(method)
+        section = _decision_section(decision)
+        if not isinstance(op, dict) or op.get("operationId") != op_id:
+            errors.append(f"{where}: unused mutations entry")
+        elif section is None:
+            errors.append(f"{where}: cites no owner decision ({decision})")
+        elif not SELECTED.search(section):
+            errors.append(f"{where}: decision {decision} has no Selected label line")
+        elif (method.upper(), path, op_id) not in APPROVES.findall(section):
+            errors.append(f"{where}: decision {decision} does not approve it on an "
+                          f"`Approves: `{method.upper()} {path}` (`{op_id}`)` line")  # fmt: skip
+        else:
+            approved.add((method, path, op_id))
+    return approved, errors
+
+
 def check_operations(
     api: Json, schemas: dict[str, Json], amendments: Json
 ) -> list[str]:
-    errors: list[str] = []
+    approved, errors = approved_mutations(amendments)
     schemes = set(api["components"].get("securitySchemes", {}))
     problem = {"$ref": "#/components/schemas/Problem"}
     prefix = "#/components/schemas/"
@@ -515,10 +597,18 @@ def check_operations(
             where = f"project contract {method.upper()} {path}"
             if method in PATH_FIELDS:
                 continue
-            if method in MUTATING:
-                errors.append(f"{where}: mutating operation refused (amendments add "
-                              "GET only; no owner-approved mutation allowlist)")  # fmt: skip
-            elif method != "get":
+            op_id = str(op.get("operationId", ""))
+            if method in MUTATING and (method, path, op_id) not in approved:
+                errors.append(f"{where}: mutating operation refused (not in the "
+                              "owner-approved mutations allowlist)")  # fmt: skip
+            if method in MUTATING and (
+                BROKER_SURFACE.search(path)
+                or TRADING_VERB.search(path)
+                or TRADING_VERB.search(op_id)
+            ):
+                errors.append(f"{where}: broker or trading mutation is never "
+                              "amendable")  # fmt: skip
+            elif method not in MUTATING and method != "get":
                 errors.append(f"{where}: only GET operations may be amended")
             security = op.get("security", api.get("security"))
             if security != SESSION or "sessionCookie" not in schemes:
@@ -839,6 +929,15 @@ def self_test(api: Json, schemas: dict[str, Json], examples: dict[str, Json]) ->
         item = m["operations"]["/session/approval-classes"]
         item["post"] = copy.deepcopy(item["get"]) | {"operationId": "grantClasses"}
 
+    def listed_mutation(decision: str, op_id: str = "noteViewed") -> Any:
+        def change(m: Json) -> None:
+            item = m["operations"]["/session/approval-classes"]
+            item["post"] = copy.deepcopy(item["get"]) | {"operationId": op_id}
+            item["post"]["parameters"] = copy.deepcopy(hdr)
+            m["mutations"] = [mut | {"operationId": op_id, "decision": decision}]
+
+        return change
+
     def new_number(m: Json) -> None:
         new_schema(m)["properties"]["cost"] = {"type": "string"}
 
@@ -875,6 +974,9 @@ def self_test(api: Json, schemas: dict[str, Json], examples: dict[str, Json]) ->
         "additionalProperties": False,
         "allOf": [{"$ref": "common.schema.json#/$defs/Problem"}],
     }
+    SC = ("security_schemes",)
+    mut = {"method": "post", "path": "/session/approval-classes",
+           "operationId": "noteViewed", "decision": "2026-10-21#15"}  # fmt: skip
     held = (
         "new_schemas",
         "approval_classes",
@@ -990,6 +1092,33 @@ def self_test(api: Json, schemas: dict[str, Json], examples: dict[str, Json]) ->
         ("3xx response key", RS, "302", ok2, "response key '302' refused"),
         ("1xx response key", RS, "100", ok2, "response key '100' refused"),
         ("204 response key", RS, "204", ok2, "response key '204' refused"),
+        ("cookie without __Host-", SC, "sessionCookie", {"name": "pi_session2"},
+         "sessionCookie.name is not __Host-pi_session (decision 14)"),
+        ("other __Host- cookie name", SC, "sessionCookie", {"name": "__Host-other"},
+         "sessionCookie.name is not __Host-pi_session (decision 14)"),
+        ("cookie name not a string", SC, "sessionCookie", {"name": 7}, "sessionCookie.name is not __Host-pi_session (decision 14)"),
+        ("cookie scheme extra key", (*SC, "sessionCookie"), "in", "header",
+         "unreviewed amendment key 'in'"),
+        ("other security scheme", SC, "bearer", {"name": "__Host-x"},
+         "security scheme 'bearer' refused"),
+        ("cookie scheme not an object", SC, "sessionCookie", "__Host-x",
+         "security_schemes.sessionCookie is not an object"),
+        ("security_schemes not an object", (), "security_schemes", [],
+         "security_schemes is not an object"),
+        ("mutations not a list", (), "mutations", {}, "mutations is not a list"),
+        ("mutation entry not an object", (), "mutations", ["x"],
+         "mutations: an entry is not dict"),
+        ("mutation entry without decision", (), "mutations",
+         [{k: v for k, v in mut.items() if k != "decision"}], "lacks ['decision']"),
+        ("mutation entry extra key", (), "mutations", [mut | {"waive": "rule 2"}],
+         "unreviewed amendment key 'waive'"),
+        ("mutation decision not an id", (), "mutations",
+         [mut | {"decision": "owner said yes"}], "not an owner decision id"),
+        ("mutation decision not a string", (), "mutations", [mut | {"decision": 15}],
+         "mutations[0]: an entry is not str"),
+        ("mutation GET method", (), "mutations", [mut | {"method": "get"}],
+         "not a mutating method"),
+        ("mutation entry unused", (), "mutations", [mut], "unused mutations entry"),
     ]  # fmt: skip
 
     def setter(path: tuple[str, ...], key: str, value: Json) -> Any:
@@ -1017,6 +1146,26 @@ def self_test(api: Json, schemas: dict[str, Json], examples: dict[str, Json]) ->
         "operation unknown body": (unknown_body, "unknown response schema"),
         "operation tenant parameter": (tenant_param, "tenant parameter"),
         "new mutating operation": (new_mutation, "missing required Idempotency-Key"),
+        "mutation citing a decision without an Approves line": (
+            listed_mutation("2026-10-21#15"),
+            "decision 2026-10-21#15 does not approve",
+        ),
+        "mutation citing a missing decision": (
+            listed_mutation("2026-10-21#99"),
+            "cites no owner decision",
+        ),
+        "mutation citing a missing decisions file": (
+            listed_mutation("2001-01-01#1"),
+            "cites no owner decision",
+        ),
+        "listed mutation still refused": (
+            listed_mutation("2026-10-21#15"),
+            "mutating operation refused",
+        ),
+        "trading-verb mutation": (
+            listed_mutation("2026-10-21#15", "placeOrder"),
+            "never amendable",
+        ),
         "new schema string money": (
             new_number,
             "new schema approval_classes/cost: money/quantity not a decimal",
@@ -1098,13 +1247,57 @@ def self_test(api: Json, schemas: dict[str, Json], examples: dict[str, Json]) ->
         print(f"self-test {label}: {'detected' if found else 'MISSED'}")
         failures += not found
 
+    # Decision text (rule 6): each case is section 1 of a scratch decisions file.
+    op = "`POST /session/approval-classes` (`noteViewed`)"
+    label = '   Selected label: "Yes".\n'
+    decision_cases = {
+        "approval only in a rejected option": (
+            f'{label}   Not "Approves: {op}": no.\n', "does not approve"),
+        "approval only in the question": (
+            f'   Question: "Approves: {op}?"\n{label}', "does not approve"),
+        "approval only in option text": (
+            f'{label}   Option text as presented: "Approves: {op}".\n',
+            "does not approve"),
+        "Approves after other text on a line": (
+            f"{label}   Option text: Approves: {op}\n", "does not approve"),
+        "Approves line without Selected label": (
+            f"   Approves: {op}\n", "has no Selected label line"),
+        "Approves line for another operation": (
+            f"{label}   Approves: `POST /session/approval-classes` (`other`)\n",
+            "does not approve"),
+        "Approves line for another method": (
+            f"{label}   Approves: `PUT /session/approval-classes` (`noteViewed`)\n",
+            "does not approve"),
+    }  # fmt: skip
+    global ROOT
+    saved_root = ROOT
+    for label_, (text, expected) in decision_cases.items():
+        with tempfile.TemporaryDirectory() as tmp:
+            folder = Path(tmp) / "docs" / "decisions"
+            folder.mkdir(parents=True)
+            body = f"# SYNTHETIC\n\n1. **Case.**\n{text}2. **Next.**\n{label}"
+            (folder / "2026-10-21-owner-decisions.md").write_text(body)
+            m = copy.deepcopy(pc.AMENDMENTS)
+            listed_mutation("2026-10-21#1")(m)
+            ROOT = Path(tmp)
+            try:
+                found = [
+                    x
+                    for x in guarded(run_checks, api, schemas, examples, m)
+                    if expected in x
+                ]
+            finally:
+                ROOT = saved_root
+        print(f"self-test {label_}: {'detected' if found else 'MISSED'}")
+        failures += not found
+
     def crash() -> list[str]:
         raise TypeError("unhashable")
 
     wrapped = guarded(crash) == ["checker crashed on malformed amendment: TypeError"]
     print(f"self-test crash reported: {'detected' if wrapped else 'MISSED'}")
     failures += not wrapped
-    total = len(cases) + len(amended_cases) + len(api_cases) + 1
+    total = len(cases) + len(amended_cases) + len(api_cases) + len(decision_cases) + 1
     print(f"self-test: {total - failures}/{total} defects detected")
     return 1 if failures else 0
 
@@ -1119,6 +1312,11 @@ def main(argv: list[str]) -> int:
     for entry in pc.AMENDMENTS.get("sensitive_fields", []):
         print(f"INFO sensitive field allowed: {entry['schema']}#{entry['field']}:",
               entry["decision"])  # fmt: skip
+    for key, change in pc.AMENDMENTS.get("security_schemes", {}).items():
+        print(f"INFO security scheme amended: {key} name {change['name']}")
+    for entry in pc.AMENDMENTS.get("mutations", []):
+        print(f"INFO mutation allowed: {entry['method'].upper()} {entry['path']} "
+              f"({entry['operationId']}): {entry['decision']}")  # fmt: skip
     enforced = format_checker_enforces_datetime()
     print(
         "INFO jsonschema format date-time enforced:",

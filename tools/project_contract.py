@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Project contract 0.7.0 (T008 A-01): the docs/spec/contracts 0.1.0 schemas with the
+"""Project contract 0.8.0 (T008 A-01): the docs/spec/contracts 0.1.0 schemas with the
 amendments of contracts/amendments.json applied (all owner decisions: see `versions`
 there). docs/spec is never edited; this derives the amended schemas in memory.
 
@@ -16,6 +16,12 @@ there). docs/spec is never edited; this derives the amended schemas in memory.
   new schemas as components, to a copy of openapi.yaml. A path already in the
   contract, a missing operationId or one already used is refused. Each call starts
   again from the unmodified base, so applying twice gives the same document.
+- `security_schemes`: only the `sessionCookie` apiKey-in-cookie scheme's `name`, and
+  only to exactly `__Host-pi_session` (owner decision 14, 2026-10-21);
+  `openapi()` applies it. Anything else, or a name already in place, is refused.
+- `mutations`: the owner-approved allowlist of amended mutating operations, read by
+  tools/check_contracts.py rules 1, 2 and 6 only (`openapi()` merges operations the
+  same way whatever their method; the checker refuses an unlisted mutation).
 - `page(name)`: the C-02 page `{items, next_cursor, coverage}` of an item schema.
 - `request(name)`: an openapi.yaml request component; `requests.<name>.optional` adds
   properties that are not required. Its `./schemas/` refs become the bare file names
@@ -124,6 +130,7 @@ def _spec_refs(node: Any) -> Any:
 
 
 METHODS = frozenset({"get", "put", "post", "delete", "patch", "head", "options"})
+SESSION_COOKIE_NAME = "__Host-pi_session"  # owner decision 14, 2026-10-21
 
 
 def openapi(base: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -140,6 +147,22 @@ def openapi(base: dict[str, Any] | None = None) -> dict[str, Any]:
                 raise ValueError(f"{method} {path}: operationId missing or used")
             used.add(op_id)
         api["paths"][path] = copy.deepcopy(item)
+    schemes = api["components"].get("securitySchemes", {})
+    for key, change in AMENDMENTS.get("security_schemes", {}).items():
+        scheme, name = schemes.get(key), change.get("name")
+        if key != "sessionCookie" or not isinstance(scheme, dict):
+            raise ValueError(f"{key}: no such amendable security scheme")
+        if set(change) != {"name"} or (scheme.get("type"), scheme.get("in")) != (
+            "apiKey", "cookie",
+        ):  # fmt: skip
+            raise ValueError(f"{key}: only the name of an apiKey cookie may change")
+        if name != SESSION_COOKIE_NAME:
+            raise ValueError(
+                f"{key}: {name!r} is not {SESSION_COOKIE_NAME} (decision 14)"
+            )
+        if name == scheme.get("name"):
+            raise ValueError(f"{key}: name {name!r} already in the contract")
+        scheme["name"] = name
     components = api["components"]["schemas"]
     for name in AMENDMENTS.get("new_schemas", {}):
         s = schema(name)  # refuses a name the contract already has
@@ -182,7 +205,9 @@ if __name__ == "__main__":
         schema(name)  # raises on a name the contract already has
     for path in AMENDMENTS.get("operations", {}):
         print(path, "new operations", sorted(AMENDMENTS["operations"][path]))
-    openapi()  # raises on a duplicate path or operationId
+    for key, change in AMENDMENTS.get("security_schemes", {}).items():
+        print(key, "security scheme", json.dumps(change, sort_keys=True))
+    openapi()  # raises on a duplicate path or operationId, or a refused scheme
     for name in AMENDMENTS["requests"]:
         print(name, json.dumps(AMENDMENTS["requests"][name], sort_keys=True))
         request(name)  # raises on a missing request or an existing property
