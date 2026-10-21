@@ -12,7 +12,8 @@ import sys
 import uuid
 from collections.abc import Callable, Iterator
 from dataclasses import replace
-from datetime import timedelta
+from datetime import UTC, datetime, timedelta
+from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
@@ -25,8 +26,9 @@ from qw_adapters import experiment_store as es
 from qw_adapters import tenancy as tn
 from qw_domain import improvement as im
 from qw_domain import trial_ledger as tl
+from qw_domain.research_data import Window
 from test_improvement import ASSESSOR, AT, GOOD, cand, promo_ledger
-from test_trial_ledger import T0, ledger, plan, trial
+from test_trial_ledger import DS, PROMO, T0, ledger, plan, trial
 
 _spec = importlib.util.spec_from_file_location(
     "qw_estore_tests", Path(__file__).with_name("test_experiment_store.py")
@@ -351,7 +353,7 @@ def test_decision_17_only_qw_assessor_writes_and_reads_assessor_tables(
     assess(wa, a, promo_ledger(GOOD), "v-1")
     tn.check_runtime_role(assessor_conn)  # a runtime role, like qw_app and qw_worker
     every = privileges(conn, "qw_migrate", "SELECT")
-    assert len(every) == 12 + 9 + 10 + 23  # the four tables' columns
+    assert len(every) == 13 + 9 + 10 + 25  # the four tables' columns
     assert privileges(conn, "qw_assessor", "SELECT") == every
     assert privileges(conn, "qw_assessor", "INSERT") == every  # 0028's full lists
     assert held(conn, "qw_assessor") == {(t, "SELECT") for t in (
@@ -544,3 +546,252 @@ def test_check_runtime_role_refuses_mixed_and_undeclared_logins(
         tn.runtime_connection(runtime_urls["qw_app"], role="qw_ingest"),  # type: ignore[arg-type]
     ):
         pass
+
+
+# Owner decision 18: a promotion window whose holdout was scored for one plan is
+# never scored again for another plan of the same tenant, target and baseline.
+EARLY = Window(datetime(2021, 7, 1, tzinfo=UTC), datetime(2022, 1, 1, tzinfo=UTC))
+MID = Window(datetime(2022, 3, 1, tzinfo=UTC), datetime(2022, 9, 1, tzinfo=UTC))
+RESEARCH, STRAT = im.Target.RESEARCH, im.Target.STRATEGY  # improvement targets
+GOOD_R = {"net_return": Decimal("0.02"), "unsupported_material_facts": Decimal(0)}
+
+
+def other_plan(pid: str, promotion: Window | None = None) -> tl.SplitPlan:
+    if promotion is None:  # the same windows as plan-synth-1
+        return plan(plan_id=pid)
+    return plan(plan_id=pid, promotion=promotion,
+                train=Window(datetime(2020, 1, 1, tzinfo=UTC),
+                             datetime(2021, 1, 1, tzinfo=UTC)),
+                development=Window(datetime(2021, 2, 1, tzinfo=UTC),
+                                   datetime(2021, 6, 1, tzinfo=UTC)))  # fmt: skip
+
+
+def reg_on(t: uuid.UUID, eid: str, sp: tl.SplitPlan, baseline: str = "strat-v0",
+           retest_of: str | None = None,
+           target: im.Target = STRAT) -> im.ExperimentRegistry:  # fmt: skip
+    base = reg_for(t, eid, target, f"bud-{eid}").protocol(eid)
+    p = replace(base, plan_id=sp.plan_id, plan_digest=im.plan_digest(sp),
+                baseline_version=baseline, retest_of=retest_of)  # fmt: skip
+    return im.ExperimentRegistry(str(t)).register(p).register_candidate(
+        cand(experiment_id=eid, target=target, parent_id=baseline))  # fmt: skip
+
+
+def read_on(t: uuid.UUID, sp: tl.SplitPlan, eid: str,
+            outcome: tl.Outcome = tl.Outcome.COMPLETED,
+            metrics: dict[str, Decimal] = GOOD) -> tl.TrialLedger:  # fmt: skip
+    """The plan's one assessor read and its promotion trial (family `eid`)."""
+    key = cand(experiment_id=eid).trial_key
+    lg = tl.TrialLedger(str(t)).register_plan(sp, DS)
+    lg, _ = lg.request_access(f"acc-{eid}", sp.plan_id, f"trial-{eid}", key,
+                              tl.Split.PROMOTION, sp.promotion, None, "actor-synth",
+                              tl.Role.ASSESSOR, T0 + timedelta(hours=1))  # fmt: skip
+    return lg.record(trial(1, tl.Split.PROMOTION, outcome, trial_id=f"trial-{eid}",
+                           plan_id=sp.plan_id, access_id=f"acc-{eid}", family=eid,
+                           material_hash=key.material_hash, metrics=metrics,
+                           config_hash=key.config_hash))  # fmt: skip
+
+
+def put_on(wa: Pair, t: uuid.UUID, eid: str, sp: tl.SplitPlan, lg: Any = None,
+           baseline: str = "strat-v0", vid: str = "v-1",
+           retest_of: str | None = None,
+           target: im.Target = im.Target.STRATEGY) -> es.Revision:  # fmt: skip
+    reg = reg_on(t, eid, sp, baseline, retest_of, target)
+    run_ = None if lg is None else im.Assessment(lg, ASSESSOR, AT + timedelta(days=1),
+                                                 vid)  # fmt: skip
+    out = im.Scheduled(eid, f"bud-{eid}") if lg is None else None
+    rev: es.Revision = es.record(*wa, t, reg, eid, "cand-1", sp, booked(reg, eid),
+                                 out, run_)[0]  # fmt: skip
+    return rev
+
+
+def protocols(conn: Conn, eid: str) -> int:
+    row = conn.execute("SELECT count(*) FROM app.assessor_protocol WHERE "
+                       "experiment_id = %s", (eid,)).fetchone()  # fmt: skip
+    assert row is not None
+    return int(row[0])
+
+
+def test_decision_18_a_scored_window_refuses_a_new_overlapping_plan(
+    wa: Pair, conn: Conn, a: uuid.UUID
+) -> None:
+    unscored = put_on(
+        wa,
+        a,
+        "exp-u",
+        other_plan("plan-u"),
+        read_on(a, other_plan("plan-u"), "exp-u", tl.Outcome.FAILED),
+    )
+    assert unscored.record.state is St.INSUFFICIENT_EVIDENCE  # read, not scored
+    assert assess(wa, a, promo_ledger(GOOD), "v-1").record.state is (
+        St.AWAITING_REVIEW)  # PROMO is now used (plan-synth-1)  # fmt: skip
+    head = Window(datetime(2023, 1, 1, tzinfo=UTC), PROMO.start + timedelta(days=1))
+    for eid, sp, base in (
+        ("exp-2", other_plan("plan-2"), "strat-v0"),  # the same window
+        ("exp-3", other_plan("plan-3", head), "strat-v0"),  # one shared day
+        ("exp-b", other_plan("plan-b"), "strat-v1"),  # a relabelled baseline
+    ):  # owner: tenant + target, whatever the baseline
+        with pytest.raises(es.ExperimentStoreError, match="holdout_window_used"):
+            put_on(wa, a, eid, sp, baseline=base)
+        assert protocols(conn, eid) == 0  # nothing of the new plan is stored
+    # another target's window is its own; windows are half-open: one ending where
+    # PROMO starts shares nothing (both bound, then scored)
+    edge = Window(datetime(2023, 1, 1, tzinfo=UTC), PROMO.start)
+    for eid, sp, target, metrics in (
+        ("exp-t", other_plan("plan-t"), RESEARCH, GOOD_R),
+        ("exp-g", other_plan("plan-g", edge), im.Target.STRATEGY, GOOD),
+    ):  # fmt: skip
+        put_on(wa, a, eid, sp, target=target)
+        got = put_on(wa, a, eid, sp, read_on(a, sp, eid, metrics=metrics),
+                     target=target)  # fmt: skip
+        assert got.record.state is St.AWAITING_REVIEW, eid
+    put_on(wa, a, "exp-e", other_plan("plan-e", EARLY))
+    done = put_on(
+        wa,
+        a,
+        "exp-e",
+        other_plan("plan-e", EARLY),
+        read_on(a, other_plan("plan-e", EARLY), "exp-e"),
+    )
+    assert done.record.state is St.AWAITING_REVIEW
+
+
+def test_decision_18_a_plan_bound_before_the_scoring_cannot_score_after_it(
+    wa: Pair, a: uuid.UUID
+) -> None:
+    p2 = other_plan("plan-2")
+    put_on(wa, a, "exp-2", p2)  # bound and authorized while PROMO is unused
+    assess(wa, a, promo_ledger(GOOD), "v-1")  # plan-synth-1 scores PROMO
+    with pytest.raises(es.ExperimentStoreError, match="holdout_window_used"):
+        put_on(wa, a, "exp-2", p2, read_on(a, p2, "exp-2"))
+
+
+def test_decision_18_the_database_refuses_a_read_or_score_of_a_used_window(
+    wa: Pair, conn: Conn, a: uuid.UUID
+) -> None:
+    p2 = other_plan("plan-2")
+    put_on(wa, a, "exp-2", p2)
+    put_on(wa, a, "exp-2", p2, read_on(a, p2, "exp-2", tl.Outcome.FAILED))  # unscored
+    assess(wa, a, promo_ledger(GOOD), "v-1")  # plan-synth-1 scores PROMO
+    score = receipt_copy(conn, src="experiment_id = 'exp-2'", scored_seq="1",
+                         trial_ids="'{trial-exp-2}'", decision="'reject'",
+                         reasons="'{goal:x}'")  # fmt: skip
+    read = ("INSERT INTO app.holdout_access SELECT tenant_id, plan_id, 2, 'acc-9', "
+            "trial_id, family, actor_id, jsonb_set(jsonb_set(body, '{0}', "
+            "'\"acc-9\"'), '{12}', '2'), clock_timestamp(), event_hash FROM "
+            "app.holdout_access WHERE plan_id = 'plan-2'")  # fmt: skip
+    for sql in (score, read):  # as the owner: only the database applies
+        with pytest.raises(psycopg.errors.CheckViolation, match="holdout_window_used"):
+            conn.execute(sql)
+    conn.execute(  # a relabelled baseline on a new plan, past the store's own check
+        "INSERT INTO app.assessor_protocol SELECT tenant_id, 'exp-z', protocol_hash, "
+        "'plan-z', 'strat-v9', assessor_actor_id, assessor_route_id, "
+        "assessor_family_id, assessor_version, body || jsonb_build_object("
+        "'experiment_id', 'exp-z', 'plan_id', 'plan-z', 'baseline_version', "
+        "'strat-v9'), clock_timestamp(), event_hash, retest_of FROM "
+        "app.assessor_protocol WHERE experiment_id = 'exp-2'"
+    )
+    with pytest.raises(psycopg.errors.CheckViolation, match="holdout_window_used"):
+        conn.execute(  # its read of the used window: the target alone decides
+            "INSERT INTO app.holdout_access SELECT tenant_id, 'plan-z', 1, 'acc-z', "
+            "trial_id, family, actor_id, jsonb_set(body, '{1}', '\"plan-z\"'), "
+            "clock_timestamp(), event_hash FROM app.holdout_access "
+            "WHERE plan_id = 'plan-2'"
+        )
+    disjoint = other_plan("plan-e", EARLY)  # the control: another window is free
+    put_on(wa, a, "exp-e", disjoint)
+    put_on(wa, a, "exp-e", disjoint, read_on(a, disjoint, "exp-e", tl.Outcome.FAILED))
+    conn.execute(receipt_copy(conn, src="experiment_id = 'exp-e'", scored_seq="1",
+                              trial_ids="'{trial-exp-e}'", decision="'reject'",
+                              reasons="'{goal:x}'"))  # fmt: skip
+    empty = ("INSERT INTO app.holdout_access SELECT tenant_id, plan_id, 2, 'acc-8', "
+             "trial_id, family, actor_id, jsonb_set(jsonb_set(jsonb_set(body, '{0}', "
+             "'\"acc-8\"'), '{12}', '2'), '{5}', jsonb_build_array(body -> 5 -> 0, "
+             "body -> 5 -> 0)), clock_timestamp(), event_hash FROM "
+             "app.holdout_access WHERE plan_id = 'plan-e'")  # fmt: skip
+    with pytest.raises(psycopg.errors.CheckViolation, match="empty"):  # [t, t)
+        conn.execute(empty)
+
+
+# Owner decision 19: `retest_of` links an experiment to the one it re-tests; each
+# receipt counts the trials of the whole chain.
+def dev_trials(lg: tl.TrialLedger, plan_id: str, start: int,
+               *families: str) -> tl.TrialLedger:  # fmt: skip
+    """Failed development trials, one per family given (counted, never dropped)."""
+    for n, family in enumerate(families, start):
+        lg = lg.record(trial(n, tl.Split.DEVELOPMENT, tl.Outcome.FAILED,
+                             family=family, trial_id=f"trial-d{n}", plan_id=plan_id,
+                             access_id=None))  # fmt: skip
+    return lg
+
+
+def counts(conn: Conn, eid: str) -> list[tuple[int, int]]:
+    rows = conn.execute("SELECT family_trials, chain_trials FROM "
+                        "app.evaluation_receipt WHERE experiment_id = %s "
+                        "ORDER BY recorded_at", (eid,)).fetchall()  # fmt: skip
+    return [(f, c) for f, c in rows]
+
+
+def retest(reg: im.ExperimentRegistry, to: str | None) -> im.ExperimentRegistry:
+    p = replace(reg.protocol(EXP), retest_of=to)
+    return im.ExperimentRegistry(reg.scope_id).register(p).register_candidate(cand())
+
+
+def test_decision_19_a_retest_counts_the_trials_of_its_whole_chain(
+    wa: Pair, app_conn: Conn, conn: Conn, a: uuid.UUID
+) -> None:
+    assess(wa, a, promo_ledger(GOOD), "v-1")  # EXP: one trial in its family
+    assert counts(conn, EXP) == [(1, 1)]
+    early = other_plan("plan-e", EARLY)
+    put_on(wa, a, "exp-r", early, retest_of=EXP)
+    lg = dev_trials(read_on(a, early, "exp-r"), "plan-e", 2, "exp-r", "exp-r", EXP, EXP)
+    done = put_on(wa, a, "exp-r", early, lg, retest_of=EXP)
+    assert done.record.state is St.AWAITING_REVIEW
+    # exp-r: 1 promotion + 2 development trials = 3; EXP: max(2 here, 1 stored) = 2
+    assert counts(conn, "exp-r") == [(3, 3 + 2)]
+    with tn.provision_tenant(app_conn) as tx:
+        b = tx.tenant_id
+    reg_b = reg_for(b, "exp-b", bud="bud-exp-b")
+    put(wa, b, reg_b, booked(reg_b, "exp-b"), eid="exp-b")
+    for target in ("exp-none", "exp-b"):  # unknown, or another tenant's
+        with pytest.raises(es.ExperimentStoreError, match="retest_of_unknown"):
+            put_on(wa, a, "exp-x", other_plan("plan-x", MID), retest_of=target)
+        assert protocols(conn, "exp-x") == 0
+    with pytest.raises(es.ExperimentStoreError, match="protocol_frozen"):  # a cycle
+        put(wa, a, retest(reg_for(a), "exp-r"), booked(reg_for(a)))
+    with pytest.raises(es.ExperimentStoreError, match="protocol_frozen"):  # unlinked
+        put_on(wa, a, "exp-r", early)
+
+
+def test_decision_19_the_database_holds_the_link_and_the_chain_count(
+    wa: Pair, conn: Conn, a: uuid.UUID
+) -> None:
+    assess(wa, a, promo_ledger(GOOD), "v-1")
+    early = other_plan("plan-e", EARLY)
+    put_on(wa, a, "exp-r", early, retest_of=EXP)
+    put_on(wa, a, "exp-r", early, read_on(a, early, "exp-r", tl.Outcome.FAILED),
+           retest_of=EXP)  # unscored; exp-r 1 + EXP 1  # fmt: skip
+    assert counts(conn, "exp-r") == [(1, 2)]
+
+    def link(target: str, column: str) -> str:  # a raw copy of exp-r's protocol
+        return ("INSERT INTO app.assessor_protocol SELECT tenant_id, 'exp-n', "
+                "protocol_hash, plan_id, baseline_version, assessor_actor_id, "
+                "assessor_route_id, assessor_family_id, assessor_version, "
+                "jsonb_set(body, '{experiment_id}', '\"exp-n\"') || "
+                f"jsonb_build_object('retest_of', '{target}'), clock_timestamp(), "
+                f"event_hash, {column} FROM app.assessor_protocol "
+                "WHERE experiment_id = 'exp-r'")  # fmt: skip
+
+    for sql, err in (
+        (link("exp-none", "'exp-none'"), psycopg.errors.ForeignKeyViolation),
+        (link("exp-n", "'exp-n'"), psycopg.errors.CheckViolation),  # never itself
+        (link("exp-r", "NULL"), psycopg.errors.CheckViolation),  # not the body's
+    ):  # fmt: skip
+        with pytest.raises(err):
+            conn.execute(sql)
+    conn.execute(link("exp-r", "'exp-r'"))  # the control: exp-n re-tests exp-r
+    low = {"verdict_id": "'v-x'", "decision": "'blocked'", "reasons": "'{blocked}'",
+           "src": "experiment_id = 'exp-r'"}  # fmt: skip
+    for chain in ("1", "NULL"):  # below exp-r's 1 + EXP's stored 1, or uncounted
+        with pytest.raises(psycopg.errors.CheckViolation):
+            conn.execute(receipt_copy(conn, chain_trials=chain, **low))
+    conn.execute(receipt_copy(conn, chain_trials="2", **low))  # the control

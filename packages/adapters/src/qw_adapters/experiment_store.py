@@ -173,7 +173,7 @@ def record(
     with tenant_transaction(assessor, tenant_id) as atx:  # phase 1: qw_assessor
         _lock(atx, shared=False)
         chain = _chains(atx, experiment_id).get(experiment_id, [])
-        stored = ast.bind(atx, registry, experiment_id, candidate_id)
+        stored = ast.bind(atx, registry, experiment_id, candidate_id, plan)
         rec, verdict = im.derive(stored, experiment_id, candidate_id, plan, book,
                                  outcome, assessment)  # fmt: skip
         if _check_follows(rec, chain):

@@ -3,18 +3,23 @@
 decision 17, the assessor-role migration; qw_worker has no privilege here) under
 the `experiment:<tenant>` lock; no route reads it. `bind` stores the protocol and
 lineage once, then requires the caller's to hash the same (`protocol_frozen`,
-`lineage`) and rebuilds the registry from the stored rows. `store_verdict` accepts
-the identical receipt of an earlier attempt (a retry whose revision was not
-written), refuses another under the same verdict id (`verdict_conflict`), else
-runs `admit` and `put_verdict`. `admit` (owner decision Q7) refuses re-assessment
-once a receipt scored the holdout read (`holdout_used`) and a ledger that does not
-extend the last stored checkpoint or begin with the plan's stored reads
-(`ledger_diverged`). `put_verdict` appends new holdout reads, then the receipt
-naming the read it scored. Reads re-hash every row and rebuild protocols,
-candidates and verdicts through the domain (stored reads are compared with the
-ledger's `Access`); failures are `integrity`. LIMITATIONS: the ledger itself and
-the budget book are the caller's; a raw qw_assessor INSERT that meets the database
-rules is not checked for provenance."""
+`lineage`) and rebuilds the registry from the stored rows; a new protocol whose
+plan's promotion window overlaps a window already scored for another plan of the
+same tenant and target (any baseline) is refused (`holdout_window_used`, decision
+18; `admit` checks it again before scoring), and its `retest_of` must name a
+stored experiment of the tenant (`retest_of_unknown`, decision 19). `store_verdict`
+accepts the identical receipt of an earlier attempt (a retry whose revision was
+not written), refuses another under the same verdict id (`verdict_conflict`),
+else runs `admit` and `put_verdict`. `admit` (owner decision Q7) refuses
+re-assessment once a receipt scored the holdout read (`holdout_used`) and a ledger
+that does not extend the last stored checkpoint or begin with the plan's stored
+reads (`ledger_diverged`). `put_verdict` appends new holdout reads, then the
+receipt naming the read it scored, with its family's and its retest chain's trial
+counts. Reads re-hash every row and rebuild protocols, candidates and verdicts
+through the domain (stored reads are compared with the ledger's `Access`);
+failures are `integrity`. LIMITATIONS: the ledger itself and the budget book are
+the caller's; a raw qw_assessor INSERT that meets the database rules is not
+checked for provenance."""
 
 from __future__ import annotations
 
@@ -27,8 +32,8 @@ import psycopg
 from psycopg.types.json import Jsonb
 from qw_domain import improvement as im
 from qw_domain import trial_ledger as tl
-from qw_domain.instants import ensure_aware_utc, format_instant
-from qw_domain.research_data import ResearchError, digest
+from qw_domain.instants import ensure_aware_utc, format_instant, parse_instant
+from qw_domain.research_data import ResearchError, Window, digest
 
 from qw_adapters.tenancy import TenantTx
 
@@ -96,9 +101,10 @@ def _protocol(tx: TenantTx, eid: str) -> im.Protocol | None:
         a = p.assessor
         if (r["protocol_hash"], r["plan_id"], r["baseline_version"],
                 r["assessor_actor_id"], r["assessor_route_id"],
-                r["assessor_family_id"], r["assessor_version"]) != (
+                r["assessor_family_id"], r["assessor_version"],
+                r.get("retest_of")) != (
                 p.content_hash, p.plan_id, p.baseline_version, a.actor_id,
-                a.route_id, a.family_id, a.version):  # fmt: skip
+                a.route_id, a.family_id, a.version, p.retest_of):  # fmt: skip
             raise ValueError("protocol columns")
         return p, p.wire()
 
@@ -122,21 +128,44 @@ def _lineage(tx: TenantTx, eid: str) -> list[im.Candidate]:
     return _verified(rows, "assessor_candidate", tx, build)
 
 
-def bind(tx: TenantTx, registry: im.ExperimentRegistry, eid: str,
-         cid: str) -> im.ExperimentRegistry:  # fmt: skip
+def _window_free(tx: TenantTx, p: im.Protocol, window: Window) -> None:
+    """Decision 18: `window` shares no instant with a window scored for another
+    plan of this tenant and target, any baseline (the scored reads' windows)."""
+    rows = _select(tx, "SELECT h.body FROM app.evaluation_receipt r JOIN "
+                   "app.holdout_access h ON (h.tenant_id, h.plan_id, h.seq) = "
+                   "(r.tenant_id, r.plan_id, r.scored_seq) JOIN app.assessor_protocol "
+                   "u ON (u.tenant_id, u.experiment_id) = (r.tenant_id, "
+                   "r.experiment_id) WHERE r.tenant_id = %s AND r.plan_id <> %s AND "
+                   "u.body ->> 'target' = %s", p.plan_id, p.target.value)  # fmt: skip
+    try:
+        used = [Window(parse_instant(r["body"][5][0]), parse_instant(r["body"][5][1]))
+                for r in rows]  # fmt: skip
+    except (ValueError, TypeError, KeyError, IndexError, ResearchError) as exc:
+        raise ExperimentStoreError("integrity", type(exc).__name__) from None
+    if any(u.start < window.end and window.start < u.end for u in used):
+        raise ExperimentStoreError("holdout_window_used", p.plan_id)
+
+
+def bind(tx: TenantTx, registry: im.ExperimentRegistry, eid: str, cid: str,
+         plan: tl.SplitPlan) -> im.ExperimentRegistry:  # fmt: skip
     """The registry rebuilt from the stored protocol and lineage of `cid`."""
     p, c = registry.protocol(eid), registry.candidate(cid)
     if c.experiment_id != eid:
         raise im.ImprovementError("candidate_experiment", cid)
     stored = _protocol(tx, eid)
     if stored is None:
+        if (plan.plan_id, im.plan_digest(plan)) != (p.plan_id, p.plan_digest):
+            raise im.ImprovementError("test_access_changed", p.plan_id)
+        _window_free(tx, p, plan.promotion)
+        if p.retest_of is not None and _protocol(tx, p.retest_of) is None:
+            raise ExperimentStoreError("retest_of_unknown", p.retest_of)
         a = p.assessor
         _insert(tx, "assessor_protocol", {
             "experiment_id": eid, "protocol_hash": p.content_hash,
             "plan_id": p.plan_id, "baseline_version": p.baseline_version,
             "assessor_actor_id": a.actor_id, "assessor_route_id": a.route_id,
             "assessor_family_id": a.family_id, "assessor_version": a.version,
-            "body": Jsonb(p.wire()),
+            "body": Jsonb(p.wire()), "retest_of": p.retest_of,
         }, p.wire())  # fmt: skip
         stored = p
     elif stored.content_hash != p.content_hash:
@@ -192,7 +221,9 @@ def receipts(tx: TenantTx, eid: str) -> list[Receipt]:
                        tuple(r["limitations"]),
                        ensure_aware_utc(r["assessed_at"]))  # fmt: skip
         extra = (r["scored_seq"], r["ledger_entries"], r["ledger_digest"])
-        return (v, *extra), [v.wire(), r["plan_id"], *extra]
+        counted = (r["family_trials"], r["chain_trials"])  # None on 0028 rows
+        tail = [] if counted == (None, None) else list(counted)
+        return (v, *extra), [v.wire(), r["plan_id"], *extra, *tail]
 
     rows = _select(tx, "SELECT * FROM app.evaluation_receipt WHERE tenant_id = %s "
                    "AND experiment_id = %s ORDER BY recorded_at, verdict_id",
@@ -220,6 +251,7 @@ def admit(tx: TenantTx, p: im.Protocol, ledger: tl.TrialLedger) -> None:
         raise ExperimentStoreError("holdout_used", p.experiment_id)
     if not _frozen_plan(p, ledger):
         return
+    _window_free(tx, p, ledger.plan(p.plan_id).promotion)
     marks = [(n, d) for _, _, n, d in done if n is not None and d is not None]
     if marks:
         n, d = marks[-1]
@@ -255,6 +287,23 @@ def store_verdict(tx: TenantTx, p: im.Protocol, v: im.Verdict,
     put_verdict(tx, p, v, ledger)
 
 
+def _chain_trials(tx: TenantTx, p: im.Protocol, ledger: tl.TrialLedger) -> int:
+    """Decision 19: the retest chain's trials (`improvement.chain_trials`) over the
+    stored links, each experiment's largest stored count and the ledger."""
+    chain, cur = [p.experiment_id], p
+    while cur.retest_of is not None:
+        nxt = _protocol(tx, cur.retest_of)
+        if nxt is None or nxt.experiment_id in chain or len(chain) >= 10000:
+            raise ExperimentStoreError("integrity", "retest chain")
+        chain.append(nxt.experiment_id)
+        cur = nxt
+    rows = _select(tx, "SELECT experiment_id, max(family_trials) AS n FROM "
+                   "app.evaluation_receipt WHERE tenant_id = %s AND experiment_id "
+                   "= ANY (%s) AND family_trials IS NOT NULL GROUP BY experiment_id",
+                   chain)  # fmt: skip
+    return im.chain_trials(ledger, chain, {r["experiment_id"]: r["n"] for r in rows})
+
+
 def put_verdict(tx: TenantTx, p: im.Protocol, v: im.Verdict,
                 ledger: tl.TrialLedger) -> None:  # fmt: skip
     """Append the ledger's new holdout reads, then the receipt (after `admit`)."""
@@ -273,6 +322,8 @@ def put_verdict(tx: TenantTx, p: im.Protocol, v: im.Verdict,
             t = next(x for x in ledger.trials() if x.trial_id == v.trial_ids[0])
             seq = next(a.seq for a in reads if a.access_id == t.access_id)
     who, w = v.assessor, v.wire()
+    family = ledger.trial_count(p.experiment_id)
+    chain = _chain_trials(tx, p, ledger)
     _insert(tx, "evaluation_receipt", {
         "experiment_id": v.experiment_id, "verdict_id": v.verdict_id,
         "candidate_id": v.candidate_id, "candidate_hash": v.candidate_hash,
@@ -283,5 +334,5 @@ def put_verdict(tx: TenantTx, p: im.Protocol, v: im.Verdict,
         "trial_ids": list(v.trial_ids), "failed_trial_ids": list(v.failed_trial_ids),
         "limitations": list(v.limitations), "assessed_at": v.assessed_at,
         "plan_id": p.plan_id, "scored_seq": seq, "ledger_entries": n,
-        "ledger_digest": d,
-    }, [w, p.plan_id, seq, n, d])  # fmt: skip
+        "ledger_digest": d, "family_trials": family, "chain_trials": chain,
+    }, [w, p.plan_id, seq, n, d, family, chain])  # fmt: skip

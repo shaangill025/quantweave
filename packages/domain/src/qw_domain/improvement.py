@@ -242,6 +242,7 @@ class Protocol:
     authorized_by: str
     registered_at: datetime
     mutation_space_hash: str | None = None  # permitted mutations (T047 search space)
+    retest_of: str | None = None  # owner decision 19: the experiment this re-tests
 
     def __post_init__(self) -> None:
         ids = ("experiment_id", "scope_id", "baseline_version", "plan_id",
@@ -284,6 +285,12 @@ class Protocol:
             _id(self.sandbox_profile_id, "sandbox_profile_id")
         if self.mutation_space_hash is not None:
             _sha(self.mutation_space_hash, "mutation_space_hash")
+        if self.retest_of is not None:
+            _id(self.retest_of, "retest_of")
+            if self.retest_of == self.experiment_id:
+                raise ImprovementError(
+                    "retest_of", "an experiment never re-tests itself"
+                )
         object.__setattr__(self, "registered_at", ensure_aware_utc(self.registered_at))
 
     def wire(self) -> dict[str, object]:
@@ -302,6 +309,8 @@ class Protocol:
                 v = str(v.total_seconds())
             elif isinstance(v, UsdBudget):
                 v = v.to_wire()
+            elif f.name == "retest_of" and v is None:
+                continue  # absent: protocols without a link keep their hashes
             out[f.name] = v
         return out
 
@@ -569,7 +578,7 @@ class ExperimentRegistry:
             if old == p:
                 return self
             a, b = old.wire(), p.wire()
-            changed = sorted(k for k in a if a[k] != b[k])
+            changed = sorted(k for k in a.keys() | b.keys() if a.get(k) != b.get(k))
             raise ImprovementError("protocol_frozen", ",".join(changed))
         return self._append(p)
 
@@ -758,6 +767,20 @@ def assess(
     if reasons:
         return verdict(Decision.REJECT, *reasons)
     return verdict(Decision.ACCEPT_FOR_REVIEW)
+
+
+def chain_trials(ledger: TrialLedger, chain: Sequence[str],
+                 stored: Mapping[str, int]) -> int:  # fmt: skip
+    """Owner decision 19: the trials of every experiment in a retest chain (`chain`,
+    this experiment first, each one's hypothesis family), the count a
+    multiple-testing adjustment must use; per experiment the larger of the ledger's
+    `trial_count` and the `stored` count of its earlier receipts. No adjustment is
+    applied here: none is named by the spec."""
+    if not chain or len(set(chain)) != len(chain) or any(
+        type(n) is not int or n < 0 for n in stored.values()
+    ):  # fmt: skip
+        raise ImprovementError("retest_chain", "distinct ids and counts >= 0")
+    return sum(max(ledger.trial_count(e), stored.get(e, 0)) for e in chain)
 
 
 class RecordState(StrEnum):  # the experiment.schema.json states derivable here
