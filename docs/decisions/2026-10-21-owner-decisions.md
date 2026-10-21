@@ -397,3 +397,66 @@ only; decision 25 settles how they meet the contract checker.
     independent-evaluator scope. Not 'UI': a UI over a path that can't yet run would
     show nothing real."
     Implemented by: T044 with T033 and T037.
+
+## Eighth quiz (2026-10-21): assessor-run promotions (decision 39)
+
+40. **Which process holds the assessor and worker logins.**
+    Question: "The assessor job needs the qw_assessor login (to read holdout data and
+    write verdicts) and a qw_worker login (to claim jobs and write the experiment
+    result). Which process holds what?"
+    Selected label: "Assessor process holds both (Recommended)".
+    Option text as presented: "A separate `qw-assessor` process holds both logins;
+    ordinary workers are refused at startup if the assessor login is configured, so
+    they can never hold it. No new database grants. Why: it keeps the decision-17
+    separation at the database (each login still does only its own role) while
+    giving the assessor process what it needs. Not 'widen qw_assessor': granting it
+    job and revision tables enlarges what a compromised assessor can touch."
+    Implemented by: T044 (worker entrypoint).
+
+41. **Where the holdout price data comes from.**
+    Question: "The assessor needs the holdout price data, which no store holds yet,
+    and the producer must never see it. Where should it come from?"
+    Selected label: "Protected table, preregistered (Recommended)".
+    Option text as presented: "A new holdout_series table readable and writable only
+    by the assessor login. The operator loads it before any experiment's protocol
+    names the plan, and loading is refused afterwards. Why: the producer never has
+    access, and preregistration stops anyone swapping in friendlier data after
+    seeing results. Not 'Wait for a market-data store': it delays the whole
+    independent-evaluator path."
+    Implemented by: T044.
+
+42. **A crash after the holdout read and before the verdict.**
+    Question: "The assessor records its holdout read before opening the data
+    (required by the spec). If it crashes after reading but before storing a
+    verdict, what happens on retry?"
+    Selected label: "Re-run once, same read (Recommended)".
+    Option text as presented: "Re-run deterministically under the same recorded
+    read, candidate and protocol, with no new read; if the result differs, refuse as
+    a conflict. Why: a crash isn't a second look at the data, and determinism means
+    the retry learns nothing new. Not 'Spend it': an infrastructure hiccup would
+    permanently burn a holdout window and force new data."
+    Implemented by: T044.
+
+43. **Caller-supplied trial ledger and budget book.**
+    Question: "The trial ledger and budget book are still supplied by the caller
+    (their stores, T032/T037, aren't built). Until they are, should assessor-run
+    promotions go ahead?"
+    Selected label: "Run, marked (Recommended)".
+    Option text as presented: "Run them, and mark each verdict 'ledger
+    caller-supplied' and 'budget caller-supplied', visible to reviewers (mirrors
+    decision 33). Why: it exercises the real path now and is honest about what's
+    still trusted. Residual: a producer could omit development trials to lower the
+    trial count. Not 'Refuse': it blocks the whole path on two more stores."
+    Implemented by: T044 (until T032 and T037 persistence replaces the marks).
+
+44. **Where the T047 strategy checks run.**
+    Question: "Strategy improvement (T047) adds extra checks (account violations and
+    a prospective shadow run) on top of the assessor's verdict, but shadow results
+    aren't stored yet. Where should those checks run for assessor-run promotions?"
+    Selected label: "At adoption (Recommended)".
+    Option text as presented: "The assessor job produces the T044 verdict (with
+    Bonferroni); the T047 account and shadow checks are re-run when a tenant adopts
+    the candidate. Why: it doesn't need shadow persistence to exist, and adoption is
+    the point where those checks protect real money. Not 'In the job': it would
+    block on building shadow-book storage first."
+    Implemented by: T044 with T047 and T051 (adoption).
