@@ -180,6 +180,9 @@
       }
     }
   },
+  "sensitive_fields": [
+    {"schema": "session", "field": "/properties/csrf_token", "decision": "Owner decision 2026-10-21 (csrf_token documented): decision 13, docs/decisions/2026-10-21-owner-decisions.md. The X-CSRF-Token value is served to the logged-in caller by GET /session (no-store); it is useful only with the HttpOnly session cookie (double-submit)."}
+  ],
   "page": {
     "add": {"coverage": {"$ref": "#/$defs/Coverage"}}
   },
