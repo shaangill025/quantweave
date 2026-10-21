@@ -54,7 +54,9 @@ from enum import StrEnum
 from types import MappingProxyType
 from typing import Any
 
+from qw_domain.backtest import EvaluationProtocol
 from qw_domain.budget import BudgetBook, Category, Reservation, Status
+from qw_domain.decimal_math import CTX, norm_cdf, norm_ppf
 from qw_domain.decimals import UsdBudget, safe_repr
 from qw_domain.feedback import Access as EvidenceAccess
 from qw_domain.feedback import ImprovementEvidence, Purpose, Use
@@ -455,8 +457,13 @@ class Verdict:
     failed_trial_ids: tuple[str, ...]
     limitations: tuple[str, ...]
     assessed_at: datetime
+    # decision 35: z', the chain's trial count and each widened excess lower bound
+    adjustment: Mapping[str, Decimal] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
+        object.__setattr__(self, "adjustment", MappingProxyType(dict(self.adjustment)))
+        if any(type(v) is not Decimal for v in self.adjustment.values()):
+            raise TypeError("adjustment values must be Decimals")
         if (self.decision is Decision.ACCEPT_FOR_REVIEW) == bool(self.reasons):
             raise ImprovementError("verdict_inconsistent", self.verdict_id)
 
@@ -476,7 +483,10 @@ class Verdict:
                 "trial_ids": list(self.trial_ids),
                 "failed_trial_ids": list(self.failed_trial_ids),
                 "limitations": list(self.limitations),
-                "assessed_at": format_instant(self.assessed_at)}  # fmt: skip
+                "assessed_at": format_instant(self.assessed_at),
+                **({"adjustment": {k: str(v) for k, v in
+                                   sorted(self.adjustment.items())}}
+                   if self.adjustment else {})}  # fmt: skip
 
     @property
     def requires_human_promotion(self) -> bool:
@@ -684,10 +694,16 @@ def schedule(
 def assess(
     registry: ExperimentRegistry, experiment_id: str, candidate_id: str,
     ledger: TrialLedger, book: BudgetBook, assessor: Party, at: datetime,
-    verdict_id: str, claimed: Mapping[str, Decimal] | None = None,
+    verdict_id: str, claimed: Mapping[str, Decimal] | None = None, *,
+    evaluation: EvaluationProtocol | None = None, chain_trials: int | None = None,
 ) -> Verdict:  # fmt: skip
-    """Score one candidate against its frozen protocol from recorded trials."""
+    """Score one candidate against its frozen protocol from recorded trials. A
+    strategy promotion must also clear the Bonferroni-widened excess bound
+    (`_widened`, owner decisions 35 to 37); `chain_trials` is the store's count of
+    the whole retest chain (else this ledger's count of the experiment's family)."""
     _id(verdict_id, "verdict_id")
+    if chain_trials is not None and (type(chain_trials) is not int or chain_trials < 0):
+        raise ImprovementError("chain_trials", "a non-negative int")
     at = ensure_aware_utc(at)
     if claimed is not None and any(type(v) is not Decimal for v in claimed.values()):
         raise TypeError("claimed metrics must be Decimals")
@@ -698,12 +714,13 @@ def assess(
     used: list[str] = []
     failed: list[str] = []
     limits: list[str] = []
+    adjust: dict[str, Decimal] = {}
 
     def verdict(decision: Decision, *reasons: str) -> Verdict:
         return Verdict(verdict_id, experiment_id, candidate_id, c.content_hash,
                        p.content_hash, assessor, decision, reasons,
                        MappingProxyType(scores), tuple(used), tuple(failed),
-                       tuple(limits), at)  # fmt: skip
+                       tuple(limits), at, adjust)  # fmt: skip
 
     if p.target in SANDBOX_TARGETS:  # T007 not qualified: no in-process substitute
         return verdict(Decision.BLOCKED, "sandbox_unqualified")
@@ -727,6 +744,8 @@ def assess(
         return verdict(Decision.BLOCKED, *blocked)
     if plan.dataset.evidence_class is EvidenceClass.SYNTHETIC:
         limits.append("synthetic_only")
+    if p.target is not Target.STRATEGY:  # decision 36: counted, not adjusted
+        limits.append("no_multiple_testing_adjustment")
     key, notes, best = c.trial_key, set(), None
     for t in ledger.trials(key.family):
         if t.split is not TrialSplit.PROMOTION or t.plan_id != p.plan_id or (
@@ -759,9 +778,19 @@ def assess(
     bad = [f"metric_invalid:{m}" for m in HARD_CONTROLS[p.target] if scores[m] < 0]
     if bad:  # violation counts are never negative
         return verdict(Decision.INSUFFICIENT, *bad)
+    widened: list[str] = []
+    if p.target is Target.STRATEGY:
+        k = chain_trials
+        if k is None and p.retest_of is None:  # no link: this family is the chain
+            k = ledger.trial_count(experiment_id)
+        why = _widened(plan, evaluation, k, scores, adjust)
+        if why:
+            return verdict(Decision.INSUFFICIENT, *why)
+        widened = [f"bonferroni:{n[: -len(_LOWER)]}" for n, b in adjust.items()
+                   if n.endswith(_LOWER) and b < 0]  # fmt: skip
     reasons = [f"{'hard' if t.hard else 'goal'}:{t.metric}"
                for t in sorted(cards, key=lambda t: not t.hard)
-               if not t.passes(scores[t.metric])]  # fmt: skip
+               if not t.passes(scores[t.metric])] + widened  # fmt: skip
     if claimed is not None and any(scores.get(k) != v for k, v in claimed.items()):
         reasons.append("metrics_mismatch")
     if reasons:
@@ -781,6 +810,46 @@ def chain_trials(ledger: TrialLedger, chain: Sequence[str],
     ):  # fmt: skip
         raise ImprovementError("retest_chain", "distinct ids and counts >= 0")
     return sum(max(ledger.trial_count(e), stored.get(e, 0)) for e in chain)
+
+
+_LOWER = ".excess_lower_widened"
+
+
+def _widened(plan: SplitPlan, ev: EvaluationProtocol | None, k: int | None,
+             scores: Mapping[str, Decimal],
+             adjust: dict[str, Decimal]) -> list[str]:  # fmt: skip
+    """Decisions 35 to 37: the excess lower bound at z' = Phi^-1(1 - alpha / (2 k)),
+    alpha = 2 (1 - Phi(z)), for the claim's baseline, else every declared one.
+    `ev` must be the evaluation protocol the frozen plan names by hash (so z is
+    not the caller's), and the trial was recorded under it (the ledger refuses a
+    trial whose protocol hash is not its plan's). Fills `adjust`; returns why
+    the evidence is insufficient (missing or unbound inputs), else []."""
+    if ev is None:
+        return ["evaluation_protocol_missing"]
+    if type(ev) is not EvaluationProtocol or ev.content_hash != plan.protocol_hash:
+        return ["evaluation_protocol_unbound"]  # (the hash covers its plan id)
+    if k is None or k < 1:  # a retest needs the store's chain count, and the
+        return ["chain_trials_unknown"]  # scored trial is always one of them
+    if "ci_z" in scores and scores["ci_z"] != ev.z:
+        return ["z_mismatch"]
+    named = ev.claim.baseline_id
+    ids = [named] if named is not None else [b.baseline_id for b in ev.baselines]
+    keys = [
+        f"baseline.{i}.{m}" for i in ids for m in ("excess_mean", "excess_std_error")
+    ]
+    if missing := [f"metric_missing:{n}" for n in keys if n not in scores]:
+        return missing
+    alpha = CTX.multiply(2, CTX.subtract(1, norm_cdf(ev.z)))
+    try:
+        z = norm_ppf(CTX.subtract(1, CTX.divide(alpha, Decimal(2 * k))))
+    except ValueError:
+        return ["widened_z_unavailable"]
+    adjust.update({"chain_trials": Decimal(k), "z_widened": z})
+    for i in ids:
+        mean, se = scores[f"baseline.{i}.excess_mean"], scores[
+            f"baseline.{i}.excess_std_error"]  # fmt: skip
+        adjust[f"baseline.{i}{_LOWER}"] = CTX.subtract(mean, CTX.multiply(z, se))
+    return []
 
 
 class RecordState(StrEnum):  # the experiment.schema.json states derivable here
@@ -963,6 +1032,7 @@ class Assessment:  # what `assess` needs beyond the registry, plan and book
     at: datetime
     verdict_id: str
     claimed: Mapping[str, Decimal] | None = None
+    evaluation: EvaluationProtocol | None = None  # T033, bound by the plan's hash
 
 
 def record(
@@ -978,7 +1048,7 @@ def record(
 def derive(
     registry: ExperimentRegistry, experiment_id: str, candidate_id: str,
     plan: SplitPlan, book: BudgetBook, outcome: Scheduled | Deferred | None = None,
-    assessment: Assessment | None = None,
+    assessment: Assessment | None = None, *, chain_trials: int | None = None,
 ) -> tuple[ExperimentRecord, Verdict | None]:  # fmt: skip
     """The record and the verdict it carries. A verdict comes only from running
     `assess` here on the given registry, ledger and book."""
@@ -987,6 +1057,14 @@ def derive(
         raise ImprovementError("candidate_experiment", candidate_id)
     if plan.plan_id != p.plan_id or plan_digest(plan) != p.plan_digest:
         raise ImprovementError("test_access_changed", p.plan_id)
+    if assessment is not None and p.target is Target.STRATEGY:
+        # review M1: refuse before any verdict, so no holdout read is spent on an
+        # assessment that cannot apply decision 35 (assess alone: insufficient)
+        ev = assessment.evaluation
+        if ev is None:
+            raise ImprovementError("evaluation_protocol_missing", experiment_id)
+        if type(ev) is not EvaluationProtocol or ev.content_hash != plan.protocol_hash:
+            raise ImprovementError("evaluation_protocol_unbound", experiment_id)
     if p.sandbox_profile_id is None:  # the schema requires one; never invented
         raise ImprovementError("contract_field_unavailable", "sandbox_profile_id")
     if outcome is not None and outcome.experiment_id != experiment_id:
@@ -1010,7 +1088,8 @@ def derive(
     v = None if assessment is None else assess(
         registry, experiment_id, candidate_id, assessment.ledger, book,
         assessment.assessor, assessment.at, assessment.verdict_id,
-        assessment.claimed)  # fmt: skip
+        assessment.claimed, evaluation=assessment.evaluation,
+        chain_trials=chain_trials)  # fmt: skip
     state = RecordState.AUTHORIZED if reserved else RecordState.PROPOSED
     if v is not None:
         kind = {Decision.BLOCKED: "blocked", Decision.INSUFFICIENT: "insufficient",

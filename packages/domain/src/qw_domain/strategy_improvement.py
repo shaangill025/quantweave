@@ -470,10 +470,10 @@ def assess_strategy(
     if registry.protocol(f) != study.protocol:
         raise Error("study_mismatch", f)
     v = im.assess(registry, f, candidate_id, ledger, book, assessor, at, verdict_id,
-                  claimed)  # fmt: skip
+                  claimed, evaluation=study.evaluation)  # fmt: skip
     c = registry.candidate(candidate_id)
     acct = account(study, registry, ledger)
-    limits = [*v.limitations, "no_multiple_testing_adjustment"]
+    limits = list(v.limitations)  # the Bonferroni widening is in v (decision 35)
 
     def out(d: im.Decision, reasons: list[str], report: ShadowReport | None = None,
             ceiling: EvidenceState = EvidenceState.NONE,

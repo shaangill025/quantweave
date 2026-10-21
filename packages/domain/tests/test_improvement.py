@@ -5,13 +5,15 @@
 import ast
 import json
 from dataclasses import replace
-from datetime import timedelta
+from datetime import datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 
 import pytest
 from qw_domain import improvement as im
 from qw_domain import trial_ledger as tl
+from qw_domain.backtest import ClaimMetric, DeclaredClaim
+from qw_domain.backtest import Direction as ClaimDirection
 from qw_domain.budget import BudgetBook, BudgetCaps, Category, Status
 from qw_domain.decimals import UsdBudget as Usd
 from qw_domain.feedback import (
@@ -24,8 +26,19 @@ from qw_domain.feedback import (
     Use,
 )
 from qw_domain.research_data import digest
+from test_backtest import protocol as bt_protocol
 from test_feedback import SUBJ
-from test_trial_ledger import DEV, PROMO, T0, TENANT, ask, ledger, plan, trial
+from test_trial_ledger import (
+    DEV,
+    PROMO,
+    T0,
+    TENANT,
+    ask,
+    evaluation,
+    ledger,
+    plan,
+    trial,  # fmt: skip
+)
 
 H = im.Threshold
 D = im.Direction
@@ -105,16 +118,30 @@ def promo_ledger(metrics: dict[str, Decimal], c: im.Candidate | None = None,
                            config_hash=key.config_hash))  # fmt: skip
 
 
+# Decision 35: a strategy promotion also needs each baseline's excess mean and se;
+# 0.02 - 2.58 * 0.002 > 0 clears the widened bound for small trial counts.
+EXCESS = {
+    f"baseline.{b}.{k}": Decimal(v)
+    for b in ("bl-hold", "bl-cash")
+    for k, v in (("excess_mean", "0.02"), ("excess_std_error", "0.002"))
+}
 GOOD = {"net_return": Decimal("0.02"), "lookahead_violations": Decimal(0),
         "survivorship_violations": Decimal(0),
-        "unrecorded_trials": Decimal(0)}  # fmt: skip
+        "unrecorded_trials": Decimal(0), **EXCESS}  # fmt: skip
+EVAL = evaluation()  # the T033 protocol the fixture plan freezes (PROTO_HASH)
+
+
+def assessed(lg: tl.TrialLedger, who: im.Party, at: datetime, vid: str,
+             **kw: object) -> im.Assessment:  # fmt: skip
+    """An assessment carrying the evaluation protocol frozen with the plan."""
+    return im.Assessment(lg, who, at, vid, evaluation=EVAL, **kw)  # type: ignore[arg-type]
 
 
 def assess(reg: im.ExperimentRegistry, lg: tl.TrialLedger, **kw: object) -> im.Verdict:
     args: dict[str, object] = {"registry": reg, "experiment_id": EXP,
         "candidate_id": "cand-1", "ledger": lg, "book": scheduled(reg),
         "assessor": ASSESSOR, "at": AT + timedelta(days=1),
-        "verdict_id": "verdict-1"} | kw  # fmt: skip
+        "verdict_id": "verdict-1", "evaluation": EVAL} | kw  # fmt: skip
     return im.assess(**args)  # type: ignore[arg-type]
 
 
@@ -451,7 +478,7 @@ def test_record_derives_honest_states_and_reasons() -> None:
         im.record(reg, EXP, "cand-1", pl, book(), im.Scheduled(EXP, "bud-exp-1"))
     later = im.record(reg, EXP, "cand-1", pl, b, im.Deferred(EXP, "queued_behind"))
     assert later.reasons == ("deferred:queued_behind", *SU)
-    run = im.Assessment(promo_ledger(GOOD), ASSESSOR, AT + timedelta(days=1), "v-1")
+    run = assessed(promo_ledger(GOOD), ASSESSOR, AT + timedelta(days=1), "v-1")
     done = im.record(reg, EXP, "cand-1", pl, b, im.Scheduled(EXP, "bud-exp-1"), run)
     assert (done.state, done.decision) == (
         im.RecordState.AWAITING_REVIEW, im.Decision.ACCEPT_FOR_REVIEW)  # fmt: skip
@@ -536,7 +563,7 @@ ALLOWED = {
 def states() -> dict[im.RecordState, im.ExperimentRecord]:
     reg, pl = registry(proto(sandbox_profile_id="sbx-synth")), plan()
     b = scheduled(reg)
-    run = im.Assessment(promo_ledger(GOOD), ASSESSOR, AT + timedelta(days=1), "v-1")
+    run = assessed(promo_ledger(GOOD), ASSESSOR, AT + timedelta(days=1), "v-1")
     bad = promo_ledger(GOOD | {"lookahead_violations": Decimal(1)})
     got = [
         im.record(reg, EXP, "cand-1", pl, book()),
@@ -578,7 +605,7 @@ def test_insufficient_evidence_is_reassessed_only_while_the_holdout_is_unused() 
     b = scheduled(reg)
     at = AT + timedelta(days=1)
     thin = im.record(reg, EXP, "cand-1", pl, b, None,
-                     im.Assessment(ledger(), ASSESSOR, at, "v-1"))  # fmt: skip
+                     assessed(ledger(), ASSESSOR, at, "v-1"))  # fmt: skip
     assert thin.reasons == (SU[0], "insufficient:no_qualifying_trial",
                             "none:evaluation_receipt_ids", SU[1])  # fmt: skip
     again = im.record(
@@ -588,7 +615,7 @@ def test_insufficient_evidence_is_reassessed_only_while_the_holdout_is_unused() 
         pl,
         b,
         None,
-        im.Assessment(promo_ledger(GOOD), ASSESSOR, at, "v-2"),
+        assessed(promo_ledger(GOOD), ASSESSOR, at, "v-2"),
     )
     assert again.state is St.AWAITING_REVIEW and again.may_follow(thin)
     assert again.budget_reservation_id == thin.budget_reservation_id
@@ -606,14 +633,14 @@ def test_insufficient_evidence_is_reassessed_only_while_the_holdout_is_unused() 
                          config_hash=key.config_hash))  # fmt: skip
     b2 = scheduled(reg2)
     first = im.record(reg2, EXP, "cand-1", two, b2, None,
-                      im.Assessment(lg, ASSESSOR, at, "v-1"))  # fmt: skip
+                      assessed(lg, ASSESSOR, at, "v-1"))  # fmt: skip
     assert "insufficient:metric_missing:unrecorded_trials" in first.reasons
     lg, _ = ask(lg, 2, tl.Split.PROMOTION, PROMO, tl.Role.ASSESSOR, candidate=key)
     lg = lg.record(trial(2, tl.Split.PROMOTION, family=EXP, metrics=GOOD,
                          material_hash=key.material_hash,
                          config_hash=key.config_hash))  # fmt: skip
     second = im.record(reg2, EXP, "cand-1", two, b2, None,
-                       im.Assessment(lg, ASSESSOR, at, "v-2"))  # fmt: skip
+                       assessed(lg, ASSESSOR, at, "v-2"))  # fmt: skip
     assert second.state is St.INSUFFICIENT_EVIDENCE and second.may_follow(first)
     assert second.reasons == first.reasons  # the second read's metrics are unused
 
@@ -623,7 +650,7 @@ def test_reassessment_never_resets_the_budget_or_changes_the_plan() -> None:
     b = scheduled(reg)
     at = AT + timedelta(days=1)
     thin = im.record(reg, EXP, "cand-1", pl, b, None,
-                     im.Assessment(ledger(), ASSESSOR, at, "v-1"))  # fmt: skip
+                     assessed(ledger(), ASSESSOR, at, "v-1"))  # fmt: skip
     released = b.release("bud-exp-1")
     late = im.record(
         reg,
@@ -632,7 +659,7 @@ def test_reassessment_never_resets_the_budget_or_changes_the_plan() -> None:
         pl,
         released,
         None,
-        im.Assessment(promo_ledger(GOOD), ASSESSOR, at, "v-2"),
+        assessed(promo_ledger(GOOD), ASSESSOR, at, "v-2"),
     )
     assert (late.state, late.decision) == (St.BLOCKED, im.Decision.BLOCKED)
     assert "blocked:budget_not_reserved" in late.reasons and late.may_follow(thin)
@@ -709,7 +736,9 @@ GOLDEN_PROTOCOL = "c8e22cf9a7f6eb41061d00db947f6707d294e65a9849fa6604bfad751582b
 
 
 def test_decision_19_retest_of_is_a_frozen_link_to_another_experiment() -> None:
-    assert proto().content_hash == GOLDEN_PROTOCOL  # pinned on base b5499fa
+    # pinned on base b5499fa, whose fixture plan froze the protocol hash "e" * 64
+    old = proto(plan_digest=im.plan_digest(plan(protocol_hash="e" * 64)))
+    assert old.content_hash == GOLDEN_PROTOCOL
     assert "retest_of" not in proto().wire()  # absent: earlier hashes unchanged
     p = proto(retest_of="exp-synth-0")
     assert p.wire()["retest_of"] == "exp-synth-0" and p.content_hash != GOLDEN_PROTOCOL
@@ -741,3 +770,151 @@ def test_decision_19_chain_trials_count_every_experiment_of_the_chain() -> None:
                               (chain, {"exp-0": -1})):  # fmt: skip
         with pytest.raises(im.ImprovementError, match="retest_chain"):
             im.chain_trials(lg, bad_chain, stored)
+
+
+# Owner decisions 35 to 37: a strategy promotion must clear "excess over baseline,
+# CI lower bound >= 0" recomputed at z' = Phi^-1(1 - alpha / (2 k)), alpha =
+# 2 (1 - Phi(z)) from the plan's frozen z, k = chain_trials; for the claim's
+# baseline, else every declared baseline. Other targets only flag the count.
+Z_995 = Decimal("2.5758293035489004")  # Phi^-1(0.995), a published quantile
+
+
+def promo_on(sp: tl.SplitPlan, metrics: dict[str, Decimal]) -> tl.TrialLedger:
+    key = cand().trial_key
+    lg, _ = ask(ledger(sp), 1, tl.Split.PROMOTION, PROMO, tl.Role.ASSESSOR, None, key)
+    return lg.record(trial(1, tl.Split.PROMOTION, family=EXP, metrics=metrics,
+                           material_hash=key.material_hash,
+                           config_hash=key.config_hash,
+                           protocol_hash=sp.protocol_hash))  # fmt: skip
+
+
+def failed_dev(lg: tl.TrialLedger, n: int) -> tl.TrialLedger:
+    for i in range(2, n + 2):  # recorded after the promotion trial, in EXP
+        lg = lg.record(trial(i, tl.Split.DEVELOPMENT, tl.Outcome.FAILED, family=EXP,
+                             trial_id=f"trial-d{i}", access_id=None))  # fmt: skip
+    return lg
+
+
+def test_decision_35_the_widened_bound_turns_a_pass_into_a_rejection() -> None:
+    # bl-hold: excess mean 0.01, se 0.004. Unadjusted (z = 1.959963984540054):
+    # 0.01 - 0.0078398559 = 0.0021601441 >= 0, a pass. With k = 5 trials:
+    # alpha = 0.05, alpha / (2 k) = 0.005, z' = Phi^-1(0.995) = 2.5758293035489:
+    # 0.01 - 0.0103033172 = -0.0003033172 < 0, a rejection. bl-cash: 0.02 and 0.002
+    # clear both (0.02 - 0.0051516586 = 0.0148483414).
+    m = GOOD | {"baseline.bl-hold.excess_mean": Decimal("0.01"),
+                "baseline.bl-hold.excess_std_error": Decimal("0.004")}  # fmt: skip
+    one = assess(registry(), promo_ledger(m))  # k = 1: z' = z, the plain bound
+    assert one.decision is im.Decision.ACCEPT_FOR_REVIEW
+    assert abs(one.adjustment["z_widened"] - EVAL.z) < Decimal("1e-14")
+    assert abs(one.adjustment["baseline.bl-hold.excess_lower_widened"]
+               - Decimal("0.0021601441")) < Decimal("1e-10")  # fmt: skip
+    for v in (
+        assess(registry(), promo_ledger(m), chain_trials=5),
+        assess(registry(), failed_dev(promo_ledger(m), 4)),
+    ):  # 1 + 4 trials
+        assert (v.decision, v.reasons) == (
+            im.Decision.REJECT,
+            ("bonferroni:baseline.bl-hold",),
+        )
+        a = v.adjustment
+        assert a["chain_trials"] == 5 and abs(a["z_widened"] - Z_995) < Decimal(
+            "1e-12")  # fmt: skip
+        assert abs(a["baseline.bl-hold.excess_lower_widened"]
+                   - Decimal("-0.0003033172")) < Decimal("1e-10")  # fmt: skip
+        assert abs(a["baseline.bl-cash.excess_lower_widened"]
+                   - Decimal("0.0148483414")) < Decimal("1e-10")  # fmt: skip
+        assert v.wire()["adjustment"]["chain_trials"] == "5"  # type: ignore[index]
+        with pytest.raises(TypeError, match="Decimals"):  # never a float or an int
+            replace(v, adjustment={"z_widened": 2})  # type: ignore[dict-item]
+    # a retest's own ledger cannot know the chain: the store must supply it
+    linked = registry(proto(retest_of="exp-synth-0"))
+    v = assess(linked, promo_ledger(GOOD))
+    assert (v.decision, v.reasons) == (
+        im.Decision.INSUFFICIENT,
+        ("chain_trials_unknown",),
+    )
+    assert assess(linked, promo_ledger(GOOD), chain_trials=3).decision is (
+        im.Decision.ACCEPT_FOR_REVIEW)  # fmt: skip
+    for bad in (-1, Decimal(2)):
+        with pytest.raises(im.ImprovementError, match="chain_trials"):
+            assess(registry(), promo_ledger(GOOD), chain_trials=bad)
+    v = assess(registry(), promo_ledger(GOOD), chain_trials=0)  # cannot be: the
+    assert v.reasons == ("chain_trials_unknown",)  # scored trial is one of them
+
+
+def test_decision_35_widened_z_at_two_and_twenty_trials() -> None:
+    # z' = Phi^-1(1 - 0.05 / (2 k)) from z = 1.959963984540054 (statistics.NormalDist
+    # agrees to 1e-14): k = 2: 2.241402727604945, k = 20: 3.023341439739147
+    for k, z in ((2, "2.241402727604945"), (20, "3.023341439739147")):
+        v = assess(registry(), promo_ledger(GOOD), chain_trials=k)
+        assert abs(v.adjustment["z_widened"] - Decimal(z)) < Decimal("1e-12"), k
+
+
+def test_review_m1_a_strategy_record_needs_its_bound_protocol_first() -> None:
+    # derive refuses before any verdict exists, so the store spends no holdout read
+    reg, at = registry(), AT + timedelta(days=1)
+    for ev, why in (
+        (None, "evaluation_protocol_missing"),
+        (evaluation("plan-other"), "evaluation_protocol_unbound"),
+    ):
+        run = im.Assessment(promo_ledger(GOOD), ASSESSOR, at, "v-1", evaluation=ev)
+        with pytest.raises(im.ImprovementError, match=why):
+            im.derive(reg, EXP, "cand-1", plan(), scheduled(reg), None, run)
+    r = im.Target.RESEARCH  # other targets have no evaluation protocol to bind
+    other = im.ExperimentRegistry(TENANT).register(proto(
+        target=r, sandbox_profile_id="sbx-synth")).register_candidate(
+        cand(target=r))  # fmt: skip
+    good = {"net_return": Decimal("0.02"), "unsupported_material_facts": Decimal(0)}
+    run = im.Assessment(promo_ledger(good), ASSESSOR, at, "v-1")
+    assert im.derive(other, EXP, "cand-1", plan(), scheduled(other), None, run)[1]
+
+
+def test_decision_37_the_claims_baseline_else_every_declared_one() -> None:
+    m = GOOD | {"baseline.bl-cash.excess_mean": Decimal("-0.01")}  # cash fails
+    v = assess(registry(), promo_ledger(m))  # NET_MEAN claim names no baseline
+    assert v.reasons == ("bonferroni:baseline.bl-cash",)
+    claim = DeclaredClaim(ClaimMetric.EXCESS_MEAN, ClaimDirection.POSITIVE, "bl-hold")
+    named = replace(EVAL, claim=claim)
+    sp = plan(protocol_hash=named.content_hash)
+    reg = registry(proto(plan_digest=im.plan_digest(sp)))
+    v = assess(reg, promo_on(sp, m), evaluation=named)  # only bl-hold is tested
+    assert v.decision is im.Decision.ACCEPT_FOR_REVIEW
+    assert set(v.adjustment) == {
+        "chain_trials",
+        "z_widened",
+        "baseline.bl-hold.excess_lower_widened",
+    }
+
+
+def test_decision_35_missing_or_unbound_inputs_are_insufficient() -> None:
+    lg = promo_ledger(GOOD)
+    no_se = {k: v for k, v in GOOD.items() if k != "baseline.bl-cash.excess_std_error"}
+    cases: list[tuple[dict[str, object], tl.TrialLedger, str]] = [
+        ({"evaluation": None}, lg, "evaluation_protocol_missing"),
+        ({"evaluation": replace(EVAL, z=Decimal("2.5"))}, lg,
+         "evaluation_protocol_unbound"),  # not the hash the plan froze
+        ({"evaluation": evaluation("plan-other")}, lg, "evaluation_protocol_unbound"),
+        ({}, promo_ledger(no_se), "metric_missing:baseline.bl-cash.excess_std_error"),
+        ({}, promo_ledger(GOOD | {"ci_z": Decimal("2.5")}), "z_mismatch"),
+    ]  # fmt: skip
+    for kw, ledger_, why in cases:
+        v = assess(registry(), ledger_, **kw)
+        assert (v.decision, v.reasons) == (im.Decision.INSUFFICIENT, (why,)), why
+        assert dict(v.adjustment) == {} and "adjustment" not in v.wire()
+
+
+def test_decision_36_count_based_targets_flag_the_missing_adjustment() -> None:
+    r = im.Target.RESEARCH
+    good = {"net_return": Decimal("0.02"), "unsupported_material_facts": Decimal(0)}
+    reg = im.ExperimentRegistry(TENANT).register(proto(target=r)).register_candidate(
+        cand(target=r))  # fmt: skip
+    v = assess(reg, promo_ledger(good), evaluation=None)  # no z, no excess CI
+    assert v.decision is im.Decision.ACCEPT_FOR_REVIEW
+    assert "no_multiple_testing_adjustment" in v.limitations
+    assert dict(v.adjustment) == {} and "adjustment" not in v.wire()
+    s = assess(registry(), promo_ledger(GOOD))  # the strategy rule was applied
+    assert "no_multiple_testing_adjustment" not in s.limitations
+
+
+def test_the_fixture_plan_freezes_test_backtests_protocol() -> None:
+    assert EVAL.content_hash == bt_protocol().content_hash  # one SYNTHETIC protocol

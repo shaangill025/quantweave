@@ -294,7 +294,8 @@ def test_publication_date_fix_improves_and_is_accepted_for_review() -> None:
         "cost_usd": D("0.00945"), "run_failures": D(0),
     }  # fmt: skip
     assert v.decision is im.Decision.ACCEPT_FOR_REVIEW
-    assert v.limitations == ("synthetic_only",) and v.requires_human_promotion
+    assert v.limitations == ("synthetic_only", "no_multiple_testing_adjustment")  # 36
+    assert v.requires_human_promotion
 
 
 def test_false_fact_regression_is_rejected_although_dates_improve() -> None:
