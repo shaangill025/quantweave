@@ -112,7 +112,8 @@ class Verifier(Protocol):
 
 @dataclass(frozen=True, slots=True)
 class TrustedKey:
-    """A maintainer release key in the operator's trusted set."""
+    """A maintainer release key in the operator's trusted set. It signs releases
+    approved in [valid_from, valid_until); a revocation ends it at read time."""
 
     key_id: str
     algorithm: str
@@ -121,6 +122,13 @@ class TrustedKey:
     valid_from: datetime
     revoked_at: datetime | None = None
     test_only: bool = True
+    valid_until: datetime | None = None  # owner decision 45: an end of validity
+
+    def __post_init__(self) -> None:
+        if self.valid_until is not None and ensure_aware_utc(
+            self.valid_until
+        ) <= ensure_aware_utc(self.valid_from):  # fmt: skip
+            raise ReleaseError("key_window", "valid_until must follow valid_from")
 
 
 @dataclass(frozen=True, slots=True)
@@ -311,8 +319,8 @@ def verify_release(
     if k.principal_id != m.approval.principal_id:
         out.append("key_principal")
     if m.approval.approved_at < k.valid_from or (
-        k.revoked_at is not None and k.revoked_at <= at
-    ):  # fmt: skip
+        k.valid_until is not None and m.approval.approved_at >= k.valid_until
+    ) or (k.revoked_at is not None and k.revoked_at <= at):  # fmt: skip
         out.append("key_not_valid")
     if k.test_only and not allow_test_keys:
         out.append("test_key_refused")

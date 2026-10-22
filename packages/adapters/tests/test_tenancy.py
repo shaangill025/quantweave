@@ -67,7 +67,13 @@ WATCHLIST_TABLES = ("watchlist_revision",)  # 0022, test_watchlist_store
 EXPERIMENT_TABLES = ("experiment_revision", "assessor_protocol", "assessor_candidate",
                      "holdout_access", "evaluation_receipt")  # fmt: skip
 # 0029, test_release_store (installation scope: a qw_worker-only policy)
-RELEASE_TABLES = ("release_deployment", "signed_release", "deployment_event")
+RELEASE_TABLES = (
+    "release_deployment",
+    "signed_release",
+    "deployment_event",
+    "release_trusted_key",
+    "release_key_revocation",
+)  # 0029, 0035
 
 
 def make_tenant(conn: Conn, name: str) -> tuple[uuid.UUID, uuid.UUID]:

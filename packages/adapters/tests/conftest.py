@@ -126,9 +126,9 @@ def runtime_urls(
     database_url: str, conn: psycopg.Connection[TupleRow]
 ) -> Iterator[dict[str, str]]:
     """Migrate the test database as the superuser, then create throwaway LOGIN roles
-    that are members of `qw_app`, `qw_worker` and `qw_assessor` (non-superuser,
-    non-owner, NOBYPASSRLS, no password: both harness modes use trust auth). Yields
-    {"qw_app": url, "qw_worker": url, "qw_assessor": url}; the roles are dropped
+    that are members of `qw_app`, `qw_worker`, `qw_assessor` and `qw_release` (the
+    release operator; non-superuser, non-owner, NOBYPASSRLS, no password: both
+    harness modes use trust auth). Yields {group: url}; the roles are dropped
     afterwards."""
     from qw_adapters.migrations import migrate
 
@@ -136,7 +136,7 @@ def runtime_urls(
     suffix = uuid.uuid4().hex[:12]
     logins = {
         group: f"qwtest_{group[3:]}_{suffix}"
-        for group in ("qw_app", "qw_worker", "qw_assessor")
+        for group in ("qw_app", "qw_worker", "qw_assessor", "qw_release")
     }
     try:
         for group, login in logins.items():
@@ -172,6 +172,18 @@ def worker_conn(
 ) -> Iterator[psycopg.Connection[TupleRow]]:
     with psycopg.connect(runtime_urls["qw_worker"], autocommit=True) as connection:
         yield connection
+
+
+@pytest.fixture
+def release_conn(
+    runtime_urls: dict[str, str],
+) -> Iterator[psycopg.Connection[TupleRow]]:
+    """The release operator (owner decisions 45 and 47): exactly a qw_release login,
+    the only role that records a deployment or a trusted key."""
+    from qw_adapters import tenancy
+
+    with tenancy.runtime_connection(runtime_urls["qw_release"], role="qw_release") as c:
+        yield c
 
 
 @pytest.fixture

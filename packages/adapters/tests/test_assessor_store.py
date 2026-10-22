@@ -1020,7 +1020,7 @@ def test_contract_0110_the_real_migration_refuses_a_revision_without_its_link(
     before = tmp_path / "sql"
     before.mkdir()
     for f in sorted(MIGRATIONS_DIR.glob("*.sql")):
-        if f != MIGRATION:
+        if f.name < MIGRATION.name:  # the version before this one
             (before / f.name).write_bytes(f.read_bytes())
     name = f"qw_test_{uuid.uuid4().hex[:16]}"
     with psycopg.connect(pg_admin_url, autocommit=True) as admin:
@@ -1056,7 +1056,7 @@ def test_contract_0110_the_real_migration_refuses_a_revision_without_its_link(
                 old.execute("SET LOCAL session_replication_role = replica")
                 old.execute("DELETE FROM app.experiment_revision "
                             "WHERE experiment_id = 'exp-r'")  # fmt: skip
-            assert migrate(old) == [int(MIGRATION.name[:4])]
+            assert migrate(old)[0] == int(MIGRATION.name[:4])  # then any later
             assert left() == (0, 1)  # the check's policies are dropped again
             rows = old.execute("SELECT DISTINCT experiment_id, retest_of FROM "
                                "app.experiment_revision").fetchall()  # fmt: skip

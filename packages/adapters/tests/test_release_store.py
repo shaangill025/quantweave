@@ -45,8 +45,9 @@ def record(w: Conn, sr: rl.SignedRelease, reg: Any = None, keys: Any = KEYS) -> 
                              keys=keys, allow_test_keys=True)  # fmt: skip
 
 
-def setup(w: Conn, *rels: rl.SignedRelease) -> None:
-    rs.record_deployment(w, DEP)
+def setup(op: Conn, w: Conn, *rels: rl.SignedRelease) -> None:
+    """The operator (qw_release) records the deployment; the worker the releases."""
+    rs.record_deployment(op, DEP)
     for sr in rels:
         assert record(w, sr)
 
@@ -68,9 +69,11 @@ def count(c: Conn, table: str = "deployment_event") -> int:
     return int(row[0])
 
 
-def test_compatible_rollback_persists_and_replays(worker_conn: Conn) -> None:
+def test_compatible_rollback_persists_and_replays(
+    release_conn: Conn, worker_conn: Conn
+) -> None:
     one, two = signed(), signed("rel-2", (1, 2, 2))
-    setup(worker_conn, one, two)
+    setup(release_conn, worker_conn, one, two)
     empty = rs.load(worker_conn, DEP.deployment_id, KEYS)
     assert empty is not None and (empty.deployment, empty.entries) == (DEP, ())
     install(worker_conn, "rel-1")
@@ -87,8 +90,12 @@ def test_compatible_rollback_persists_and_replays(worker_conn: Conn) -> None:
     assert got.entries[0].at > REL  # the database clock, not the caller's
 
 
-def test_unsupported_rollback_pauses_and_the_pause_persists(worker_conn: Conn) -> None:
-    setup(worker_conn, signed(compat=(1, 1, 1)), signed("rel-2", (1, 2, 2)))
+def test_unsupported_rollback_pauses_and_the_pause_persists(
+    release_conn: Conn, worker_conn: Conn
+) -> None:
+    setup(
+        release_conn, worker_conn, signed(compat=(1, 1, 1)), signed("rel-2", (1, 2, 2))
+    )
     install(worker_conn, "rel-1")
     install(worker_conn, "rel-2", 1)
     p = rollback(worker_conn).entries[-1]
@@ -131,8 +138,10 @@ def test_a_release_is_rederived_from_the_registry(worker_conn: Conn) -> None:
         record(worker_conn, other, reg)
 
 
-def test_the_deployment_is_frozen(worker_conn: Conn, conn: Conn) -> None:
-    rs.record_deployment(worker_conn, DEP)
+def test_the_deployment_is_frozen(
+    release_conn: Conn, worker_conn: Conn, conn: Conn
+) -> None:
+    rs.record_deployment(release_conn, DEP)
     raw = ("INSERT INTO app.release_deployment SELECT 'deploy-{}', edition, '{}', "
            "tenants, initial_schema, allows_test_keys, clock_timestamp(), event_hash, "
            "solo_maintainer "
@@ -141,20 +150,22 @@ def test_the_deployment_is_frozen(worker_conn: Conn, conn: Conn) -> None:
         with pytest.raises(psycopg.errors.CheckViolation):
             conn.execute(raw.format(1, ops))
     conn.execute(raw.format(2, "{op-a,op-b}"))  # the control
-    rs.record_deployment(worker_conn, DEP)  # the same: no-op
+    rs.record_deployment(release_conn, DEP)  # the same: no-op
     for bad in (replace(DEP, operators=frozenset({"operator-other"})),
                 replace(DEP, allows_test_keys=False)):  # fmt: skip
         with pytest.raises(rs.ReleaseStoreError, match="deployment_frozen"):
-            rs.record_deployment(worker_conn, bad)
+            rs.record_deployment(release_conn, bad)
     assert count(worker_conn, "release_deployment") == 2
 
 
-def test_unknown_ids_and_refused_acts_write_nothing(worker_conn: Conn) -> None:
+def test_unknown_ids_and_refused_acts_write_nothing(
+    release_conn: Conn, worker_conn: Conn
+) -> None:
     assert rs.load(worker_conn, "deploy-none", KEYS) is None
     with pytest.raises(rs.ReleaseStoreError, match="not_found") as unknown_dep:
         rs.install(worker_conn, "deploy-none", KEYS, "ev-0", "rel-1",
                    "operator-synth", "stepup-op-0", strategies=NO)  # fmt: skip
-    setup(worker_conn, signed())
+    setup(release_conn, worker_conn, signed())
     with pytest.raises(rs.ReleaseStoreError, match="not_found") as unknown_rel:
         install(worker_conn, "rel-9")
     assert str(unknown_dep.value) == str(unknown_rel.value)  # the same answer
@@ -189,9 +200,11 @@ def copy_event(src: str, **over: str) -> str:
             f"WHERE {src}")  # fmt: skip
 
 
-def test_each_database_rule_refuses_a_raw_insert(worker_conn: Conn, conn: Conn) -> None:
-    setup(worker_conn, signed(compat=(1, 1, 1)), signed("rel-2", (1, 2, 2)),
-          signed("rel-3", (2, 2, 2)))  # fmt: skip
+def test_each_database_rule_refuses_a_raw_insert(
+    release_conn: Conn, worker_conn: Conn, conn: Conn
+) -> None:
+    setup(release_conn, worker_conn, signed(compat=(1, 1, 1)),
+          signed("rel-2", (1, 2, 2)), signed("rel-3", (2, 2, 2)))  # fmt: skip
     install(worker_conn, "rel-1")
 
     def refused(*sqls: str, error: type[Exception] = psycopg.errors.CheckViolation
@@ -277,9 +290,9 @@ def test_each_database_rule_refuses_a_raw_insert(worker_conn: Conn, conn: Conn) 
 
 
 def test_installation_scope_rls_append_only_and_verified_reads(
-    worker_conn: Conn, app_conn: Conn, conn: Conn
+    release_conn: Conn, worker_conn: Conn, app_conn: Conn, conn: Conn
 ) -> None:
-    setup(worker_conn, signed(), signed("rel-2", (1, 2, 2)))
+    setup(release_conn, worker_conn, signed(), signed("rel-2", (1, 2, 2)))
     install(worker_conn, "rel-1")
     rows = conn.execute(
         "SELECT relname, relrowsecurity, relforcerowsecurity, has_table_privilege("
@@ -330,11 +343,11 @@ def test_installation_scope_rls_append_only_and_verified_reads(
 
 
 def test_concurrent_acts_queue_on_the_deployment_lock(
-    worker_conn: Conn, conn: Conn, runtime_urls: dict[str, str]
+    release_conn: Conn, worker_conn: Conn, conn: Conn, runtime_urls: dict[str, str]
 ) -> None:
     # Review F3: both installs read the ledger only after the lock, so both land
     # (seq 1 and 2); without the store's lock the second would fail in the database.
-    setup(worker_conn, signed(), signed("rel-2", (1, 2, 2)))
+    setup(release_conn, worker_conn, signed(), signed("rel-2", (1, 2, 2)))
     key = "hashtextextended('release:deploy-synth', 0)"
     conn.execute(f"SELECT pg_advisory_lock({key})")  # held: both acts must queue
     got: dict[str, object] = {}
@@ -378,10 +391,10 @@ SOLO = rl.Deployment(
 
 
 def test_decision_23_solo_installs_are_recorded_self_approved(
-    worker_conn: Conn, conn: Conn
+    release_conn: Conn, worker_conn: Conn, conn: Conn
 ) -> None:
-    rs.record_deployment(worker_conn, SOLO)
-    setup(worker_conn, signed(), signed("rel-2", (1, 2, 2)))  # and DEP
+    rs.record_deployment(release_conn, SOLO)
+    setup(release_conn, worker_conn, signed(), signed("rel-2", (1, 2, 2)))  # and DEP
     rs.install(worker_conn, SOLO.deployment_id, KEYS, "ev-0", "rel-1", "maint-synth",
                "stepup-op-0", strategies=NO)  # fmt: skip
     install(worker_conn, "rel-1")
@@ -389,7 +402,7 @@ def test_decision_23_solo_installs_are_recorded_self_approved(
     assert got is not None and got.deployment == SOLO
     assert [e.self_approved for e in got.entries if isinstance(e, rl.Install)] == [True]
     with pytest.raises(rs.ReleaseStoreError, match="deployment_frozen"):
-        rs.record_deployment(worker_conn, replace(SOLO, solo=None))
+        rs.record_deployment(release_conn, replace(SOLO, solo=None))
     dep = ("INSERT INTO app.release_deployment SELECT 'deploy-x', {}, {}, tenants, "
            "initial_schema, allows_test_keys, clock_timestamp(), event_hash, {} FROM "
            "app.release_deployment WHERE deployment_id = 'deploy-solo'")  # fmt: skip
@@ -409,7 +422,7 @@ def test_decision_23_solo_installs_are_recorded_self_approved(
     ):
         with pytest.raises(psycopg.errors.CheckViolation):
             conn.execute(sql)
-    rs.record_deployment(worker_conn, replace(SOLO, deployment_id="deploy-two"))
+    rs.record_deployment(release_conn, replace(SOLO, deployment_id="deploy-two"))
     with conn.transaction():  # the flag is hashed: turning it off is detected
         conn.execute("SET LOCAL session_replication_role = replica")
         conn.execute("UPDATE app.release_deployment SET solo_maintainer = false "
@@ -421,9 +434,9 @@ def test_decision_23_solo_installs_are_recorded_self_approved(
 
 
 def test_decision_33_releases_are_marked_caller_supplied(
-    worker_conn: Conn, conn: Conn
+    release_conn: Conn, worker_conn: Conn, conn: Conn
 ) -> None:
-    setup(worker_conn, signed())
+    setup(release_conn, worker_conn, signed())
     install(worker_conn, "rel-1")
     got = rs.load(worker_conn, DEP.deployment_id, KEYS)
     assert got is not None
