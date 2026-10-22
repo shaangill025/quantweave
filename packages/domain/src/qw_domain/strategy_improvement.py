@@ -14,6 +14,14 @@
 - `request_research_access` refuses reused trial ids and goes no further than the
   trial budget; `account` counts every trial and unrecorded access on the plan or
   in the family (failed, abandoned, other families, unregistered variants).
+- `holdout_run` (owner decision 39) is the assessor's own promotion run (no
+  promotion of the candidate; nothing here promotes): it refuses
+  before reading anything (study, registered assessor, frozen plan, the candidate's
+  manifest version, the freeze time, any promotion entry not made by the registered
+  assessor, any earlier granted promotion read), then records the one assessor
+  read and the walk-forward on the caller's `HoldoutData` as a promotion trial
+  (`run_promotion_trial`, recorded at `at`; a failed evaluation still spends the
+  read). The caller then derives the verdict with `assessed_at == at`.
 - `assess_strategy` runs the T044 assessor (holdout read once by its own actor),
   then rejects on ledger-derived violations (unrecorded trials, budget overrun,
   unregistered variants, other families), then needs a prospective shadow window
@@ -42,11 +50,12 @@ from qw_domain.backtest import (
     TrialOutcome,
     TrialReport,
     ledger_report,
+    run_promotion_trial,
     run_trial,
 )
 from qw_domain.budget import BudgetBook
 from qw_domain.decimals import safe_repr
-from qw_domain.instants import format_instant
+from qw_domain.instants import ensure_aware_utc, format_instant
 from qw_domain.research_data import (
     EvidenceClass,
     ResearchDataset,
@@ -458,6 +467,56 @@ def _prospective(
     if not report.claim_permitted:
         why.append("prospective_below_declared_minimum")
     return report, why
+
+
+@dataclass(frozen=True, slots=True)
+class HoldoutData:
+    """The holdout price data the assessor evaluates on (owner decision 39); its
+    store (owner decision 41) is not built, so it is the caller's."""
+
+    series: PriceSeries
+    baseline_series: Mapping[str, PriceSeries]
+
+
+def holdout_run(
+    study: StrategyStudy, registry: im.ExperimentRegistry,
+    strategies: StrategyRegistry, ledger: TrialLedger, candidate_id: str,
+    dataset: ResearchDataset, rights: ResearchRights, holdout: HoldoutData,
+    build: Callable[[Mapping[str, ParamValue]], Strategy], assessor: im.Party,
+    at: datetime, access_id: str, trial_id: str,
+) -> tuple[TrialLedger, TrialOutcome]:  # fmt: skip
+    """The assessor's promotion run of `candidate_id` on the holdout. Refusals come
+    before any read, and the caller's ledger is unchanged."""
+    p, c = study.protocol, registry.candidate(candidate_id)
+    if c.experiment_id != study.family or registry.protocol(study.family) != p:
+        raise Error("study_mismatch", candidate_id)
+    if assessor != p.assessor:
+        raise Error("assessor_not_registered", assessor.actor_id)
+    study.check_plan(ledger)
+    m = _version(study, strategies, c)
+    at = ensure_aware_utc(at)
+    if at < max(p.registered_at, c.created_at):
+        raise Error("before_freeze", format_instant(at))
+    mine = [a for a in ledger.accesses()
+            if a.plan_id == p.plan_id and a.split is Split.PROMOTION]  # fmt: skip
+    trials = [t for t in ledger.trials()
+              if t.plan_id == p.plan_id and t.split is Split.PROMOTION]  # fmt: skip
+    if any(
+        (a.role, a.actor_id) != (Role.ASSESSOR, assessor.actor_id) for a in mine
+    ) or any(t.access_id is None for t in trials):  # fmt: skip
+        raise Error("promotion_entry_not_assessor", p.plan_id)
+    if any(a.granted for a in mine):
+        raise Error("holdout_used", p.plan_id)
+    plan = ledger.plan(p.plan_id)
+    lg, a = ledger.request_access(access_id, p.plan_id, trial_id, c.trial_key,
+                                  Split.PROMOTION, plan.promotion, None,
+                                  assessor.actor_id, Role.ASSESSOR, at)  # fmt: skip
+    if not a.granted:
+        raise Error("promotion_refused", ",".join(a.reasons))
+    return run_promotion_trial(lg, trial_id, p.hypothesis, at, dataset, rights,
+                               access_id, study.evaluation, holdout.series,
+                               build(MappingProxyType(m.resolve({}))),
+                               holdout.baseline_series)  # fmt: skip
 
 
 def assess_strategy(

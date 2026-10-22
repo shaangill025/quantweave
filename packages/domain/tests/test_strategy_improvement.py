@@ -7,24 +7,26 @@ All data is SYNTHETIC; expected values are hand-written.
 
 import ast
 from dataclasses import replace
-from datetime import timedelta
+from datetime import datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 
 import pytest
 from qw_domain import improvement as im
 from qw_domain import strategy_improvement as si
+from qw_domain.backtest import TrialOutcome
 from qw_domain.research_data import EvidenceClass
 from qw_domain.shadow import ShadowBook, open_run, score
 from qw_domain.strategy_registry import (
     AdoptionState,
     EvidenceState,
+    StrategyError,
     StrategyManifest,
     StrategyRegistry,
     status,
 )
 from qw_domain.trial_ledger import Candidate, Outcome, Role, Split, TrialLedger
-from test_backtest import PX, protocol, scripted
+from test_backtest import PX, PXP, protocol, scripted
 from test_improvement import ASSESSOR, EXP, GOOD, PRODUCER, card, proto, scheduled
 from test_research_data import iid, rights
 from test_shadow import GRID, LATE, LIVE, dec, series
@@ -522,3 +524,126 @@ def test_review_round_1_adoption_refuses_caller_built_assessments() -> None:
             si.Dimension(name, 1, 2)
     with pytest.raises(im.ImprovementError, match="outside_search_space"):  # N3
         cand(replace(DERIVED, title="Approved: risk-free alpha"))
+
+
+# Owner decision 39: the assessor runs the strategy promotion itself (domain only).
+HOLDOUT = si.HoldoutData(PXP, {"px-synth-1": PXP})  # SYNTHETIC, on iid(3) in PROMO
+SAND = iproto(sandbox_profile_id="sbx-synth")  # derive needs a sandbox profile id
+
+
+def reg_s() -> im.ExperimentRegistry:
+    return im.ExperimentRegistry(TENANT).register(SAND).register_candidate(CAND)
+
+
+AT_P = T0 + 3 * H  # after the development trial (T0 + 2h)
+
+
+def prom(lg: TrialLedger, assessor: im.Party = ASSESSOR, at: datetime = AT_P,
+         holdout: si.HoldoutData = HOLDOUT, r: im.ExperimentRegistry | None = None,
+         strategies: StrategyRegistry = STRATS,
+         ) -> tuple[TrialLedger, TrialOutcome]:  # fmt: skip
+    return si.holdout_run(study(SAND), r or reg_s(), strategies, lg, "cand-1", DS,
+                          rights(),
+                      holdout, lambda cfg: scripted(["1", "0", "1", "0", "0"]),
+                      assessor, at, "acc-p", "trial-p")  # fmt: skip
+
+
+def derived(lg: TrialLedger) -> im.Verdict:
+    r = reg_s()
+    run = im.Assessment(lg, ASSESSOR, AT_P, "v-1", evaluation=EVAL)  # assessed at at
+    v = im.derive(r, EXP, "cand-1", PLAN, scheduled(r), None, run)[1]
+    assert v is not None
+    return v
+
+
+def test_decision_39_the_assessor_runs_and_records_the_promotion_trial() -> None:
+    lg, out = prom(dev_ledger())
+    t, a = out.trial, lg.access("acc-p")
+    assert (a.split, a.role, a.actor_id, a.seq, a.at) == (
+        Split.PROMOTION, Role.ASSESSOR, ASSESSOR.actor_id, 1, AT_P)  # fmt: skip
+    assert (t.split, t.outcome, t.recorded_at, t.family) == (
+        Split.PROMOTION, Outcome.COMPLETED, AT_P, EXP)  # fmt: skip
+    assert t.metrics["net_mean"] == D("-0.002")  # the hand-computed backtest
+    assert "baseline.bl-hold.excess_std_error" in t.metrics
+    v = derived(lg)
+    # The strategy scorecard's hard controls and its goal are not backtest metrics:
+    # nothing records lookahead_violations, survivorship_violations or
+    # unrecorded_trials, so an assessor-run promotion is insufficient evidence
+    # (reported as an open owner question), and its one read is spent.
+    assert v.decision is im.Decision.INSUFFICIENT and v.trial_ids == ("trial-p",)
+    assert set(v.reasons) == {f"metric_missing:{m}" for m in (
+        "lookahead_violations", "survivorship_violations", "unrecorded_trials",
+        "net_return")}  # fmt: skip
+
+
+def test_decision_39_a_failed_evaluation_spends_the_read() -> None:
+    short = PXP.bars[:2]  # too few bars: refused, recorded as a FAILED trial
+    lg, out = prom(
+        dev_ledger(),
+        holdout=si.HoldoutData(
+            replace(PXP, bars=short), {"px-synth-1": replace(PXP, bars=short)}
+        ),
+    )
+    assert (out.trial.outcome, out.reason) == (Outcome.FAILED, "insufficient_bars")
+    v = derived(lg)
+    assert (v.decision, v.reasons, v.failed_trial_ids) == (
+        im.Decision.INSUFFICIENT, ("no_qualifying_trial",), ("trial-p",))  # fmt: skip
+    with pytest.raises(im.ImprovementError, match="holdout_used"):
+        prom(lg, at=AT_P + H)
+
+
+def test_decision_39_promote_refuses_before_reading_anything() -> None:
+    lg = dev_ledger()
+    done, _ = prom(lg)
+    forged, _ = lg.request_access(
+        "acc-x",
+        PLAN.plan_id,
+        "trial-x",
+        CAND.trial_key,
+        Split.PROMOTION,
+        PROMO,
+        None,
+        PRODUCER.actor_id,
+        Role.ASSESSOR,
+        AT_P,
+    )  # a producer claiming the role
+    asked, a = lg.request_access("acc-y", PLAN.plan_id, "trial-y", CAND.trial_key,
+                                 Split.PROMOTION, PROMO, None, "res-synth",
+                                 Role.RESEARCHER, AT_P)  # fmt: skip
+    assert forged.access("acc-x").granted and not a.granted
+    k = CAND.trial_key
+    blind = lg.record(
+        trial(
+            30,
+            Split.PROMOTION,
+            Outcome.FAILED,
+            family=EXP,
+            trial_id="trial-z",
+            access_id=None,
+            metrics={},
+            material_hash=k.material_hash,
+            config_hash=k.config_hash,
+            protocol_hash=EVAL.content_hash,
+        )
+    )  # no read behind it
+    other = im.ExperimentRegistry(TENANT).register(iproto(
+        hypothesis="SYNTHETIC: another", sandbox_profile_id="sbx-synth")
+    ).register_candidate(CAND)  # fmt: skip
+    changed = TrialLedger(TENANT).register_plan(replace(PLAN, max_promotion_accesses=2),
+                                                DS)  # fmt: skip
+    fresh = TrialLedger(TENANT).register_plan(PLAN, DS)
+    cases: list[tuple[TrialLedger, dict[str, object], str]] = [
+        (lg, {"r": other}, "study_mismatch"),
+        (lg, {"assessor": PRODUCER}, "assessor_not_registered"),
+        (changed, {}, "test_access_changed"),
+        (lg, {"strategies": StrategyRegistry().register(BASE)}, "unknown_strategy"),
+        (fresh, {"at": T0 + timedelta(minutes=1)}, "before_freeze"),
+        (forged, {"at": AT_P + H}, "promotion_entry_not_assessor"),
+        (asked, {"at": AT_P + H}, "promotion_entry_not_assessor"),
+        (blind, {"at": T0 + 31 * H}, "promotion_entry_not_assessor"),
+        (done, {"at": AT_P + H}, "holdout_used"),
+    ]  # fmt: skip
+    for ledger_, kw, why in cases:
+        with pytest.raises((im.ImprovementError, StrategyError), match=why):
+            prom(ledger_, **kw)  # type: ignore[arg-type]
+    assert lg.entries == dev_ledger().entries  # the caller's ledger is unchanged
