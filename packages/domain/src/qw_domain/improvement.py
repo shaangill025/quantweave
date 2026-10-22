@@ -47,10 +47,12 @@ LIMITATIONS: the budget book is not persisted; times and actor ids are
 caller-asserted; evidence uses
 are checked against the store only when a candidate is first registered;
 `record_verdict` checks hashes and assessor identity but cannot re-run `assess`.
-An assessor-run strategy promotion is insufficient evidence today: the backtest
-records no `lookahead_violations`, `survivorship_violations` or
-`unrecorded_trials`, which every strategy scorecard holds as hard controls (an
-open owner question). The holdout data and the ledger are still the caller's.
+An assessor-run strategy promotion records its hard controls as derived values
+(owner decisions 46, 49 and 50; `strategy_improvement.DERIVED_BASIS`), not as
+measurements: look-ahead rests on a cooperative guard over trusted strategy code,
+and survivorship stays missing (insufficient evidence) unless the plan
+preregisters exactly one holdout instrument and the run is on it. The holdout
+data and the ledger are still the caller's.
 """
 
 import re

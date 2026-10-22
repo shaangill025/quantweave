@@ -7,7 +7,7 @@ All data is SYNTHETIC; expected values are hand-written.
 
 import ast
 from dataclasses import replace
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 
@@ -25,8 +25,15 @@ from qw_domain.strategy_registry import (
     StrategyRegistry,
     status,
 )
-from qw_domain.trial_ledger import Candidate, Outcome, Role, Split, TrialLedger
-from test_backtest import PX, PXP, protocol, scripted
+from qw_domain.trial_ledger import (
+    Candidate,
+    Outcome,
+    Role,
+    Split,
+    SplitPlan,
+    TrialLedger,
+)
+from test_backtest import PX, PXP, bars, protocol, scripted
 from test_improvement import ASSESSOR, EXP, GOOD, PRODUCER, card, proto, scheduled
 from test_research_data import iid, rights
 from test_shadow import GRID, LATE, LIVE, dec, series
@@ -528,11 +535,18 @@ def test_review_round_1_adoption_refuses_caller_built_assessments() -> None:
 
 # Owner decision 39: the assessor runs the strategy promotion itself (domain only).
 HOLDOUT = si.HoldoutData(PXP, {"px-synth-1": PXP})  # SYNTHETIC, on iid(3) in PROMO
-SAND = iproto(sandbox_profile_id="sbx-synth")  # derive needs a sandbox profile id
+LOSE = ["1", "0", "1", "0", "0"]  # test_backtest's hand-computed losing strategy
+# Owner decision 46: the goal is a metric the backtest records (`net_mean`); the
+# fixture's `net_return` is not one.
+NET = im.Scorecard("card-synth", im.Target.STRATEGY, (
+    *(im.Threshold(m, im.Direction.AT_MOST, D(0), True)
+      for m in im.HARD_CONTROLS[im.Target.STRATEGY]),
+    im.Threshold("net_mean", im.Direction.AT_LEAST, D("0.001"), False)))  # fmt: skip
+SAND = iproto(sandbox_profile_id="sbx-synth", scorecard=NET)  # derive needs one
 
 
-def reg_s() -> im.ExperimentRegistry:
-    return im.ExperimentRegistry(TENANT).register(SAND).register_candidate(CAND)
+def reg_s(p: im.Protocol = SAND) -> im.ExperimentRegistry:
+    return im.ExperimentRegistry(TENANT).register(p).register_candidate(CAND)
 
 
 AT_P = T0 + 3 * H  # after the development trial (T0 + 2h)
@@ -540,20 +554,25 @@ AT_P = T0 + 3 * H  # after the development trial (T0 + 2h)
 
 def prom(lg: TrialLedger, assessor: im.Party = ASSESSOR, at: datetime = AT_P,
          holdout: si.HoldoutData = HOLDOUT, r: im.ExperimentRegistry | None = None,
-         strategies: StrategyRegistry = STRATS,
-         ) -> tuple[TrialLedger, TrialOutcome]:  # fmt: skip
-    return si.holdout_run(study(SAND), r or reg_s(), strategies, lg, "cand-1", DS,
-                          rights(),
-                      holdout, lambda cfg: scripted(["1", "0", "1", "0", "0"]),
-                      assessor, at, "acc-p", "trial-p")  # fmt: skip
+         strategies: StrategyRegistry = STRATS, p: im.Protocol = SAND,
+         weights: list[str] = LOSE) -> tuple[TrialLedger, TrialOutcome]:  # fmt: skip
+    return si.holdout_run(study(p), r or reg_s(p), strategies, lg, "cand-1", DS,
+                          rights(), holdout, lambda cfg: scripted(weights),
+                          assessor, at, "acc-p", "trial-p")  # fmt: skip
 
 
-def derived(lg: TrialLedger) -> im.Verdict:
-    r = reg_s()
+def derived(lg: TrialLedger, p: im.Protocol = SAND, sp: SplitPlan = PLAN,
+            k: int | None = None) -> im.Verdict:  # fmt: skip
+    r = reg_s(p)
     run = im.Assessment(lg, ASSESSOR, AT_P, "v-1", evaluation=EVAL)  # assessed at at
-    v = im.derive(r, EXP, "cand-1", PLAN, scheduled(r), None, run)[1]
+    v = im.derive(r, EXP, "cand-1", sp, scheduled(r), None, run, chain_trials=k)[1]
     assert v is not None
     return v
+
+
+BASIS = {k: D(1) for k in si.DERIVED_BASIS}  # the three markers, value 1
+HARD0 = {"lookahead_violations": D(0), "survivorship_violations": D(0),
+         "unrecorded_trials": D(0)}  # fmt: skip
 
 
 def test_decision_39_the_assessor_runs_and_records_the_promotion_trial() -> None:
@@ -565,15 +584,19 @@ def test_decision_39_the_assessor_runs_and_records_the_promotion_trial() -> None
         Split.PROMOTION, Outcome.COMPLETED, AT_P, EXP)  # fmt: skip
     assert t.metrics["net_mean"] == D("-0.002")  # the hand-computed backtest
     assert "baseline.bl-hold.excess_std_error" in t.metrics
+    # decisions 46 and 49: the run's derived hard controls, each with its basis
+    assert {k: t.metrics[k] for k in (*HARD0, *BASIS)} == HARD0 | BASIS
+    assert si.DERIVED_BASIS["basis.lookahead_violations.walk_forward_refusal"] == (
+        "walk-forward refusal; strategy code is manifest-registered and trusted; "
+        "data captured outside the context is not detected")  # fmt: skip
     v = derived(lg)
-    # The strategy scorecard's hard controls and its goal are not backtest metrics:
-    # nothing records lookahead_violations, survivorship_violations or
-    # unrecorded_trials, so an assessor-run promotion is insufficient evidence
-    # (reported as an open owner question), and its one read is spent.
-    assert v.decision is im.Decision.INSUFFICIENT and v.trial_ids == ("trial-p",)
-    assert set(v.reasons) == {f"metric_missing:{m}" for m in (
-        "lookahead_violations", "survivorship_violations", "unrecorded_trials",
-        "net_return")}  # fmt: skip
+    # a real verdict now: net_mean -0.002 misses the 0.001 goal, and the excess
+    # means over both baselines are negative (-0.004 / 3 and -0.002), so both
+    # widened lower bounds are below 0 (k = 2: trial-1 and trial-p)
+    assert (v.decision, v.reasons, v.trial_ids) == (
+        im.Decision.REJECT, ("goal:net_mean", "bonferroni:baseline.bl-hold",
+                             "bonferroni:baseline.bl-cash"), ("trial-p",))  # fmt: skip
+    assert v.scores["unrecorded_trials"] == D(0) and v.adjustment["chain_trials"] == 2
 
 
 def test_decision_39_a_failed_evaluation_spends_the_read() -> None:
@@ -585,11 +608,82 @@ def test_decision_39_a_failed_evaluation_spends_the_read() -> None:
         ),
     )
     assert (out.trial.outcome, out.reason) == (Outcome.FAILED, "insufficient_bars")
+    assert out.trial.metrics == {}  # nothing derived for a run that did not finish
     v = derived(lg)
     assert (v.decision, v.reasons, v.failed_trial_ids) == (
         im.Decision.INSUFFICIENT, ("no_qualifying_trial",), ("trial-p",))  # fmt: skip
     with pytest.raises(im.ImprovementError, match="holdout_used"):
         prom(lg, at=AT_P + H)
+
+
+# SYNTHETIC holdout where the strategy steps aside before each falling open. The
+# figures below were computed by the backtest (a search over integer opens), not by
+# hand: net_mean 0.0106579...; bl-hold excess lower bound +0.0000434 at z = 1.96
+# (k = 1) and -0.000915 at z' = Phi^-1(0.995) = 2.5758 (k = 5); bl-cash's stays
+# positive at both (0.00727, 0.00620).
+WIN = bars(["100", "101", "100", "103", "101", "103", "104", "103", "105", "106",
+            "108", "109"], instrument=3,
+           day0=datetime(2024, 1, 2, 14, 30, tzinfo=UTC))  # fmt: skip
+WIN_W = ["0", "1", "0", "1", "1", "0", "1", "1", "1", "1", "0", "0"]
+WIN_H = si.HoldoutData(WIN, {"px-synth-1": WIN})
+
+
+def fresh() -> TrialLedger:  # the plan alone: no research trial, so k = 1
+    return TrialLedger(TENANT).register_plan(PLAN, DS)
+
+
+def test_decision_46_k1_accepts_and_k5_rejects_on_the_widened_bound() -> None:
+    lg, out = prom(fresh(), holdout=WIN_H, weights=WIN_W)
+    m = out.trial.metrics
+    assert out.trial.outcome is Outcome.COMPLETED and m["net_mean"] > D("0.001")
+    one = derived(lg)  # k = 1 from the ledger: z' = z
+    assert (one.decision, one.reasons) == (im.Decision.ACCEPT_FOR_REVIEW, ())
+    assert one.adjustment["chain_trials"] == 1  # z' = z, up to norm_ppf rounding
+    assert abs(one.adjustment["z_widened"] - EVAL.z) < D("1e-14")
+    low = one.adjustment["baseline.bl-hold.excess_lower_widened"]
+    assert D(0) < low < D("0.0001")  # +0.0000434 (computed, see WIN)
+    five = derived(lg, k=5)  # the store's chain count (decision 19)
+    assert (five.decision, five.reasons) == (
+        im.Decision.REJECT, ("bonferroni:baseline.bl-hold",))  # fmt: skip
+    hold = five.adjustment["baseline.bl-hold.excess_lower_widened"]
+    assert D("-0.001") < hold < D(0)  # -0.000915 (computed)
+    assert five.adjustment["baseline.bl-cash.excess_lower_widened"] > D(0)
+
+
+def test_decision_46_universe_selection_leaves_survivorship_missing() -> None:
+    two = replace(PLAN, holdout_instruments=frozenset({iid(3), iid(4)}))
+    none = replace(PLAN, holdout_instruments=frozenset())
+    off = replace(WIN, instrument=iid(1))  # a caller-chosen, unregistered instrument
+    cases = [
+        (two, WIN_H),
+        (none, WIN_H),
+        (PLAN, si.HoldoutData(off, {"px-synth-1": off})),
+    ]
+    for sp, holdout in cases:  # fmt: skip
+        p = iproto(sandbox_profile_id="sbx-synth", scorecard=NET,
+                   plan_digest=im.plan_digest(sp))  # fmt: skip
+        lg = TrialLedger(TENANT).register_plan(sp, DS)
+        lg, out = prom(lg, p=p, holdout=holdout, weights=WIN_W)
+        m = out.trial.metrics
+        assert "survivorship_violations" not in m and (
+            "basis.survivorship_violations.single_preregistered_instrument" not in m
+        )
+        assert m["lookahead_violations"] == m["unrecorded_trials"] == D(0)
+        v = derived(lg, p, sp)
+        assert (v.decision, v.reasons) == (
+            im.Decision.INSUFFICIENT,
+            ("metric_missing:survivorship_violations",),
+        )
+
+
+def test_decision_50_an_unrecorded_trial_refuses_before_the_read() -> None:
+    lg = research(dev_ledger(), 2)  # acc-2 granted, its trial never recorded
+    with pytest.raises(im.ImprovementError, match="unrecorded_trials"):
+        prom(lg, holdout=WIN_H, weights=WIN_W)
+    assert not [a for a in lg.accesses() if a.split is Split.PROMOTION]
+    done, out = prom(rec(lg, 2), holdout=WIN_H, weights=WIN_W)  # recorded: it runs
+    assert out.trial.metrics["unrecorded_trials"] == D(0)
+    assert done.access("acc-p").seq == 1  # the read was kept for this run
 
 
 def test_decision_39_promote_refuses_before_reading_anything() -> None:
@@ -642,6 +736,7 @@ def test_decision_39_promote_refuses_before_reading_anything() -> None:
         (asked, {"at": AT_P + H}, "promotion_entry_not_assessor"),
         (blind, {"at": T0 + 31 * H}, "promotion_entry_not_assessor"),
         (done, {"at": AT_P + H}, "holdout_used"),
+        (research(lg, 4), {"at": AT_P + 2 * H}, "unrecorded_trials"),
     ]  # fmt: skip
     for ledger_, kw, why in cases:
         with pytest.raises((im.ImprovementError, StrategyError), match=why):

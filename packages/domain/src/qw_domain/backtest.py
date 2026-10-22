@@ -12,7 +12,10 @@ limited), §17, R040, R059, R065, R084.
 - At each decision time (a bar's knowledge time) the strategy sees a `PitContext`:
   bars known by then and facts/membership through the split view. Asking for a later
   time, or returning a decision based on later inputs, is a `look_ahead` refusal.
-  The guard is cooperative: a strategy closure holding other data is not detected.
+  The raw split view is not served (`raw_view`, owner decision 49), so these
+  time-checked reads are the context's only way in. The guard is cooperative: data a
+  strategy captures outside the context (a closure, a private attribute) is not
+  detected; strategy code is manifest-registered and trusted.
 - The decision at bar i fills at the open of bar i + lag (lag >= 1), which must start
   strictly after the decision; otherwise `same_bar_fill`. Period j runs open_j to
   open_{j+1}: gross = w * R, cost = |w - drifted previous weight| * (commission +
@@ -25,7 +28,9 @@ limited), §17, R040, R059, R065, R084.
   claimed here; train/development evidence is capped at `limited`. Each trial
   records the standard error and z behind its intervals (`ci_std_error`, `ci_z`,
   `baseline.<id>.excess_std_error`), so the assessor can recompute a bound at a
-  Bonferroni-widened z (owner decision 35).
+  Bonferroni-widened z (owner decision 35). `run_promotion_trial` can add metrics
+  the assessor run derived (`derived`, owner decision 46) to a completed trial;
+  a name the backtest records itself is refused before the read.
 LIMITATIONS: one instrument per evaluation; price series are caller-supplied, not
 yet part of the hashed dataset or its rights gate; no shorting, borrow, partial
 fills, volume limits or corporate actions; times are caller-supplied.
@@ -257,8 +262,13 @@ class PitContext:
     """What a strategy may see at decision time `now`."""
 
     now: datetime
-    view: SplitView
+    _view: SplitView  # private (owner decision 49): reads go through the methods
     visible: tuple[PriceBar, ...]
+
+    @property
+    def view(self) -> SplitView:
+        """Not served: the raw view would read past `now` (owner decision 49)."""
+        raise ResearchError("raw_view", "read through facts_at, members and bars")
 
     def _until_now(self, t: datetime) -> datetime:
         t = ensure_aware_utc(t)
@@ -270,12 +280,12 @@ class PitContext:
         return self.visible
 
     def facts_at(self, t: datetime) -> AsOfView:
-        return self.view.facts_at(self._until_now(t))
+        return self._view.facts_at(self._until_now(t))
 
     def members(self, on: date) -> frozenset[InstrumentId]:
         if on > self.now.date():
             raise ResearchError("look_ahead", "membership on a later date")
-        return self.view.members(on, self.now)
+        return self._view.members(on, self.now)
 
 
 type Strategy = Callable[[PitContext], Decision]
@@ -516,22 +526,40 @@ def run_promotion_trial(
     ledger: TrialLedger, trial_id: str, hypothesis: str, recorded_at: datetime,
     dataset: ResearchDataset, rights: ResearchRights, access_id: str,
     protocol: EvaluationProtocol, series: PriceSeries, strategy: Strategy,
-    baseline_series: Mapping[str, PriceSeries],
+    baseline_series: Mapping[str, PriceSeries], *,
+    derived: Mapping[str, Decimal] | None = None,
 ) -> tuple[TrialLedger, TrialOutcome]:  # fmt: skip
     """`run_trial` for the assessor's promotion read (owner decision 39): a refusal
     is a FAILED promotion trial (the read is spent). Not a promotion access at all
-    is `promotion_access`, and nothing is recorded."""
+    is `promotion_access`, and nothing is recorded. `derived` metrics (owner
+    decision 46) join a completed trial's metrics only; a malformed one, or one
+    named like a backtest metric, is `derived_metric` before anything is read."""
+    extra = dict(derived or {})
+    for k, v in extra.items():
+        if not isinstance(k, str) or k in _BACKTEST_METRICS or k.startswith(
+            "baseline."
+        ) or type(v) is not Decimal or not v.is_finite():  # fmt: skip
+            raise ResearchError("derived_metric", str(k))
+        check_id(k, "derived_metric")
     if ledger.access(access_id).split is not Split.PROMOTION:
         raise ResearchError("promotion_access", access_id)
     return _record(ledger, trial_id, hypothesis, recorded_at, access_id, protocol,
                    lambda: promotion_walk_forward(ledger, dataset, rights, access_id,
                                                   protocol, series, strategy,
-                                                  baseline_series))  # fmt: skip
+                                                  baseline_series), extra)  # fmt: skip
+
+
+# every name `_metrics` records outside the `baseline.` prefix
+_BACKTEST_METRICS = frozenset({
+    "net_mean", "gross_mean", "total_cost", "periods", "max_drawdown", "volatility",
+    "sharpe_like", "ci_lower", "ci_upper", "ci_std_error", "ci_z",
+})  # fmt: skip
 
 
 def _record(
     ledger: TrialLedger, trial_id: str, hypothesis: str, recorded_at: datetime,
     access_id: str, protocol: EvaluationProtocol, evaluate: Callable[[], Evaluation],
+    derived: Mapping[str, Decimal] | None = None,
 ) -> tuple[TrialLedger, TrialOutcome]:  # fmt: skip
     a = ledger.access(access_id)
     ev: Evaluation | None = None
@@ -547,7 +575,8 @@ def _record(
               c.config_hash, ledger.plan(a.plan_id).dataset_hash,
               protocol.content_hash, a.split,
               Outcome.FAILED if ev is None else Outcome.COMPLETED,
-              {} if ev is None else _metrics(ev), access_id, recorded_at)  # fmt: skip
+              {} if ev is None else {**_metrics(ev), **(derived or {})}, access_id,
+              recorded_at)  # fmt: skip
     return ledger.record(t), TrialOutcome(t, ev, reason)
 
 
