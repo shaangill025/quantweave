@@ -70,3 +70,33 @@ quoted option text, "decision 5" is decision 5 of `2026-10-20-owner-decisions.md
     safer default. Not 'Before the read': it delays the approved read for a case
     that doesn't exist yet."
     Implemented by: T051 and T055 (a frozen deployment; versioning deferred).
+
+49. **Look-ahead "by construction" for decision 46.**
+    Question: "Decision 49: the implementer found a hole in the look-ahead guard.
+    Strategies receive the raw data view through the backtest context, and through
+    it they can read facts dated after 'now' without being refused (shown with a
+    probe; no strategy uses it today). With the hole closed, the guard still can't
+    see data a strategy smuggles in another way, such as data captured when the
+    strategy was built or private attributes. Does that count as decision 46's
+    'look-ahead is 0 by construction'?"
+    Selected label: "Fix, then record 0 with basis (Recommended)".
+    Option text as presented: "Hide the raw view, so the context's own time-checked
+    reads are the only way in, and add a regression test. Then record
+    lookahead_violations = 0 with its basis stated: 'walk-forward refusal; strategy
+    code is manifest-registered and trusted; data captured outside the context is
+    not detected'. Why: it closes the real hole, and stating the limit keeps the
+    evidence honest. Strategy code is reviewed and registered, not generated at run
+    time. Not 'Leave it missing': no strategy promotion could ever pass."
+    Implemented by: T044 (with T033, the backtest look-ahead guard).
+
+50. **Unrecorded trials before an assessor-run promotion.**
+    Question: "Decision 50: before an assessor-run promotion, the trial ledger may
+    show granted reads that have no recorded trial (unrecorded trials). What should
+    the run do?"
+    Selected label: "Refuse before the read (Recommended)".
+    Option text as presented: "If any unrecorded trial exists, refuse up front with
+    'unrecorded_trials', so the holdout read is not spent. Why: the result would be
+    a certain REJECT anyway, and spending the one-time holdout read on a known
+    reject wastes it. Refusing keeps the read for after the missing trials are
+    recorded."
+    Implemented by: T044 (decision 39, the assessor-run promotion).
