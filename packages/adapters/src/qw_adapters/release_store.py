@@ -21,6 +21,16 @@ id and no qw_app privilege (0029); tenant adoptions stay in `strategy_store`.
   install's `self_approved` and each release's `verdict_source` are stored and
   hashed; a NULL (a row recorded before those columns) reads as no opt-in, not
   self-approved and caller-supplied, under its original hash.
+- Owner decision 45: the operator (qw_release, `0035_release_keys.sql`) records the
+  deployment and the trusted keys (`record_key`) and revokes one (`revoke_key`,
+  at the database clock). `stored_keys` re-hashes them and builds the domain
+  `TrustedKey`s; `load`, `install`, `rollback` and `record_release` use them when
+  no `keys` are given. Public key material only: a non-test key needs an algorithm
+  in `PRODUCTION_ALGORITHMS` (empty until T009) and a verifier from `VERIFIERS`
+  (none yet, so a stored public key verifies nothing); a test-only key stores no
+  material and is trusted only when the caller's in-process `test_verifiers`
+  supplies its verifier. A secret never reaches a table: PEM private keys and
+  material on a test key are refused.
 LIMITATIONS: verdicts are the caller's registry (T044 N3, marked caller-supplied
 per decision 33): the assessor store holds tenant-scope protocols only, and an
 installation-scope release cannot cite one. Keys, adoptions (step-up reuse across
@@ -30,7 +40,10 @@ Nothing here deploys, contacts a network or touches broker state."""
 
 from __future__ import annotations
 
+import re
+import unicodedata
 from collections.abc import Callable, Mapping
+from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
 
@@ -46,6 +59,10 @@ from qw_domain.strategy_registry import StrategyRegistry as Strategies
 Conn = psycopg.Connection[Any]
 Row = dict[str, Any]
 Keys = Mapping[str, rl.TrustedKey]
+ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}")
+ALGORITHM = re.compile(r"[a-z0-9][a-z0-9_.-]{0,63}")
+# Verifier factories from public key material, per reviewed algorithm (T009).
+VERIFIERS: Mapping[str, Callable[[str], rl.Verifier]] = {}
 
 
 class ReleaseStoreError(Exception):
@@ -120,8 +137,9 @@ def _deployment(conn: Conn, deployment_id: str) -> rl.Deployment | None:
     return d
 
 
-def record_deployment(conn: Conn, d: rl.Deployment) -> None:
-    """Store the deployment once; the same deployment again writes nothing."""
+def record_deployment(conn: Conn, d: rl.Deployment) -> bool:
+    """Store the deployment once (True); the same deployment again writes nothing
+    (False)."""
     if type(d) is not rl.Deployment:
         raise TypeError("the domain deployment is required")
     rl.DeploymentLedger(d, {})  # the domain's own checks
@@ -131,7 +149,7 @@ def record_deployment(conn: Conn, d: rl.Deployment) -> None:
         if stored is not None:
             if stored != d:
                 raise ReleaseStoreError("deployment_frozen", d.deployment_id)
-            return
+            return False
         at = _now(conn)
         _insert(conn, "release_deployment", {
             "deployment_id": d.deployment_id, "edition": d.edition.value,
@@ -141,6 +159,7 @@ def record_deployment(conn: Conn, d: rl.Deployment) -> None:
             "solo_maintainer": d.solo is not None,
             "event_hash": _hash("release_deployment", _deployment_wire(d), at),
         })  # fmt: skip
+    return True
 
 
 def _release_wire(sr: rl.SignedRelease, legacy: bool = False) -> list[object]:
@@ -191,7 +210,8 @@ def _release(conn: Conn, release_id: str) -> rl.SignedRelease | None:
 
 def record_release(conn: Conn, registry: im.ExperimentRegistry,
                    sr: rl.SignedRelease, strategy: StrategyManifest | None = None, *,
-                   keys: Keys, allow_test_keys: bool) -> bool:  # fmt: skip
+                   allow_test_keys: bool,
+                   keys: Keys | None = None) -> bool:  # fmt: skip
     """Store a signed release that `prepare_release` re-derives exactly from the
     registry and that verifies against the operator's trusted keys now (so no
     unverifiable release can claim an id); True when written, False when already
@@ -209,7 +229,8 @@ def record_release(conn: Conn, registry: im.ExperimentRegistry,
     with conn.transaction():
         conn.execute("SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
                      (f"release_id:{m.release_id}",))  # fmt: skip
-        if why := rl.verify_release(sr, keys, _now(conn), allow_test_keys):
+        trusted = stored_keys(conn) if keys is None else keys
+        if why := rl.verify_release(sr, trusted, _now(conn), allow_test_keys):
             raise ReleaseStoreError(why[0], ",".join(why))
         stored = _release(conn, m.release_id)
         if stored is not None:
@@ -230,6 +251,149 @@ def record_release(conn: Conn, registry: im.ExperimentRegistry,
             "event_hash": _hash("signed_release", _release_wire(sr), at),
         })  # fmt: skip
     return True
+
+
+@dataclass(frozen=True, slots=True)
+class KeyRecord:
+    """A trusted maintainer key as the operator records it (owner decision 45)."""
+
+    key_id: str
+    principal_id: str
+    algorithm: str
+    valid_from: datetime
+    valid_until: datetime | None
+    public_key: str | None  # public material only; None exactly for a test key
+    test_only: bool = False
+
+
+class _NoVerifier:
+    """A stored public key whose algorithm has no reviewed verifier: never verifies."""
+
+    def verify(self, message: bytes, signature: str) -> bool:
+        return False
+
+
+def _key_wire(k: KeyRecord) -> list[object]:
+    until = None if k.valid_until is None else format_instant(k.valid_until)
+    return [k.key_id, k.principal_id, k.algorithm, k.public_key, k.test_only,
+            format_instant(k.valid_from), until]  # fmt: skip
+
+
+def _check_key(k: KeyRecord) -> None:
+    for name in ("key_id", "principal_id"):
+        if not isinstance(v := getattr(k, name), str) or not ID.fullmatch(v):
+            raise ReleaseStoreError(name, "not an id")
+    if not isinstance(k.algorithm, str) or not ALGORITHM.fullmatch(k.algorithm):
+        raise ReleaseStoreError("algorithm", "not an algorithm name")
+    if k.valid_until is not None and k.valid_until <= k.valid_from:
+        raise ReleaseStoreError("key_window", "valid_until must follow valid_from")
+    if k.test_only:
+        if k.public_key is not None:  # its verifier is a secret: never stored
+            raise ReleaseStoreError("test_key_material", "a test key stores nothing")
+        return
+    if not k.public_key:
+        raise ReleaseStoreError("public_key_required", k.key_id)
+    if "PRIVATE KEY" in k.public_key.upper() or len(k.public_key) > 8192:
+        raise ReleaseStoreError("private_key_material", "public material only")
+    if k.algorithm not in rl.PRODUCTION_ALGORITHMS:  # asymmetric, reviewed (T009)
+        raise ReleaseStoreError("algorithm_not_production", k.algorithm)
+
+
+def _key_rows(conn: Conn) -> tuple[list[Row], dict[str, Row]]:
+    keys = _rows(conn, "SELECT * FROM app.release_trusted_key ORDER BY key_id")
+    revoked = _rows(conn, "SELECT * FROM app.release_key_revocation ORDER BY key_id")
+    return keys, {r["key_id"]: r for r in revoked}
+
+
+def _key_record(r: Row) -> KeyRecord:
+    until = r["valid_until"]
+    k = KeyRecord(r["key_id"], r["principal_id"], r["algorithm"],
+                  ensure_aware_utc(r["valid_from"]),
+                  None if until is None else ensure_aware_utc(until),
+                  r["public_key"], r["test_only"])  # fmt: skip
+    if r["event_hash"] != _hash("release_trusted_key", _key_wire(k),
+                                ensure_aware_utc(r["recorded_at"])):  # fmt: skip
+        raise ReleaseStoreError("integrity", "release_trusted_key")
+    return k
+
+
+def stored_keys(conn: Conn, test_verifiers: Mapping[str, rl.Verifier] | None = None,
+                ) -> dict[str, rl.TrustedKey]:  # fmt: skip
+    """The operator's trusted keys and revocations, re-hashed; a test key appears
+    only with its verifier from `test_verifiers` (in process, never stored)."""
+    hook = test_verifiers or {}
+    rows, revoked = _key_rows(conn)
+    out: dict[str, rl.TrustedKey] = {}
+    try:
+        for r in rows:
+            k, rv = _key_record(r), revoked.get(r["key_id"])
+            at = None
+            if rv is not None:
+                at = ensure_aware_utc(rv["revoked_at"])
+                if rv["event_hash"] != _hash("release_key_revocation",
+                                             [k.key_id, rv["reason"]], at):  # fmt: skip
+                    raise ReleaseStoreError("integrity", "release_key_revocation")
+            if k.test_only:
+                if k.key_id not in hook:
+                    continue  # not trusted in this process
+                verifier = hook[k.key_id]
+            else:
+                factory = VERIFIERS.get(k.algorithm)
+                verifier = factory(k.public_key or "") if factory else _NoVerifier()
+            out[k.key_id] = rl.TrustedKey(k.key_id, k.algorithm, k.principal_id,
+                                          verifier, k.valid_from, at, k.test_only,
+                                          k.valid_until)  # fmt: skip
+        if set(revoked) - {r["key_id"] for r in rows}:
+            raise ReleaseStoreError("integrity", "a revocation of no key")
+    except (ValueError, TypeError) as exc:  # ReleaseError included
+        raise ReleaseStoreError("integrity", type(exc).__name__) from None
+    return out
+
+
+def record_key(conn: Conn, k: KeyRecord) -> bool:
+    """The operator records a trusted key; True when written, False when the same
+    key is already stored (another key under its id is `key_conflict`)."""
+    _check_key(k)
+    with conn.transaction():
+        conn.execute("SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
+                     ("release_keys",))  # fmt: skip
+        rows = _rows(conn, "SELECT * FROM app.release_trusted_key WHERE key_id = %s",
+                     k.key_id)  # fmt: skip
+        if rows:
+            if _key_record(rows[0]) != k:
+                raise ReleaseStoreError("key_conflict", k.key_id)
+            return False
+        at = _now(conn)
+        _insert(conn, "release_trusted_key", {
+            "key_id": k.key_id, "principal_id": k.principal_id,
+            "algorithm": k.algorithm, "public_key": k.public_key,
+            "test_only": k.test_only, "valid_from": k.valid_from,
+            "valid_until": k.valid_until, "recorded_at": at,
+            "event_hash": _hash("release_trusted_key", _key_wire(k), at),
+        })  # fmt: skip
+    return True
+
+
+def revoke_key(conn: Conn, key_id: str, reason: str) -> datetime:
+    """Append the key's one revocation at the database clock (never back-dated)."""
+    if not isinstance(reason, str) or not 1 <= len(reason) <= 500 or any(
+        unicodedata.category(c) == "Cc" for c in reason
+    ):  # fmt: skip
+        raise ReleaseStoreError("reason", "1 to 500 characters, no control")
+    with conn.transaction():
+        conn.execute("SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
+                     ("release_keys",))  # fmt: skip
+        rows, revoked = _key_rows(conn)
+        if key_id not in {r["key_id"] for r in rows}:
+            raise ReleaseStoreError("not_found", key_id)
+        if key_id in revoked:
+            raise ReleaseStoreError("already_revoked", key_id)
+        at = _now(conn)
+        _insert(conn, "release_key_revocation", {
+            "key_id": key_id, "reason": reason, "revoked_at": at,
+            "event_hash": _hash("release_key_revocation", [key_id, reason], at),
+        })  # fmt: skip
+    return at
 
 
 def _lock(conn: Conn, deployment_id: str, shared: bool) -> None:
@@ -312,18 +476,22 @@ def _ledger(conn: Conn, deployment_id: str, keys: Keys) -> rl.DeploymentLedger |
     return lg
 
 
-def load(conn: Conn, deployment_id: str, keys: Keys) -> rl.DeploymentLedger | None:
-    """The deployment's ledger, replayed and verified; None when unknown."""
+def load(conn: Conn, deployment_id: str,
+         keys: Keys | None = None) -> rl.DeploymentLedger | None:  # fmt: skip
+    """The deployment's ledger, replayed and verified against `keys` or, by
+    default, the operator's stored keys; None when unknown."""
     with conn.transaction():
         _lock(conn, deployment_id, shared=True)
-        return _ledger(conn, deployment_id, keys)
+        return _ledger(conn, deployment_id,
+                       stored_keys(conn) if keys is None else keys)  # fmt: skip
 
 
-def _append(conn: Conn, deployment_id: str, keys: Keys,
+def _append(conn: Conn, deployment_id: str, keys: Keys | None,
             act: Callable[[rl.DeploymentLedger, datetime], rl.DeploymentLedger],
             ) -> rl.DeploymentLedger:  # fmt: skip
     with conn.transaction():
         _lock(conn, deployment_id, shared=False)
+        keys = stored_keys(conn) if keys is None else keys
         lg = _ledger(conn, deployment_id, keys)
         if lg is None:
             raise ReleaseStoreError("not_found")
@@ -343,7 +511,7 @@ def _append(conn: Conn, deployment_id: str, keys: Keys,
     return got
 
 
-def install(conn: Conn, deployment_id: str, keys: Keys, event_id: str,
+def install(conn: Conn, deployment_id: str, keys: Keys | None, event_id: str,
             release_id: str, operator_id: str, step_up: str, *,
             strategies: Strategies) -> rl.DeploymentLedger:  # fmt: skip
     """The operator's install of a stored release, at the database clock."""
@@ -358,7 +526,7 @@ def install(conn: Conn, deployment_id: str, keys: Keys, event_id: str,
     return _append(conn, deployment_id, keys, act)
 
 
-def rollback(conn: Conn, deployment_id: str, keys: Keys, event_id: str,
+def rollback(conn: Conn, deployment_id: str, keys: Keys | None, event_id: str,
              component: str, operator_id: str, step_up: str, *,
              strategies: Strategies, to_release_id: str | None = None,
              ) -> rl.DeploymentLedger:  # fmt: skip

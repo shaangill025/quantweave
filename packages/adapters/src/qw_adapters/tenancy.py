@@ -433,9 +433,10 @@ def bootstrap_installation(
     return tx.tenant_id, user_id
 
 
-RuntimeRole = Literal["qw_app", "qw_worker", "qw_assessor"]
-_RUNTIME = ("qw_app", "qw_worker", "qw_assessor")
-_GROUPS = (*_RUNTIME, "qw_ingest", "qw_release")
+RuntimeRole = Literal["qw_app", "qw_worker", "qw_assessor", "qw_release"]
+_RUNTIME = ("qw_app", "qw_worker", "qw_assessor", "qw_release")
+_EXCLUSIVE = ("qw_assessor", "qw_release")  # decisions 17 and 45: never mixed
+_GROUPS = (*_RUNTIME, "qw_ingest")
 
 
 @contextmanager
@@ -450,9 +451,10 @@ def runtime_connection(
 
 def check_runtime_role(conn: Conn, role: RuntimeRole | None = None) -> None:
     """Refuse a connection that could bypass row level security or is not a member
-    of qw_app, qw_worker or qw_assessor. Owner decision 17: a qw_assessor login
-    holds no other group of 0001, and a declared `role` must be the login's only
-    one, so a mixed login cannot be both the assessor and anything else."""
+    of qw_app, qw_worker, qw_assessor or qw_release. Owner decision 17: a
+    qw_assessor login holds no other group of 0001; decision 45: neither does the
+    release operator's qw_release login. A declared `role` must be the login's only
+    one, so a mixed login cannot be the assessor or the operator and anything else."""
     if role is not None and role not in _RUNTIME:
         raise TenancyError(f"unknown runtime role {role!r}")
     row = conn.execute(
@@ -468,7 +470,8 @@ def check_runtime_role(conn: Conn, role: RuntimeRole | None = None) -> None:
     groups = set(row[3])
     if not groups & set(_RUNTIME):
         raise TenancyError("runtime connection is not a member of a runtime role")
-    if "qw_assessor" in groups and len(groups) > 1:
-        raise TenancyError("a qw_assessor login holds no other runtime role")
+    for alone in _EXCLUSIVE:
+        if alone in groups and len(groups) > 1:
+            raise TenancyError(f"a {alone} login holds no other runtime role")
     if role is not None and groups != {role}:
         raise TenancyError(f"runtime connection is not exactly a member of {role}")

@@ -40,6 +40,7 @@ SAFE_METHODS = frozenset({"GET", "HEAD"})
 _ORIGIN = re.compile(r"(https://[a-z0-9.-]+|http://(localhost|127\.0\.0\.1))(:\d+)?")
 _REFERER = re.compile(_ORIGIN.pattern + r"(?=/|$)")
 _REGION = re.compile(r"[A-Z]{2}(-[A-Z0-9]{1,3})?", re.ASCII)  # as qw_domain.rights
+_DEPLOYMENT_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}", re.ASCII)
 
 
 _ACCOUNT = ThrottlePolicy(
@@ -63,7 +64,10 @@ class Settings:
     operator's, the place rights are checked for; unset, no rights gate passes.
     `notification_keys` (operator-held, shared with the qw_worker producer) seals
     and identifies notifications; it shares no key with `secret_key`, so rotating
-    `secret_key` leaves stored notifications valid. Unset, the feed is 503."""
+    `secret_key` leaves stored notifications valid. Unset, the feed is 503.
+    `release_deployment_id` (owner decision 45): the release deployment this server
+    runs as, the id the operator recorded with `qw-release-admin`; an id, never a
+    secret. Unset, the server belongs to no recorded deployment."""
 
     allowed_origins: frozenset[str]
     secret_key: bytes = field(repr=False)  # never in repr/str or logs
@@ -77,8 +81,13 @@ class Settings:
     deployment: Edition = Edition.HOSTED
     jurisdiction: str | None = None
     notification_keys: Keyring | None = None
+    release_deployment_id: str | None = None
 
     def __post_init__(self) -> None:
+        if self.release_deployment_id is not None and not _DEPLOYMENT_ID.fullmatch(
+            self.release_deployment_id
+        ):  # fmt: skip
+            raise ValueError("release_deployment_id must be an id")
         if not isinstance(self.deployment, Edition):
             raise ValueError("deployment must be an Edition")
         if self.jurisdiction is not None and (
