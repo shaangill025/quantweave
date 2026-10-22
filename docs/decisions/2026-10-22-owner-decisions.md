@@ -100,3 +100,37 @@ quoted option text, "decision 5" is decision 5 of `2026-10-20-owner-decisions.md
     reject wastes it. Refusing keeps the read for after the missing trials are
     recorded."
     Implemented by: T044 (decision 39, the assessor-run promotion).
+
+## Protected holdout series
+
+51. **Baseline series in the protected holdout table.**
+    Question: "Decision 51: a promotion run uses the holdout price series and also
+    baseline series (such as buy-and-hold). Decision 41 protects 'holdout_series'
+    but doesn't say whether the baselines are preregistered too. Should they be?"
+    Selected label: "Preregister baselines too (Recommended)".
+    Option text as presented: "Store the baseline series in the same protected
+    table, tied to the plan, and loaded before the freeze. Why: the accept or reject
+    decision compares against the baselines, so a caller who could supply them after
+    seeing results could steer the verdict. Protecting only the main series leaves
+    that door open."
+    Implemented by: T044 (decision 39, the protected holdout series).
+
+52. **Correcting a protected series before the freeze.**
+    Question: "Decision 52: the protected table is append-only. If the operator
+    loads a wrong series before the freeze, can they load a corrected one?"
+    Selected label: "One row; fix = new plan (Recommended)".
+    Option text as presented: "Exactly one series per plan, instrument and role,
+    enforced unique. A mistake is fixed by making a new plan. Why: there's no choice
+    of which version to use, so nobody can load several and keep the best. A new
+    plan is cheap before any experiment names it."
+    Implemented by: T044 (decision 39, the protected holdout series).
+
+53. **What protected series rows are tied to.**
+    Question: "Decision 53: what should protected series rows be tied to? Decision
+    41 says 'the plan'."
+    Selected label: "The plan (Recommended)".
+    Option text as presented: "Key the rows on tenant and plan_id. The freeze
+    happens when any assessor protocol names that plan. Why: it's what decision 41
+    says, and the plan is what the holdout window and instruments are frozen into.
+    Study or experiment keys would allow one plan to have several data sets."
+    Implemented by: T044 (decision 39, the protected holdout series).
