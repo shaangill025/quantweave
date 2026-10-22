@@ -31,6 +31,8 @@ from qw_domain.backtest import (
     TrialOutcome,
     claim_for,
     evaluation_receipt,
+    promotion_walk_forward,
+    run_promotion_trial,
     run_trial,
     trial_report,
     walk_forward,
@@ -386,3 +388,78 @@ def test_trials_record_the_standard_error_and_z_behind_each_interval() -> None:
     c = "baseline.bl-cash."  # the second baseline too, bound for bound
     assert m[c + "excess_ci_lower"] == CTX.subtract(
         m[c + "excess_mean"], CTX.multiply(Z95, m[c + "excess_std_error"]))  # fmt: skip
+
+
+# Owner decision 39: the assessor runs the promotion evaluation on the holdout.
+# SYNTHETIC holdout bars inside PROMO, on the plan's holdout instrument iid(3), with
+# the same opens as PX (so the same hand-computed periods and summaries).
+PXP = bars(["100", "110", "99", "99", "108.9"], instrument=3,
+           day0=datetime(2024, 1, 2, 14, 30, tzinfo=UTC))  # fmt: skip
+HOLD = {"px-synth-1": PXP}
+
+
+def promotion(lg: TrialLedger | None = None, n: int = 1,
+              role: Role = Role.ASSESSOR) -> TrialLedger:  # fmt: skip
+    lg = lg or ledger(plan(protocol_hash=PROTO_HASH))
+    return ask(lg, n, Split.PROMOTION, PROMO, role)[0]
+
+
+def prun(lg: TrialLedger, access_id: str = "acc-1", **kw: object) -> Evaluation:
+    args: dict[str, object] = {
+        "ledger": lg, "dataset": DS, "rights": rights(), "access_id": access_id,
+        "protocol": protocol(), "series": PXP,
+        "strategy": scripted(["1", "0", "1", "0", "0"]), "baseline_series": HOLD,
+    } | kw  # fmt: skip
+    return promotion_walk_forward(**args)  # type: ignore[arg-type]
+
+
+def test_the_assessor_evaluates_its_one_promotion_read_on_the_holdout() -> None:
+    ev = prun(promotion())
+    assert [p.net for p in ev.periods] == [D("-0.102"), D("-0.002"), D("0.098")]
+    assert ev.summary.mean == D("-0.002") and ev.instrument == iid(3)
+    dev = granted(Split.DEVELOPMENT)  # the holdout instrument only on promotion
+    with pytest.raises(ResearchError, match="holdout_instrument"):
+        run(["1"] * 5, lg=dev, series=PXP, baseline_series=HOLD)
+    with pytest.raises(ResearchError, match="promotion_access"):
+        prun(dev)  # a development access is not a promotion read
+    with pytest.raises(ResearchError, match="access_refused"):
+        prun(promotion(role=Role.RESEARCHER))  # the ledger refuses a researcher
+    twice = promotion(
+        promotion(ledger(plan(protocol_hash=PROTO_HASH, max_promotion_accesses=2))), 2
+    )
+    assert twice.access("acc-2").seq == 2
+    with pytest.raises(ResearchError, match="promotion_access"):
+        prun(twice, "acc-2")  # only the first read is assessed
+    with pytest.raises(ResearchError, match="protocol_changed"):
+        prun(promotion(), protocol=protocol(costs=CostModel(D(0), D(0), D(0))))
+
+
+def test_a_promotion_trial_is_recorded_whatever_happens() -> None:
+    when = T0 + timedelta(hours=2)
+
+    def go(lg: TrialLedger, series: PriceSeries) -> tuple[TrialLedger, TrialOutcome]:
+        strategy = scripted(["1", "0", "1", "0", "0"])
+        return run_promotion_trial(lg, "trial-1", "SYNTHETIC: scripted", when, DS,
+                                   rights(), "acc-1", protocol(), series, strategy,
+                                   HOLD)  # fmt: skip
+
+    lg, out = go(promotion(), PXP)
+    t = lg.trials()[0]
+    assert (t.split, t.outcome, out.reason) == (
+        Split.PROMOTION,
+        Outcome.COMPLETED,
+        None,
+    )
+    assert out.evaluation is not None and t.metrics["net_mean"] == D("-0.002")
+    assert "baseline.bl-hold.excess_std_error" in t.metrics
+    short = bars(["100", "110"], instrument=3, day0=datetime(2024, 1, 2, 14, 30,
+                                                             tzinfo=UTC))  # fmt: skip
+    lg, out = go(promotion(), short)  # refused: a FAILED promotion trial, read spent
+    t = lg.trials()[0]
+    assert (t.split, t.outcome, out.reason, t.metrics) == (
+        Split.PROMOTION, Outcome.FAILED, "insufficient_bars", {})  # fmt: skip
+    dev = granted(Split.DEVELOPMENT)
+    with pytest.raises(ResearchError, match="promotion_access"):  # nothing recorded
+        run_promotion_trial(dev, "trial-1", "SYNTHETIC: scripted", when, DS, rights(),
+                            "acc-1", protocol(), PX, scripted(["1"] * 5),
+                            {"px-synth-1": PX})  # fmt: skip

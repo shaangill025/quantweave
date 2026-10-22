@@ -39,10 +39,18 @@ R030, R032, R033, R035, R037, R084, R092, R099). Domain only, stdlib only.
   (0028). 0.5.0 records
   (`failed` for insufficient evidence; blocked verdicts and code targets as
   proposed or authorized) stay readable and are never derived.
+- The promotion trial `assess` scores may be recorded by the caller or, for a
+  strategy, by the assessor's own run (`strategy_improvement.holdout_run`, owner
+  decision 39: one assessor read, a walk-forward on the holdout, recorded at the
+  run's time, then `derive` with that time).
 LIMITATIONS: the budget book is not persisted; times and actor ids are
 caller-asserted; evidence uses
 are checked against the store only when a candidate is first registered;
 `record_verdict` checks hashes and assessor identity but cannot re-run `assess`.
+An assessor-run strategy promotion is insufficient evidence today: the backtest
+records no `lookahead_violations`, `survivorship_violations` or
+`unrecorded_trials`, which every strategy scorecard holds as hard controls (an
+open owner question). The holdout data and the ledger are still the caller's.
 """
 
 import re

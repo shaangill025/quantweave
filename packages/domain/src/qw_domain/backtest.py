@@ -56,6 +56,7 @@ from qw_domain.strategy_registry import EvidenceState
 from qw_domain.trial_ledger import (
     Access,
     Outcome,
+    Role,
     Split,
     SplitView,
     Trial,
@@ -325,7 +326,8 @@ def _usable(s: PriceSeries, view: SplitView, ds: ResearchDataset) -> list[PriceB
     a = view.access
     if a.instruments is not None and s.instrument not in a.instruments:
         raise ResearchError("instrument_not_granted", s.series_id)
-    if s.instrument in view.plan.holdout_instruments:
+    # as SplitView._allowed: the holdout instruments are the promotion read's only
+    if a.split is not Split.PROMOTION and s.instrument in view.plan.holdout_instruments:
         raise ResearchError("holdout_instrument", s.series_id)
     w: Window = a.window
     return [b for b in s.bars if w.start <= b.start and b.known_at < w.end]
@@ -353,9 +355,30 @@ def walk_forward(
     strategy: Strategy, baseline_series: Mapping[str, PriceSeries],
 ) -> Evaluation:  # fmt: skip
     view = open_view(ledger, dataset, access_id, rights)
-    a, plan = view.access, view.plan
-    if a.split is Split.PROMOTION:
+    if view.access.split is Split.PROMOTION:
         raise ResearchError("promotion_protocol", "holdout runs via the assessor")
+    return _evaluate(view, protocol, series, strategy, baseline_series)
+
+
+def promotion_walk_forward(
+    ledger: TrialLedger, dataset: ResearchDataset, rights: ResearchRights,
+    access_id: str, protocol: EvaluationProtocol, series: PriceSeries,
+    strategy: Strategy, baseline_series: Mapping[str, PriceSeries],
+) -> Evaluation:  # fmt: skip
+    """The assessor's evaluation of its one holdout read (owner decision 39): only a
+    granted promotion access by the assessor role with seq 1 (`promotion_access`)."""
+    view = open_view(ledger, dataset, access_id, rights)
+    a = view.access
+    if (a.split, a.role, a.seq) != (Split.PROMOTION, Role.ASSESSOR, 1):
+        raise ResearchError("promotion_access", access_id)
+    return _evaluate(view, protocol, series, strategy, baseline_series)
+
+
+def _evaluate(
+    view: SplitView, protocol: EvaluationProtocol, series: PriceSeries,
+    strategy: Strategy, baseline_series: Mapping[str, PriceSeries],
+) -> Evaluation:  # fmt: skip
+    a, plan, dataset = view.access, view.plan, view.dataset
     if protocol.plan_id != plan.plan_id:
         raise ResearchError("protocol_plan", protocol.protocol_id)
     if protocol.content_hash != plan.protocol_hash:
@@ -484,12 +507,37 @@ def run_trial(
     baseline_series: Mapping[str, PriceSeries],
 ) -> tuple[TrialLedger, TrialOutcome]:  # fmt: skip
     """Evaluate and record the trial whatever happens; a refusal is a failed trial."""
+    return _record(ledger, trial_id, hypothesis, recorded_at, access_id, protocol,
+                   lambda: walk_forward(ledger, dataset, rights, access_id, protocol,
+                                        series, strategy, baseline_series))  # fmt: skip
+
+
+def run_promotion_trial(
+    ledger: TrialLedger, trial_id: str, hypothesis: str, recorded_at: datetime,
+    dataset: ResearchDataset, rights: ResearchRights, access_id: str,
+    protocol: EvaluationProtocol, series: PriceSeries, strategy: Strategy,
+    baseline_series: Mapping[str, PriceSeries],
+) -> tuple[TrialLedger, TrialOutcome]:  # fmt: skip
+    """`run_trial` for the assessor's promotion read (owner decision 39): a refusal
+    is a FAILED promotion trial (the read is spent). Not a promotion access at all
+    is `promotion_access`, and nothing is recorded."""
+    if ledger.access(access_id).split is not Split.PROMOTION:
+        raise ResearchError("promotion_access", access_id)
+    return _record(ledger, trial_id, hypothesis, recorded_at, access_id, protocol,
+                   lambda: promotion_walk_forward(ledger, dataset, rights, access_id,
+                                                  protocol, series, strategy,
+                                                  baseline_series))  # fmt: skip
+
+
+def _record(
+    ledger: TrialLedger, trial_id: str, hypothesis: str, recorded_at: datetime,
+    access_id: str, protocol: EvaluationProtocol, evaluate: Callable[[], Evaluation],
+) -> tuple[TrialLedger, TrialOutcome]:  # fmt: skip
     a = ledger.access(access_id)
     ev: Evaluation | None = None
     reason: str | None = None
     try:
-        ev = walk_forward(ledger, dataset, rights, access_id, protocol, series,
-                          strategy, baseline_series)  # fmt: skip
+        ev = evaluate()
     except ResearchError as exc:
         reason = exc.code
     except StatsError as exc:
