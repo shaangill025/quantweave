@@ -463,3 +463,60 @@ def test_a_promotion_trial_is_recorded_whatever_happens() -> None:
         run_promotion_trial(dev, "trial-1", "SYNTHETIC: scripted", when, DS, rights(),
                             "acc-1", protocol(), PX, scripted(["1"] * 5),
                             {"px-synth-1": PX})  # fmt: skip
+
+
+def test_decision_49_the_raw_view_is_not_served_to_a_strategy() -> None:
+    """Owner decision 49: the review's probe read facts and membership after `now`
+    through `ctx.view` and the promotion trial COMPLETED; it is now FAILED."""
+    future = datetime(2025, 6, 1, tzinfo=UTC)  # inside the promotion window
+
+    def through_view(ctx: PitContext) -> Decision:
+        ctx.view.facts_at(future)
+        return Decision(D(1), ctx.bars()[-1].known_at)
+
+    def through_members(ctx: PitContext) -> Decision:
+        ctx.view.members(future.date(), future)
+        return Decision(D(1), ctx.bars()[-1].known_at)
+
+    def later_members(ctx: PitContext) -> Decision:
+        ctx.members(future.date())
+        return Decision(D(1), ctx.bars()[-1].known_at)
+
+    when = T0 + timedelta(hours=2)
+    for strategy, why in ((through_view, "raw_view"), (through_members, "raw_view"),
+                          (later_members, "look_ahead")):  # fmt: skip
+        _, out = run_promotion_trial(promotion(), "trial-1", "SYNTHETIC: peek", when,
+                                      DS, rights(), "acc-1", protocol(), PXP,
+                                      strategy, HOLD)  # fmt: skip
+        assert (out.trial.outcome, out.reason, out.trial.metrics) == (
+            Outcome.FAILED, why, {})  # fmt: skip
+
+
+def test_decision_46_derived_metrics_join_a_completed_promotion_trial_only() -> None:
+    when, extra = T0 + timedelta(hours=2), {"lookahead_violations": D(0)}
+
+    def go(
+        lg: TrialLedger, series: PriceSeries, derived: dict[str, Decimal]
+    ) -> tuple[TrialLedger, TrialOutcome]:
+        return run_promotion_trial(lg, "trial-1", "SYNTHETIC: scripted", when, DS,
+                                   rights(), "acc-1", protocol(), series,
+                                   scripted(["1", "0", "1", "0", "0"]), HOLD,
+                                   derived=derived)  # fmt: skip
+
+    _, out = go(promotion(), PXP, extra)
+    assert out.trial.metrics["lookahead_violations"] == D(0)
+    assert out.trial.metrics["net_mean"] == D("-0.002")  # the backtest's own
+    short = bars(["100", "110"], instrument=3, day0=datetime(2024, 1, 2, 14, 30,
+                                                             tzinfo=UTC))  # fmt: skip
+    _, out = go(promotion(), short, extra)  # a failed trial carries none
+    assert (out.trial.outcome, out.trial.metrics) == (Outcome.FAILED, {})
+    before = promotion()
+    for bad in (
+        {"net_mean": D(1)},
+        {"baseline.bl-hold.excess_mean": D(1)},
+        {"ci_z": D(1)},
+        {"x y": D(0)},
+        {"lookahead_violations": 0},
+    ):
+        with pytest.raises(ResearchError, match="derived_metric"):
+            go(before, PXP, bad)  # type: ignore[arg-type]  # refused before reading

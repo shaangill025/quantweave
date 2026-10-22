@@ -18,10 +18,14 @@
   promotion of the candidate; nothing here promotes): it refuses
   before reading anything (study, registered assessor, frozen plan, the candidate's
   manifest version, the freeze time, any promotion entry not made by the registered
-  assessor, any earlier granted promotion read), then records the one assessor
-  read and the walk-forward on the caller's `HoldoutData` as a promotion trial
-  (`run_promotion_trial`, recorded at `at`; a failed evaluation still spends the
-  read). The caller then derives the verdict with `assessed_at == at`.
+  assessor, any earlier granted promotion read, any unrecorded trial: decision
+  50), then records the one assessor read and the walk-forward on the caller's
+  `HoldoutData` as a promotion trial (`run_promotion_trial`, recorded at `at`; a
+  failed evaluation still spends the read). A completed trial also carries the
+  hard controls the run derives (decisions 46 and 49, `DERIVED_BASIS`):
+  look-ahead 0, unrecorded trials 0, and survivorship 0 only for the plan's single
+  preregistered holdout instrument (else missing). The caller then derives the
+  verdict with `assessed_at == at`.
 - `assess_strategy` runs the T044 assessor (holdout read once by its own actor),
   then rejects on ledger-derived violations (unrecorded trials, budget overrun,
   unregistered variants, other families), then needs a prospective shadow window
@@ -55,6 +59,7 @@ from qw_domain.backtest import (
 )
 from qw_domain.budget import BudgetBook
 from qw_domain.decimals import safe_repr
+from qw_domain.identity import InstrumentId
 from qw_domain.instants import ensure_aware_utc, format_instant
 from qw_domain.research_data import (
     EvidenceClass,
@@ -507,6 +512,8 @@ def holdout_run(
         raise Error("promotion_entry_not_assessor", p.plan_id)
     if any(a.granted for a in mine):
         raise Error("holdout_used", p.plan_id)
+    if (n := account(study, registry, ledger).unrecorded) > 0:  # decision 50
+        raise Error("unrecorded_trials", str(n))
     plan = ledger.plan(p.plan_id)
     lg, a = ledger.request_access(access_id, p.plan_id, trial_id, c.trial_key,
                                   Split.PROMOTION, plan.promotion, None,
@@ -516,7 +523,37 @@ def holdout_run(
     return run_promotion_trial(lg, trial_id, p.hypothesis, at, dataset, rights,
                                access_id, study.evaluation, holdout.series,
                                build(MappingProxyType(m.resolve({}))),
-                               holdout.baseline_series)  # fmt: skip
+                               holdout.baseline_series,
+                               derived=_derived(plan.holdout_instruments,
+                                                holdout))  # fmt: skip
+
+
+_ONE = Decimal(1)
+# Owner decisions 46, 49 and 50: the hard controls the assessor run derives, each
+# recorded with a marker metric (value 1) naming its basis, stated here in full.
+DERIVED_BASIS: Mapping[str, str] = MappingProxyType({
+    "basis.lookahead_violations.walk_forward_refusal": (
+        "walk-forward refusal; strategy code is manifest-registered and trusted; "
+        "data captured outside the context is not detected"),
+    "basis.unrecorded_trials.account_before_read": (
+        "account() on the ledger before the read: no granted access without a "
+        "recorded trial on the plan or in the family (else refused)"),
+    "basis.survivorship_violations.single_preregistered_instrument": (
+        "the plan preregisters exactly one holdout instrument and the holdout "
+        "series is on it: no universe selection"),
+})  # fmt: skip
+
+
+def _derived(preregistered: frozenset[InstrumentId],
+             holdout: HoldoutData) -> dict[str, Decimal]:  # fmt: skip
+    """Recorded only on a completed promotion trial, so `lookahead_violations` is 0
+    only when the walk-forward guard refused nothing (decision 49); the unrecorded
+    count was 0 before the read (decision 50); survivorship is left missing unless
+    the evaluated instrument is the plan's single preregistered one (decision 46)."""
+    m = {"lookahead_violations": Decimal(0), "unrecorded_trials": Decimal(0)}
+    if preregistered == {holdout.series.instrument}:
+        m["survivorship_violations"] = Decimal(0)
+    return m | {k: _ONE for k in DERIVED_BASIS if k.split(".")[1] in m}
 
 
 def assess_strategy(
