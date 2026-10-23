@@ -141,3 +141,57 @@ below waives a test, gate or spec requirement. Numbering continues from
     withdrawn release for an installed one; the schema enforces which fields each
     kind fills."
     Implemented by: T055 (the release-history read).
+
+## Assessment request inputs
+
+64. **Who writes and reads the assessment request store.**
+    Question: "Decision 64: a new 'assessment_request' table will keep each
+    promotion request durably until its run returns. Decision 40 says 'no new
+    database grants' (meaning: don't widen the roles). Who may write and read it?"
+    Selected label: "Worker writes, assessor reads (Recommended)".
+    Option text as presented: "qw_worker inserts the request as part of the job it
+    submits; qw_assessor may only read it; qw_app nothing. Why: the request comes
+    from the job side, and the assessor must read exactly what was submitted. A
+    read-only grant on one request table doesn't let a compromised assessor change
+    jobs or revisions, which is what decision 40 guards against."
+    Implemented by: T044 (decision 39, the assessor-run promotion).
+
+65. **How a stored request refers to strategy code.**
+    Question: "Decision 65: a request names strategy code (a Python function), which
+    can't be stored. How should a stored request refer to it?"
+    Selected label: "Id + version + code hash (Recommended)".
+    Option text as presented: "Store the strategy id, version and implementation
+    hash; on load, look it up in the qw-assessor process's built-in, reviewed
+    strategy registry and refuse if missing or the hash differs. Add the hash to the
+    re-run digest. Why: only reviewed, registered code can run (decision 49), and
+    the hash catches code that changed between attempts. The registry is built with
+    the qw-assessor entrypoint and starts empty, so runs fail closed until a real
+    strategy is registered."
+    Implemented by: T044 (decision 39, the assessor-run promotion).
+
+66. **Where the caller-supplied marks live.**
+    Question: "Decision 66: decision 43 says each verdict is marked 'ledger
+    caller-supplied' and 'budget caller-supplied', visible to reviewers, mirroring
+    decision 33. Where do the marks live?"
+    Selected label: "Columns on the verdict (Recommended)".
+    Option text as presented: "Add the two marks as hashed columns on the stored
+    verdict record, like decision 33's verdict_source on a signed release, set when
+    the verdict is recorded. Reviewers see them wherever they see the verdict. Why:
+    a mark that lives on the record can't be separated from it or forgotten, and it
+    reuses the read paths reviewers already have. Built in the wiring increment,
+    after the re-run work lands."
+    Implemented by: T044 (decision 39, the assessor-run promotion).
+
+67. **What the request store holds.**
+    Question: "Decision 67: storing the whole request means building storable
+    formats for ~15 inputs (ledger, budget, experiment and strategy registries,
+    dataset, etc.), about 4 PRs. Most of those inputs don't have their own stores
+    yet. What should the request store hold?"
+    Selected label: "Ledger + budget in full, rest by hash (Recommended)".
+    Option text as presented: "Store the trial ledger and budget book in full (what
+    decision 43 names) and bind every other input by content hash; the run refuses
+    if the inputs it's given don't match. Why: the two caller-supplied inputs are
+    the ones with no other durable home, while the rest will get real stores in
+    their own tasks (e.g. T032); building throwaway formats for them now would be
+    wasted. The decision-59 digest already binds them."
+    Implemented by: T044 (decision 39, the assessor-run promotion).
