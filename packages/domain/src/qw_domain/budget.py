@@ -17,16 +17,19 @@ Spec §10/§15 budgets, §11 improvement cap, config `budgets_and_slos.json`, sc
   arrives (pending owner/spec confirmation of the billing-month rule).
 - The book is immutable and versioned: `apply` installs a new book by
   compare-and-set on `version`; persistence does it in one transaction.
+- `BudgetBook.to_wire`/`from_wire` keep every field (a reservation's
+  `to_book_wire`, not the schema's `to_wire`), for a stored assessment request
+  (owner decisions 43 and 67): decimal strings, UTC `Z` instants, canonical input.
 Stdlib only.
 """
 
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, replace
 from datetime import datetime
 from enum import StrEnum
 
 from qw_domain.decimals import UsdBudget, safe_repr
-from qw_domain.instants import ensure_aware_utc, format_instant
+from qw_domain.instants import ensure_aware_utc, format_instant, parse_instant
 from qw_domain.sources import ID_PATTERN
 
 ZERO = UsdBudget(0)
@@ -56,6 +59,36 @@ class Status(StrEnum):
     SETTLED = "settled"
     RELEASED = "released"
     EXPIRED = "expired"  # deadline passed unreconciled: charged at the reservation
+
+
+def _text(w: object) -> str:
+    if type(w) is not str:
+        raise BudgetError("book_wire", "a string is required")
+    return w
+
+
+def _usd(w: object) -> UsdBudget:
+    return UsdBudget.from_wire(_text(w))
+
+
+def _instant(w: object) -> datetime:
+    return parse_instant(_text(w))
+
+
+def _canonical[T: "BudgetCaps | Reservation | BudgetBook"](
+    w: object, build: Callable[[], T]
+) -> T:
+    """Build from a wire; refuse any input that does not re-serialize to it."""
+    try:
+        out = build()
+    except BudgetError:
+        raise
+    except (ValueError, TypeError, ArithmeticError) as exc:  # enums, instants
+        raise BudgetError("book_wire", type(exc).__name__) from None
+    wire = out.to_book_wire() if isinstance(out, Reservation) else out.to_wire()
+    if wire != w:
+        raise BudgetError("book_wire", "not the canonical wire form")
+    return out
 
 
 def period_of(at: datetime) -> str:
@@ -92,6 +125,22 @@ class BudgetCaps:
         pilot = _budget(config, "pilot_monthly_usd")
         return cls(pilot, _budget(config, "improvement_monthly_usd_max"),
                    authorization_ref)  # fmt: skip
+
+    def to_wire(self) -> dict[str, object]:
+        return {"inference": self.inference.to_wire(),
+                "improvement": self.improvement.to_wire(),
+                "authorization_ref": self.authorization_ref}  # fmt: skip
+
+    @classmethod
+    def from_wire(cls, w: object) -> "BudgetCaps":
+        if type(w) is not dict or set(w) != {"inference", "improvement",
+                                             "authorization_ref"}:  # fmt: skip
+            raise BudgetError("book_wire", "caps keys")
+        ref = w["authorization_ref"]
+        if ref is not None and type(ref) is not str:
+            raise BudgetError("book_wire", "authorization_ref")
+        return _canonical(w, lambda: cls(_usd(w["inference"]),
+                                         _usd(w["improvement"]), ref))  # fmt: skip
 
 
 @dataclass(frozen=True, slots=True)
@@ -136,6 +185,52 @@ class Reservation:
             "created_at": format_instant(self.created_at),
         }  # fmt: skip
 
+    def to_book_wire(self) -> dict[str, object]:
+        """Every field, for the book's own wire (the schema form omits some)."""
+        actual = None if self.actual is None else self.actual.to_wire()
+        return {
+            "reservation_id": self.reservation_id, "scope_id": self.scope_id,
+            "period": self.period, "category": self.category.value,
+            "reserved": self.reserved.to_wire(),
+            "provider_account_ref": self.provider_account_ref,
+            "max_output_tokens": self.max_output_tokens,
+            "created_at": format_instant(self.created_at),
+            "deadline": format_instant(self.deadline), "status": self.status.value,
+            "dispatched": self.dispatched, "actual": actual, "sends": self.sends,
+            "returned": self.returned,
+        }  # fmt: skip
+
+    @classmethod
+    def from_book_wire(cls, w: object) -> "Reservation":
+        """Refuses what no book method makes: a non-positive reservation, a
+        negative actual, an actual on an open or released reservation (or none on
+        a charged one), more returns than sends, a deadline not after creation."""
+        keys = {"reservation_id", "scope_id", "period", "category", "reserved",
+                "provider_account_ref", "max_output_tokens", "created_at", "deadline",
+                "status", "dispatched", "actual", "sends", "returned"}  # fmt: skip
+        if type(w) is not dict or set(w) != keys:
+            raise BudgetError("book_wire", "reservation keys")
+        n = (w["max_output_tokens"], w["sends"], w["returned"])
+        if not all(type(x) is int and x >= 0 for x in n) or n[0] < 1 or (
+            n[2] > n[1] or type(w["dispatched"]) is not bool
+        ):  # fmt: skip
+            raise BudgetError("book_wire", "counts and dispatched")
+        for k in ("reservation_id", "scope_id", "provider_account_ref"):
+            check_id(w[k], k)
+        a = w["actual"]
+        r = _canonical(w, lambda: cls(
+            w["reservation_id"], w["scope_id"], _text(w["period"]),
+            Category(w["category"]), _usd(w["reserved"]), w["provider_account_ref"],
+            n[0], _instant(w["created_at"]), _instant(w["deadline"]),
+            Status(w["status"]), w["dispatched"], None if a is None else _usd(a),
+            n[1], n[2]))  # fmt: skip
+        charged = r.status in (Status.SETTLED, Status.EXPIRED)
+        if r.reserved.value <= 0 or (r.actual is not None and r.actual.value < 0) or (
+            (r.actual is not None) != charged or r.deadline <= r.created_at
+        ):  # fmt: skip
+            raise BudgetError("book_wire", r.reservation_id)
+        return r
+
 
 @dataclass(frozen=True, slots=True)
 class Summary:  # openapi `BudgetSummary`
@@ -168,6 +263,28 @@ class BudgetBook:
     @classmethod
     def open(cls, scope_id: str, at: datetime, caps: BudgetCaps) -> "BudgetBook":
         return cls(scope_id, period_of(at), caps)
+
+    def to_wire(self) -> dict[str, object]:
+        return {"scope_id": self.scope_id, "period": self.period,
+                "caps": self.caps.to_wire(),
+                "reservations": [r.to_book_wire() for r in self.reservations],
+                "version": self.version}  # fmt: skip
+
+    @classmethod
+    def from_wire(cls, w: object) -> "BudgetBook":
+        """Canonical input only, with distinct reservation ids."""
+        keys = {"scope_id", "period", "caps", "reservations", "version"}
+        if type(w) is not dict or set(w) != keys or (
+            type(w["reservations"]) is not list
+            or type(w["version"]) is not int or w["version"] < 0
+        ):  # fmt: skip
+            raise BudgetError("book_wire", "book keys, reservations and version")
+        rows = tuple(Reservation.from_book_wire(r) for r in w["reservations"])
+        if len({r.reservation_id for r in rows}) != len(rows):
+            raise BudgetError("book_wire", "duplicate reservation")
+        return _canonical(w, lambda: cls(w["scope_id"], _text(w["period"]),
+                                         BudgetCaps.from_wire(w["caps"]), rows,
+                                         w["version"]))  # fmt: skip
 
     def find(self, reservation_id: str) -> Reservation | None:
         return next((r for r in self.reservations

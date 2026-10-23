@@ -28,7 +28,13 @@ from types import MappingProxyType
 from qw_domain.decimals import safe_repr
 from qw_domain.filings import AsOfView, Fact, FactBook, KnowledgeBasis, known_at
 from qw_domain.identity import InstrumentId
-from qw_domain.instants import ensure_aware_utc, format_instant, require_date
+from qw_domain.instants import (
+    InstantError,
+    ensure_aware_utc,
+    format_instant,
+    parse_instant,
+    require_date,
+)
 from qw_domain.rights import DenyReason, Registry, Use, UseScope, check_use
 from qw_domain.sources import ID_PATTERN
 
@@ -128,6 +134,19 @@ class Window:
 
     def to_wire(self) -> list[str]:
         return [format_instant(self.start), format_instant(self.end)]
+
+    @classmethod
+    def from_wire(cls, w: object) -> "Window":
+        """Two canonical UTC `Z` instants; anything else is refused."""
+        if type(w) is not list or len(w) != 2 or not all(type(x) is str for x in w):
+            raise ResearchError("window_wire", "two instant strings")
+        try:
+            out = cls(parse_instant(w[0]), parse_instant(w[1]))
+        except InstantError as exc:
+            raise ResearchError("window_wire", type(exc).__name__) from None
+        if out.to_wire() != w:
+            raise ResearchError("window_wire", "not the canonical wire form")
+        return out
 
 
 class Change(StrEnum):
@@ -233,6 +252,36 @@ class DatasetManifest:
                 "price_mode": m.price_mode.value, "observed": m.observed.to_wire(),
                 "as_of": format_instant(m.as_of),
                 "frozen_at": format_instant(m.frozen_at)}  # fmt: skip
+
+    def to_wire(self) -> dict[str, object]:
+        """The terms and the content hash. The hash covers the records, which are
+        not here, so a read cannot re-derive it: a store binds the wire itself."""
+        return {**self.body(), "content_hash": self.content_hash}
+
+    @classmethod
+    def from_wire(cls, w: object) -> "DatasetManifest":
+        keys = {"dataset_id", "tenant_id", "sources", "evidence_class", "basis",
+                "price_mode", "observed", "as_of", "frozen_at",
+                "content_hash"}  # fmt: skip
+        if type(w) is not dict or set(w) != keys or type(w["sources"]) is not dict:
+            raise ResearchError("manifest_wire", "an object with the manifest keys")
+        if not all(type(w[k]) is str for k in keys - {"sources", "observed"}) or not (
+            all(type(v) is str for v in w["sources"].values())
+        ):  # fmt: skip
+            raise ResearchError("manifest_wire", "string fields are required")
+        try:
+            m = cls(w["dataset_id"], w["tenant_id"], w["sources"],
+                    EvidenceClass(w["evidence_class"]), KnowledgeBasis(w["basis"]),
+                    PriceMode(w["price_mode"]), Window.from_wire(w["observed"]),
+                    parse_instant(w["as_of"]), parse_instant(w["frozen_at"]),
+                    w["content_hash"])  # fmt: skip
+        except ResearchError:
+            raise
+        except ValueError as exc:  # the enums' and InstantError
+            raise ResearchError("manifest_wire", type(exc).__name__) from None
+        if m.to_wire() != w:
+            raise ResearchError("manifest_wire", "not the canonical wire form")
+        return m
 
 
 @dataclass(frozen=True, slots=True)
