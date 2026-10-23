@@ -223,3 +223,20 @@ below waives a test, gate or spec requirement. Numbering continues from
     the reviewed code, and code is registered per base version, not per candidate.
     Two meanings of 'version' would let them drift apart."
     Implemented by: T044 (decision 39, the assessor-run promotion).
+
+## Assessor-run inputs
+
+70. **Where the hash-bound run inputs come from.**
+    Question: "Decision 70: the assessor-run path is now wired end to end, but every
+    run refuses with 'inputs_unavailable'. Inputs bound only by hash (decision 67:
+    the study, experiment registry, strategy manifests, research dataset, research
+    rights) have nowhere for the assessor to load them from. What next?"
+    Selected label: "Build those stores next (Recommended)".
+    Option text as presented: "Build durable stores for the missing inputs (the
+    T032 experiment/trial store, research datasets, search spaces and evaluation
+    protocols), each with its own task's rules, and give qw_assessor read-only
+    grants on what it must read. Why: those stores are required by their own tasks
+    anyway, so this finishes real work instead of adding a temporary path, and it
+    keeps decision 67's 'bind by hash, refuse on mismatch' honest. Not 'store them
+    in the request': that's the throwaway-format route decision 67 rejected."
+    Implemented by: T032 and the research-data tasks, then T044 (the assessor run).
