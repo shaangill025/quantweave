@@ -240,3 +240,103 @@ below waives a test, gate or spec requirement. Numbering continues from
     keeps decision 67's 'bind by hash, refuse on mismatch' honest. Not 'store them
     in the request': that's the throwaway-format route decision 67 rejected."
     Implemented by: T032 and the research-data tasks, then T044 (the assessor run).
+
+## Assessor-run input stores
+
+71. **How the experiment registry is stored and read.**
+    Question: "Decision 71: the assessor needs the experiment registry (protocols,
+    candidates, verdicts) that a request binds by hash. A new verdict anywhere in
+    the tenant between submit and run would change that hash. How should the
+    registry be stored and read?"
+    Selected label: "Tenant log, read as of submit (Recommended)".
+    Option text as presented: "A new append-only, hash-chained tenant log of
+    registry entries, written by qw_worker as protocols, candidates and verdicts are
+    recorded. The assessor replays it as of the request's recorded time, so later
+    entries don't disturb a pending run or its re-runs. Why: it's the real T044
+    registry the spec needs anyway, and reading 'as of submit' makes the hash stable
+    without freezing the tenant."
+    Implemented by: T044 (the experiment registry store).
+
+72. **Who writes the study inputs.**
+    Question: "Decision 72: who may write the study inputs (search space,
+    evaluation protocol)? The evaluation protocol names an approver, but today
+    that's just whatever the caller writes."
+    Selected label: "Worker writes; approval later (Recommended)".
+    Option text as presented: "qw_worker records them (content-addressed,
+    append-only); the assessor only reads. The 'approved_by' stays caller-asserted
+    for now and is marked as such, like decision 43's marks, until a step-up
+    approval flow exists. Why: these are the job side's inputs, and their hashes are
+    already frozen into the protocol and plan, so a later write can't change a
+    frozen study; real approval needs its own step-up task."
+    Implemented by: T047 and T033 (the study input store).
+
+73. **Who writes and reads stored research datasets.**
+    Question: "Decision 73: who writes and reads the stored research datasets
+    (facts, universe)?"
+    Selected label: "Ingest writes; worker+assessor read (Recommended)".
+    Option text as presented: "qw_ingest (the data-loading role) writes; qw_worker
+    reads (development trials need datasets) and qw_assessor reads; qw_app nothing
+    until a route needs it. Why: datasets come from ingested data, not from jobs,
+    and both evaluation roles legitimately need them; keeping qw_app off matches the
+    other research stores."
+    Implemented by: T032 (the research dataset store).
+
+74. **Re-freezing a dataset or search space id.**
+    Question: "Decision 74: can a dataset or search space id be re-frozen with
+    different content?"
+    Selected label: "Refuse; new content = new id (Recommended)".
+    Option text as presented: "One content per id; a second, different freeze is
+    refused ('dataset_exists'). Why: like decision 52, there's never a choice of
+    which version a run used, so nobody can swap data under an id; a new id is
+    cheap."
+    Implemented by: T032 and T047 (the dataset and study input stores).
+
+75. **Purge or rights revocation of a frozen dataset.**
+    Question: "Decision 75: stored research facts may later need retention purges
+    or rights revocation (T023), but a frozen dataset is hash-bound and re-runs
+    (decision 59) need it unchanged. What happens when a frozen dataset's facts
+    must be purged or their rights are revoked?"
+    Selected label: "Refuse further use (Recommended)".
+    Option text as presented: "Purge or revocation is honored: the facts are
+    removed or marked revoked, and any run that needs the dataset afterwards refuses
+    ('dataset_purged' / rights refusal), even a pending re-run. Past verdicts keep
+    their hashes as evidence. Why: data rights and retention outrank research
+    convenience; nothing is silently kept, and the refusal is explicit rather than a
+    broken hash."
+    Implemented by: T032 and T023 (the research dataset store).
+
+76. **What the dataset content hash covers.**
+    Question: "Decision 76: a dataset's content hash omits each fact's instrument
+    and several other fields, yet the holdout split hides facts by instrument. Fix
+    the hash?"
+    Selected label: "Extend the hash to all fields (Recommended)".
+    Option text as presented: "Include every fact field (instrument, fiscal
+    year/period, form, filing and acceptance times, publication basis) in the
+    dataset content hash. Only synthetic data exists today, so changing every
+    manifest hash now costs nothing. Why: a field the split relies on must be bound,
+    or facts could be moved between instruments without changing the hash."
+    Implemented by: T032 (research datasets).
+
+77. **Where research-rights terms live and which time applies.**
+    Question: "Decision 77: a run checks research rights against terms (use scope,
+    jurisdiction, retention period) and a time. Where do those terms live, and which
+    time applies?"
+    Selected label: "On the dataset; DB clock (Recommended)".
+    Option text as presented: "Store the terms with the frozen dataset (checked when
+    frozen and again at each run), and check rights at the database clock's time of
+    use. Why: the terms belong to the data, and T021 says 'at' must be the time of
+    use from the server clock, so a caller can't pick a convenient time. A rights
+    change after freezing is then caught at run time."
+    Implemented by: T032 and T021, then T044 (the assessor run).
+
+78. **The candidate strategy manifest.**
+    Question: "Decision 78: the candidate strategy's manifest isn't stored; it can
+    be re-derived exactly from the base manifest, the search space and the
+    candidate's parameters. Store it, or re-derive it?"
+    Selected label: "Re-derive and check hash (Recommended)".
+    Option text as presented: "Re-derive it from stored inputs on load and require
+    its hash to match the bound one; no new table. qw_assessor gets read access to
+    strategy manifests but not adoption records. Why: everything it's built from is
+    already stored and hash-bound, so a separate copy adds a second source of truth
+    that could disagree."
+    Implemented by: T027 and T047, then T044 (the assessor run).
