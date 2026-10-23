@@ -17,6 +17,10 @@ needed before release tooling exists.
 Rows rewritten together with matching hashes (an owner bypassing triggers) are not
 detected; a changed body under the stored hashes is.
 
+`manifest` reads one manifest version without touching adoptions (owner decision
+78: qw_assessor reads manifests, not adoption records; 0043 grants it SELECT on
+`strategy_manifest` only). It verifies that row as `load` does, else `integrity`.
+
 Writers go through the domain: `record_manifest` (`register`: a changed manifest
 under a stored version is `immutable`, the same content is a no-op) and
 `record_adoption` (`adopt`: bounded configuration, registered manifest, receipts in
@@ -47,7 +51,7 @@ from qw_domain.rights import Use
 
 from qw_adapters.tenancy import Conn, TenantTx
 
-__all__ = ["Snapshot", "StrategyStoreError", "load", "record_adoption",
+__all__ = ["Snapshot", "StrategyStoreError", "load", "manifest", "record_adoption",
            "record_manifest", "snapshot"]  # fmt: skip
 TABLES = ("strategy_manifest", "strategy_adoption")
 _KEYS = {"strategy_id", "version", "family", "implementation_hash", "data",
@@ -132,19 +136,25 @@ def _rows(conn: Conn, sql: str, args: tuple[Any, ...] = ()) -> list[tuple[Any, .
     return [tuple(r) for r in conn.execute(sql, args).fetchall()]
 
 
+_MANIFEST = ("SELECT strategy_id, version, family, body, material_hash, content_hash "
+             "FROM app.strategy_manifest")  # fmt: skip
+
+
+def _verified(row: tuple[Any, ...]) -> sr.StrategyManifest:
+    """A stored manifest row: canonical body, and its columns match the rebuild."""
+    sid, ver, family, j, material, content = row
+    m = manifest_of(j)
+    if (sid, ver, family, material, content) != (m.strategy_id, m.version,
+            m.family.value, m.material_hash, m.content_hash):  # fmt: skip
+        raise ValueError(f"{sid}@{ver} does not match its hashes")
+    return m
+
+
 def _read(conn: Conn, tenant: str | None) -> tuple[sr.StrategyRegistry, list[Any]]:
     manifests, order = {}, []
-    for sid, ver, family, j, material, content in _rows(
-        conn,
-        "SELECT strategy_id, version, family, body, material_hash, content_hash "
-        "FROM app.strategy_manifest ORDER BY seq",
-    ):
-        m = manifest_of(j)
-        stored = (sid, ver, family, material, content)
-        if stored != (m.strategy_id, m.version, m.family.value, m.material_hash,
-                      m.content_hash):  # fmt: skip
-            raise ValueError(f"{sid}@{ver} does not match its hashes")
-        manifests[(sid, ver)] = m
+    for row in _rows(conn, _MANIFEST + " ORDER BY seq"):
+        m = _verified(row)
+        manifests[(m.strategy_id, m.version)] = m
         order.append(m)
     receipts: dict[tuple[str, str], list[sr.StrategyAdoption]] = defaultdict(list)
     if tenant is not None:
@@ -193,6 +203,34 @@ def snapshot(tx: TenantTx) -> Snapshot:
         raise StrategyStoreError("database", type(exc).__name__) from None
     latest = {m.strategy_id: m for m in order}  # registration order: last wins
     return Snapshot(reg, tuple(latest[k] for k in sorted(latest)), ensure_aware_utc(at))
+
+
+def manifest(
+    tx_or_conn: TenantTx | Conn, strategy_id: str, version: str
+) -> sr.StrategyManifest | None:
+    """One stored manifest version, re-verified as `load` does; `None` if absent.
+
+    Reads `strategy_manifest` only, never adoptions, so the assessor (owner
+    decision 78: manifests but not adoption records) can call it. Only the
+    requested row is checked: its body must rebuild through the domain and
+    re-encode exactly, and its id, version, family and both hashes must match the
+    rebuild, else `integrity`. The caller compares the result's hash with the one
+    it bound."""
+    conn = tx_or_conn.conn if isinstance(tx_or_conn, TenantTx) else tx_or_conn
+    try:
+        with conn.transaction():
+            _lock(conn, shared=True)
+            rows = _rows(conn, _MANIFEST + " WHERE strategy_id = %s AND version = %s",
+                         (strategy_id, version))  # fmt: skip
+    except psycopg.Error as exc:
+        raise StrategyStoreError("database", type(exc).__name__) from None
+    if not rows:
+        return None
+    try:
+        m = _verified(rows[0])
+    except (KeyError, TypeError, ValueError, AttributeError) as exc:  # StrategyError
+        raise StrategyStoreError("integrity", str(exc)) from None
+    return m  # the WHERE matched the columns, and the columns match the body
 
 
 @contextmanager
