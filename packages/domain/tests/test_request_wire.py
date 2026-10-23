@@ -188,6 +188,26 @@ BOOK_BAD = [
     (("reservations", 2, "actual"), "-1"),
     (("reservations", 4, "category"), "Research"),
 ]
+# #168 review F2 and F3: what no book method makes. Each is refused by that rule
+# alone (the dispatch history; the book's period and scope).
+BOOK_HISTORY = [
+    (("reservations", 0, "sends"), 1),  # a send never dispatched
+    (("reservations", 2, "dispatched"), False),  # settled, never dispatched
+    (("reservations", 4, "dispatched"), False),  # expired as charged, undispatched
+    (("reservations", 3, "dispatched"), True),  # released after a dispatch
+    (("period",), "2026-11"),  # the book's month is not its reservations'
+    (("reservations", 0, "period"), "2026-11"),
+    (("reservations", 0, "scope_id"), "tenant-synth-b"),
+    (("reservations", 0, "created_at"), "2026-09-30T23:00:00Z"),  # last month
+]
+
+
+@pytest.mark.parametrize(("path", "value"), BOOK_HISTORY)
+def test_book_wire_holds_dispatch_history_and_period(
+    path: tuple[Any, ...], value: object
+) -> None:
+    with pytest.raises(BudgetError, match="book_wire"):
+        BudgetBook.from_wire(_edit(full_book().to_wire(), path, value))
 
 
 @pytest.mark.parametrize(("path", "value"), BOOK_BAD)

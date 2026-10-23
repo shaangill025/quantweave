@@ -229,6 +229,25 @@ def test_decision_42_the_happy_path_reserves_then_records(
     assert reads == [(1, "acc-p", lg.access("acc-p").to_wire())]
 
 
+def test_decision_66_the_verdict_carries_the_caller_supplied_marks(
+    wrk: Conn, asr: Conn, conn: Conn, w: World, app_conn: Conn
+) -> None:
+    go(wrk, asr, w)
+    marks = "SELECT ledger_caller_supplied, book_caller_supplied FROM "
+    marks += "app.evaluation_receipt WHERE verdict_id = 'v-p'"
+    with tn.tenant_transaction(app_conn, w.t) as tx:  # reviewers read them
+        assert tx.conn.execute(marks).fetchall() == [(True, True)]
+    conn.execute("ALTER TABLE app.evaluation_receipt DISABLE TRIGGER USER")
+    for value in ("NULL", "false"):  # decision 43: caller-supplied until T032/T037
+        with pytest.raises(errors.CheckViolation), conn.transaction():
+            conn.execute(f"UPDATE app.evaluation_receipt SET ledger_caller_supplied "
+                         f"= {value}")  # fmt: skip
+    conn.execute("ALTER TABLE app.evaluation_receipt DROP CONSTRAINT "
+                 "evaluation_receipt_caller_marks")  # fmt: skip
+    conn.execute("UPDATE app.evaluation_receipt SET book_caller_supplied = false")
+    assert code(lambda: stored(asr, w)) == "integrity"  # the marks are hashed
+
+
 def test_decision_42_the_read_is_recorded_before_any_data_is_opened(
     wrk: Conn, asr: Conn, conn: Conn, w: World, monkeypatch: pytest.MonkeyPatch
 ) -> None:

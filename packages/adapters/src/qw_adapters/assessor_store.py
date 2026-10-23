@@ -236,6 +236,8 @@ def receipts(tx: TenantTx, eid: str) -> list[Receipt]:
         extra = (r["scored_seq"], r["ledger_entries"], r["ledger_digest"])
         counted = (r["family_trials"], r["chain_trials"])  # None on 0028 rows
         tail = [] if counted == (None, None) else list(counted)
+        marks = (r["ledger_caller_supplied"], r["book_caller_supplied"])  # 0042
+        tail += [] if marks == (None, None) else list(marks)
         return (v, *extra), [v.wire(), r["plan_id"], *extra, *tail]
 
     rows = _select(tx, "SELECT * FROM app.evaluation_receipt WHERE tenant_id = %s "
@@ -426,4 +428,7 @@ def put_verdict(tx: TenantTx, p: im.Protocol, v: im.Verdict,
         "plan_id": p.plan_id, "scored_seq": seq, "ledger_entries": n,
         "ledger_digest": d, "family_trials": family, "chain_trials": chain,
         "adjustment": Jsonb(w["adjustment"]) if "adjustment" in w else None,
-    }, [w, p.plan_id, seq, n, d, family, chain])  # fmt: skip
+        # decisions 43 and 66: the ledger and the book are the caller's until the
+        # T032 and T037 stores exist
+        "ledger_caller_supplied": True, "book_caller_supplied": True,
+    }, [w, p.plan_id, seq, n, d, family, chain, True, True])  # fmt: skip
