@@ -498,9 +498,62 @@ class Verdict:
                                    sorted(self.adjustment.items())}}
                    if self.adjustment else {})}  # fmt: skip
 
+    @classmethod
+    def from_wire(cls, w: Mapping[str, Any]) -> "Verdict":
+        """The inverse of `wire` (a stored copy, owner decision 71), strictly: JSON
+        strings and lists only, finite canonical decimal strings and the UTC `Z`
+        instant; it must give `w` back exactly, else `verdict_wire`."""
+
+        def bad(what: str) -> ImprovementError:
+            return ImprovementError("verdict_wire", what)
+
+        if not isinstance(w, Mapping) or set(w) - {"adjustment"} != _VERDICT_KEYS:
+            raise bad("keys")
+
+        def strs(k: str) -> tuple[str, ...]:
+            if type(w[k]) is not list or any(type(x) is not str for x in w[k]):
+                raise bad(k)
+            return tuple(w[k])
+
+        def decimals(k: str) -> dict[str, Decimal]:
+            v = w.get(k, {})
+            if type(v) is not dict or not all(
+                type(n) is str and type(x) is str and _DECIMAL.fullmatch(x)
+                for n, x in v.items()
+            ):  # fmt: skip
+                raise bad(k)
+            return {n: Decimal(x) for n, x in v.items()}  # wire() re-checks str()
+
+        d, at, a = w["decision"], w["assessed_at"], strs("assessor")
+        if type(d) is not str or d not in set(Decision) or len(a) != 4:
+            raise bad("decision or assessor")
+        try:
+            when = parse_instant(at)
+        except (ValueError, TypeError):
+            raise bad("assessed_at") from None
+        v = cls(_id(w["verdict_id"], "verdict_id"),
+                _id(w["experiment_id"], "experiment_id"),
+                _id(w["candidate_id"], "candidate_id"),
+                _sha(w["candidate_hash"], "candidate_hash"),
+                _sha(w["protocol_hash"], "protocol_hash"), Party(*a), Decision(d),
+                strs("reasons"), decimals("scores"), strs("trial_ids"),
+                strs("failed_trial_ids"), strs("limitations"), when,
+                decimals("adjustment"))  # fmt: skip
+        if v.wire() != dict(w):
+            raise bad(v.verdict_id)
+        return v
+
     @property
     def requires_human_promotion(self) -> bool:
         return True  # experiment.schema.json const; no path here promotes
+
+
+_VERDICT_KEYS = frozenset({
+    "verdict_id", "experiment_id", "candidate_id", "candidate_hash", "protocol_hash",
+    "assessor", "decision", "reasons", "scores", "trial_ids", "failed_trial_ids",
+    "limitations", "assessed_at",
+})  # fmt: skip
+_DECIMAL = re.compile(r"-?[0-9]+(\.[0-9]+)?(E[+-][0-9]+)?")  # finite, as str() writes
 
 
 type Entry = Protocol | Candidate | Verdict

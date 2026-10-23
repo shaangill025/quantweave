@@ -5,7 +5,7 @@
 import ast
 import json
 from dataclasses import replace
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
 
@@ -944,3 +944,69 @@ def test_decision_36_count_based_targets_flag_the_missing_adjustment() -> None:
 
 def test_the_fixture_plan_freezes_test_backtests_protocol() -> None:
     assert EVAL.content_hash == bt_protocol().content_hash  # one SYNTHETIC protocol
+
+
+def test_decision_71_verdict_wire_round_trips_strictly() -> None:
+    accepted = assess(registry(), promo_ledger(GOOD))
+    blocked = assess(registry(), promo_ledger(GOOD), assessor=PRODUCER)
+    assert accepted.adjustment and blocked.decision is im.Decision.BLOCKED
+    for v in (accepted, blocked):
+        w = json.loads(json.dumps(v.wire()))  # as stored in jsonb
+        back = im.Verdict.from_wire(w)
+        assert back == v and back.wire() == v.wire() == w
+        assert all(type(x) is Decimal for x in back.scores.values())
+    assert (
+        im.Verdict.from_wire(
+            json.loads(
+                json.dumps(
+                    replace(
+                        accepted,
+                        assessed_at=AT.astimezone(timezone(timedelta(hours=-5))),
+                    ).wire()
+                )
+            )
+        ).assessed_at
+        == AT
+    )  # an offset is normalized to UTC Z on the wire
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        {"scores": {"net_return": 2}},  # a JSON number, not a decimal string
+        {"scores": {"net_return": "1e2"}},  # not canonical (str gives 1E+2)
+        {"scores": {"net_return": " 0.02"}},
+        {"scores": {"net_return": "NaN"}},
+        {"scores": {"net_return": "Infinity"}},
+        {"scores": {"net_return": True}},
+        {"adjustment": {}},  # absent when empty, never an empty object
+        {"adjustment": {"z": 3}},
+        {"assessed_at": "2026-01-02T03:04:05+00:00"},  # not the UTC Z form
+        {"assessed_at": "2026-01-02T03:04:05"},  # naive
+        {"assessed_at": 0},
+        {"decision": "promote"},
+        {"decision": True},
+        {"reasons": "evidence"},  # a string, not a list
+        {"reasons": [1]},
+        {"trial_ids": [None]},
+        {"limitations": "synthetic_only"},
+        {"verdict_id": "bad id"},
+        {"candidate_hash": "a" * 63},
+        {"protocol_hash": "A" * 64},
+        {"assessor": ["actor-synth", "route-b", "family-b"]},
+        {"extra": "x"},
+        {"verdict_id": None},
+    ],
+)
+def test_decision_71_verdict_from_wire_refuses_non_canonical_forms(
+    change: dict[str, object],
+) -> None:
+    w = json.loads(json.dumps(assess(registry(), promo_ledger(GOOD)).wire()))
+    with pytest.raises(im.ImprovementError):  # verdict_wire or the id/hash check
+        im.Verdict.from_wire(w | change)
+    missing = {k: x for k, x in w.items() if k != "trial_ids"}
+    with pytest.raises(im.ImprovementError, match="verdict_wire"):
+        im.Verdict.from_wire(missing)
+    reasons = w | {"reasons": ["forged"]}  # an accept carries no reason
+    with pytest.raises(im.ImprovementError, match="verdict_inconsistent"):
+        im.Verdict.from_wire(reasons)

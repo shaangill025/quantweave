@@ -14,12 +14,15 @@ from typing import Any
 
 import psycopg
 import pytest
+from qw_adapters import assessor_store as ast
+from qw_adapters import experiment_registry_store as ers
 from qw_adapters import experiment_store as es
 from qw_adapters import tenancy as tn
 from qw_adapters.migrations import MIGRATIONS_DIR, migrate
 from qw_domain import improvement as im
 from qw_domain import trial_ledger as tl
 from qw_domain.budget import BudgetBook
+from qw_domain.feedback import Access, ImprovementEvidence, Purpose
 from test_improvement import (
     ASSESSOR,
     AT,
@@ -44,7 +47,11 @@ def reg_for(t: uuid.UUID, eid: str = EXP, target: im.Target = im.Target.STRATEGY
     p = proto(scope_id=str(t), experiment_id=eid, target=target, baseline_version=base,
               budget_reservation_id=bud, sandbox_profile_id="sbx-synth")  # fmt: skip
     return im.ExperimentRegistry(str(t)).register(p).register_candidate(
-        cand(experiment_id=eid, target=target, parent_id=base))  # fmt: skip
+        cand(cid(eid), experiment_id=eid, target=target, parent_id=base))  # fmt: skip
+
+
+def cid(eid: str) -> str:  # decision 80: a candidate id is unique in the tenant
+    return "cand-1" if eid == EXP else f"cand-{eid}"
 
 
 def empty(t: uuid.UUID) -> BudgetBook:
@@ -67,7 +74,7 @@ Pair = tuple[Conn, Conn]  # (the qw_worker connection, the qw_assessor connectio
 def put(conns: Pair, t: uuid.UUID, reg: im.ExperimentRegistry, book: BudgetBook,
         *rest: Any, eid: str = EXP) -> tuple[es.Revision, bool]:  # fmt: skip
     worker, assessor = conns
-    return es.record(worker, assessor, t, reg, eid, "cand-1", plan(), book, *rest)
+    return es.record(worker, assessor, t, reg, eid, cid(eid), plan(), book, *rest)
 
 
 @pytest.fixture
@@ -300,7 +307,7 @@ def legacy(t: uuid.UUID, eid: str = EXP, target: im.Target = im.Target.STRATEGY,
            bud: str = "bud-exp-1") -> list[im.ExperimentRecord]:  # fmt: skip
     """0.5.0 (PR #126) records of one experiment, as 0026 stored them."""
     reg = reg_for(t, eid, target, bud)
-    first = im.record(reg, eid, "cand-1", plan(), empty(t))
+    first = im.record(reg, eid, cid(eid), plan(), empty(t))
     if target is OPT:  # 0.5.0: code and optimizer stayed proposed
         return [replace(first, state=im.RecordState.PROPOSED)]
     old = tuple(sorted({*first.reasons} - {"none:parent_optimizer_version"} | {
@@ -377,3 +384,95 @@ def test_0026_rows_stay_readable_after_0027(conn: Conn, tmp_path: Any) -> None:
     with pytest.raises(psycopg.errors.CheckViolation):  # new rows: 0.6.0 only
         conn.execute(copy("'exp-n'", "tenant_id", "scope_id", "1", "'bud-n'", "NULL",
                           state="'proposed'"))  # fmt: skip
+
+
+def db_now(tx: tn.TenantTx) -> datetime:
+    row = tx.conn.execute("SELECT clock_timestamp()").fetchone()
+    assert row is not None
+    return row[0]  # type: ignore[no-any-return]
+
+
+def logged(assessor: Conn, t: uuid.UUID) -> list[tuple[str, str]]:
+    with tn.tenant_transaction(assessor, t) as tx:
+        reg = ers.load(tx, str(t), db_now(tx))
+    return [ers._ident(e) for e in reg.entries]
+
+
+def test_decisions_79_and_81_record_logs_what_it_binds_and_its_verdict_once(
+    wa: Pair, tenants: tuple[uuid.UUID, uuid.UUID]
+) -> None:
+    a, _ = tenants
+    reg = reg_for(a)
+    put(wa, a, reg, booked(reg), im.Scheduled(EXP, "bud-exp-1"))  # bind mirrors
+    assert logged(wa[1], a) == [("protocol", EXP), ("candidate", "cand-1")]
+    rev, _ = put(wa, a, reg, booked(reg), None, run(a))
+    assert rev.record.verdict_id == "v-1"
+    entries = [("protocol", EXP), ("candidate", "cand-1"), ("verdict", "v-1")]
+    assert logged(wa[1], a) == entries
+    with tn.tenant_transaction(wa[1], a) as tx:
+        (v, *_), = ast.receipts(tx, EXP)  # fmt: skip
+        assert ers.load(tx, str(a), db_now(tx)).verdicts("cand-1") == (v,)
+    assert put(wa, a, reg, booked(reg), None, run(a))[1] is False  # the same verdict
+    assert logged(wa[1], a) == entries  # once
+
+
+def test_decision_79_a_moved_head_rolls_phase_2_back_and_the_retry_completes(
+    wa: Pair, tenants: tuple[uuid.UUID, uuid.UUID], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    a, _ = tenants
+    reg = reg_for(a)
+    put(wa, a, reg, booked(reg), im.Scheduled(EXP, "bud-exp-1"))
+    real = ers.verdict_head
+
+    def stale(tx: tn.TenantTx, v: im.Verdict) -> ers.Head:
+        h = real(tx, v)
+        assert h is not None
+        return replace(h, seq=1)  # not the head: the log "moved"
+
+    monkeypatch.setattr(ers, "verdict_head", stale)
+    with pytest.raises(es.ExperimentStoreError) as moved:
+        put(wa, a, reg, booked(reg), None, run(a))
+    assert moved.value.code == "registry_moved"
+    assert call(wa[0], a, "load", EXP).revision == 1  # no revision without it
+    monkeypatch.setattr(ers, "verdict_head", real)
+    rev, wrote = put(wa, a, reg, booked(reg), None, run(a))  # the identical retry
+    assert wrote and rev.revision == 2 and logged(wa[1], a)[-1] == ("verdict", "v-1")
+
+
+def test_decision_80_a_candidate_id_is_unique_in_the_tenant(
+    wa: Pair, tenants: tuple[uuid.UUID, uuid.UUID]
+) -> None:
+    a, b = tenants
+    put(wa, a, reg_for(a), empty(a))
+    p = reg_for(a, "exp-2", bud="bud-2").protocol("exp-2")
+    reuse = (
+        im.ExperimentRegistry(str(a))
+        .register(p)
+        .register_candidate(cand(experiment_id="exp-2"))
+    )  # cand-1 again, under another experiment
+    with pytest.raises(es.ExperimentStoreError) as dup:
+        es.record(*wa, a, reuse, "exp-2", "cand-1", plan(), empty(a))
+    assert dup.value.code == "duplicate"
+    with tn.tenant_transaction(wa[1], a) as tx:
+        assert ast.load_protocol(tx, "exp-2") is None  # bind rolled back with it
+    assert call(wa[0], a, "load", "exp-2") is None
+    put(wa, b, reg_for(b), empty(b))  # another tenant may use the same id
+
+
+def test_decision_81_bind_re_checks_each_candidates_evidence(
+    wa: Pair, tenants: tuple[uuid.UUID, uuid.UUID]
+) -> None:
+    a, _ = tenants
+    store = ImprovementEvidence()
+    use = store.select(str(a), EXP, Purpose.PERSONAL_ADAPTATION, Access.DEVELOPMENT,
+                       AT).use  # fmt: skip
+    p = reg_for(a).protocol(EXP)
+    reg = im.ExperimentRegistry(str(a)).register(p).register_candidate(
+        cand(evidence_uses=(use,)), store)  # fmt: skip
+    for evidence in (None, ImprovementEvidence()):
+        with pytest.raises(es.ExperimentStoreError, match="evidence_not_logged"):
+            es.record(*wa, a, reg, EXP, "cand-1", plan(), empty(a), evidence=evidence)
+        with tn.tenant_transaction(wa[1], a) as tx:
+            assert ast.load_protocol(tx, EXP) is None
+    _, wrote = es.record(*wa, a, reg, EXP, "cand-1", plan(), empty(a), evidence=store)
+    assert wrote and logged(wa[1], a) == [("protocol", EXP), ("candidate", "cand-1")]
