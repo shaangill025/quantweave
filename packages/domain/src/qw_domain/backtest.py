@@ -40,14 +40,20 @@ Stdlib only.
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from datetime import date, datetime
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from enum import StrEnum
+from typing import Any, Self
 
 from qw_domain.decimal_math import CTX, PRECISION, div
 from qw_domain.eval_stats import HacInterval, StatsError, Summary, mean, summarize
 from qw_domain.filings import AsOfView
 from qw_domain.identity import InstrumentId
-from qw_domain.instants import ensure_aware_utc, format_instant
+from qw_domain.instants import (
+    InstantError,
+    ensure_aware_utc,
+    format_instant,
+    parse_instant,
+)
 from qw_domain.research_data import (
     EvidenceClass,
     ResearchDataset,
@@ -97,6 +103,17 @@ class PriceBar:
         times = [format_instant(t) for t in (self.start, self.end, self.known_at)]
         return [*times, str(self.open), str(self.close)]
 
+    @classmethod
+    def from_wire(cls, w: object) -> Self:
+        """Five strings: UTC instants and decimal strings (never JSON numbers)."""
+        if type(w) is not list or len(w) != 5 or not all(type(x) is str for x in w):
+            raise ResearchError("bar", "five strings are required")
+        try:
+            start, end, known = (parse_instant(x) for x in w[:3])
+            return cls(start, end, known, Decimal(w[3]), Decimal(w[4]))
+        except (InstantError, InvalidOperation) as exc:
+            raise ResearchError("bar", type(exc).__name__) from None
+
 
 @dataclass(frozen=True, slots=True)
 class PriceSeries:
@@ -119,12 +136,40 @@ class PriceSeries:
         if any(a.end > b.start for a, b in zip(self.bars, self.bars[1:], strict=False)):
             raise ResearchError("bar_order", "bars are chronological, non-overlapping")
 
+    def to_wire(self) -> dict[str, Any]:
+        """The body `content_hash` digests (owner decision 41: the protected
+        holdout_series store keeps it)."""
+        return {"series_id": self.series_id, "tenant_id": self.tenant_id,
+                "instrument": self.instrument.to_wire(),
+                "evidence_class": self.evidence_class.value,
+                "bars": [b.to_wire() for b in self.bars]}  # fmt: skip
+
+    @classmethod
+    def from_wire(cls, w: object) -> Self:
+        """Canonical input only: it must re-serialize to the same wire, so an
+        offset other than `Z`, an exponent or any extra key is refused, never
+        normalized."""
+        keys = {"series_id", "tenant_id", "instrument", "evidence_class", "bars"}
+        if type(w) is not dict or set(w) != keys:
+            raise ResearchError("series_wire", "an object with exactly the series keys")
+        if not all(type(w[k]) is str for k in keys - {"bars"}):
+            raise ResearchError("series_wire", "string fields are required")
+        if type(w["bars"]) is not list:
+            raise ResearchError("series_wire", "bars must be a list")
+        try:
+            instrument = InstrumentId.from_wire(w["instrument"])
+            evidence = EvidenceClass(w["evidence_class"])
+        except ValueError as exc:  # IdentityError and the enum's
+            raise ResearchError("series_wire", type(exc).__name__) from None
+        s = cls(w["series_id"], w["tenant_id"], instrument, evidence,
+                tuple(PriceBar.from_wire(b) for b in w["bars"]))  # fmt: skip
+        if s.to_wire() != w:
+            raise ResearchError("series_wire", "not the canonical wire form")
+        return s
+
     @property
     def content_hash(self) -> str:
-        return digest({"series_id": self.series_id, "tenant_id": self.tenant_id,
-                       "instrument": self.instrument.to_wire(),
-                       "evidence_class": self.evidence_class.value,
-                       "bars": [b.to_wire() for b in self.bars]})  # fmt: skip
+        return digest(self.to_wire())
 
 
 @dataclass(frozen=True, slots=True)
