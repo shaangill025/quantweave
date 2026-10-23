@@ -71,3 +71,73 @@ below waives a test, gate or spec requirement. Numbering continues from
     keeps the promise visible in the contract and honest about the gap; nothing is
     invented, and clients won't need a contract change later."
     Implemented by: T055 (the release-history read).
+
+## Assessor-run promotion re-runs
+
+59. **More than one crash re-run.**
+    Question: "Decision 59: decision 42 allows 're-run once' after a crash. If the
+    re-run also crashes, the next call is refused and the plan's one-time holdout
+    read is permanently spent, which decision 42's reasoning ('an infrastructure
+    hiccup would permanently burn a holdout window') wanted to avoid. Allow more
+    crash re-runs?"
+    Selected label: "Up to 3, same digest (Recommended)".
+    Option text as presented: "Allow up to three re-runs, each under exactly the
+    same recorded read and input digest, then stop. Why: each re-run is
+    deterministic on the same inputs, so it learns nothing new and is not a second
+    look; a small fixed cap handles repeated infrastructure failures without
+    allowing endless retries. Not 'unlimited': a fixed limit keeps the rule
+    auditable."
+    Implemented by: T044 (decision 39, the assessor-run promotion).
+
+60. **Comparing a re-run when no receipt was stored.**
+    Question: "Decision 60: 'if the result differs, refuse as a conflict' can only
+    be checked when the first attempt's receipt was stored. A crash after
+    evaluating but before storing leaves nothing to compare. Record the outcome
+    first?"
+    Selected label: "Record outcome digest first (Recommended)".
+    Option text as presented: "Right after evaluation, durably record a digest of
+    the trial outcome before the receipt. Every re-run is then compared against it,
+    and a different result is refused as a conflict. Why: it makes decision 42's
+    conflict check work for every crash point, not just some, and a
+    non-deterministic strategy is caught."
+    Implemented by: T044 (decision 39, the assessor-run promotion).
+
+61. **Loading the protected series before the reservation.**
+    Question: "Decision 61: before reserving the read, the run loads and
+    hash-checks the protected holdout series (without evaluating it), so a missing
+    series is refused without spending the read. Does loading count as 'opening'
+    the holdout?"
+    Selected label: "Loading is not opening (Recommended)".
+    Option text as presented: "Keep it: loading and verifying stored series is a
+    technical check that nobody and no strategy sees; 'opening' means evaluating a
+    strategy on it. Why: refusing a missing or tampered series before the
+    reservation saves the read from being burned by a data-loading fault, and no
+    information about the data reaches anyone."
+    Implemented by: T044 (decision 39, the assessor-run promotion).
+
+62. **Certain BLOCKED verdicts before the read.**
+    Question: "Decision 62: some BLOCKED verdicts (sandbox unavailable, assessor not
+    registered, budget reservation, plan problems) are certain before the read, but
+    the run still spends the read to record them. Refuse those before the read
+    too?"
+    Selected label: "Refuse before read (Recommended)".
+    Option text as presented: "Extend decision 50's rule: any cause that is known
+    before the read and would certainly give BLOCKED refuses up front, so the read
+    is kept. Why: the same reasoning as decision 50; spending the one-time read on
+    an outcome known in advance wastes it. The refusal is still recorded as a job
+    failure, so nothing is hidden."
+    Implemented by: T044 (decision 39, the assessor-run promotion).
+
+## Release history events
+
+63. **Release fields on deployment events.**
+    Question: "Decision 63: in the deployment-events list, which release fields
+    does each event show? A rollback withdraws one release and restores another; the
+    stored row also names the withdrawn release as its 'release_id'."
+    Selected label: "Rollback: from/to only (Recommended)".
+    Option text as presented: "Install and pause show release_id; a rollback shows
+    from_release_id (withdrawn) and to_release_id (restored), with release_id null.
+    Why: each field has one meaning across all kinds, so a client can't mistake a
+    withdrawn release for an installed one; the schema enforces which fields each
+    kind fills."
+    Implemented by: T055 (the release-history read).
