@@ -11,6 +11,7 @@ dependencies = [
 
 [project.scripts]
 qw-worker = "qw_worker.__main__:main"
+qw-assessor = "qw_worker.assessor:main"
 
 [tool.uv.sources]
 qw-adapters = { workspace = true }

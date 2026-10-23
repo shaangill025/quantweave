@@ -25,6 +25,7 @@ from psycopg import sql as pgsql
 from psycopg.conninfo import make_conninfo
 from qw_adapters import assessment_request_store as ars
 from qw_adapters import assessor_run as ar
+from qw_adapters import strategy_implementations as sim
 from qw_adapters import tenancy as tn
 from qw_domain import strategy_improvement as si
 from qw_domain.research_data import digest
@@ -101,8 +102,12 @@ def test_round_trip_keeps_ledger_book_strategy_and_input_hashes(
     n = len(w.ledger.entries)
     assert n == 2 and s.ledger.checkpoint(n) == w.ledger.checkpoint(n)
     m = fx.STRATS.manifest(fx.BASE.strategy_id, "cand-1")
-    assert s.strategy == ars.StrategyRef(fx.BASE.strategy_id, "cand-1",
-                                         m.implementation_hash)  # fmt: skip
+    # decisions 65, 68 and 69: the reviewed base strategy and its registry hash
+    assert s.strategy == sim.StrategyRef(fx.BASE.strategy_id, fx.BASE.version,
+        sim.implementation_hash(fx.BASE.strategy_id, fx.BASE.version,
+                                _run.synth_win)) == r.strategy  # fmt: skip
+    assert s.body["strategy"] == [fx.BASE.strategy_id, "0.1.0",
+                                  r.strategy.implementation_hash]  # fmt: skip
     st = w.study
     assert s.body["inputs"] == {  # independent oracle for each binding
         "study": digest(["strategy_study", st.protocol.content_hash,
@@ -128,6 +133,7 @@ def test_round_trip_keeps_ledger_book_strategy_and_input_hashes(
         ("instrument", lambda w: {"instrument": iid(4)}),
         ("access_id", lambda w: {"access_id": "acc-q"}),
         ("assessor", lambda w: {"assessor": PRODUCER}),
+        ("strategy", lambda w: {"strategy": _run.ref(_run.synth_held)}),
         ("inputs.rights", lambda w: {"rights": replace(w.rights, at=fx.AT_P)}),
         ("inputs.rights", lambda w: {"rights": replace(w.rights, registry=Registry())}),
         (

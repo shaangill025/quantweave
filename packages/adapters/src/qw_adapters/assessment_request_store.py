@@ -3,11 +3,13 @@ owner decisions 43, 64, 65 and 67). The caller of an assessor-run promotion keep
 its request durably here until the run returns:
 - `describe(request)`: the stored form. The caller-supplied trial ledger and
   budget book in full (decision 67; the domain wire forms), the strategy
-  reference: id, version and implementation hash of the manifest the run builds
-  (decision 65), and every other input by content hash (decision 67):
+  reference `r.strategy` (decisions 65, 68 and 69: the reviewed base strategy's
+  id and version and its registry implementation hash,
+  `strategy_implementations.StrategyRef`), and every other input by content hash
+  (decision 67):
   `study` (protocol, search space, evaluation protocol and base manifest
   hashes), `registry` (every experiment-registry entry's wire), `strategy_manifest`
-  (that manifest's material hash), `dataset` (its manifest content hash, which
+  (the candidate manifest's material hash), `dataset` (its manifest content hash, which
   covers every record) and `rights` (defined here: the rights terms and the
   research-use decision for each dataset feed at `rights.at`, so the registry is
   bound by its effect on this dataset, not by its full body). The ids, time,
@@ -21,8 +23,8 @@ its request durably here until the run returns:
 - `check(stored, request)`: what the run calls before it acts; any difference is
   `request_mismatch`, naming the fields.
 Any other login is `forbidden` (the database refuses it). LIMITATIONS: nothing
-calls `load` or `check` yet (the wiring increment); `build` is resolved by the
-qw-assessor process's reviewed registry, not built yet (decision 65); decision
+calls `load` or `check` yet (the wiring increment); the reference is resolved by
+the qw-assessor process's reviewed registry (`assessor.STRATEGIES`); decision
 43's caller-supplied marks go on the verdict record (decision 66), not here."""
 
 from __future__ import annotations
@@ -48,6 +50,7 @@ from qw_domain.rights import Use, check_use
 from qw_domain.trial_ledger import TrialLedger
 
 from qw_adapters.assessor_run import Request
+from qw_adapters.strategy_implementations import StrategyRef
 from qw_adapters.tenancy import TenantTx
 
 _COLS = ("experiment_id", "verdict_id", "body", "recorded_at", "request_hash")
@@ -57,13 +60,6 @@ class AssessmentRequestError(Exception):
     def __init__(self, code: str, message: str = "") -> None:
         super().__init__(f"{code}: {message}")
         self.code = code
-
-
-@dataclass(frozen=True, slots=True)
-class StrategyRef:  # decision 65
-    strategy_id: str
-    version: str
-    implementation_hash: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -111,7 +107,7 @@ def describe(r: Request) -> dict[str, Any]:
     """The stored form of `r` (decisions 65 and 67)."""
     try:
         m = r.strategies.manifest(r.study.base.strategy_id, r.candidate_id)
-        a = r.assessor
+        a, ref = r.assessor, r.strategy
         return {
             "experiment_id": r.study.protocol.experiment_id,
             "verdict_id": r.verdict_id, "candidate_id": r.candidate_id,
@@ -119,7 +115,7 @@ def describe(r: Request) -> dict[str, Any]:
             "at": format_instant(r.at), "instrument": r.instrument.to_wire(),
             "assessor": [a.actor_id, a.route_id, a.family_id, a.version],
             "ledger": r.ledger.to_wire(), "book": r.book.to_wire(),
-            "strategy": [m.strategy_id, m.version, m.implementation_hash],
+            "strategy": [ref.strategy_id, ref.version, ref.implementation_hash],
             "inputs": {"study": study_hash(r.study),
                        "registry": registry_hash(r.registry),
                        "strategy_manifest": m.material_hash,
@@ -184,18 +180,18 @@ def load(tx: TenantTx, experiment_id: str, verdict_id: str) -> StoredRequest | N
         ledger = TrialLedger.from_wire(body["ledger"])
         book = BudgetBook.from_wire(body["book"])
         ref = body["strategy"]
+        if type(ref) is not list or len(ref) != 3:
+            raise ValueError("strategy")
+        strategy = StrategyRef(*ref)  # validated (decision 65)
         if (
             r["request_hash"] != _hash(tx, body, at)
             or (r["experiment_id"], r["verdict_id"]) != (experiment_id, verdict_id)
             or ledger.tenant_id != str(tx.tenant_id)
-            or type(ref) is not list
-            or len(ref) != 3
-            or not all(type(x) is str for x in ref)
         ):
             raise ValueError("assessment_request")
     except (ValueError, TypeError, KeyError) as exc:  # ResearchError, BudgetError
         raise AssessmentRequestError("integrity", type(exc).__name__) from None
-    return StoredRequest(experiment_id, verdict_id, ledger, book, StrategyRef(*ref),
+    return StoredRequest(experiment_id, verdict_id, ledger, book, strategy,
                          body, at, r["request_hash"])  # fmt: skip
 
 

@@ -24,25 +24,29 @@ re-runs under the recorded read, at most three times (attempts 2 to 4): same
 read, candidate, protocol and inputs (`inputs_digest`; any difference is
 `rerun_mismatch`), no new read. A different result is `verdict_conflict` once an
 outcome is recorded (decision 60; also `store_verdict` once a receipt is). A
-fifth attempt is `rerun_used`, and a recorded run is `holdout_used`. Decision 61:
+fifth attempt is `rerun_used`, and a recorded run is `run_recorded`. Decision 61:
 loading and verifying the stored series in phase 0 is not opening it; opening is
-the evaluation. The caller keeps the request (and its pre-read ledger) durably
-until a run returns, and persists the returned ledger.
+the evaluation. Decision 65: the request names its strategy code by `StrategyRef`,
+resolved through the process's reviewed registry before phase 0 (unregistered,
+changed or another strategy's code is refused), and the reference with its
+implementation hash is in the input digest, so changed code is `rerun_mismatch`.
+The caller keeps the request (and its pre-read ledger) durably until a run
+returns, and persists the returned ledger.
 LIMITATIONS: the ledger and budget book are still the caller's (decision 43's
-marks are not added here); the strategy code (`build`) is not in the input
-digest (decision 49), so a crash after the evaluation and before the outcome is
-recorded leaves no earlier result to compare."""
+marks are not added here); a crash after the evaluation and before the outcome is
+recorded leaves no earlier result to compare. A reservation made before decision
+65 (0038 and 0040 rows) carries a digest without the reference, so its re-run is
+`rerun_mismatch`: refused, never misread; no stored row changes."""
 
 from __future__ import annotations
 
 import uuid
-from collections.abc import Callable, Mapping
 from dataclasses import dataclass, replace
 from datetime import datetime
 
 from qw_domain import improvement as im
 from qw_domain import strategy_improvement as si
-from qw_domain.backtest import Strategy, TrialOutcome
+from qw_domain.backtest import TrialOutcome
 from qw_domain.budget import BudgetBook
 from qw_domain.identity import InstrumentId
 from qw_domain.instants import ensure_aware_utc, format_instant
@@ -52,13 +56,14 @@ from qw_domain.research_data import (
     ResearchRights,
     digest,
 )
-from qw_domain.strategy_registry import ParamValue, StrategyRegistry
+from qw_domain.strategy_registry import StrategyRegistry
 from qw_domain.trial_ledger import Access, TrialLedger
 
 from qw_adapters import assessor_store as ast
 from qw_adapters import experiment_store as es
 from qw_adapters import holdout_series_store as hs
 from qw_adapters.assessor_store import ExperimentStoreError
+from qw_adapters.strategy_implementations import Implementations, StrategyRef
 from qw_adapters.tenancy import Conn, TenantTx, tenant_transaction
 
 
@@ -74,7 +79,7 @@ class Request:
     dataset: ResearchDataset
     rights: ResearchRights
     instrument: InstrumentId  # the plan's holdout series to evaluate on
-    build: Callable[[Mapping[str, ParamValue]], Strategy]
+    strategy: StrategyRef  # resolved through the reviewed registry (decision 65)
     book: BudgetBook
     assessor: im.Party
     at: datetime  # the read, the trial and the verdict
@@ -93,7 +98,8 @@ class Run:
 
 
 def _inputs(r: Request, p: im.Protocol, a: Access, data: si.HoldoutData) -> str:
-    """The digest of everything the run and its verdict depend on, but the code."""
+    """The digest of everything the run and its verdict depend on; the code by
+    its reviewed implementation hash (decision 65)."""
     n = len(r.ledger.entries)
     c = r.registry.candidate(r.candidate_id)
     res = r.book.find(p.budget_reservation_id)
@@ -106,13 +112,18 @@ def _inputs(r: Request, p: im.Protocol, a: Access, data: si.HoldoutData) -> str:
         r.dataset.manifest.content_hash, r.study.evaluation.content_hash,
         [r.rights.tenant_id, format_instant(r.rights.at)],
         None if res is None else res.to_wire(), r.book.scope_id,
+        [r.strategy.strategy_id, r.strategy.version, r.strategy.implementation_hash],
     ])  # fmt: skip
 
 
-def _recorded(tx: TenantTx, eid: str, vid: str) -> bool:
+def _recorded(tx: TenantTx, eid: str, vid: str, cid: str) -> bool:
+    """A revision records this verdict for this candidate (`candidate_version`
+    holds the candidate id): the run is done. Another candidate's revision under
+    the verdict id is not this run."""
     row = tx.conn.execute("SELECT count(*) FROM app.experiment_revision WHERE "
-                          "tenant_id = %s AND experiment_id = %s AND verdict_id = %s",
-                          (tx.tenant_id, eid, vid)).fetchone()  # fmt: skip
+                          "tenant_id = %s AND experiment_id = %s AND verdict_id = %s "
+                          "AND candidate_version = %s",
+                          (tx.tenant_id, eid, vid, cid)).fetchone()  # fmt: skip
     return row is not None and row[0] > 0
 
 
@@ -137,8 +148,8 @@ def _reserve(tx: TenantTx, r: Request) -> Reserved:
         data = hs.holdout_data(tx, p.plan_id, r.instrument)
     except hs.HoldoutSeriesError as exc:
         raise ExperimentStoreError(exc.code, str(exc)) from None
-    if _recorded(tx, p.experiment_id, r.verdict_id):
-        raise ExperimentStoreError("holdout_used", "the run is recorded")
+    if _recorded(tx, p.experiment_id, r.verdict_id, r.candidate_id):
+        raise ExperimentStoreError("run_recorded", r.verdict_id)
     _, a = si.holdout_read(study, reg, r.strategies, r.ledger, r.candidate_id,
                            r.assessor, r.at, r.access_id, r.trial_id)  # fmt: skip
     # what `experiment_store.record` would refuse after the read, refused now: the
@@ -155,12 +166,18 @@ def _reserve(tx: TenantTx, r: Request) -> Reserved:
     return attempt, a, data, study, reg
 
 
-def promotion_run(worker: Conn, assessor: Conn, tenant_id: uuid.UUID,
-                  r: Request) -> Run:  # fmt: skip
-    """Run `r` on the plan's one holdout read, recorded before it is opened."""
+def promotion_run(worker: Conn, assessor: Conn, tenant_id: uuid.UUID, r: Request,
+                  strategies: Implementations) -> Run:  # fmt: skip
+    """Run `r` on the plan's one holdout read, recorded before it is opened, with
+    the strategy code `strategies` (the process's reviewed registry) resolves."""
     p = r.study.protocol
     if p.scope is not im.Scope.TENANT or p.scope_id != str(tenant_id):
         raise ExperimentStoreError("scope", "tenant-scope runs of this tenant")
+    base = r.study.base
+    if (r.strategy.strategy_id, r.strategy.version) != (base.strategy_id,
+                                                        base.version):  # fmt: skip
+        raise ExperimentStoreError("strategy_mismatch", r.strategy.strategy_id)
+    build = strategies.resolve(r.strategy).build
     try:
         r.ledger.plan(p.plan_id)
     except ResearchError as exc:
@@ -171,7 +188,7 @@ def promotion_run(worker: Conn, assessor: Conn, tenant_id: uuid.UUID,
         attempt, a, data, study, reg = _reserve(tx, r)
     # phase 2: the read is recorded; only now is the holdout data opened
     lg, out = si.holdout_run(study, reg, r.strategies, r.ledger, r.candidate_id,
-                             r.dataset, r.rights, data, r.build, r.assessor, r.at,
+                             r.dataset, r.rights, data, build, r.assessor, r.at,
                              r.access_id, r.trial_id)  # fmt: skip
     if lg.access(r.access_id).to_wire() != a.to_wire():
         raise ExperimentStoreError("read_mismatch", r.access_id)

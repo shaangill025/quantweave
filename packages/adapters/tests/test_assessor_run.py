@@ -11,7 +11,7 @@ tenant id."""
 from __future__ import annotations
 
 import uuid
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass, replace
 from functools import partial
 from typing import Any
@@ -25,13 +25,15 @@ from qw_adapters import assessor_run as ar
 from qw_adapters import assessor_store as ast
 from qw_adapters import experiment_store as es
 from qw_adapters import holdout_series_store as hs
+from qw_adapters import strategy_implementations as sim
 from qw_adapters import tenancy as tn
 from qw_domain import improvement as im
 from qw_domain import strategy_improvement as si
-from qw_domain.backtest import TrialOutcome
+from qw_domain.backtest import Strategy, TrialOutcome
 from qw_domain.budget import BudgetBook, Category
 from qw_domain.decimals import UsdBudget
 from qw_domain.research_data import ResearchDataset, ResearchRights
+from qw_domain.strategy_registry import ParamValue
 from qw_domain.trial_ledger import Outcome, Split, SplitPlan, TrialLedger
 from test_backtest import scripted
 from test_improvement import AT, CAPS, EXP, PRODUCER
@@ -85,12 +87,41 @@ def research(w: World, lg: TrialLedger, n: int) -> TrialLedger:
                                       T0 + n * fx.H)[0]  # fmt: skip
 
 
+SID, SV = fx.BASE.strategy_id, fx.BASE.version
+HELD = ["1"] * len(fx.WIN_W)  # other strategy behaviour: always in the market
+FLAKY = {"weights": fx.WIN_W}  # what synth_flaky reads at run time
+
+
+def synth_win(cfg: Mapping[str, ParamValue]) -> Strategy:  # SYNTHETIC, k = 1 accepts
+    return scripted(fx.WIN_W)
+
+
+def synth_held(cfg: Mapping[str, ParamValue]) -> Strategy:  # SYNTHETIC: other code
+    return scripted(HELD)
+
+
+def synth_flaky(cfg: Mapping[str, ParamValue]) -> Strategy:  # SYNTHETIC: not
+    return scripted(FLAKY["weights"])  # determinate (reads state outside its inputs)
+
+
+def ref(build: sim.Build = synth_win) -> sim.StrategyRef:
+    return sim.StrategyRef(SID, SV, sim.implementation_hash(SID, SV, build))
+
+
+def registry(build: sim.Build = synth_win) -> sim.Implementations:
+    """A reviewed registry holding `build` (the test reviews it by its hash)."""
+    return sim.Implementations([(SID, SV, build, ref(build).implementation_hash)])
+
+
+REG = registry()
+
+
 def request(w: World, **kw: Any) -> ar.Request:
     args: dict[str, Any] = {
         "study": w.study, "registry": w.reg, "strategies": fx.STRATS,
         "ledger": w.ledger, "candidate_id": "cand-1", "dataset": w.ds,
         "rights": w.rights, "instrument": iid(3),
-        "build": lambda cfg: scripted(fx.WIN_W), "book": w.book,
+        "strategy": ref(), "book": w.book,
         "assessor": w.study.protocol.assessor, "at": fx.AT_P, "access_id": "acc-p",
         "trial_id": "trial-p", "verdict_id": "v-p",
     } | kw  # fmt: skip
@@ -101,7 +132,7 @@ def expected(w: World) -> tuple[TrialLedger, TrialOutcome, im.Verdict]:
     """The pure domain oracle: the same run and verdict with no store at all."""
     r = request(w)
     lg, out = si.holdout_run(w.study, w.reg, fx.STRATS, w.ledger, "cand-1", w.ds,
-                             w.rights, w.holdout, r.build, r.assessor, fx.AT_P,
+                             w.rights, w.holdout, synth_win, r.assessor, fx.AT_P,
                              "acc-p", "trial-p")  # fmt: skip
     run = im.Assessment(lg, r.assessor, fx.AT_P, "v-p", evaluation=fx.EVAL)
     v = im.derive(w.reg, EXP, "cand-1", w.plan, w.book, None, run)[1]
@@ -135,8 +166,9 @@ def w(app_conn: Conn, asr: Conn, wrk: Conn) -> World:
     return w
 
 
-def go(wrk: Conn, asr: Conn, w: World, **kw: Any) -> ar.Run:
-    return ar.promotion_run(wrk, asr, w.t, request(w, **kw))
+def go(wrk: Conn, asr: Conn, w: World, strategies: sim.Implementations = REG,
+       **kw: Any) -> ar.Run:  # fmt: skip
+    return ar.promotion_run(wrk, asr, w.t, request(w, **kw), strategies)
 
 
 def counts(conn: Conn, t: uuid.UUID) -> dict[str, int]:
@@ -238,7 +270,8 @@ def test_decision_42_refusals_before_the_read_change_nothing(
     with tn.provision_tenant(app_conn) as tx:  # nothing frozen for this experiment
         bare = world(tx.tenant_id)
     assert code(lambda: go(wrk, asr, bare)) == "protocol_not_frozen"
-    assert code(lambda: ar.promotion_run(wrk, asr, bare.t, request(w))) == "scope"
+    assert code(lambda: ar.promotion_run(wrk, asr, bare.t, request(w), REG)) == (
+        "scope")  # fmt: skip
     assert counts(conn, w.t) == before
     run = go(wrk, asr, w)  # the read was kept for the real run
     assert (run.attempt, run.outcome.trial.outcome) == (1, Outcome.COMPLETED)
@@ -350,7 +383,7 @@ def test_decision_42_a_crash_after_the_reservation_reruns_the_same_read(
     assert (after["holdout_access"], after["holdout_run_outcome"]) == (1, 1)
     assert attempts(conn, w.t) == [(1, 1, "acc-p", "v-p"), (2, 1, "acc-p", "v-p")]
     assert after["experiment_revision"] == mid["experiment_revision"] + 1
-    assert code(lambda: go(wrk, asr, w)) == "holdout_used"  # recorded: done
+    assert code(lambda: go(wrk, asr, w)) == "run_recorded"  # recorded: done
     assert counts(conn, w.t) == after
 
 
@@ -414,9 +447,6 @@ def test_decision_42_a_rerun_must_be_the_same_read(
     assert go(wrk, asr, w).attempt == 2  # the true re-run is still available
 
 
-HELD = ["1"] * len(fx.WIN_W)  # other strategy code: always in the market
-
-
 @pytest.mark.parametrize("where", ["record", "revision"])
 def test_decision_60_a_rerun_whose_outcome_differs_is_a_conflict(
     wrk: Conn,
@@ -426,15 +456,16 @@ def test_decision_60_a_rerun_whose_outcome_differs_is_a_conflict(
     monkeypatch: pytest.MonkeyPatch,
     where: str,
 ) -> None:
+    flaky = partial(go, wrk, asr, w, registry(synth_flaky), strategy=ref(synth_flaky))
     crash(monkeypatch, *POINTS[where])  # the outcome is recorded first
     with pytest.raises(Crash):
-        go(wrk, asr, w)
+        flaky()
     monkeypatch.undo()
     first, before = stored(asr, w), counts(conn, w.t)
     with tn.tenant_transaction(asr, w.t) as tx:
         kept = ast.outcome(tx, w.plan.plan_id)
-    held = partial(go, wrk, asr, w, build=lambda cfg: scripted(HELD))
-    assert code(held) == "verdict_conflict"  # a non-deterministic strategy
+    monkeypatch.setitem(FLAKY, "weights", HELD)  # same reviewed code, other result
+    assert code(flaky) == "verdict_conflict"  # a non-deterministic strategy
     with tn.tenant_transaction(asr, w.t) as tx:
         assert ast.outcome(tx, w.plan.plan_id) == kept
     assert stored(asr, w) == first  # the first result stands, no receipt added
@@ -450,14 +481,77 @@ def test_decision_60_before_an_outcome_there_is_nothing_to_compare(
     monkeypatch: pytest.MonkeyPatch,
     where: str,
 ) -> None:
+    flaky = partial(go, wrk, asr, w, registry(synth_flaky), strategy=ref(synth_flaky))
     crash(monkeypatch, *POINTS[where])
     with pytest.raises(Crash):
-        go(wrk, asr, w)
+        flaky()
     monkeypatch.undo()
-    run = go(wrk, asr, w, build=lambda cfg: scripted(HELD))  # no result was kept
+    monkeypatch.setitem(FLAKY, "weights", HELD)
+    run = flaky()  # no result was kept
     assert run.attempt == 2
     with tn.tenant_transaction(asr, w.t) as tx:  # its outcome is now the one
         assert ast.outcome(tx, w.plan.plan_id) is not None
+
+
+# --- decision 65: reviewed strategy code by reference ---
+
+
+def test_decision_65_only_registered_reviewed_code_runs(
+    wrk: Conn, asr: Conn, conn: Conn, w: World
+) -> None:
+    before = counts(conn, w.t)
+    other = sim.StrategyRef("str-synth-other", SV, ref().implementation_hash)
+    cases: list[tuple[sim.Implementations, sim.StrategyRef, str]] = [
+        (sim.Implementations(()), ref(), "strategy_implementation_unavailable"),
+        (REG, ref(synth_held), "strategy_implementation_mismatch"),
+        (REG, other, "strategy_mismatch"),  # not the study's strategy
+    ]
+    for reg, sref, want in cases:
+        assert code(partial(go, wrk, asr, w, reg, strategy=sref)) == want, want
+        assert counts(conn, w.t) == before, want
+    assert go(wrk, asr, w).attempt == 1  # the read was kept
+
+
+def test_decision_65_changed_code_is_not_a_rerun(
+    wrk: Conn, asr: Conn, conn: Conn, w: World, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    crash(monkeypatch, si, "holdout_run")
+    with pytest.raises(Crash):
+        go(wrk, asr, w)
+    monkeypatch.undo()
+    before = counts(conn, w.t)
+    changed = partial(go, wrk, asr, w, registry(synth_held), strategy=ref(synth_held))
+    assert code(changed) == "rerun_mismatch"  # the hash is in the input digest
+    assert counts(conn, w.t) == before
+    assert go(wrk, asr, w).attempt == 2
+
+
+def test_a_recorded_verdict_of_another_candidate_is_not_this_run(
+    wrk: Conn, asr: Conn, conn: Conn, w: World
+) -> None:
+    go(wrk, asr, w)  # recorded: v-p for cand-1
+    assert code(lambda: go(wrk, asr, w)) == "run_recorded"
+    conn.execute("ALTER TABLE app.experiment_revision DISABLE TRIGGER USER")
+    conn.execute("UPDATE app.experiment_revision SET candidate_version = 'cand-x' "
+                 "WHERE verdict_id = 'v-p'")  # fmt: skip
+    conn.execute("ALTER TABLE app.experiment_revision ENABLE TRIGGER USER")
+    before = counts(conn, w.t)
+    assert code(lambda: go(wrk, asr, w)) == "integrity"  # not taken as done
+    assert counts(conn, w.t) == before
+
+
+def test_decision_65_a_reservation_without_the_reference_is_refused(
+    wrk: Conn, asr: Conn, conn: Conn, w: World
+) -> None:
+    # a 0038/0040 reservation: its inputs digest predates the code reference
+    _, a = si.holdout_read(w.study, w.reg, fx.STRATS, w.ledger, "cand-1",
+                           w.study.protocol.assessor, fx.AT_P, "acc-p",
+                           "trial-p")  # fmt: skip
+    with tn.tenant_transaction(asr, w.t) as tx:
+        ast.reserve_read(tx, w.study.protocol, a, "cand-1", "v-p", "e" * 64)
+    before = counts(conn, w.t)
+    assert code(lambda: go(wrk, asr, w)) == "rerun_mismatch"  # never misread
+    assert counts(conn, w.t) == before
 
 
 # --- the database ---
@@ -636,12 +730,12 @@ def test_decision_42_other_roles_are_denied(
     wrk: Conn, asr: Conn, conn: Conn, w: World, runtime_urls: dict[str, str]
 ) -> None:
     before = counts(conn, w.t)
-    assert code(lambda: ar.promotion_run(asr, wrk, w.t, request(w))) in (
+    assert code(lambda: ar.promotion_run(asr, wrk, w.t, request(w), REG)) in (
         "forbidden", "database")  # the logins swapped  # fmt: skip
     roles: tuple[tn.RuntimeRole, ...] = ("qw_app", "qw_worker", "qw_release")
     for role in roles:
         with tn.runtime_connection(runtime_urls[role], role=role) as c:
-            assert code(lambda: ar.promotion_run(wrk, c, w.t, request(w))) in (
+            assert code(lambda: ar.promotion_run(wrk, c, w.t, request(w), REG)) in (
                 "forbidden", "database"), role  # fmt: skip
             for sql in ("SELECT attempt FROM app.holdout_run",
                         "DELETE FROM app.holdout_run",
