@@ -74,6 +74,7 @@ RELEASE_TABLES = (
     "release_trusted_key",
     "release_key_revocation",
 )  # 0029, 0035
+HOLDOUT_TABLES = ("holdout_series",)  # 0036, test_holdout_series_store
 
 
 def make_tenant(conn: Conn, name: str) -> tuple[uuid.UUID, uuid.UUID]:
@@ -175,6 +176,7 @@ def test_tables_have_forced_rls_and_no_public_grants(conn: Conn) -> None:
         + WATCHLIST_TABLES
         + EXPERIMENT_TABLES
         + RELEASE_TABLES
+        + HOLDOUT_TABLES
     )
     for name, rls, forced, owner, acl in rows:
         assert (rls, forced, owner) == (True, True, "qw_migrate"), name
