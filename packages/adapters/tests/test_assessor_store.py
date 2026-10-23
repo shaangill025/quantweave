@@ -388,7 +388,11 @@ def test_decision_17_only_qw_assessor_writes_and_reads_assessor_tables(
         ("holdout_run", "SELECT"), ("holdout_run", "INSERT"),
         ("holdout_run_outcome", "SELECT"),
         ("holdout_run_outcome", "INSERT"),
-        ("assessment_request", "SELECT")}  # fmt: skip
+        ("assessment_request", "SELECT")} | {  # 0042: decisions 70 and 78
+        (t, "SELECT") for t in (
+            "strategy_manifest", "rights_provider", "rights_feed",
+            "rights_feed_revision", "rights_feed_transition",
+            "rights_entitlement")}  # fmt: skip
     for kind in ("SELECT", "INSERT", "UPDATE", "REFERENCES"):
         assert privileges(conn, "qw_worker", kind) == set(), kind
     assert privileges(conn, "qw_app", "INSERT") == set()
