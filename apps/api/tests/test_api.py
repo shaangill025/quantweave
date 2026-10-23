@@ -170,10 +170,10 @@ def test_health_caps_and_malformed_input_use_the_envelope() -> None:
 def test_no_implemented_operation_accepts_a_tenant_id() -> None:
     spec = create_app(Settings(frozenset({ORIGIN}), KEY), lambda: None, AUTH).openapi()  # type: ignore[arg-type, return-value]
     operations = [op for item in spec["paths"].values() for op in item.values()]
-    assert len(operations) == 43  # HEAD /health/live, T019-T021, T036-T054, T041,
+    assert len(operations) == 45  # HEAD /health/live, T019-T021, T036-T054, T041,
     # T027, T056 (list and set preferences), T043, T024 (eight watchlist operations),
     # T025 (readJob), T044 (listExperiments, readExperiment), 0.7.0 approval classes,
-    # 0.12.0 listReleases
+    # 0.12.0 listReleases, 0.13.0 readRelease and listDeploymentEvents
     params = [p["name"] for op in operations for p in op.get("parameters", [])]
     keys = re.findall(r'"([^"]+)": ', json.dumps(spec))  # every object key, refs too
     assert {"login", "password", "role", "user_id", "If-Match"} <= {*keys, *params}

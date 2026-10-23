@@ -1,5 +1,5 @@
 {
-  "version": "0.12.0",
+  "version": "0.13.0",
   "base": "docs/spec/contracts 0.1.0",
   "versions": {
     "0.2.0": {"decision": "Owner decision 2026-10-14 (T008 A-01; docs/receipts/T053-api.md)"},
@@ -12,10 +12,11 @@
     "0.9.0": {"decision": "Owner decisions 2026-10-21, 24 (createSession, revokeSession, stepUpSession and changeMembershipRole documented), 25 (per-operation sensitive_fields entries for password and X-CSRF-Token; the unauthenticated_login and no_content exemptions, only for those listed, approved operations) and 26 (the role change returns the stored display_name and reuses the list's Membership item) (docs/decisions/2026-10-21-owner-decisions.md; shapes: docs/decisions/2026-10-21-contract-0.8.0-session-mutation-proposals.md)"},
     "0.10.0": {"decision": "Owner decision 2026-10-21, 27 (GET /policies documented through a T019 contract amendment; /health/live stays outside the contract) (docs/decisions/2026-10-21-owner-decisions.md; T008 C-18)"},
     "0.11.0": {"decision": "Owner decision 2026-10-21, 19 (an optional, immutable retest_of experiment id; served here as the follow-up its T044 receipt names) (docs/decisions/2026-10-21-owner-decisions.md; docs/receipts/T044.md)"},
-    "0.12.0": {"decision": "Owner decisions 2026-10-22, 45 (serve the release history with full signature checks once the operator setup records the deployment and its trusted keys; receipts unavailable until stored), 47 and 48 (an operator-recorded, frozen deployment), with decisions 2026-10-20, 5 (served only from real backing storage) and 10 (Q5: no identities for tenants), 2026-10-21, 23 (self_approved) and 33 (verdict_source), and 2026-10-23, 55 (a hash-only signature_reference), 56 (self_approved stays shown) and 58 (approved_at null until receipts are stored) (docs/decisions/2026-10-22-owner-decisions.md, docs/decisions/2026-10-23-owner-decisions.md; shape: docs/decisions/2026-10-20-contract-0.6.0-read-proposals.md, Read B)"}
+    "0.12.0": {"decision": "Owner decisions 2026-10-22, 45 (serve the release history with full signature checks once the operator setup records the deployment and its trusted keys; receipts unavailable until stored), 47 and 48 (an operator-recorded, frozen deployment), with decisions 2026-10-20, 5 (served only from real backing storage) and 10 (Q5: no identities for tenants), 2026-10-21, 23 (self_approved) and 33 (verdict_source), and 2026-10-23, 55 (a hash-only signature_reference), 56 (self_approved stays shown) and 58 (approved_at null until receipts are stored) (docs/decisions/2026-10-22-owner-decisions.md, docs/decisions/2026-10-23-owner-decisions.md; shape: docs/decisions/2026-10-20-contract-0.6.0-read-proposals.md, Read B)"},
+    "0.13.0": {"decision": "Owner decision 2026-10-22, 45 (the release history served with full signature checks), with the disclosure rules of decisions 2026-10-20, 5 and 10 (Q5) and 2026-10-23, 55 to 58: readRelease and listDeploymentEvents, the two Read B operations 0.12.0 deferred; owner decision 2026-10-23, 63 (install and pause show release_id, a rollback from_release_id and to_release_id with release_id null) (docs/decisions/2026-10-22-owner-decisions.md, docs/decisions/2026-10-23-owner-decisions.md; shape: docs/decisions/2026-10-20-contract-0.6.0-read-proposals.md, Read B)"}
   },
   "about": "Project-owned contract (T008 A-01). docs/spec/contracts stays unchanged; tools/project_contract.py applies these amendments to its schemas and request bodies, and adds the new operations (operations) and schemas (new_schemas), refusing a path, operationId or schema name the contract already has. Unnamed schemas are the spec's. Consumers (apps/api tests, apps/web/src/api.ts guards) enforce the rule below; a null receipt or qualification never makes a proposal actionable.",
-  "changes": "0.2.0: fields no store holds yet become nullable (account, account_snapshot, proposal); snapshot gains ledger_cash (trade-date journal cash, not available cash) and coverage; pages gain the C-02 coverage; the active-proposal rule accepts a null final-check receipt or qualification. 0.3.0: claim and evidence gain coverage (withheld text, invalid citations and limitations are named there); claim material becomes nullable (no store records materiality). 0.4.0: proposal gains coverage (readProposal returns one proposal, so its nulls are named on the item; list items carry it too); ledger_event lot_policy_id becomes nullable (the journal stores a lot-policy name such as economic_average_cost/1, which is not a contract id; it is served in economic_annotations). 0.5.0: the request WatchlistEntry (addWatchlistEntry, updateWatchlistEntry) gains an optional, nullable review_at (RFC 3339 with an offset, normalized to UTC; on update, omitting it keeps the stored value); needs stays server-derived and is refused in requests. If-Match on every route: a stale or malformed value is 412 Precondition Failed and a required but missing one is 428 Precondition Required; this replaces the 409 that the OpenAPI If-Match descriptions name. 0.6.0: experiment gains coverage (readExperiment serves an incomplete or blocked record with its reasons instead of refusing it; list items carry it too); parent_optimizer_version is a string exactly when target is recursive_optimizer and null otherwise, named none:parent_optimizer_version; state gains blocked and insufficient_evidence (insufficient evidence is re-assessable while the plan's one holdout read is unused, checked against the ledger the assessor is given; failed is no longer derived for it). 0.7.0: GET /session (readSession) is documented exactly as T010 serves it; readApprovalClasses (GET /session/approval-classes) serves the caller's three approval classes, advisory only and never a grant: every action re-derives its own checks, no token or receipt is issued and no identity is served. Both are Cache-Control: no-store (the API sends no-store on every response). 0.8.0: the sessionCookie scheme's cookie name is __Host-pi_session (security_schemes; the __Host- prefix makes browsers require Secure and Path=/ and refuse a Domain). listMemberships (GET /memberships) is documented exactly as T010 serves it: any member reads the session tenant's memberships by user id, a C-02 page of at most 200 with an opaque, HMAC-bound cursor that expires after an hour. mutations is the owner-approved allowlist for amended mutating operations; it is empty, so login, logout, step-up and role change stay undocumented until each entry is approved. 0.9.0: createSession (POST /session, login), revokeSession (DELETE /session, logout), stepUpSession (POST /session/step-up) and changeMembershipRole (PATCH /memberships/{user_id}) are documented exactly as T010 serves them, each with a mutations entry citing decision 24. Login is unauthenticated (security []; no CSRF token or Idempotency-Key exists before a session) and logout is 204 with no body, through the unauthenticated_login and no_content exemptions on those two entries only (decision 25). The role change returns the stored display_name, so it reuses the list's Membership item (decision 26). 0.10.0: listPolicies (GET /policies, T019, T008 C-18) is documented exactly as served (decision 27): any member reads the session tenant's policies by policy id, a C-02 page of at most 100 whose items are the spec's policy schema, exactly readPolicy's body (status paused while a pause is active), with the T010 HMAC-bound cursor that expires after an hour. GET is added to the spec's /policies path, which keeps its POST proposePolicy unchanged. 0.11.0: experiment gains retest_of, the id of the same tenant's experiment this one re-tests (owner decision 19), or null, named none:retest_of. It is the frozen protocol's link, copied into each revision (immutable between revisions; the database holds the copy equal to the protocol's). qw_app still reads no assessor table. 0.12.0: listReleases (GET /releases, Read B; owner decision 45) serves the releases installed in the server's own recorded deployment, sorted by (installed_at, id), optionally one component, to members of a tenant in that deployment; no recorded deployment and a non-member are the same 404. Each release is verified at read time against the operator's stored trusted keys (signature.verification, reasons such as key_not_valid after a revocation), and its install state, runnability, self_approved (decision 23) and verdict_source (decision 33) are served. Receipts are not stored: receipt_status is unavailable, named unavailable:receipts. approved_at is null until receipts are stored, named unavailable:receipts too (decision 58 of 2026-10-23). Tenant members see no identity or installation-scope id (decision 10): experiment_id, candidate_id and verdict_id are null, named unavailable:<field>; the signature's key_id is null, named none:signature/key_id; signature_reference is sig-sha256. and 32 hex digits of the signature's SHA-256, carrying no key id (decision 55 of 2026-10-23). A stored row that fails a check is 409 integrity. readRelease and listDeploymentEvents are not served yet.",
+  "changes": "0.2.0: fields no store holds yet become nullable (account, account_snapshot, proposal); snapshot gains ledger_cash (trade-date journal cash, not available cash) and coverage; pages gain the C-02 coverage; the active-proposal rule accepts a null final-check receipt or qualification. 0.3.0: claim and evidence gain coverage (withheld text, invalid citations and limitations are named there); claim material becomes nullable (no store records materiality). 0.4.0: proposal gains coverage (readProposal returns one proposal, so its nulls are named on the item; list items carry it too); ledger_event lot_policy_id becomes nullable (the journal stores a lot-policy name such as economic_average_cost/1, which is not a contract id; it is served in economic_annotations). 0.5.0: the request WatchlistEntry (addWatchlistEntry, updateWatchlistEntry) gains an optional, nullable review_at (RFC 3339 with an offset, normalized to UTC; on update, omitting it keeps the stored value); needs stays server-derived and is refused in requests. If-Match on every route: a stale or malformed value is 412 Precondition Failed and a required but missing one is 428 Precondition Required; this replaces the 409 that the OpenAPI If-Match descriptions name. 0.6.0: experiment gains coverage (readExperiment serves an incomplete or blocked record with its reasons instead of refusing it; list items carry it too); parent_optimizer_version is a string exactly when target is recursive_optimizer and null otherwise, named none:parent_optimizer_version; state gains blocked and insufficient_evidence (insufficient evidence is re-assessable while the plan's one holdout read is unused, checked against the ledger the assessor is given; failed is no longer derived for it). 0.7.0: GET /session (readSession) is documented exactly as T010 serves it; readApprovalClasses (GET /session/approval-classes) serves the caller's three approval classes, advisory only and never a grant: every action re-derives its own checks, no token or receipt is issued and no identity is served. Both are Cache-Control: no-store (the API sends no-store on every response). 0.8.0: the sessionCookie scheme's cookie name is __Host-pi_session (security_schemes; the __Host- prefix makes browsers require Secure and Path=/ and refuse a Domain). listMemberships (GET /memberships) is documented exactly as T010 serves it: any member reads the session tenant's memberships by user id, a C-02 page of at most 200 with an opaque, HMAC-bound cursor that expires after an hour. mutations is the owner-approved allowlist for amended mutating operations; it is empty, so login, logout, step-up and role change stay undocumented until each entry is approved. 0.9.0: createSession (POST /session, login), revokeSession (DELETE /session, logout), stepUpSession (POST /session/step-up) and changeMembershipRole (PATCH /memberships/{user_id}) are documented exactly as T010 serves them, each with a mutations entry citing decision 24. Login is unauthenticated (security []; no CSRF token or Idempotency-Key exists before a session) and logout is 204 with no body, through the unauthenticated_login and no_content exemptions on those two entries only (decision 25). The role change returns the stored display_name, so it reuses the list's Membership item (decision 26). 0.10.0: listPolicies (GET /policies, T019, T008 C-18) is documented exactly as served (decision 27): any member reads the session tenant's policies by policy id, a C-02 page of at most 100 whose items are the spec's policy schema, exactly readPolicy's body (status paused while a pause is active), with the T010 HMAC-bound cursor that expires after an hour. GET is added to the spec's /policies path, which keeps its POST proposePolicy unchanged. 0.11.0: experiment gains retest_of, the id of the same tenant's experiment this one re-tests (owner decision 19), or null, named none:retest_of. It is the frozen protocol's link, copied into each revision (immutable between revisions; the database holds the copy equal to the protocol's). qw_app still reads no assessor table. 0.12.0: listReleases (GET /releases, Read B; owner decision 45) serves the releases installed in the server's own recorded deployment, sorted by (installed_at, id), optionally one component, to members of a tenant in that deployment; no recorded deployment and a non-member are the same 404. Each release is verified at read time against the operator's stored trusted keys (signature.verification, reasons such as key_not_valid after a revocation), and its install state, runnability, self_approved (decision 23) and verdict_source (decision 33) are served. Receipts are not stored: receipt_status is unavailable, named unavailable:receipts. approved_at is null until receipts are stored, named unavailable:receipts too (decision 58 of 2026-10-23). Tenant members see no identity or installation-scope id (decision 10): experiment_id, candidate_id and verdict_id are null, named unavailable:<field>; the signature's key_id is null, named none:signature/key_id; signature_reference is sig-sha256. and 32 hex digits of the signature's SHA-256, carrying no key id (decision 55 of 2026-10-23). A stored row that fails a check is 409 integrity. 0.13.0: readRelease (GET /releases/{release_id}) serves one installed release, exactly its listReleases item (the Release schema, the same disclosure rules); a release that is not installed in the deployment is the same 404 as an unknown id, with a byte-identical problem body to a non-member's or a missing deployment's (only the correlation id differs). listDeploymentEvents (GET /deployment/events) serves the deployment's install, rollback and pause events in ledger order (at, then sequence), optionally one component: install and pause name release_id (from_release_id and to_release_id null, named none:<field>), rollback names from_release_id and to_release_id (release_id null, named none:release_id; decision 63); schema_after is the state schema after the event. operator_id and step_up_receipt_id are null for tenant members, named none:<field> (decision 10). A rollback never removes the install it withdrew: both events stay.",
   "rule": "A null in an amended field must be named in the response coverage.reasons as unavailable:<field>, unavailable:<id>/<field>, unknown:<field>, none:<field> or none:<id>/<field>. Item coverage reasons are <kind>:<detail>; page reasons are <kind>:<id>/<detail>.",
   "schemas": {
     "account": {
@@ -280,6 +281,52 @@
           }
         }
       }
+    },
+    "/releases/{release_id}": {
+      "get": {
+        "operationId": "readRelease",
+        "summary": "Read one release installed in this server's deployment",
+        "description": "Read B (owner decision 45). Exactly the release's listReleases item, under the same rules: members of a tenant in the server's recorded deployment only, every row re-hashed and the ledger replayed with full signature checks against the stored trusted keys, and no identity or installation-scope id for tenant members (decisions 10 and 55 to 58). A release that is not installed in the deployment, an unknown id, no recorded deployment and a non-member are all 404 not_found. Nothing is written except the authentication bookkeeping every authenticated request records.",
+        "security": [{"sessionCookie": []}],
+        "parameters": [
+          {"name": "release_id", "in": "path", "required": true, "schema": {"type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]*$"}}
+        ],
+        "responses": {
+          "200": {
+            "description": "Success.",
+            "headers": {"Cache-Control": {"schema": {"type": "string", "const": "no-store"}}},
+            "content": {"application/json": {"schema": {"$ref": "#/components/schemas/Release"}}}
+          },
+          "default": {
+            "description": "Typed validation, authorization, conflict, capacity or dependency failure; never a synthetic success. 401 unauthenticated without a valid session; 400 invalid_request; 404 not_found without a recorded deployment, for a non-member or a release not installed in it; 409 integrity.",
+            "content": {"application/problem+json": {"schema": {"$ref": "#/components/schemas/Problem"}}}
+          }
+        }
+      }
+    },
+    "/deployment/events": {
+      "get": {
+        "operationId": "listDeploymentEvents",
+        "summary": "List the install, rollback and pause events of this server's deployment",
+        "description": "Read B (owner decision 45). Members of a tenant in the server's recorded deployment read its events in ledger order (at, then sequence), optionally only one component. Every row is re-hashed and the ledger replayed with full signature checks against the stored trusted keys; a stored row that fails a check is 409 integrity. Tenant members see no operator identity or step-up receipt (decision 10). The cursor is opaque, bound to tenant, principal, route, sort order and component by the server key, and expires after an hour; an invalid, foreign or expired cursor is 400 invalid_cursor. Nothing is written except the authentication bookkeeping every authenticated request records.",
+        "security": [{"sessionCookie": []}],
+        "parameters": [
+          {"name": "cursor", "in": "query", "schema": {"type": "string", "maxLength": 256}},
+          {"name": "limit", "in": "query", "schema": {"type": "integer", "minimum": 1, "maximum": 200, "default": 50}, "description": "Server-bounded page size; tenant derived from session."},
+          {"name": "component", "in": "query", "schema": {"type": "string", "maxLength": 161, "pattern": "^[a-z_]{1,32}:[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$"}, "description": "Only this component (<target>:<strategy id or target>)."}
+        ],
+        "responses": {
+          "200": {
+            "description": "Success.",
+            "headers": {"Cache-Control": {"schema": {"type": "string", "const": "no-store"}}},
+            "content": {"application/json": {"schema": {"$ref": "#/components/schemas/deploymentEventPage"}}}
+          },
+          "default": {
+            "description": "Typed validation, authorization, conflict, capacity or dependency failure; never a synthetic success. 401 unauthenticated without a valid session; 400 invalid_request or invalid_cursor; 404 not_found without a recorded deployment, for a non-member; 409 integrity.",
+            "content": {"application/problem+json": {"schema": {"$ref": "#/components/schemas/Problem"}}}
+          }
+        }
+      }
     }
   },
   "new_schemas": {
@@ -483,6 +530,44 @@
           },
           "required": ["id", "component", "target", "change_kind", "experiment_id", "candidate_id", "verdict_id", "rollback_version_id", "candidate_hash", "artifact_hash", "protocol_hash", "manifest_hash", "required_approvals", "compatibility", "strategy_version", "strategy_material_hash", "verdict_source", "signature", "install", "receipt_status", "approved_at", "user_adoption_required", "tenant_adoption", "coverage"],
           "additionalProperties": false
+        }
+      }
+    },
+    "deploymentEventPage": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "title": "Deployment event page",
+      "description": "C-02 page of the server's deployment events in ledger order (Read B, owner decision 45). install: release_id is the installed release; pause: release_id is the suspended head and reasons say why no earlier release could run; rollback: from_release_id is withdrawn and to_release_id becomes the head. A field a kind does not have is null, named none:<field>. schema_after is the state schema after the event (it only moves forward). operator_id and step_up_receipt_id are null for tenant members, named none:<field> (decision 10). next_cursor is null on the last page.",
+      "type": "object",
+      "properties": {
+        "items": {"type": "array", "maxItems": 200, "items": {"$ref": "#/$defs/DeploymentEvent"}},
+        "next_cursor": {"type": ["string", "null"], "pattern": "^[A-Za-z0-9_-]{1,256}$"},
+        "coverage": {"$ref": "#/$defs/Coverage"}
+      },
+      "required": ["items", "next_cursor", "coverage"],
+      "additionalProperties": false,
+      "$defs": {
+        "DeploymentEvent": {
+          "type": "object",
+          "properties": {
+            "id": {"$ref": "common.schema.json#/$defs/Id"},
+            "kind": {"type": "string", "enum": ["install", "rollback", "pause"]},
+            "component": {"type": "string", "maxLength": 161, "pattern": "^[a-z_]{1,32}:[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$"},
+            "at": {"$ref": "common.schema.json#/$defs/Timestamp"},
+            "release_id": {"anyOf": [{"$ref": "common.schema.json#/$defs/Id"}, {"type": "null"}]},
+            "from_release_id": {"anyOf": [{"$ref": "common.schema.json#/$defs/Id"}, {"type": "null"}]},
+            "to_release_id": {"anyOf": [{"$ref": "common.schema.json#/$defs/Id"}, {"type": "null"}]},
+            "reasons": {"type": "array", "items": {"type": "string", "minLength": 1, "maxLength": 300}},
+            "schema_after": {"type": "integer", "minimum": 1},
+            "operator_id": {"anyOf": [{"$ref": "common.schema.json#/$defs/Id"}, {"type": "null"}]},
+            "step_up_receipt_id": {"anyOf": [{"$ref": "common.schema.json#/$defs/Id"}, {"type": "null"}]},
+            "coverage": {"$ref": "#/$defs/Coverage"}
+          },
+          "required": ["id", "kind", "component", "at", "release_id", "from_release_id", "to_release_id", "reasons", "schema_after", "operator_id", "step_up_receipt_id", "coverage"],
+          "additionalProperties": false,
+          "allOf": [
+            {"if": {"properties": {"kind": {"const": "rollback"}}}, "then": {"properties": {"release_id": {"type": "null"}, "from_release_id": {"$ref": "common.schema.json#/$defs/Id"}, "to_release_id": {"$ref": "common.schema.json#/$defs/Id"}, "reasons": {"maxItems": 0}}}, "else": {"properties": {"release_id": {"$ref": "common.schema.json#/$defs/Id"}, "from_release_id": {"type": "null"}, "to_release_id": {"type": "null"}}}},
+            {"if": {"properties": {"kind": {"const": "pause"}}}, "then": {"properties": {"reasons": {"minItems": 1}}}, "else": {"properties": {"reasons": {"maxItems": 0}}}}
+          ]
         }
       }
     }
