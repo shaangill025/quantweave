@@ -74,8 +74,14 @@ RELEASE_TABLES = (
     "release_trusted_key",
     "release_key_revocation",
 )  # 0029, 0035
-# 0036, test_holdout_series_store; 0038 and 0040 (provisional), test_assessor_run
-HOLDOUT_TABLES = ("holdout_series", "holdout_run", "holdout_run_outcome")
+# 0036, test_holdout_series_store; 0038 and 0040, test_assessor_run; 0041,
+# test_assessment_request_store
+HOLDOUT_TABLES = (
+    "holdout_series",
+    "holdout_run",
+    "holdout_run_outcome",
+    "assessment_request",
+)
 
 
 def make_tenant(conn: Conn, name: str) -> tuple[uuid.UUID, uuid.UUID]:

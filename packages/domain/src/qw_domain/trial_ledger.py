@@ -22,6 +22,10 @@ access recorded), R029, R065, R084.
   Construction replays every entry (forged grants fail).
 - `checkpoint(n)` digests the first n entries (`entry_wire`), so a store can require
   a later ledger to extend an earlier one (T044).
+- `to_wire`/`from_wire`: the whole ledger (owner decisions 43 and 67: a stored
+  assessment request keeps it in full). Decimal strings, UTC `Z` instants, the
+  embargo in whole microseconds as a decimal string; canonical input only, every
+  entry replayed, so the read-back ledger has the same checkpoints.
 LIMITATIONS: persisted only as T044 holdout reads and checkpoints; roles are
 caller-asserted; times must come from the server clock; no multiple-testing
 adjustment is computed yet.
@@ -29,7 +33,7 @@ Stdlib only.
 """
 
 import re
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
 from decimal import Decimal
@@ -40,7 +44,7 @@ from types import MappingProxyType
 from qw_domain.decimals import safe_repr
 from qw_domain.filings import AsOfView
 from qw_domain.identity import InstrumentId
-from qw_domain.instants import ensure_aware_utc, format_instant
+from qw_domain.instants import ensure_aware_utc, format_instant, parse_instant
 from qw_domain.research_data import (
     DatasetManifest,
     EvidenceClass,
@@ -91,6 +95,15 @@ class Candidate:
         check_id(self.family, "family")
         _sha(self.material_hash, "material_hash")
         _sha(self.config_hash, "config_hash")
+
+    def to_wire(self) -> list[str]:
+        return [self.family, self.material_hash, self.config_hash]
+
+    @classmethod
+    def from_wire(cls, w: object) -> "Candidate":
+        if type(w) is not list or len(w) != 3 or not all(type(x) is str for x in w):
+            raise ResearchError("candidate_wire", "three strings")
+        return cls(w[0], w[1], w[2])
 
 
 @dataclass(frozen=True, slots=True)
@@ -146,6 +159,37 @@ class SplitPlan:
         return {Split.TRAIN: self.train, Split.DEVELOPMENT: self.development,
                 Split.PROMOTION: self.promotion}[split]  # fmt: skip
 
+    def to_wire(self) -> dict[str, object]:
+        return {"plan_id": self.plan_id, "dataset": self.dataset.to_wire(),
+                "train": self.train.to_wire(),
+                "development": self.development.to_wire(),
+                "promotion": self.promotion.to_wire(),
+                "embargo_us": str(self.embargo // timedelta(microseconds=1)),
+                "holdout_instruments": sorted(
+                    i.to_wire() for i in self.holdout_instruments),
+                "max_promotion_accesses": self.max_promotion_accesses,
+                "approved_by": self.approved_by,
+                "registered_at": format_instant(self.registered_at),
+                "protocol_hash": self.protocol_hash}  # fmt: skip
+
+    @classmethod
+    def from_wire(cls, w: object) -> "SplitPlan":
+        keys = {"plan_id", "dataset", "train", "development", "promotion",
+                "embargo_us", "holdout_instruments", "max_promotion_accesses",
+                "approved_by", "registered_at", "protocol_hash"}  # fmt: skip
+        if type(w) is not dict or set(w) != keys:
+            raise ResearchError("plan_wire", "an object with the plan keys")
+        us, ins = w["embargo_us"], w["holdout_instruments"]
+        if type(us) is not str or _COUNT.fullmatch(us) is None or type(ins) is not list:
+            raise ResearchError("plan_wire", "embargo_us and holdout_instruments")
+        return _canonical(cls, w, lambda: cls(
+            w["plan_id"], DatasetManifest.from_wire(w["dataset"]),
+            Window.from_wire(w["train"]), Window.from_wire(w["development"]),
+            Window.from_wire(w["promotion"]),
+            timedelta(microseconds=int(us)), _instruments(ins),
+            w["max_promotion_accesses"], w["approved_by"],
+            _instant(w["registered_at"]), w["protocol_hash"]))  # fmt: skip
+
 
 @dataclass(frozen=True, slots=True)
 class Access:
@@ -180,6 +224,21 @@ class Access:
                 None if ins is None else sorted(i.to_wire() for i in ins),
                 self.actor_id, self.role.value, format_instant(self.at),
                 self.granted, list(self.reasons), self.seq]  # fmt: skip
+
+    @classmethod
+    def from_wire(cls, w: object) -> "Access":
+        if type(w) is not list or len(w) != 13:
+            raise ResearchError("access_wire", "a list of 13 fields")
+        ins, reasons = w[6], w[11]
+        if type(w[10]) is not bool or type(w[12]) is not int or w[12] < 0 or (
+            type(reasons) is not list or not all(type(r) is str for r in reasons)
+        ) or not (ins is None or type(ins) is list):  # fmt: skip
+            raise ResearchError("access_wire", "typed granted, reasons and seq")
+        return _canonical(cls, w, lambda: cls(
+            w[0], w[1], w[2], Candidate.from_wire(w[3]), Split(w[4]),
+            Window.from_wire(w[5]), None if ins is None else _instruments(ins),
+            w[7], Role(w[8]), _instant(w[9]), w[10], tuple(reasons),
+            w[12]))  # fmt: skip
 
 
 @dataclass(frozen=True, slots=True)
@@ -220,8 +279,66 @@ class Trial:
     def metrics_wire(self) -> dict[str, str]:
         return {k: str(v) for k, v in sorted(self.metrics.items())}
 
+    def to_wire(self) -> dict[str, object]:
+        """Every field; metrics as `metrics_wire` (each Decimal's own string, so
+        the checkpoint of a read-back ledger is unchanged)."""
+        return {"trial_id": self.trial_id, "plan_id": self.plan_id,
+                "family": self.family, "hypothesis": self.hypothesis,
+                "material_hash": self.material_hash, "config_hash": self.config_hash,
+                "dataset_hash": self.dataset_hash, "protocol_hash": self.protocol_hash,
+                "split": self.split.value, "outcome": self.outcome.value,
+                "metrics": self.metrics_wire(), "access_id": self.access_id,
+                "recorded_at": format_instant(self.recorded_at)}  # fmt: skip
+
+    @classmethod
+    def from_wire(cls, w: object) -> "Trial":
+        keys = {"trial_id", "plan_id", "family", "hypothesis", "material_hash",
+                "config_hash", "dataset_hash", "protocol_hash", "split", "outcome",
+                "metrics", "access_id", "recorded_at"}  # fmt: skip
+        if type(w) is not dict or set(w) != keys or type(w["metrics"]) is not dict:
+            raise ResearchError("trial_wire", "an object with the trial keys")
+        if not all(type(v) is str for v in w["metrics"].values()):
+            raise ResearchError("trial_wire", "metrics are decimal strings")
+        return _canonical(cls, w, lambda: cls(
+            w["trial_id"], w["plan_id"], w["family"], w["hypothesis"],
+            w["material_hash"], w["config_hash"], w["dataset_hash"],
+            w["protocol_hash"], Split(w["split"]), Outcome(w["outcome"]),
+            {k: Decimal(v) for k, v in w["metrics"].items()}, w["access_id"],
+            _instant(w["recorded_at"])))  # fmt: skip
+
 
 type Entry = SplitPlan | Access | Trial
+_COUNT = re.compile(r"0|[1-9][0-9]*", re.ASCII)
+_KINDS: dict[str, type[SplitPlan] | type[Access] | type[Trial]] = {
+    "plan": SplitPlan, "access": Access, "trial": Trial}  # fmt: skip
+
+
+def _instant(text: object) -> datetime:
+    if type(text) is not str:
+        raise ResearchError("instant_wire", "an instant string")
+    return parse_instant(text)
+
+
+def _instruments(w: list[object]) -> frozenset[InstrumentId]:
+    if not all(type(x) is str for x in w):
+        raise ResearchError("instrument_wire", "instrument strings")
+    return frozenset(InstrumentId.from_wire(str(x)) for x in w)
+
+
+def _canonical[T: SplitPlan | Access | Trial](
+    cls: type[T], w: object, build: Callable[[], T]
+) -> T:
+    """Build one entry from its wire; refuse any input that is not canonical."""
+    code = f"{cls.__name__.lower()}_wire"
+    try:
+        out = build()
+    except ResearchError:
+        raise
+    except (ValueError, TypeError, ArithmeticError) as exc:  # enums, instants
+        raise ResearchError(code, type(exc).__name__) from None
+    if out.to_wire() != w:
+        raise ResearchError(code, "not the canonical form")
+    return out
 
 
 def entry_wire(e: Entry) -> list[object]:
@@ -338,6 +455,25 @@ class TrialLedger:
 
     def _append(self, e: Entry) -> "TrialLedger":
         return TrialLedger(self.tenant_id, (*self.entries, e))
+
+    def to_wire(self) -> dict[str, object]:
+        kind = {SplitPlan: "plan", Access: "access", Trial: "trial"}
+        rows = [[kind[type(e)], e.to_wire()] for e in self.entries]
+        return {"tenant_id": self.tenant_id, "entries": rows}
+
+    @classmethod
+    def from_wire(cls, w: object) -> "TrialLedger":
+        """Canonical input only; construction replays every entry."""
+        if type(w) is not dict or set(w) != {"tenant_id", "entries"} or (
+            type(w["tenant_id"]) is not str or type(w["entries"]) is not list
+        ):  # fmt: skip
+            raise ResearchError("ledger_wire", "an object with tenant_id, entries")
+        entries: list[Entry] = []
+        for e in w["entries"]:
+            if type(e) is not list or len(e) != 2 or e[0] not in _KINDS:
+                raise ResearchError("ledger_wire", "[kind, entry] pairs")
+            entries.append(_KINDS[e[0]].from_wire(e[1]))
+        return cls(w["tenant_id"], tuple(entries))
 
     def register_plan(self, plan: SplitPlan, dataset: ResearchDataset) -> "TrialLedger":
         """Register `plan` for `dataset`, whose hash was re-derived from its content
