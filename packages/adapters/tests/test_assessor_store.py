@@ -371,7 +371,9 @@ def test_decision_17_only_qw_assessor_writes_and_reads_assessor_tables(
         *ASSESSOR_TABLES, "experiment_revision")} | {
         (t, "INSERT") for t in ASSESSOR_TABLES} | {  # nothing else in app
         ("holdout_series", "SELECT"), ("holdout_series", "INSERT"),
-        ("holdout_run", "SELECT"), ("holdout_run", "INSERT")}  # fmt: skip
+        ("holdout_run", "SELECT"), ("holdout_run", "INSERT"),
+        ("holdout_run_outcome", "SELECT"),
+        ("holdout_run_outcome", "INSERT")}  # fmt: skip
     for kind in ("SELECT", "INSERT", "UPDATE", "REFERENCES"):
         assert privileges(conn, "qw_worker", kind) == set(), kind
     assert privileges(conn, "qw_app", "INSERT") == set()

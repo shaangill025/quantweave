@@ -18,7 +18,8 @@ receipt naming the read it scored, with its family's and its retest chain's tria
 counts and the verdict's Bonferroni adjustment (decisions 35 to 37; `chain_count`
 is the k `assess` widens z with). `reserve_read` (decision 42, 0038) records
 the assessor run's read before any data is opened: the plan's seq-1 read with
-attempt 1, then at most one re-run (attempt 2) under the same read and inputs.
+attempt 1, then at most three re-runs (decision 59) under the same read and
+inputs; `record_outcome` keeps the trial outcome's digest (decision 60).
 Reads re-hash every row and rebuild protocols,
 candidates and verdicts through the domain (stored reads are compared with the
 ledger's `Access`);
@@ -326,12 +327,13 @@ def put_read(tx: TenantTx, a: tl.Access) -> None:
     }, body)  # fmt: skip
 
 
+MAX_ATTEMPTS = 4  # the reservation and three re-runs (decision 59)
 # attempt, experiment, candidate, verdict, access, seq, inputs digest (0038)
 type Reservation = tuple[int, str, str, str, str, int, str]
 
 
 def reservations(tx: TenantTx, plan_id: str) -> list[Reservation]:
-    """The plan's reserved promotion run: attempt 1, then its one re-run."""
+    """The plan's reserved promotion run: attempt 1, then its re-runs."""
 
     def build(r: Row) -> tuple[Reservation, object]:
         x: Reservation = (r["attempt"], r["experiment_id"], r["candidate_id"],
@@ -349,17 +351,17 @@ def reservations(tx: TenantTx, plan_id: str) -> list[Reservation]:
 def reserve_read(tx: TenantTx, p: im.Protocol, a: tl.Access, candidate_id: str,
                  verdict_id: str, inputs: str) -> int:  # fmt: skip
     """Owner decision 42's write-ahead, before any data is opened: the first run
-    stores the read `a` and attempt 1; after a crash the one re-run stores attempt
-    2 under the same read and inputs. Returns the attempt; refuses a read no run
-    reserved (`holdout_used`), a third attempt (`rerun_used`) and any other read or
-    input (`rerun_mismatch`)."""
+    stores the read `a` and attempt 1; after a crash each re-run (decision 59: at
+    most three) stores the next attempt under the same read and inputs. Returns the
+    attempt; refuses a read no run reserved (`holdout_used`), a fifth attempt
+    (`rerun_used`) and any other read or input (`rerun_mismatch`)."""
     runs, reads = reservations(tx, p.plan_id), _reads(tx, p.plan_id)
     mine = (p.experiment_id, candidate_id, verdict_id, a.access_id, a.seq, inputs)
     if not runs:
         if reads:  # a stored read (a caller-recorded one) that no run reserved
             raise ExperimentStoreError("holdout_used", p.plan_id)
         put_read(tx, a)
-    elif len(runs) > 1:
+    elif len(runs) >= MAX_ATTEMPTS:
         raise ExperimentStoreError("rerun_used", p.plan_id)
     elif runs[0][1:] != mine or reads != [a.to_wire()]:
         raise ExperimentStoreError("rerun_mismatch", p.plan_id)
@@ -370,6 +372,31 @@ def reserve_read(tx: TenantTx, p: im.Protocol, a: tl.Access, candidate_id: str,
         "verdict_id": verdict_id, "access_id": a.access_id, "inputs_digest": inputs,
     }, [p.plan_id, attempt, *mine])  # fmt: skip
     return attempt
+
+
+def outcome(tx: TenantTx, plan_id: str) -> tuple[int, str] | None:
+    """The plan's recorded trial outcome (decision 60): (attempt, digest)."""
+
+    def build(r: Row) -> tuple[tuple[int, str], object]:
+        x = (r["attempt"], r["outcome_digest"])
+        return x, [r["plan_id"], *x]
+
+    rows = _select(tx, "SELECT * FROM app.holdout_run_outcome WHERE tenant_id = %s "
+                   "AND plan_id = %s", plan_id)  # fmt: skip
+    got = _verified(rows, "holdout_run_outcome", tx, build)
+    return got[0] if got else None
+
+
+def record_outcome(tx: TenantTx, plan_id: str, attempt: int, digest_: str) -> None:
+    """Decision 60: the first evaluation's outcome digest, stored before any
+    receipt; a re-run whose outcome differs from the stored one is
+    `verdict_conflict`, and an equal one stores nothing."""
+    got = outcome(tx, plan_id)
+    if got is None:
+        _insert(tx, "holdout_run_outcome", {"plan_id": plan_id, "attempt": attempt,
+                "outcome_digest": digest_}, [plan_id, attempt, digest_])  # fmt: skip
+    elif got[1] != digest_:
+        raise ExperimentStoreError("verdict_conflict", "the trial outcome differs")
 
 
 def put_verdict(tx: TenantTx, p: im.Protocol, v: im.Verdict,
