@@ -195,3 +195,31 @@ below waives a test, gate or spec requirement. Numbering continues from
     their own tasks (e.g. T032); building throwaway formats for them now would be
     wasted. The decision-59 digest already binds them."
     Implemented by: T044 (decision 39, the assessor-run promotion).
+
+## Reviewed strategy code
+
+68. **What the strategy code hash covers.**
+    Question: "Decision 68: the strategy code hash (decision 65) covers only the file
+    that defines the strategy. If a strategy imports shared helper code from another
+    file and that file changes, the hash stays the same. How should this be
+    handled?"
+    Selected label: "Hash project imports too (Recommended)".
+    Option text as presented: "Include in the hash every project module the
+    strategy's file imports, transitively (standard-library and pinned third-party
+    code excluded, since the lockfile pins them). Why: it makes 'the hash catches
+    code that changed' true for all project code a strategy actually runs, without
+    restricting how strategies are written. Not 'self-contained only': it would
+    force copying shared code into each strategy."
+    Implemented by: T044 (decision 39, the assessor-run promotion).
+
+69. **The version a stored strategy reference carries.**
+    Question: "Decision 69: a stored request's strategy reference needs one
+    'version'. The request store (#168) used the candidate's id; the assessor
+    registry uses the base strategy's version. Which should the reference carry?"
+    Selected label: "Base strategy version (Recommended)".
+    Option text as presented: "Use the reviewed base strategy's id and version,
+    matching the registry entry whose code actually runs; the candidate is already
+    bound separately by its id and content hash. Why: the reference's job is to name
+    the reviewed code, and code is registered per base version, not per candidate.
+    Two meanings of 'version' would let them drift apart."
+    Implemented by: T044 (decision 39, the assessor-run promotion).
