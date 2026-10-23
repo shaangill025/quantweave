@@ -732,7 +732,10 @@ def test_stored_wire_forms_round_trip_with_unchanged_hashes() -> None:
     assert lg.checkpoint(1) == ledger().checkpoint(1) != lg.checkpoint(2)
 
 
-GOLDEN_PROTOCOL = "c8e22cf9a7f6eb41061d00db947f6707d294e65a9849fa6604bfad751582b1b3"
+# Re-pinned for owner decision 76 (the dataset hash covers every fact field, so the
+# fixture plan's dataset_hash moved). Was c8e22cf9...b1b3, which the pre-76 dataset
+# hash reproduces exactly; only the dataset hash changed (receipt T032).
+GOLDEN_PROTOCOL = "5a141c3cb13ad7b2d3a5d210e67be68f761fa134fba40fac7abcfce46f80fa97"
 
 
 def test_decision_19_retest_of_is_a_frozen_link_to_another_experiment() -> None:

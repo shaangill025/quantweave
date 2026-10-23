@@ -26,6 +26,10 @@ availability timestamps), R071/R098. Pure parsing, normalization and queries.
   the latest knowledge time <= t: publication time (`PUBLICATION`, the backtest
   available-data convention) or max(publication, receipt) (`RECEIPT`, what this system
   had). Tied versions with different values are `conflicted`, never guessed.
+- Wire forms (`to_wire`/`from_wire` on `Unit`, `Period`, `Fact`, `FactBook`) are
+  canonical and strict: a decimal string value with one text per value, UTC `Z`
+  instants, exact keys and the ingest patterns and bounds; a `Unit` whose kind or
+  currency disagrees with its text is refused.
 LIMITATIONS: no persistence or fetch adapter; XBRL `frame` and dimensional facts are
 not read; per-concept unit expectations (e.g. EPS in currency/shares) are not checked.
 Facts carry no tenant and `as_of` does not re-check retention expiry or rights
@@ -42,9 +46,15 @@ from decimal import Decimal
 from enum import StrEnum
 
 from qw_domain.decimals import safe_repr
-from qw_domain.identity import ProviderId, Resolution, SecurityMaster
+from qw_domain.identity import IdentityError, ProviderId, Resolution, SecurityMaster
 from qw_domain.ingest import IngestError, IngestRights, load_exact_json, require_ingest
-from qw_domain.instants import InstantError, ensure_aware_utc, parse_instant
+from qw_domain.instants import (
+    InstantError,
+    ensure_aware_utc,
+    format_instant,
+    parse_instant,
+)
+from qw_domain.sources import ID_PATTERN
 
 SEC_CIK_NAMESPACE = "sec_cik"
 FILED_DATE_BOUND = timedelta(days=1, hours=5)
@@ -58,6 +68,9 @@ _CONCEPT = re.compile(r"[A-Za-z][A-Za-z0-9_]{0,255}", re.ASCII)
 _FP = re.compile(r"FY|Q[1-4]|H[12]", re.ASCII)
 _DATE = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}", re.ASCII)
 _CURRENCY = re.compile(r"[A-Z]{3}", re.ASCII)
+_CIK10 = re.compile(r"(?!0{10})[0-9]{10}", re.ASCII)
+_HEX64 = re.compile(r"[0-9a-f]{64}", re.ASCII)
+_VALUE = re.compile(r"-?(0|[1-9][0-9]*)(\.[0-9]*[1-9])?", re.ASCII)  # canonical
 
 
 class FilingsError(IngestError):
@@ -103,26 +116,49 @@ class UnitKind(StrEnum):
     PURE = "pure"
 
 
+def _unit_parts(raw: object) -> tuple[UnitKind, str | None] | None:
+    """Kind and currency read from the unit text (any three-letter currency)."""
+    if raw == "shares":
+        return UnitKind.SHARES, None
+    if raw == "pure":
+        return UnitKind.PURE, None
+    if type(raw) is str:
+        cur, sep, per = raw.partition("/")
+        if _CURRENCY.fullmatch(cur) and (not sep or per == "shares"):
+            return (UnitKind.PER_SHARE if sep else UnitKind.CURRENCY), cur
+    return None
+
+
 @dataclass(frozen=True, slots=True)
 class Unit:
+    """`raw` determines the kind and currency; a disagreeing triple is refused."""
+
     kind: UnitKind
     currency: str | None
     raw: str
 
+    def __post_init__(self) -> None:
+        if not isinstance(self.kind, UnitKind) or (
+            _unit_parts(self.raw) != (self.kind, self.currency)
+        ):  # fmt: skip
+            raise _fail("unit", self.raw)
+
+    def to_wire(self) -> str:
+        return self.raw
+
+    @classmethod
+    def from_wire(cls, w: object) -> "Unit":
+        parts = _unit_parts(w)
+        if parts is None or type(w) is not str:
+            raise _fail("unit_wire", w)
+        return cls(*parts, w)
+
 
 def parse_unit(raw: object, currencies: frozenset[str] = DEFAULT_CURRENCIES) -> Unit:
-    if raw == "shares":
-        return Unit(UnitKind.SHARES, None, "shares")
-    if raw == "pure":
-        return Unit(UnitKind.PURE, None, "pure")
-    if isinstance(raw, str):
-        cur, sep, per = raw.partition("/")
-        if _CURRENCY.fullmatch(cur) and cur in currencies:
-            if not sep:
-                return Unit(UnitKind.CURRENCY, cur, raw)
-            if per == "shares":
-                return Unit(UnitKind.PER_SHARE, cur, raw)
-    raise _fail("unit_unknown", raw)
+    parts = _unit_parts(raw)
+    if parts is None or type(raw) is not str or parts[1] not in {None, *currencies}:
+        raise _fail("unit_unknown", raw)
+    return Unit(*parts, raw)
 
 
 @dataclass(frozen=True, slots=True, order=True)
@@ -137,6 +173,18 @@ class Period:
             raise TypeError("period bounds must be dates")
         if self.start is not None and self.start > self.end:
             raise _fail("period", self)
+
+    def to_wire(self) -> list[str | None]:
+        start = None if self.start is None else self.start.isoformat()
+        return [start, self.end.isoformat()]
+
+    @classmethod
+    def from_wire(cls, w: object) -> "Period":
+        """`[start or null, end]` as `YYYY-MM-DD` strings."""
+        if type(w) is not list or len(w) != 2 or type(w[0]) not in (str, type(None)):
+            raise _fail("period_wire", w)
+        start = None if w[0] is None else _date(w[0], "period_wire")
+        return cls(start, _date(w[1], "period_wire"))
 
 
 @dataclass(frozen=True, slots=True)
@@ -188,6 +236,75 @@ class Fact:
     @property
     def key(self) -> FactKey:
         return (self.cik, self.taxonomy, self.concept, self.unit.raw, self.period)
+
+    def to_wire(self) -> dict[str, object]:
+        """Every field (owner decision 76: the dataset content hash digests this)."""
+        f, acc = self, self.accepted_at
+        return {"cik": f.cik, "instrument": f.instrument.to_wire(),
+                "taxonomy": f.taxonomy, "concept": f.concept, "unit": f.unit.to_wire(),
+                "period": f.period.to_wire(), "fy": f.fy, "fp": f.fp,
+                "value": _value_wire(f.value), "accession": f.accession,
+                "form": f.form, "filed": f.filed.isoformat(),
+                "published_at": format_instant(f.published_at),
+                "publication_basis": f.publication_basis.value,
+                "received_at": format_instant(f.received_at), "feed_id": f.feed_id,
+                "feed_hash": f.feed_hash,
+                "accepted_at": None if acc is None else format_instant(acc),
+                }  # fmt: skip
+
+    @classmethod
+    def from_wire(cls, w: object) -> "Fact":
+        """Canonical input only, with the ingest rules (patterns, value bounds):
+        a decimal string value, UTC `Z` instants, exactly the fact keys. Floats,
+        booleans as integers and anything that would re-serialize differently are
+        refused, never normalized."""
+        if type(w) is not dict or set(w) != _FACT_KEYS:
+            raise _fail("fact_wire", "an object with exactly the fact keys")
+        fy, fp, acc = w["fy"], w["fp"], w["accepted_at"]
+        if fy is not None and (type(fy) is not int or not 1900 <= fy <= 2200):
+            raise _fail("fy", fy)
+        if type(w["value"]) is not str or _VALUE.fullmatch(w["value"]) is None:
+            raise _fail("value", w["value"])
+        try:
+            f = cls(
+                _text(w["cik"], _CIK10, "cik"), Resolution.from_wire(w["instrument"]),
+                _text(w["taxonomy"], _TAXONOMY, "taxonomy"),
+                _text(w["concept"], _CONCEPT, "concept"), Unit.from_wire(w["unit"]),
+                Period.from_wire(w["period"]), fy,
+                None if fp is None else _text(fp, _FP, "fp"),
+                _value(Decimal(w["value"])), _text(w["accession"], _ACCN, "accession"),
+                _text(w["form"], _FORM, "form"), _date(w["filed"], "filed"),
+                _instant(w["published_at"]),
+                PublicationBasis(_text(w["publication_basis"], _ANY, "basis")),
+                _instant(w["received_at"]), _text(w["feed_id"], ID_PATTERN, "feed"),
+                _text(w["feed_hash"], _HEX64, "feed_hash"),
+                None if acc is None else _instant(acc),
+            )  # fmt: skip
+        except FilingsError:
+            raise
+        except (IdentityError, InstantError, ValueError) as exc:  # and the enum's
+            raise _fail("fact_wire", type(exc).__name__) from None
+        if f.to_wire() != w:
+            raise _fail("fact_wire", "not the canonical wire form")
+        return f
+
+
+_FACT_KEYS = frozenset(Fact.__dataclass_fields__)
+_ANY = re.compile(r"[a-z_]{1,32}", re.ASCII)
+
+
+def _instant(value: object) -> datetime:
+    if type(value) is not str:
+        raise _fail("instant", value)
+    return parse_instant(value)
+
+
+def _value_wire(value: Decimal) -> str:
+    """One text per decimal value: fixed point, no trailing zeros, no `-0`."""
+    text = format(value, "f")  # exact: no precision, so nothing rounds
+    if "." in text:
+        text = text.rstrip("0").rstrip(".")
+    return "0" if text == "-0" else text
 
 
 @dataclass(frozen=True, slots=True)
@@ -356,6 +473,19 @@ class FactBook:
             elif old.value != fact.value:
                 raise _fail("fact_conflict", fact.accession)
         return FactBook(tuple(out))
+
+    def to_wire(self) -> list[dict[str, object]]:
+        return [f.to_wire() for f in self.facts]
+
+    @classmethod
+    def from_wire(cls, w: object) -> "FactBook":
+        """Fact wires in book order; a repeated version is refused."""
+        if type(w) is not list:
+            raise _fail("factbook_wire", type(w).__name__)
+        book = cls().add(Fact.from_wire(x) for x in w)
+        if book.to_wire() != w:
+            raise _fail("factbook_wire", "a fact version is repeated")
+        return book
 
     def history(self, key: FactKey) -> tuple[Fact, ...]:
         mine = (f for f in self.facts if f.key == key)

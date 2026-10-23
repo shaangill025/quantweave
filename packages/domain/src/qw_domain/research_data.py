@@ -13,8 +13,14 @@ membership and point-in-time facts (T032 increment 1). Spec §14 "Research datas
   listing, and a change is invisible before its knowledge time.
 - Facts are read with T023 `FactBook.as_of`, so restatements stay invisible before
   their knowledge time.
+- Wire forms (for the later durable store): strict and canonical for every record;
+  `ResearchDataset.from_wire` re-derives the content hash and refuses a mismatch. The
+  hash covers every fact field (owner decision 76), so a fact cannot move between
+  instruments, periods or filings without changing it, and a dataset only holds
+  facts whose wire form round-trips.
 LIMITATIONS: no price/bar or corporate-action records yet (`price_mode` is declared
-only); no persistence. Stdlib only.
+only); no persistence; the research-rights terms are not yet on the dataset wire
+(decision 77). Stdlib only.
 """
 
 import hashlib
@@ -26,7 +32,14 @@ from enum import StrEnum
 from types import MappingProxyType
 
 from qw_domain.decimals import safe_repr
-from qw_domain.filings import AsOfView, Fact, FactBook, KnowledgeBasis, known_at
+from qw_domain.filings import (
+    AsOfView,
+    Fact,
+    FactBook,
+    FilingsError,
+    KnowledgeBasis,
+    known_at,
+)
 from qw_domain.identity import InstrumentId
 from qw_domain.instants import (
     InstantError,
@@ -60,9 +73,12 @@ def check_id(value: object, what: str) -> str:
     return value
 
 
+def canonical(body: object) -> str:
+    return json.dumps(body, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+
+
 def digest(body: object) -> str:
-    text = json.dumps(body, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
-    return hashlib.sha256(text.encode()).hexdigest()
+    return hashlib.sha256(canonical(body).encode()).hexdigest()
 
 
 class EvidenceClass(StrEnum):  # R040: never interchangeable
@@ -176,6 +192,22 @@ class MembershipEvent:
         return [e.instrument_id.to_wire(), e.change.value, e.effective.isoformat(),
                 when, e.feed_id]  # fmt: skip
 
+    @classmethod
+    def from_wire(cls, w: object) -> "MembershipEvent":
+        """Five canonical strings: instrument, change, date, UTC `Z` instant, feed."""
+        if type(w) is not list or len(w) != 5 or not all(type(x) is str for x in w):
+            raise ResearchError("event_wire", "five strings")
+        try:
+            e = cls(InstrumentId.from_wire(w[0]), Change(w[1]),
+                    date.fromisoformat(w[2]), parse_instant(w[3]), w[4])  # fmt: skip
+        except ResearchError:
+            raise
+        except ValueError as exc:  # IdentityError, InstantError and the enum's
+            raise ResearchError("event_wire", type(exc).__name__) from None
+        if e.to_wire() != w:
+            raise ResearchError("event_wire", "not the canonical wire form")
+        return e
+
 
 @dataclass(frozen=True, slots=True)
 class Universe:
@@ -209,12 +241,28 @@ class Universe:
                     latest[e.instrument_id] = e
         return frozenset(i for i, e in latest.items() if e.change is Change.ADD)
 
+    def to_wire(self) -> dict[str, object]:
+        return {"universe_id": self.universe_id,
+                "events": [e.to_wire() for e in self.events]}  # fmt: skip
 
-def _fact_wire(f: Fact) -> list[str]:
-    start = "" if f.period.start is None else f.period.start.isoformat()
-    return [f.cik, f.taxonomy, f.concept, f.unit.raw, start, f.period.end.isoformat(),
-            f.accession, str(f.value), format_instant(f.published_at),
-            format_instant(f.received_at), f.feed_id, f.feed_hash]  # fmt: skip
+    @classmethod
+    def from_wire(cls, w: object) -> "Universe":
+        if type(w) is not dict or set(w) != {"universe_id", "events"} or not (
+            type(w["universe_id"]) is str and type(w["events"]) is list
+        ):  # fmt: skip
+            raise ResearchError("universe_wire", "an id and a list of events")
+        events = tuple(MembershipEvent.from_wire(e) for e in w["events"])
+        return cls(w["universe_id"], events)
+
+
+def _storable(f: Fact) -> None:
+    """A dataset fact must survive its wire form unchanged (the store keeps it)."""
+    try:
+        same = Fact.from_wire(f.to_wire()) == f
+    except FilingsError as exc:
+        raise ResearchError("fact_wire", exc.code) from None
+    if not same:
+        raise ResearchError("fact_wire", "does not round-trip")
 
 
 @dataclass(frozen=True, slots=True)
@@ -292,8 +340,42 @@ class ResearchDataset:
 
     def __post_init__(self) -> None:
         m = self.manifest
+        if (type(m), type(self.facts), type(self.universe)) != (
+            DatasetManifest, FactBook, Universe
+        ):  # fmt: skip
+            raise ResearchError("dataset", "a manifest, a FactBook and a Universe")
+        for f in self.facts.facts:
+            _storable(f)
+        # One stored form per dataset (decision 74 compares bytes): facts in canonical
+        # JSON order of their wire, events in wire order. Order carries no meaning.
+        facts = sorted(self.facts.facts, key=lambda f: canonical(f.to_wire()))
+        events = sorted(self.universe.events, key=lambda e: e.to_wire())
+        object.__setattr__(self, "facts", FactBook(tuple(facts)))
+        u = Universe(self.universe.universe_id, tuple(events))
+        object.__setattr__(self, "universe", u)
         if m.content_hash != _content_hash(m, self.facts, self.universe):
             raise ResearchError("integrity", "content differs from its manifest hash")
+
+    def to_wire(self) -> dict[str, object]:
+        return {"manifest": self.manifest.to_wire(), "facts": self.facts.to_wire(),
+                "universe": self.universe.to_wire()}  # fmt: skip
+
+    @classmethod
+    def from_wire(cls, w: object) -> "ResearchDataset":
+        """Canonical parts in canonical order (an unsorted wire is refused); the
+        content hash is re-derived on construction and a mismatch is refused
+        (`integrity`)."""
+        if type(w) is not dict or set(w) != {"manifest", "facts", "universe"}:
+            raise ResearchError("dataset_wire", "manifest, facts and universe")
+        try:
+            facts = FactBook.from_wire(w["facts"])
+        except FilingsError as exc:
+            raise ResearchError("dataset_wire", exc.code) from None
+        m = DatasetManifest.from_wire(w["manifest"])
+        ds = cls(m, facts, Universe.from_wire(w["universe"]))
+        if ds.to_wire() != w:
+            raise ResearchError("dataset_wire", "not the canonical wire form")
+        return ds
 
     def _check_time(self, t: datetime) -> datetime:
         t = ensure_aware_utc(t)
@@ -310,9 +392,10 @@ class ResearchDataset:
 
 
 def _content_hash(m: DatasetManifest, facts: FactBook, universe: Universe) -> str:
+    """Owner decision 76: every fact field, through the complete fact wire."""
     return digest({
         "manifest": m.body(), "universe_id": universe.universe_id,
-        "facts": sorted(_fact_wire(f) for f in facts.facts),
+        "facts": sorted((f.to_wire() for f in facts.facts), key=canonical),
         "events": sorted(e.to_wire() for e in universe.events),
     })  # fmt: skip
 
