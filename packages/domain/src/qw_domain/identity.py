@@ -156,6 +156,32 @@ class Resolution:
     def found(cls, instrument_id: InstrumentId) -> "Resolution":
         return cls("found", instrument_id, (instrument_id,))
 
+    def to_wire(self) -> dict[str, object]:
+        iid = None if self.instrument_id is None else self.instrument_id.to_wire()
+        return {"status": self.status, "instrument_id": iid,
+                "candidates": [c.to_wire() for c in self.candidates]}  # fmt: skip
+
+    @classmethod
+    def from_wire(cls, w: object) -> "Resolution":
+        """Exactly the three keys, lowercase UUID strings; inconsistent refused."""
+        if type(w) is not dict or set(w) != {"status", "instrument_id", "candidates"}:
+            raise IdentityError("resolution wire needs exactly its three keys")
+        iid, cands = w["instrument_id"], w["candidates"]
+        status = next((s for s in _STATUSES if s == w["status"]), None)
+        if status is None or not (iid is None or type(iid) is str) or not (
+            type(cands) is list and all(type(c) is str for c in cands)
+        ):  # fmt: skip
+            raise IdentityError("resolution wire: malformed fields")
+        out = cls(status, None if iid is None else InstrumentId.from_wire(iid),
+                  tuple(InstrumentId.from_wire(c) for c in cands))  # fmt: skip
+        if out.to_wire() != w:
+            raise IdentityError("resolution wire: not the canonical form")
+        return out
+
+
+_STATUSES: tuple[Literal["found", "ambiguous", "unknown"], ...] = (
+    "found", "ambiguous", "unknown")  # fmt: skip
+
 
 @dataclass
 class SecurityMaster:
