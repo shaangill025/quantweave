@@ -1,5 +1,5 @@
-"""The T044 assessor store (`0028_assessor_ledger.sql`), used only by
-`experiment_store.record` in its assessor phase: a qw_assessor connection (owner
+"""The T044 assessor store (`0028_assessor_ledger.sql`), used by `assessor_run`
+and by `experiment_store.record` in its assessor phase: a qw_assessor connection (owner
 decision 17, the assessor-role migration; qw_worker has no privilege here) under
 the `experiment:<tenant>` lock; no route reads it. `bind` stores the protocol and
 lineage once, then requires the caller's to hash the same (`protocol_frozen`,
@@ -16,7 +16,10 @@ that does not extend the last stored checkpoint or begin with the plan's stored
 reads (`ledger_diverged`). `put_verdict` appends new holdout reads, then the
 receipt naming the read it scored, with its family's and its retest chain's trial
 counts and the verdict's Bonferroni adjustment (decisions 35 to 37; `chain_count`
-is the k `assess` widens z with). Reads re-hash every row and rebuild protocols,
+is the k `assess` widens z with). `reserve_read` (decision 42, 0038) records
+the assessor run's read before any data is opened: the plan's seq-1 read with
+attempt 1, then at most one re-run (attempt 2) under the same read and inputs.
+Reads re-hash every row and rebuild protocols,
 candidates and verdicts through the domain (stored reads are compared with the
 ledger's `Access`);
 failures are `integrity`. LIMITATIONS: the ledger itself and the budget book are
@@ -114,6 +117,11 @@ def _protocol(tx: TenantTx, eid: str) -> im.Protocol | None:
                    "AND experiment_id = %s", eid)  # fmt: skip
     got = _verified(rows, "assessor_protocol", tx, build)
     return got[0] if got else None
+
+
+def load_protocol(tx: TenantTx, eid: str) -> im.Protocol | None:
+    """The experiment's frozen protocol, verified; None if none is stored."""
+    return _protocol(tx, eid)
 
 
 def _lineage(tx: TenantTx, eid: str) -> list[im.Candidate]:
@@ -308,6 +316,62 @@ def chain_count(tx: TenantTx, p: im.Protocol, ledger: tl.TrialLedger) -> int:
     return im.chain_trials(ledger, chain, {r["experiment_id"]: r["n"] for r in rows})
 
 
+def put_read(tx: TenantTx, a: tl.Access) -> None:
+    """Append the granted holdout read `a` (the plan's next seq)."""
+    body = a.to_wire()
+    _insert(tx, "holdout_access", {
+        "plan_id": a.plan_id, "seq": a.seq, "access_id": a.access_id,
+        "trial_id": a.trial_id, "family": a.candidate.family,
+        "actor_id": a.actor_id, "body": Jsonb(body),
+    }, body)  # fmt: skip
+
+
+# attempt, experiment, candidate, verdict, access, seq, inputs digest (0038)
+type Reservation = tuple[int, str, str, str, str, int, str]
+
+
+def reservations(tx: TenantTx, plan_id: str) -> list[Reservation]:
+    """The plan's reserved promotion run: attempt 1, then its one re-run."""
+
+    def build(r: Row) -> tuple[Reservation, object]:
+        x: Reservation = (r["attempt"], r["experiment_id"], r["candidate_id"],
+                          r["verdict_id"], r["access_id"], r["seq"],
+                          r["inputs_digest"])  # fmt: skip
+        return x, [r["plan_id"], *x]
+
+    rows = _select(tx, "SELECT * FROM app.holdout_run WHERE tenant_id = %s "
+                   "AND plan_id = %s ORDER BY attempt", plan_id)  # fmt: skip
+    if [r["attempt"] for r in rows] != list(range(1, len(rows) + 1)):
+        raise ExperimentStoreError("integrity", "holdout run attempts")
+    return _verified(rows, "holdout_run", tx, build)
+
+
+def reserve_read(tx: TenantTx, p: im.Protocol, a: tl.Access, candidate_id: str,
+                 verdict_id: str, inputs: str) -> int:  # fmt: skip
+    """Owner decision 42's write-ahead, before any data is opened: the first run
+    stores the read `a` and attempt 1; after a crash the one re-run stores attempt
+    2 under the same read and inputs. Returns the attempt; refuses a read no run
+    reserved (`holdout_used`), a third attempt (`rerun_used`) and any other read or
+    input (`rerun_mismatch`)."""
+    runs, reads = reservations(tx, p.plan_id), _reads(tx, p.plan_id)
+    mine = (p.experiment_id, candidate_id, verdict_id, a.access_id, a.seq, inputs)
+    if not runs:
+        if reads:  # a stored read (a caller-recorded one) that no run reserved
+            raise ExperimentStoreError("holdout_used", p.plan_id)
+        put_read(tx, a)
+    elif len(runs) > 1:
+        raise ExperimentStoreError("rerun_used", p.plan_id)
+    elif runs[0][1:] != mine or reads != [a.to_wire()]:
+        raise ExperimentStoreError("rerun_mismatch", p.plan_id)
+    attempt = len(runs) + 1
+    _insert(tx, "holdout_run", {
+        "plan_id": p.plan_id, "attempt": attempt, "seq": a.seq,
+        "experiment_id": p.experiment_id, "candidate_id": candidate_id,
+        "verdict_id": verdict_id, "access_id": a.access_id, "inputs_digest": inputs,
+    }, [p.plan_id, attempt, *mine])  # fmt: skip
+    return attempt
+
+
 def put_verdict(tx: TenantTx, p: im.Protocol, v: im.Verdict,
                 ledger: tl.TrialLedger) -> None:  # fmt: skip
     """Append the ledger's new holdout reads, then the receipt (after `admit`)."""
@@ -316,12 +380,7 @@ def put_verdict(tx: TenantTx, p: im.Protocol, v: im.Verdict,
     if n is not None:
         reads, k = _holdout(p, ledger), len(_reads(tx, p.plan_id))
         for a in reads[k:]:
-            body = a.to_wire()
-            _insert(tx, "holdout_access", {
-                "plan_id": a.plan_id, "seq": a.seq, "access_id": a.access_id,
-                "trial_id": a.trial_id, "family": a.candidate.family,
-                "actor_id": a.actor_id, "body": Jsonb(body),
-            }, body)  # fmt: skip
+            put_read(tx, a)
         if v.trial_ids:
             t = next(x for x in ledger.trials() if x.trial_id == v.trial_ids[0])
             seq = next(a.seq for a in reads if a.access_id == t.access_id)

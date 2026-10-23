@@ -476,29 +476,29 @@ def _prospective(
 
 @dataclass(frozen=True, slots=True)
 class HoldoutData:
-    """The holdout price data the assessor evaluates on (owner decision 39); its
-    store (owner decision 41) is not built, so it is the caller's."""
+    """The holdout price data the assessor evaluates on (owner decision 39), read
+    from the protected store (owner decision 41, `holdout_series_store`)."""
 
     series: PriceSeries
     baseline_series: Mapping[str, PriceSeries]
 
 
-def holdout_run(
+def holdout_read(
     study: StrategyStudy, registry: im.ExperimentRegistry,
     strategies: StrategyRegistry, ledger: TrialLedger, candidate_id: str,
-    dataset: ResearchDataset, rights: ResearchRights, holdout: HoldoutData,
-    build: Callable[[Mapping[str, ParamValue]], Strategy], assessor: im.Party,
-    at: datetime, access_id: str, trial_id: str,
-) -> tuple[TrialLedger, TrialOutcome]:  # fmt: skip
-    """The assessor's promotion run of `candidate_id` on the holdout. Refusals come
-    before any read, and the caller's ledger is unchanged."""
+    assessor: im.Party, at: datetime, access_id: str, trial_id: str,
+) -> tuple[TrialLedger, Access]:  # fmt: skip
+    """The one promotion read `holdout_run` takes, requested on `ledger` but not
+    opened: every refusal comes first, so a refused caller's ledger is unchanged.
+    Deterministic, so a store can record the read before any data is opened (owner
+    decision 42) and `holdout_run` re-derives the same one."""
     p, c = study.protocol, registry.candidate(candidate_id)
     if c.experiment_id != study.family or registry.protocol(study.family) != p:
         raise Error("study_mismatch", candidate_id)
     if assessor != p.assessor:
         raise Error("assessor_not_registered", assessor.actor_id)
     study.check_plan(ledger)
-    m = _version(study, strategies, c)
+    _version(study, strategies, c)
     at = ensure_aware_utc(at)
     if at < max(p.registered_at, c.created_at):
         raise Error("before_freeze", format_instant(at))
@@ -520,9 +520,26 @@ def holdout_run(
                                   assessor.actor_id, Role.ASSESSOR, at)  # fmt: skip
     if not a.granted:
         raise Error("promotion_refused", ",".join(a.reasons))
-    return run_promotion_trial(lg, trial_id, p.hypothesis, at, dataset, rights,
-                               access_id, study.evaluation, holdout.series,
-                               build(MappingProxyType(m.resolve({}))),
+    return lg, a
+
+
+def holdout_run(
+    study: StrategyStudy, registry: im.ExperimentRegistry,
+    strategies: StrategyRegistry, ledger: TrialLedger, candidate_id: str,
+    dataset: ResearchDataset, rights: ResearchRights, holdout: HoldoutData,
+    build: Callable[[Mapping[str, ParamValue]], Strategy], assessor: im.Party,
+    at: datetime, access_id: str, trial_id: str,
+) -> tuple[TrialLedger, TrialOutcome]:  # fmt: skip
+    """The assessor's promotion run of `candidate_id` on the holdout: `holdout_read`
+    (refusals before any read; the caller's ledger is unchanged), then the trial."""
+    lg, _ = holdout_read(study, registry, strategies, ledger, candidate_id, assessor,
+                         at, access_id, trial_id)  # fmt: skip
+    p, c = study.protocol, registry.candidate(candidate_id)
+    m = _version(study, strategies, c)
+    plan = ledger.plan(p.plan_id)
+    return run_promotion_trial(lg, trial_id, p.hypothesis, ensure_aware_utc(at),
+                               dataset, rights, access_id, study.evaluation,
+                               holdout.series, build(MappingProxyType(m.resolve({}))),
                                holdout.baseline_series,
                                derived=_derived(plan.holdout_instruments,
                                                 holdout))  # fmt: skip

@@ -42,8 +42,8 @@ from qw_adapters import assessor_store as ast
 from qw_adapters.assessor_store import ExperimentStoreError
 from qw_adapters.tenancy import Conn, TenantTx, tenant_transaction
 
-__all__ = ["ExperimentStoreError", "Revision", "load", "page", "record",
-           "revision_hash"]  # fmt: skip
+__all__ = ["ExperimentStoreError", "Revision", "check_next", "load", "page",
+           "record", "revision_hash"]  # fmt: skip
 _COLUMNS = tuple(f.name for f in fields(im.ExperimentRecord))
 
 
@@ -152,6 +152,12 @@ def _check_follows(rec: im.ExperimentRecord, chain: list[Revision]) -> bool:
                                  and _new_verdict(rec, chain)):  # fmt: skip
         raise ExperimentStoreError("transition", "not a later state of this record")
     return False
+
+
+def check_next(tx: TenantTx, rec: im.ExperimentRecord) -> None:
+    """Raise `transition` unless `rec` may follow (or equals) the latest revision:
+    the check `record` makes, for a caller that must refuse before it acts."""
+    _check_follows(rec, _chains(tx, rec.experiment_id).get(rec.experiment_id, []))
 
 
 def record(
