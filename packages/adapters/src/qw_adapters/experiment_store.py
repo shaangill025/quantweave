@@ -6,9 +6,12 @@ the assessor store of `0028_assessor_ledger.sql`).
   protocol and lineage and a ledger that `assessor_store` admits (Q7 across
   ledgers). Owner decision 17: two transactions on two connections, one after the
   other, so the `experiment:<tenant>` lock is never held by both. (1) As qw_assessor
-  it binds, derives, checks the transition and stores the verdict's evaluation
-  receipt, then commits. (2) As qw_worker (the only revision INSERT role) it
-  re-checks the chain under its own lock and appends the revision. If (2) fails,
+  it binds (mirroring the protocol and lineage into the registry log, decision
+  81), derives, checks the transition, stores the verdict's evaluation receipt and
+  takes the registry log head the verdict extends (decision 79), then commits.
+  (2) As qw_worker (the only revision INSERT role) it re-checks the chain under
+  its own lock and appends the revision and, in the same transaction, the verdict
+  after that head (`registry_moved` if the log moved: retry). If (2) fails,
   the committed receipt stays without a revision: fail-closed, its scored holdout
   read counts as spent (`holdout_used` for any other verdict), and only the
   identical retry (same verdict and ledger checkpoint) completes it. Equal to the
@@ -28,6 +31,7 @@ from __future__ import annotations
 import hashlib
 import json
 import uuid
+from collections.abc import Callable
 from dataclasses import dataclass, fields
 from datetime import datetime
 from typing import Any
@@ -35,10 +39,12 @@ from typing import Any
 import psycopg
 from qw_domain import improvement as im
 from qw_domain.budget import BudgetBook
+from qw_domain.feedback import ImprovementEvidence
 from qw_domain.instants import ensure_aware_utc, format_instant
 from qw_domain.trial_ledger import SplitPlan
 
 from qw_adapters import assessor_store as ast
+from qw_adapters import experiment_registry_store as ers
 from qw_adapters.assessor_store import ExperimentStoreError
 from qw_adapters.tenancy import Conn, TenantTx, tenant_transaction
 
@@ -166,6 +172,7 @@ def record(
     plan: SplitPlan, book: BudgetBook,
     outcome: im.Scheduled | im.Deferred | None = None,
     assessment: im.Assessment | None = None,
+    evidence: ImprovementEvidence | None = None,
 ) -> tuple[Revision, bool]:  # fmt: skip
     """Derive the record (`improvement.record`) and append it as the experiment's
     next revision; (revision, wrote). `assessor` (a qw_assessor login) and `worker`
@@ -179,7 +186,7 @@ def record(
     with tenant_transaction(assessor, tenant_id) as atx:  # phase 1: qw_assessor
         _lock(atx, shared=False)
         chain = _chains(atx, experiment_id).get(experiment_id, [])
-        stored = ast.bind(atx, registry, experiment_id, candidate_id, plan)
+        stored = ast.bind(atx, registry, experiment_id, candidate_id, plan, evidence)
         k = (
             None
             if assessment is None
@@ -189,15 +196,27 @@ def record(
                                  outcome, assessment, chain_trials=k)  # fmt: skip
         if _check_follows(rec, chain):
             return chain[-1], False
+        head = None
         if verdict is not None and assessment is not None:
             ast.store_verdict(atx, stored.protocol(experiment_id), verdict,
                               assessment.ledger)  # fmt: skip
+            head = _registry(ers.verdict_head, atx, verdict)  # decision 79
     with tenant_transaction(worker, tenant_id) as tx:  # phase 2: qw_worker
         _lock(tx, shared=False)
         chain = _chains(tx, experiment_id).get(experiment_id, [])
         if _check_follows(rec, chain):
             return chain[-1], False
-        return _append(tx, rec, chain), True
+        out = _append(tx, rec, chain)
+        if verdict is not None and head is not None:  # with its revision, once
+            _registry(ers.append_verdict, tx, verdict, head)
+        return out, True
+
+
+def _registry[**P, T](fn: Callable[P, T], *args: P.args, **kw: P.kwargs) -> T:
+    try:
+        return fn(*args, **kw)
+    except ers.ExperimentRegistryError as exc:
+        raise ExperimentStoreError(exc.code, str(exc)) from None
 
 
 def _append(tx: TenantTx, rec: im.ExperimentRecord,

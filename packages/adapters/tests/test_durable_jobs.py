@@ -577,9 +577,10 @@ def test_security_definer_functions_are_hardened(conn: Conn) -> None:
         "WHERE a.privilege_type = 'EXECUTE' ORDER BY 1) FROM pg_proc p "
         "WHERE p.pronamespace = 'app'::regnamespace AND p.prosecdef ORDER BY 1"
     ).fetchall()
-    guard = [r for r in rows if r[0] == "experiment_retest_guard"]  # a trigger
-    assert guard == [("experiment_retest_guard", "qw_migrate", True,
-                      ["search_path=pg_catalog"], ["qw_migrate"])]  # fmt: skip
+    guard = [r for r in rows if r[0].startswith("experiment_")]  # 0042, 0034 triggers
+    assert guard == [(f"experiment_{n}_guard", "qw_migrate", True,
+                      ["search_path=pg_catalog"], ["qw_migrate"])
+                     for n in ("registry_entry", "retest")]  # fmt: skip
     history = [r for r in rows if r[0].startswith("release_history_")]  # 0037
     assert history == [(f"release_history_{n}", "qw_migrate", True,
                         ["search_path=pg_catalog"], ["qw_app", "qw_migrate"])

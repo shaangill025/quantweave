@@ -75,12 +75,14 @@ RELEASE_TABLES = (
     "release_key_revocation",
 )  # 0029, 0035
 # 0036, test_holdout_series_store; 0038 and 0040, test_assessor_run; 0041,
-# test_assessment_request_store
+# test_assessment_request_store; 0042 (0044 at commit),
+# test_experiment_registry_store
 HOLDOUT_TABLES = (
     "holdout_series",
     "holdout_run",
     "holdout_run_outcome",
     "assessment_request",
+    "experiment_registry_entry",
 )
 
 
