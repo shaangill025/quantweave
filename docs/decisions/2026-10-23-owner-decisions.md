@@ -340,3 +340,44 @@ below waives a test, gate or spec requirement. Numbering continues from
     already stored and hash-bound, so a separate copy adds a second source of truth
     that could disagree."
     Implemented by: T027 and T047, then T044 (the assessor run).
+
+## Experiment registry log
+
+79. **Who reads the experiment registry log.**
+    Question: "Decision 79: the experiment registry log (decision 71) records
+    verdicts, which carry holdout scores. Decision 17 keeps holdout scores away from
+    qw_worker, but the worker's append needs to replay the whole log. How should
+    appends work?"
+    Selected label: "Assessor replays; worker blind (Recommended)".
+    Option text as presented: "Only qw_assessor can read the log. When a verdict is
+    recorded, the assessor-side step replays it and hands the worker the current
+    head; the database refuses any append that doesn't extend that exact head, so
+    qw_worker needs no read access. Why: keeps decision 17's separation — the role
+    that runs untrusted experiments never sees holdout scores — while the chain stays
+    verified."
+    Implemented by: T044 (the experiment registry store).
+
+80. **Candidate ids across experiments.**
+    Question: "Decision 80: the domain registry requires candidate ids to be unique
+    across a whole tenant, but the stores today key candidates per experiment (two
+    experiments may each have a 'cand-1'). Which rule wins?"
+    Selected label: "Unique per tenant (Recommended)".
+    Option text as presented: "Keep the domain rule: a candidate id is unique within
+    the tenant, and the stores refuse a duplicate across experiments. Why: the
+    registry's cross-experiment rules (no reusing ids or reservations to blur trial
+    counts) depend on it, and there is no real data yet, so tightening now is free.
+    Not 'per experiment': that loses those cross-experiment protections."
+    Implemented by: T044 (the experiment and assessor stores).
+
+81. **Who logs protocols and candidates.**
+    Question: "Decision 81: nothing writes protocols and candidates to the registry
+    log yet; the only place they're stored is when the assessor binds a run. Who
+    should log them?"
+    Selected label: "Mirror at bind, checked (Recommended)".
+    Option text as presented: "When the assessor binds a protocol and candidate
+    lineage, append them to the log in the same step, re-checking the candidate's
+    evidence the way the registry requires. Why: the log then has every entry a
+    verdict depends on, written by the one path that already validates them, with
+    no separate registration step to forget. Rechecking evidence closes the gap that
+    bind doesn't check it today."
+    Implemented by: T044 (the assessor store and the registry log).
