@@ -2,7 +2,9 @@
 daemonisation; a process supervisor owns restarts). The runtime database URL comes
 from QW_DATABASE_URL and must be exactly a qw_worker member (owner decision 17:
 `runtime_connection(..., role="qw_worker")` refuses a qw_app, qw_assessor or mixed
-login at startup); settings from `settings_from_env`. No publish target is passed,
+login at startup); it refuses to start at all when QW_ASSESSOR_DATABASE_URL is set
+(owner decision 40: only `qw-assessor` holds the assessor login); settings from
+`settings_from_env`. No publish target is passed,
 so the outbox relay is off and events stay pending: a real transport needs explicit
 owner authorisation.
 """
@@ -19,6 +21,10 @@ from qw_worker.loop import Worker, install_signal_handlers
 
 def main() -> int:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(message)s")
+    if os.environ.get("QW_ASSESSOR_DATABASE_URL"):  # owner decision 40
+        print("refused: QW_ASSESSOR_DATABASE_URL is set; the assessor login is for "
+              "qw-assessor only", file=sys.stderr)  # fmt: skip
+        return 1
     conninfo = os.environ.get("QW_DATABASE_URL")
     if not conninfo:
         print("need QW_DATABASE_URL", file=sys.stderr)
