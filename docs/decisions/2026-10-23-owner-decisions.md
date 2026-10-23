@@ -381,3 +381,16 @@ below waives a test, gate or spec requirement. Numbering continues from
     no separate registration step to forget. Rechecking evidence closes the gap that
     bind doesn't check it today."
     Implemented by: T044 (the assessor store and the registry log).
+
+82. **Verdict ids across experiments.**
+    Question: "Decision 82: following decision 80's rule for candidate ids, the
+    registry log now also requires verdict ids to be unique across the whole tenant
+    (the domain registry already refuses duplicate verdict ids). The older stores
+    keyed verdicts per experiment. Accept tenant-wide unique verdict ids?"
+    Selected label: "Yes, unique per tenant (Recommended)".
+    Option text as presented: "Verdict ids are unique within the tenant, like
+    candidate ids (decision 80). Why: same reasoning as decision 80 — a reused
+    verdict id across experiments could blur which verdict a later reference means;
+    the domain registry already enforces it, and there is no real data, so
+    tightening now is free."
+    Implemented by: T044 (the experiment registry log).
