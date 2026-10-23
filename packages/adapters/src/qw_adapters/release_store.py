@@ -31,6 +31,9 @@ id and no qw_app privilege (0029); tenant adoptions stay in `strategy_store`.
   material and is trusted only when the caller's in-process `test_verifiers`
   supplies its verifier. A secret never reaches a table: PEM private keys and
   material on a test key are refused.
+- Owner decision 45, the read: `history` serves qw_app, which holds no privilege
+  on these tables, through 0037's member-only SECURITY DEFINER reads; the
+  deployment's tenant list never leaves the database (its hash is checked there).
 LIMITATIONS: verdicts are the caller's registry (T044 N3, marked caller-supplied
 per decision 33): the assessor store holds tenant-scope protocols only, and an
 installation-scope release cannot cite one. Keys, adoptions (step-up reuse across
@@ -55,6 +58,8 @@ from qw_domain.instants import ensure_aware_utc, format_instant, parse_instant
 from qw_domain.research_data import digest
 from qw_domain.strategy_registry import StrategyManifest
 from qw_domain.strategy_registry import StrategyRegistry as Strategies
+
+from qw_adapters.tenancy import TenantTx
 
 Conn = psycopg.Connection[Any]
 Row = dict[str, Any]
@@ -185,9 +190,10 @@ def _manifest(w: Mapping[str, Any]) -> rl.ReleaseManifest:
 def _release(conn: Conn, release_id: str) -> rl.SignedRelease | None:
     rows = _rows(conn, "SELECT * FROM app.signed_release WHERE release_id = %s",
                  release_id)  # fmt: skip
-    if not rows:
-        return None
-    r = rows[0]
+    return _release_of(rows[0]) if rows else None
+
+
+def _release_of(r: Row) -> rl.SignedRelease:
     try:
         m = _manifest(r["body"])
         src = r["verdict_source"]  # NULL: recorded before decision 33's mark
@@ -299,9 +305,17 @@ def _check_key(k: KeyRecord) -> None:
         raise ReleaseStoreError("algorithm_not_production", k.algorithm)
 
 
-def _key_rows(conn: Conn) -> tuple[list[Row], dict[str, Row]]:
-    keys = _rows(conn, "SELECT * FROM app.release_trusted_key ORDER BY key_id")
-    revoked = _rows(conn, "SELECT * FROM app.release_key_revocation ORDER BY key_id")
+def _key_rows(conn: Conn, member_of: str | None = None,
+              ) -> tuple[list[Row], dict[str, Row]]:  # fmt: skip
+    """The tables (operator and worker), or 0037's member reads (qw_app)."""
+    if member_of is None:
+        keys = _rows(conn, "SELECT * FROM app.release_trusted_key ORDER BY key_id")
+        revoked = _rows(conn, "SELECT * FROM app.release_key_revocation "
+                        "ORDER BY key_id")  # fmt: skip
+    else:
+        keys = _rows(conn, "SELECT * FROM app.release_history_keys(%s)", member_of)
+        revoked = _rows(conn, "SELECT * FROM app.release_history_revocations(%s)",
+                        member_of)  # fmt: skip
     return keys, {r["key_id"]: r for r in revoked}
 
 
@@ -318,11 +332,12 @@ def _key_record(r: Row) -> KeyRecord:
 
 
 def stored_keys(conn: Conn, test_verifiers: Mapping[str, rl.Verifier] | None = None,
-                ) -> dict[str, rl.TrustedKey]:  # fmt: skip
+                member_of: str | None = None) -> dict[str, rl.TrustedKey]:  # fmt: skip
     """The operator's trusted keys and revocations, re-hashed; a test key appears
-    only with its verifier from `test_verifiers` (in process, never stored)."""
+    only with its verifier from `test_verifiers` (in process, never stored).
+    `member_of` reads them through 0037 as a member of that deployment."""
     hook = test_verifiers or {}
-    rows, revoked = _key_rows(conn)
+    rows, revoked = _key_rows(conn, member_of)
     out: dict[str, rl.TrustedKey] = {}
     try:
         for r in rows:
@@ -440,10 +455,22 @@ def _ledger(conn: Conn, deployment_id: str, keys: Keys) -> rl.DeploymentLedger |
                  "ORDER BY seq", deployment_id)  # fmt: skip
     releases: dict[str, rl.SignedRelease | None] = {}
 
-    def rel(rid: str) -> rl.SignedRelease:
+    def rel(rid: str) -> rl.SignedRelease | None:
         if rid not in releases:
             releases[rid] = _release(conn, rid)
-        if (sr := releases[rid]) is None:
+        return releases[rid]
+
+    return _replay(d, rows, rel, keys)
+
+
+def _replay(d: rl.Deployment, rows: list[Row],
+            release: Callable[[str], rl.SignedRelease | None],
+            keys: Keys) -> rl.DeploymentLedger:  # fmt: skip
+    """Rebuild, re-hash and replay the stored events; any failure is `integrity`."""
+    deployment_id = d.deployment_id
+
+    def rel(rid: str) -> rl.SignedRelease:
+        if (sr := release(rid)) is None:
             raise ValueError("unknown release")
         return sr
 
@@ -484,6 +511,59 @@ def load(conn: Conn, deployment_id: str,
         _lock(conn, deployment_id, shared=True)
         return _ledger(conn, deployment_id,
                        stored_keys(conn) if keys is None else keys)  # fmt: skip
+
+
+@dataclass(frozen=True, slots=True)
+class History:
+    """A member's view (0037): the replayed ledger, whose deployment names only the
+    caller's tenant, the stored keys it was verified with and the database clock."""
+
+    ledger: rl.DeploymentLedger
+    keys: Keys
+    at: datetime
+
+
+def _member_deployment(conn: Conn, deployment_id: str) -> rl.Deployment | None:
+    rows = _rows(conn, "SELECT * FROM app.release_history_deployment(%s)",
+                 deployment_id)  # fmt: skip
+    if not rows:
+        return None
+    r = rows[0]
+    if r["hash_ok"] is not True or list(r["operators"]) != sorted(set(r["operators"])):
+        raise ReleaseStoreError("integrity", "release_deployment")
+    try:
+        ed, ops = rl.Edition(r["edition"]), frozenset(r["operators"])
+        return rl.Deployment(r["deployment_id"], ed, ops, frozenset(r["tenants"]),
+                             r["initial_schema"], r["allows_test_keys"],
+                             rl.SoloMaintainer(ed, ops) if r["solo_maintainer"]
+                             else None)  # fmt: skip
+    except (ValueError, TypeError) as exc:
+        raise ReleaseStoreError("integrity", type(exc).__name__) from None
+
+
+def history(tx: TenantTx, deployment_id: str,
+            test_verifiers: Mapping[str, rl.Verifier] | None = None,
+            ) -> History | None:  # fmt: skip
+    """The release history the session tenant may read (qw_app, owner decision 45):
+    None unless the deployment is recorded and the tenant is one of its members.
+    Every row is re-hashed and the ledger replayed with full signature checks
+    against the stored keys; a test key verifies only through `test_verifiers`."""
+    conn = tx.conn
+    _lock(conn, deployment_id, shared=True)  # inside the tenant transaction
+    d = _member_deployment(conn, deployment_id)
+    if d is None:
+        return None
+    keys = stored_keys(conn, test_verifiers, member_of=deployment_id)
+    rows = _rows(conn, "SELECT * FROM app.release_history_events(%s) ORDER BY seq",
+                 deployment_id)  # fmt: skip
+    found = _rows(conn, "SELECT * FROM app.release_history_releases(%s)",
+                  deployment_id)  # fmt: skip
+    stored = {r["release_id"]: r for r in found}
+
+    def rel(rid: str) -> rl.SignedRelease | None:
+        return _release_of(stored[rid]) if rid in stored else None
+
+    return History(_replay(d, rows, rel, keys), keys, _now(conn))
 
 
 def _append(conn: Conn, deployment_id: str, keys: Keys | None,

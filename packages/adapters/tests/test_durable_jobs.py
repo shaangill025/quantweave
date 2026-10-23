@@ -580,7 +580,13 @@ def test_security_definer_functions_are_hardened(conn: Conn) -> None:
     guard = [r for r in rows if r[0] == "experiment_retest_guard"]  # a trigger
     assert guard == [("experiment_retest_guard", "qw_migrate", True,
                       ["search_path=pg_catalog"], ["qw_migrate"])]  # fmt: skip
-    jobs = [r for r in rows if not r[0].startswith("throttle_") and r not in guard]
+    history = [r for r in rows if r[0].startswith("release_history_")]  # 0037
+    assert history == [(f"release_history_{n}", "qw_migrate", True,
+                        ["search_path=pg_catalog"], ["qw_app", "qw_migrate"])
+                       for n in ("deployment", "events", "keys", "releases",
+                                 "revocations")]  # fmt: skip
+    jobs = [r for r in rows if not r[0].startswith("throttle_")
+            and r not in guard + history]  # fmt: skip
     assert [r[0] for r in jobs] == [
         "idempotency_purge", "inbox_purge", "job_expired_leases", "job_overdue",
         "job_pick", "outbox_pick", "outbox_purge"]  # fmt: skip

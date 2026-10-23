@@ -251,6 +251,7 @@ def test_decision_47_only_the_operator_records_a_deployment(
         "'app' AND tablename = 'release_deployment' ORDER BY 1"
     ).fetchall()  # fmt: skip
     assert policies == [
+        ("history_reader", "SELECT", "{qw_migrate}"),  # 0037's definer reads
         ("installation_operator", "ALL", "{qw_release}"),
         ("installation_worker_read", "SELECT", "{qw_worker}"),
     ]

@@ -9,7 +9,7 @@ import ipaddress
 import logging
 import re
 import secrets
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Mapping
 from contextlib import AbstractContextManager
 from dataclasses import dataclass, field
 from datetime import timedelta
@@ -22,7 +22,7 @@ from fastapi.responses import JSONResponse
 from qw_adapters import rights_store
 from qw_adapters.notification_store import Keyring
 from qw_adapters.tenancy import MAX_SESSION_TTL, Conn, TenantTx, ThrottlePolicy
-from qw_domain.release import Edition
+from qw_domain.release import Edition, Verifier
 from qw_domain.rights import Registry
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
@@ -278,7 +278,11 @@ def create_app(
     connections: ConnectionProvider,
     authenticator: Authenticator,
     rights: RightsProvider = rights_store.load,
+    release_test_verifiers: Mapping[str, Verifier] | None = None,
 ) -> FastAPI:
+    """`release_test_verifiers` is the in-process test hook of
+    `release_store.stored_keys`: test-only release keys store no material, so they
+    verify only with a verifier the process supplies (none in production)."""
     from qw_api.capabilities import router as capabilities
     from qw_api.experiments import router as experiments
     from qw_api.feedback import router as feedback
@@ -286,6 +290,7 @@ def create_app(
     from qw_api.notifications import router as notifications
     from qw_api.policies import router as policies
     from qw_api.reads import router as reads
+    from qw_api.releases import router as releases
     from qw_api.research import router as research
     from qw_api.routes import router
     from qw_api.simulations import router as simulations
@@ -303,6 +308,7 @@ def create_app(
     app.state.connections = connections
     app.state.authenticator = authenticator
     app.state.rights = rights
+    app.state.release_test_verifiers = dict(release_test_verifiers or {})
     app.include_router(router)
     app.include_router(capabilities)
     app.include_router(experiments)
@@ -311,6 +317,7 @@ def create_app(
     app.include_router(notifications)
     app.include_router(policies)
     app.include_router(reads)
+    app.include_router(releases)
     app.include_router(research)
     app.include_router(simulations)
     app.include_router(strategies)
