@@ -41,6 +41,7 @@ recorded leaves no earlier result to compare. A reservation made before decision
 from __future__ import annotations
 
 import uuid
+from collections.abc import Callable
 from dataclasses import dataclass, replace
 from datetime import datetime
 
@@ -167,9 +168,12 @@ def _reserve(tx: TenantTx, r: Request) -> Reserved:
 
 
 def promotion_run(worker: Conn, assessor: Conn, tenant_id: uuid.UUID, r: Request,
-                  strategies: Implementations) -> Run:  # fmt: skip
+                  strategies: Implementations,
+                  beat: Callable[[], object] = lambda: None) -> Run:  # fmt: skip
     """Run `r` on the plan's one holdout read, recorded before it is opened, with
-    the strategy code `strategies` (the process's reviewed registry) resolves."""
+    the strategy code `strategies` (the process's reviewed registry) resolves.
+    `beat` (the job's lease heartbeat) runs after each committed phase; whatever
+    it raises stops the run there."""
     p = r.study.protocol
     if p.scope is not im.Scope.TENANT or p.scope_id != str(tenant_id):
         raise ExperimentStoreError("scope", "tenant-scope runs of this tenant")
@@ -186,16 +190,19 @@ def promotion_run(worker: Conn, assessor: Conn, tenant_id: uuid.UUID, r: Request
         tx.conn.execute("SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
                         (f"experiment:{tenant_id}",))  # fmt: skip
         attempt, a, data, study, reg = _reserve(tx, r)
+    beat()
     # phase 2: the read is recorded; only now is the holdout data opened
     lg, out = si.holdout_run(study, reg, r.strategies, r.ledger, r.candidate_id,
                              r.dataset, r.rights, data, build, r.assessor, r.at,
                              r.access_id, r.trial_id)  # fmt: skip
     if lg.access(r.access_id).to_wire() != a.to_wire():
         raise ExperimentStoreError("read_mismatch", r.access_id)
+    beat()
     n = len(lg.entries)  # the read and the trial, metrics included
     done = digest(["holdout_run_outcome", n, lg.checkpoint(n), out.reason])
     with tenant_transaction(assessor, tenant_id) as tx:  # phase 3 (decision 60)
         ast.record_outcome(tx, p.plan_id, attempt, done)
+    beat()
     run = im.Assessment(lg, r.assessor, ensure_aware_utc(r.at), r.verdict_id,
                         evaluation=r.study.evaluation)  # fmt: skip
     rev, wrote = es.record(worker, assessor, tenant_id, r.registry, p.experiment_id,

@@ -204,7 +204,8 @@ class Reservation:
     def from_book_wire(cls, w: object) -> "Reservation":
         """Refuses what no book method makes: a non-positive reservation, a
         negative actual, an actual on an open or released reservation (or none on
-        a charged one), more returns than sends, a deadline not after creation."""
+        a charged one), more returns than sends, a deadline not after creation, a
+        send or charge never dispatched, or a release after a dispatch."""
         keys = {"reservation_id", "scope_id", "period", "category", "reserved",
                 "provider_account_ref", "max_output_tokens", "created_at", "deadline",
                 "status", "dispatched", "actual", "sends", "returned"}  # fmt: skip
@@ -229,6 +230,12 @@ class Reservation:
             (r.actual is not None) != charged or r.deadline <= r.created_at
         ):  # fmt: skip
             raise BudgetError("book_wire", r.reservation_id)
+        # #168 review F2: a send dispatches, a charge needs a dispatch (settle,
+        # expire_due), a release needs none (release, expire_due)
+        if ((r.sends > 0 or charged) and not r.dispatched) or (
+            r.status is Status.RELEASED and r.dispatched
+        ):  # fmt: skip
+            raise BudgetError("book_wire", f"{r.reservation_id}: dispatch history")
         return r
 
 
@@ -272,7 +279,8 @@ class BudgetBook:
 
     @classmethod
     def from_wire(cls, w: object) -> "BudgetBook":
-        """Canonical input only, with distinct reservation ids."""
+        """Canonical input only, with distinct reservation ids, each of this
+        book's scope and month and created in that month (`reserve`'s rule)."""
         keys = {"scope_id", "period", "caps", "reservations", "version"}
         if type(w) is not dict or set(w) != keys or (
             type(w["reservations"]) is not list
@@ -282,6 +290,9 @@ class BudgetBook:
         rows = tuple(Reservation.from_book_wire(r) for r in w["reservations"])
         if len({r.reservation_id for r in rows}) != len(rows):
             raise BudgetError("book_wire", "duplicate reservation")
+        if any((r.scope_id, r.period) != (w["scope_id"], w["period"])
+               or period_of(r.created_at) != r.period for r in rows):  # fmt: skip
+            raise BudgetError("book_wire", "a reservation of another book or month")
         return _canonical(w, lambda: cls(w["scope_id"], _text(w["period"]),
                                          BudgetCaps.from_wire(w["caps"]), rows,
                                          w["version"]))  # fmt: skip

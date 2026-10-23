@@ -24,9 +24,12 @@ refused (`strategy_implementation_unnamed`). A registry is
 built from entries carrying their reviewed hash; an entry whose code no longer
 hashes to it is refused when the registry is built
 (`strategy_implementation_changed`), so edited code cannot run under an old
-review. LIMITATIONS: a module loaded dynamically (`importlib.import_module`,
-`__import__`) is not seen by the parser, and non-Python files a strategy reads
-are not hashed."""
+review. A file in the closure that calls `import_module` or `__import__` (by any
+name or attribute) is refused (`strategy_implementation_dynamic_import`): what it
+would load cannot be hashed. LIMITATIONS: other dynamic loading (`importlib.util`
+loaders, `runpy`, `exec`, and a call through an alias or `getattr`), star imports
+of submodules and non-Python files are not seen; a strategy outside the project
+packages is hashed by its own file only."""
 
 from __future__ import annotations
 
@@ -103,6 +106,12 @@ def _name(path: Path, project: tuple[str, ...]) -> str | None:
     return None
 
 
+def _dynamic(f: ast.expr) -> bool:
+    """A call of `import_module` or `__import__`, by any name or attribute."""
+    name = f.id if isinstance(f, ast.Name) else getattr(f, "attr", None)
+    return name in ("import_module", "__import__")
+
+
 def _closure(root: Path, project: tuple[str, ...]) -> dict[str, Path]:
     """Every project module `root` imports, transitively, with its package
     parents (their `__init__` runs too), by parsing import statements."""
@@ -117,6 +126,8 @@ def _closure(root: Path, project: tuple[str, ...]) -> dict[str, Path]:
         if path == root and package:  # the root's own packages run at import
             wanted.append((package, True))
         for node in ast.walk(ast.parse(path.read_bytes(), str(path))):
+            if isinstance(node, ast.Call) and _dynamic(node.func):  # gap 2
+                raise ValueError(f"strategy_implementation_dynamic_import: {path}")
             if isinstance(node, ast.Import):
                 wanted += [(a.name, True) for a in node.names]
             elif isinstance(node, ast.ImportFrom):

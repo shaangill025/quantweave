@@ -6,7 +6,6 @@ computed deterministically from the code. SYNTHETIC strategies only."""
 from __future__ import annotations
 
 import hashlib
-import importlib
 import inspect
 import subprocess
 import sys
@@ -84,7 +83,10 @@ def pkg(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[Path]:
 
 
 def _strat(pkg: Path) -> Any:
-    return importlib.import_module("synthpkg.strat").build
+    import synthpkg.strat  # type: ignore[import-not-found]  # static: this module's own code may not import
+    # dynamically (gap 2), and synthpkg is not project code for it
+
+    return synthpkg.strat.build
 
 
 def test_decision_68_project_imports_are_hashed_transitively(pkg: Path) -> None:
@@ -120,12 +122,28 @@ def test_decision_68_project_imports_are_hashed_transitively(pkg: Path) -> None:
 
 def test_decision_68_the_roots_own_packages_are_hashed(pkg: Path) -> None:
     (pkg / "synthpkg" / "sub" / "lone.py").write_text("def build(cfg):\n    return 1\n")
-    build = importlib.import_module("synthpkg.sub.lone").build  # imports nothing
+    import synthpkg.sub.lone  # type: ignore[import-not-found]
+
+    build = synthpkg.sub.lone.build  # imports nothing
     h = si.implementation_hash(ID, V, build, project=("synthpkg",))
     for init in ("synthpkg/__init__.py", "synthpkg/sub/__init__.py"):
         (pkg / init).write_text("# changed\n")  # runs when lone is imported
         assert si.implementation_hash(ID, V, build, project=("synthpkg",)) != h
         (pkg / init).write_text("")
+
+
+@pytest.mark.parametrize("call", [
+    "importlib.import_module('json')", "__import__('json')",
+    "import_module('json')", "builtins.__import__('json')"])  # fmt: skip
+def test_gap_2_a_dynamic_import_in_the_closure_is_refused(pkg: Path, call: str) -> None:
+    build = _strat(pkg)
+    h = si.implementation_hash(ID, V, build, project=("synthpkg",))
+    f = pkg / "synthpkg" / "sub" / "deep.py"  # two imports down from the strategy
+    f.write_text(PKG["synthpkg/sub/deep.py"] + f"def load():\n    return {call}\n")
+    with pytest.raises(ValueError, match="strategy_implementation_dynamic_import"):
+        si.implementation_hash(ID, V, build, project=("synthpkg",))
+    f.write_text(PKG["synthpkg/sub/deep.py"] + "# the name import_module, not a call\n")
+    assert si.implementation_hash(ID, V, build, project=("synthpkg",)) != h
 
 
 def test_decision_68_an_unresolvable_project_import_is_refused(pkg: Path) -> None:

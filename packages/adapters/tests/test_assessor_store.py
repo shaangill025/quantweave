@@ -46,10 +46,24 @@ Conn = psycopg.Connection[Any]
 Pair = tuple[Conn, Conn]  # (qw_worker, qw_assessor), as in test_experiment_store
 St = im.RecordState
 PROTECTED = ("assessor_protocol", "assessor_candidate", "holdout_access")
-APP_RECEIPT = {"tenant_id", "experiment_id", "verdict_id", "candidate_id",
-               "candidate_hash", "protocol_hash", "assessor_version", "decision",
-               "reasons", "trial_ids", "failed_trial_ids", "limitations",
-               "assessed_at", "recorded_at"}  # fmt: skip
+APP_RECEIPT = {
+    "tenant_id",
+    "experiment_id",
+    "verdict_id",
+    "candidate_id",
+    "candidate_hash",
+    "protocol_hash",
+    "assessor_version",
+    "decision",
+    "reasons",
+    "trial_ids",
+    "failed_trial_ids",
+    "limitations",
+    "assessed_at",
+    "recorded_at",
+    "ledger_caller_supplied",
+    "book_caller_supplied",
+}  # fmt: skip (decision 66: reviewers see them)
 PARTIAL = {k: v for k, v in GOOD.items() if k != "unrecorded_trials"}
 
 
@@ -364,7 +378,7 @@ def test_decision_17_only_qw_assessor_writes_and_reads_assessor_tables(
     assess(wa, a, promo_ledger(GOOD), "v-1")
     tn.check_runtime_role(assessor_conn)  # a runtime role, like qw_app and qw_worker
     every = privileges(conn, "qw_migrate", "SELECT")
-    assert len(every) == 13 + 9 + 10 + 26  # the four tables' columns
+    assert len(every) == 13 + 9 + 10 + 28  # the four tables' columns
     assert privileges(conn, "qw_assessor", "SELECT") == every
     assert privileges(conn, "qw_assessor", "INSERT") == every  # 0028's full lists
     assert held(conn, "qw_assessor") == {(t, "SELECT") for t in (
