@@ -38,9 +38,11 @@ import psycopg
 from psycopg.types.json import Jsonb
 from qw_domain import improvement as im
 from qw_domain import trial_ledger as tl
+from qw_domain.feedback import ImprovementEvidence
 from qw_domain.instants import ensure_aware_utc, format_instant, parse_instant
 from qw_domain.research_data import ResearchError, Window, digest
 
+from qw_adapters import experiment_registry_store as ers
 from qw_adapters.tenancy import TenantTx
 
 Row = dict[str, Any]
@@ -158,8 +160,12 @@ def _window_free(tx: TenantTx, p: im.Protocol, window: Window) -> None:
 
 
 def bind(tx: TenantTx, registry: im.ExperimentRegistry, eid: str, cid: str,
-         plan: tl.SplitPlan) -> im.ExperimentRegistry:  # fmt: skip
-    """The registry rebuilt from the stored protocol and lineage of `cid`."""
+         plan: tl.SplitPlan, evidence: ImprovementEvidence | None = None,
+         ) -> im.ExperimentRegistry:  # fmt: skip
+    """The registry rebuilt from the stored protocol and lineage of `cid`, both
+    mirrored into the tenant's registry log in this step (owner decision 81: each
+    new candidate's evidence uses re-checked against `evidence`; decision 80: a
+    candidate id another experiment of the tenant uses is `duplicate`)."""
     p, c = registry.protocol(eid), registry.candidate(cid)
     if c.experiment_id != eid:
         raise im.ImprovementError("candidate_experiment", cid)
@@ -194,6 +200,12 @@ def bind(tx: TenantTx, registry: im.ExperimentRegistry, eid: str, cid: str,
             "body": Jsonb(x.wire()),
         }, [depth, x.wire()])  # fmt: skip
         have.append(x)
+    try:
+        ers.append(tx, stored)
+        for x in have:
+            ers.append(tx, x, evidence)
+    except ers.ExperimentRegistryError as exc:
+        raise ExperimentStoreError(exc.code, str(exc)) from None
     try:
         return im.ExperimentRegistry(str(tx.tenant_id), (stored, *have))
     except (im.ImprovementError, TypeError) as exc:

@@ -67,6 +67,10 @@ APP_RECEIPT = {
 PARTIAL = {k: v for k, v in GOOD.items() if k != "unrecorded_trials"}
 
 
+def vid_on(vid: str, eid: str) -> str:  # a verdict id is unique in the tenant
+    return vid if eid == EXP else f"{vid}.{eid}"
+
+
 def lg(t: uuid.UUID, base: tl.TrialLedger) -> tl.TrialLedger:
     return tl.TrialLedger(str(t), base.entries)
 
@@ -90,7 +94,7 @@ def assess(wa: Pair, t: uuid.UUID, base: tl.TrialLedger, vid: str,
            eid: str = EXP) -> es.Revision:  # fmt: skip
     reg = reg_for(t, eid, bud="bud-exp-1" if eid == EXP else f"bud-{eid}")
     rev: es.Revision = put(wa, t, reg, booked(reg, eid), None,
-                           run(t, base, vid), eid=eid)[0]  # fmt: skip
+                           run(t, base, vid_on(vid, eid)), eid=eid)[0]  # fmt: skip
     return rev
 
 
@@ -388,7 +392,9 @@ def test_decision_17_only_qw_assessor_writes_and_reads_assessor_tables(
         ("holdout_run", "SELECT"), ("holdout_run", "INSERT"),
         ("holdout_run_outcome", "SELECT"),
         ("holdout_run_outcome", "INSERT"),
-        ("assessment_request", "SELECT")} | {  # 0042: decisions 70 and 78
+        ("assessment_request", "SELECT"),
+        ("experiment_registry_entry", "SELECT"),
+        ("experiment_registry_entry", "INSERT")} | {  # 0043: decisions 70 and 78
         (t, "SELECT") for t in (
             "strategy_manifest", "rights_provider", "rights_feed",
             "rights_feed_revision", "rights_feed_transition",
@@ -608,7 +614,8 @@ def reg_on(t: uuid.UUID, eid: str, sp: tl.SplitPlan, baseline: str = "strat-v0",
     p = replace(base, plan_id=sp.plan_id, plan_digest=im.plan_digest(sp),
                 baseline_version=baseline, retest_of=retest_of)  # fmt: skip
     return im.ExperimentRegistry(str(t)).register(p).register_candidate(
-        cand(experiment_id=eid, target=target, parent_id=baseline))  # fmt: skip
+        cand(st.cid(eid), experiment_id=eid, target=target,
+             parent_id=baseline))  # fmt: skip
 
 
 def read_on(t: uuid.UUID, sp: tl.SplitPlan, eid: str,
@@ -633,10 +640,11 @@ def put_on(wa: Pair, t: uuid.UUID, eid: str, sp: tl.SplitPlan, lg: Any = None,
            target: im.Target = im.Target.STRATEGY) -> es.Revision:  # fmt: skip
     reg = reg_on(t, eid, sp, baseline, retest_of, target)
     run_ = None if lg is None else im.Assessment(lg, ASSESSOR, AT + timedelta(days=1),
-                                                 vid, evaluation=evaluation(
+                                                 vid_on(vid, eid),
+                                                 evaluation=evaluation(
                                                      sp.plan_id))  # fmt: skip
     out = im.Scheduled(eid, f"bud-{eid}") if lg is None else None
-    rev: es.Revision = es.record(*wa, t, reg, eid, "cand-1", sp, booked(reg, eid),
+    rev: es.Revision = es.record(*wa, t, reg, eid, st.cid(eid), sp, booked(reg, eid),
                                  out, run_)[0]  # fmt: skip
     return rev
 
