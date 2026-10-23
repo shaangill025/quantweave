@@ -29,7 +29,8 @@ from qw_adapters import tenancy as tn
 from qw_domain import improvement as im
 from qw_domain import strategy_improvement as si
 from qw_domain.backtest import TrialOutcome
-from qw_domain.budget import BudgetBook
+from qw_domain.budget import BudgetBook, Category
+from qw_domain.decimals import UsdBudget
 from qw_domain.research_data import ResearchDataset, ResearchRights
 from qw_domain.trial_ledger import Outcome, Split, SplitPlan, TrialLedger
 from test_backtest import scripted
@@ -39,8 +40,9 @@ from test_trial_ledger import DS, T0, TRAIN, plan
 
 pytestmark = pytest.mark.db
 Conn = psycopg.Connection[Any]
-TABLES = ("assessor_protocol", "assessor_candidate", "holdout_access", "holdout_run",
-          "evaluation_receipt", "experiment_revision")  # fmt: skip
+TABLES = ("assessor_protocol", "assessor_candidate", "holdout_access",
+          "holdout_run", "holdout_run_outcome", "evaluation_receipt",
+          "experiment_revision")  # fmt: skip
 
 
 class Crash(RuntimeError):
@@ -315,8 +317,16 @@ def test_decision_42_a_crash_before_the_reservation_leaves_a_fresh_run(
     assert go(wrk, asr, w).attempt == 1  # so the next run is the first
 
 
-@pytest.mark.parametrize("where", ["evaluate", "record", "revision"])
-def test_decision_42_a_crash_after_the_reservation_reruns_the_same_read_once(
+POINTS = {
+    "evaluate": (si, "holdout_run"),
+    "outcome": (ast, "record_outcome"),
+    "record": (es, "record"),
+    "revision": (es, "_append"),
+}
+
+
+@pytest.mark.parametrize("where", list(POINTS))
+def test_decision_42_a_crash_after_the_reservation_reruns_the_same_read(
     wrk: Conn,
     asr: Conn,
     conn: Conn,
@@ -325,38 +335,60 @@ def test_decision_42_a_crash_after_the_reservation_reruns_the_same_read_once(
     where: str,
 ) -> None:
     lg, out, v = expected(w)
-    owner, name = {"evaluate": (si, "holdout_run"), "record": (es, "record"),
-                   "revision": (es, "_append")}[where]  # fmt: skip
-    crash(monkeypatch, owner, name)
+    crash(monkeypatch, *POINTS[where])
     with pytest.raises(Crash):
         go(wrk, asr, w)
     mid = counts(conn, w.t)
     assert (mid["holdout_access"], mid["holdout_run"]) == (1, 1)
-    assert mid["evaluation_receipt"] == (1 if where == "revision" else 0)
+    assert mid["holdout_run_outcome"] == (where in ("record", "revision"))
+    assert mid["evaluation_receipt"] == (where == "revision")
     monkeypatch.undo()
     run = go(wrk, asr, w)  # the same request: a re-run under the recorded read
     assert (run.attempt, run.wrote, run.ledger, run.outcome) == (2, True, lg, out)
     assert [x[0] for x in stored(asr, w)] == [v]  # one receipt, the oracle's
     after = counts(conn, w.t)
-    assert after["holdout_access"] == 1  # no second read
+    assert (after["holdout_access"], after["holdout_run_outcome"]) == (1, 1)
     assert attempts(conn, w.t) == [(1, 1, "acc-p", "v-p"), (2, 1, "acc-p", "v-p")]
     assert after["experiment_revision"] == mid["experiment_revision"] + 1
     assert code(lambda: go(wrk, asr, w)) == "holdout_used"  # recorded: done
     assert counts(conn, w.t) == after
 
 
-def test_decision_42_a_second_rerun_is_refused(
+def test_decision_59_three_reruns_under_the_same_read(
+    wrk: Conn, asr: Conn, conn: Conn, w: World, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    lg, out, v = expected(w)
+    for where in ("evaluate", "outcome", "record"):  # three different deaths
+        crash(monkeypatch, *POINTS[where])
+        with pytest.raises(Crash):
+            go(wrk, asr, w)
+        monkeypatch.undo()
+    run = go(wrk, asr, w)  # the third re-run
+    assert (run.attempt, run.ledger, run.outcome) == (4, lg, out)
+    assert [x[0] for x in stored(asr, w)] == [v]
+    assert [a for a, *_ in attempts(conn, w.t)] == [1, 2, 3, 4]
+    assert counts(conn, w.t)["holdout_access"] == 1  # still the one read
+
+
+def test_decision_59_a_fourth_rerun_is_refused(
     wrk: Conn, asr: Conn, conn: Conn, w: World, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     crash(monkeypatch, si, "holdout_run")
-    for _ in range(2):  # the run, then its one re-run, both die
+    for _ in range(4):  # the run, then its three re-runs, all die
         with pytest.raises(Crash):
             go(wrk, asr, w)
     monkeypatch.undo()
     before = counts(conn, w.t)
-    assert before["holdout_run"] == 2 and before["holdout_access"] == 1
+    assert before["holdout_run"] == 4 and before["holdout_access"] == 1
     assert code(lambda: go(wrk, asr, w)) == "rerun_used"
     assert counts(conn, w.t) == before
+    fifth = (
+        "INSERT INTO app.holdout_run SELECT tenant_id, plan_id, 5, seq, "
+        "experiment_id, candidate_id, verdict_id, access_id, inputs_digest, "
+        "clock_timestamp(), event_hash FROM app.holdout_run WHERE attempt = 4"
+    )
+    with tn.tenant_transaction(asr, w.t) as tx, pytest.raises(errors.CheckViolation):
+        tx.conn.execute(fifth)  # the database holds the cap too
     conn.execute("ALTER TABLE app.holdout_run DISABLE TRIGGER append_only")
     conn.execute("DELETE FROM app.holdout_run WHERE attempt = 1")  # tampered
     conn.execute("ALTER TABLE app.holdout_run ENABLE TRIGGER append_only")
@@ -382,19 +414,50 @@ def test_decision_42_a_rerun_must_be_the_same_read(
     assert go(wrk, asr, w).attempt == 2  # the true re-run is still available
 
 
-def test_decision_42_a_rerun_whose_result_differs_is_a_conflict(
-    wrk: Conn, asr: Conn, conn: Conn, w: World, monkeypatch: pytest.MonkeyPatch
+HELD = ["1"] * len(fx.WIN_W)  # other strategy code: always in the market
+
+
+@pytest.mark.parametrize("where", ["record", "revision"])
+def test_decision_60_a_rerun_whose_outcome_differs_is_a_conflict(
+    wrk: Conn,
+    asr: Conn,
+    conn: Conn,
+    w: World,
+    monkeypatch: pytest.MonkeyPatch,
+    where: str,
 ) -> None:
-    crash(monkeypatch, es, "_append")  # the receipt is stored, the revision is not
+    crash(monkeypatch, *POINTS[where])  # the outcome is recorded first
     with pytest.raises(Crash):
         go(wrk, asr, w)
     monkeypatch.undo()
-    first = stored(asr, w)
-    held = ["1"] * len(fx.WIN_W)  # other strategy code: always in the market
-    lose = request(w, build=lambda cfg: scripted(held)).build
-    assert code(lambda: go(wrk, asr, w, build=lose)) == "verdict_conflict"
-    assert stored(asr, w) == first  # the first result stands
-    assert counts(conn, w.t)["experiment_revision"] == 1  # scheduled only
+    first, before = stored(asr, w), counts(conn, w.t)
+    with tn.tenant_transaction(asr, w.t) as tx:
+        kept = ast.outcome(tx, w.plan.plan_id)
+    held = partial(go, wrk, asr, w, build=lambda cfg: scripted(HELD))
+    assert code(held) == "verdict_conflict"  # a non-deterministic strategy
+    with tn.tenant_transaction(asr, w.t) as tx:
+        assert ast.outcome(tx, w.plan.plan_id) == kept
+    assert stored(asr, w) == first  # the first result stands, no receipt added
+    assert counts(conn, w.t) == before | {"holdout_run": 2}  # the attempt is spent
+
+
+@pytest.mark.parametrize("where", ["evaluate", "outcome"])
+def test_decision_60_before_an_outcome_there_is_nothing_to_compare(
+    wrk: Conn,
+    asr: Conn,
+    conn: Conn,
+    w: World,
+    monkeypatch: pytest.MonkeyPatch,
+    where: str,
+) -> None:
+    crash(monkeypatch, *POINTS[where])
+    with pytest.raises(Crash):
+        go(wrk, asr, w)
+    monkeypatch.undo()
+    run = go(wrk, asr, w, build=lambda cfg: scripted(HELD))  # no result was kept
+    assert run.attempt == 2
+    with tn.tenant_transaction(asr, w.t) as tx:  # its outcome is now the one
+        assert ast.outcome(tx, w.plan.plan_id) is not None
 
 
 # --- the database ---
@@ -413,7 +476,8 @@ def test_decision_42_the_database_holds_one_rerun_of_one_read(
             "experiment_id, candidate_id, {v}, access_id, {d}, clock_timestamp(), "
             "event_hash FROM app.holdout_run WHERE attempt = 1")  # fmt: skip
     bad = [
-        copy.format(a=3, v="verdict_id", d="inputs_digest"),  # a third attempt
+        copy.format(a=3, v="verdict_id", d="inputs_digest"),  # skips attempt 2
+        copy.format(a=5, v="verdict_id", d="inputs_digest"),  # a fifth attempt
         copy.format(a=2, v="'v-q'", d="inputs_digest"),  # another verdict
         copy.format(a=2, v="verdict_id", d="repeat('0', 64)"),  # other inputs
         copy.format(a=2, v="verdict_id", d="inputs_digest").replace(
@@ -442,6 +506,59 @@ def test_decision_42_the_database_holds_one_rerun_of_one_read(
     assert go(wrk, asr, w).attempt == 2
 
 
+def test_decision_60_the_database_records_the_outcome_before_the_receipt(
+    wrk: Conn, asr: Conn, conn: Conn, w: World, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    for _ in range(2):  # attempts 1 and 2, neither recorded an outcome
+        crash(monkeypatch, ast, "record_outcome")
+        with pytest.raises(Crash):
+            go(wrk, asr, w)
+        monkeypatch.undo()
+    lg, _, _ = expected(w)
+    run = im.Assessment(lg, w.study.protocol.assessor, fx.AT_P, "v-p",
+                        evaluation=fx.EVAL)  # the run's own verdict  # fmt: skip
+    with pytest.raises(es.ExperimentStoreError, match="database"):
+        es.record(wrk, asr, w.t, w.reg, EXP, "cand-1", w.plan, w.book, None, run)
+    raw = ("INSERT INTO app.holdout_run_outcome (tenant_id, plan_id, attempt, "
+           "outcome_digest, recorded_at, event_hash) VALUES (%s, %s, %s, "
+           "repeat('a', 64), clock_timestamp(), repeat('b', 64))")  # fmt: skip
+    with tn.tenant_transaction(asr, w.t) as tx, pytest.raises(errors.CheckViolation):
+        tx.conn.execute(raw, (w.t, w.plan.plan_id, 1))  # not the latest attempt
+    with tn.tenant_transaction(asr, w.t) as tx, pytest.raises(errors.CheckViolation):
+        tx.conn.execute(
+            raw.replace(
+                "clock_timestamp()", "clock_timestamp() - interval '2 minutes'"
+            ),
+            (w.t, w.plan.plan_id, 2),
+        )
+    assert counts(conn, w.t)["evaluation_receipt"] == 0
+    assert go(wrk, asr, w).attempt == 3
+    with tn.tenant_transaction(asr, w.t) as tx, pytest.raises(errors.CheckViolation):
+        tx.conn.execute(raw, (w.t, w.plan.plan_id, 3))  # after the receipt
+    for sql in (
+        "UPDATE app.holdout_run_outcome SET attempt = 1",
+        "DELETE FROM app.holdout_run_outcome",
+    ):  # append-only, owner too
+        with pytest.raises(errors.RaiseException):
+            conn.execute(sql)
+
+
+def test_decision_60_after_the_outcome_only_the_runs_verdict_is_stored(
+    wrk: Conn, asr: Conn, conn: Conn, w: World, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    crash(monkeypatch, es, "record")  # the read and the outcome are recorded
+    with pytest.raises(Crash):
+        go(wrk, asr, w)
+    monkeypatch.undo()
+    lg, _, _ = expected(w)
+    other = im.Assessment(lg, w.study.protocol.assessor, fx.AT_P, "v-other",
+                          evaluation=fx.EVAL)  # fmt: skip
+    with pytest.raises(es.ExperimentStoreError, match="database"):
+        es.record(wrk, asr, w.t, w.reg, EXP, "cand-1", w.plan, w.book, None, other)
+    assert counts(conn, w.t)["evaluation_receipt"] == 0
+    assert go(wrk, asr, w).attempt == 2
+
+
 def test_decision_42_a_tampered_reservation_is_integrity(
     wrk: Conn, asr: Conn, conn: Conn, w: World, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -457,6 +574,64 @@ def test_decision_42_a_tampered_reservation_is_integrity(
     assert counts(conn, w.t) == before
 
 
+def test_decision_60_a_tampered_outcome_is_integrity(
+    wrk: Conn, asr: Conn, conn: Conn, w: World, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    crash(monkeypatch, es, "record")  # the outcome is recorded
+    with pytest.raises(Crash):
+        go(wrk, asr, w)
+    monkeypatch.undo()
+    conn.execute("ALTER TABLE app.holdout_run_outcome DISABLE TRIGGER append_only")
+    conn.execute("UPDATE app.holdout_run_outcome SET outcome_digest = repeat('0', 64)")
+    conn.execute("ALTER TABLE app.holdout_run_outcome ENABLE TRIGGER append_only")
+    assert code(lambda: go(wrk, asr, w)) == "integrity"
+    assert counts(conn, w.t)["evaluation_receipt"] == 0
+
+
+# --- decision 62: a verdict certain to be BLOCKED refuses before the read ---
+
+
+def test_decision_62_every_certain_blocked_cause_refuses_before_the_read(
+    wrk: Conn, asr: Conn, conn: Conn, w: World
+) -> None:
+    p, s = w.study.protocol, str(w.t)
+    open_ = BudgetBook.open(s, AT, CAPS)
+    other = open_.reserve(
+        p.budget_reservation_id,
+        Category.IMPROVEMENT,
+        UsdBudget("0.01"),
+        p.provider_account_ref,
+        p.max_output_tokens,
+        AT,
+        AT + p.max_duration,
+    )[0]
+    cases: list[tuple[dict[str, Any], str]] = [
+        ({"book": open_}, "budget_not_reserved"),  # no reservation
+        ({"book": w.book.release(p.budget_reservation_id)}, "budget_not_reserved"),
+        ({"book": BudgetBook.open(str(uuid.uuid4()), AT, CAPS)},
+         "budget_not_reserved"),  # another scope
+        ({"book": other}, "reservation_terms_mismatch"),
+        ({"ledger": TrialLedger("tenant-synth-other", w.ledger.entries)},
+         "test_access_changed"),  # the ledger is not the protocol's scope
+    ]  # fmt: skip
+    before = counts(conn, w.t)
+    # a ledger without the plan is refused even before phase 0
+    assert code(lambda: go(wrk, asr, w, ledger=TrialLedger(s))) == (
+        "test_access_changed")  # fmt: skip
+    for kw, reason in cases:
+        with pytest.raises(es.ExperimentStoreError) as e:
+            go(wrk, asr, w, **kw)
+        assert (e.value.code, reason in str(e.value)) == ("blocked", True), kw
+        assert counts(conn, w.t) == before, kw
+    # the other BLOCKED causes of `assess` are refused earlier still:
+    # assessor_not_registered by `holdout_read` (test above), and
+    # sandbox_unqualified cannot arise, since a strategy study is a strategy target
+    with pytest.raises(im.ImprovementError, match="target"):
+        si.StrategyStudy(replace(p, target=im.Target.APPLICATION_CODE), fx.SPACE,
+                         fx.EVAL, fx.BASE)  # fmt: skip
+    assert go(wrk, asr, w).attempt == 1  # the read was kept
+
+
 def test_decision_42_other_roles_are_denied(
     wrk: Conn, asr: Conn, conn: Conn, w: World, runtime_urls: dict[str, str]
 ) -> None:
@@ -469,17 +644,24 @@ def test_decision_42_other_roles_are_denied(
             assert code(lambda: ar.promotion_run(wrk, c, w.t, request(w))) in (
                 "forbidden", "database"), role  # fmt: skip
             for sql in ("SELECT attempt FROM app.holdout_run",
-                        "DELETE FROM app.holdout_run"):  # fmt: skip
+                        "DELETE FROM app.holdout_run",
+                        "SELECT attempt FROM app.holdout_run_outcome",
+                        "DELETE FROM app.holdout_run_outcome"):  # fmt: skip
                 with tn.tenant_transaction(c, w.t), pytest.raises(
                         errors.InsufficientPrivilege):  # fmt: skip
                     c.execute(sql)
     assert counts(conn, w.t) == before
     held = conn.execute(
-        "SELECT r, k FROM unnest(ARRAY['qw_app', 'qw_worker', 'qw_release', "
-        "'qw_ingest', 'qw_assessor']) r CROSS JOIN unnest(ARRAY['SELECT', 'INSERT', "
-        "'UPDATE', 'DELETE', 'TRUNCATE', 'REFERENCES', 'TRIGGER']) k WHERE "
-        "has_table_privilege(r, 'app.holdout_run', k) OR (k IN ('SELECT', 'INSERT', "
-        "'UPDATE', 'REFERENCES') AND has_any_column_privilege(r, "
-        "'app.holdout_run', k))").fetchall()  # fmt: skip
-    assert set(held) == {("qw_assessor", "SELECT"), ("qw_assessor", "INSERT")}
+        "SELECT t, r, k FROM unnest(ARRAY['app.holdout_run', "
+        "'app.holdout_run_outcome']) t CROSS JOIN unnest(ARRAY['qw_app', "
+        "'qw_worker', 'qw_release', 'qw_ingest', 'qw_assessor']) r CROSS JOIN "
+        "unnest(ARRAY['SELECT', 'INSERT', 'UPDATE', 'DELETE', 'TRUNCATE', "
+        "'REFERENCES', 'TRIGGER']) k WHERE has_table_privilege(r, t, k) OR (k IN "
+        "('SELECT', 'INSERT', 'UPDATE', 'REFERENCES') AND "
+        "has_any_column_privilege(r, t, k))").fetchall()  # fmt: skip
+    assert set(held) == {
+        (t, "qw_assessor", k)
+        for t in ("app.holdout_run", "app.holdout_run_outcome")
+        for k in ("SELECT", "INSERT")
+    }
     assert go(wrk, asr, w).attempt == 1

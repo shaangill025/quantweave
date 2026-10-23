@@ -6,25 +6,32 @@ the assessor process holds a qw_assessor and a qw_worker login):
   `protocol_frozen` if it differs), its lineage (`assessor_store.bind`) and the
   plan's protected `HoldoutData` (`holdout_series_store`); run every pre-read
   refusal (`strategy_improvement.holdout_read`, then what `experiment_store.record`
-  would refuse, by the same derive on the unread ledger: `transition` and derive's
-  own); then `assessor_store.reserve_read` records the read and the attempt, and
-  the transaction commits. Every refusal comes first and rolls back, so the stored
+  would refuse, by the same derive on the unread ledger: `transition`, derive's
+  own, and decision 62's `blocked` for a verdict certain to be BLOCKED); then
+  `assessor_store.reserve_read` records the read and the attempt, and the
+  transaction commits. Every refusal comes first and rolls back, so the stored
   ledger is unchanged.
 - phase 2: `holdout_run` evaluates on the reserved read (it must re-derive the
-  same read, else `read_mismatch`), and `experiment_store.record` stores the
-  trial's verdict as a receipt (qw_assessor) and the revision (qw_worker).
-Decision 42: if the process dies after the reservation, the same request re-runs
-once (attempt 2) under the recorded read: same read, candidate, protocol and
-inputs (`inputs_digest`; any difference is `rerun_mismatch`), no new read. If the
-first attempt's receipt was already stored, a re-run with a different verdict is
-`verdict_conflict` (`store_verdict`). A further re-run is `rerun_used`, and a
-recorded run is `holdout_used`. The caller keeps the request (and its pre-read
-ledger) durably until a run returns, and persists the returned ledger.
+  same read, else `read_mismatch`).
+- phase 3 (decision 60), its own qw_assessor transaction: the digest of the trial
+  outcome (the ledger after the read and trial, and the refusal reason) is
+  recorded once per plan, before any receipt; a later attempt whose outcome
+  differs is `verdict_conflict`.
+- phase 4: `experiment_store.record` stores the trial's verdict as a receipt
+  (qw_assessor) and the revision (qw_worker).
+Decisions 42 and 59: if the process dies after the reservation, the same request
+re-runs under the recorded read, at most three times (attempts 2 to 4): same
+read, candidate, protocol and inputs (`inputs_digest`; any difference is
+`rerun_mismatch`), no new read. A different result is `verdict_conflict` once an
+outcome is recorded (decision 60; also `store_verdict` once a receipt is). A
+fifth attempt is `rerun_used`, and a recorded run is `holdout_used`. Decision 61:
+loading and verifying the stored series in phase 0 is not opening it; opening is
+the evaluation. The caller keeps the request (and its pre-read ledger) durably
+until a run returns, and persists the returned ledger.
 LIMITATIONS: the ledger and budget book are still the caller's (decision 43's
-marks are not added here); the strategy code (`build`) is not in the input digest
-(it is manifest-registered and trusted, decision 49), so a re-run only proves it
-determinate when the first receipt was stored; a crash before the receipt leaves
-no earlier result to compare."""
+marks are not added here); the strategy code (`build`) is not in the input
+digest (decision 49), so a crash after the evaluation and before the outcome is
+recorded leaves no earlier result to compare."""
 
 from __future__ import annotations
 
@@ -138,8 +145,10 @@ def _reserve(tx: TenantTx, r: Request) -> Reserved:
     # same derive on the unread ledger (its state has the same predecessors)
     dry = im.Assessment(r.ledger, r.assessor, r.at, r.verdict_id,
                         evaluation=study.evaluation)  # fmt: skip
-    rec, _ = im.derive(reg, p.experiment_id, r.candidate_id, r.ledger.plan(p.plan_id),
+    rec, v = im.derive(reg, p.experiment_id, r.candidate_id, r.ledger.plan(p.plan_id),
                        r.book, None, dry)  # fmt: skip
+    if v is not None and v.decision is im.Decision.BLOCKED:  # decision 62
+        raise ExperimentStoreError("blocked", ",".join(v.reasons))
     es.check_next(tx, rec)
     attempt = ast.reserve_read(tx, p, a, r.candidate_id, r.verdict_id,
                                _inputs(r, p, a, data))  # fmt: skip
@@ -166,6 +175,10 @@ def promotion_run(worker: Conn, assessor: Conn, tenant_id: uuid.UUID,
                              r.access_id, r.trial_id)  # fmt: skip
     if lg.access(r.access_id).to_wire() != a.to_wire():
         raise ExperimentStoreError("read_mismatch", r.access_id)
+    n = len(lg.entries)  # the read and the trial, metrics included
+    done = digest(["holdout_run_outcome", n, lg.checkpoint(n), out.reason])
+    with tenant_transaction(assessor, tenant_id) as tx:  # phase 3 (decision 60)
+        ast.record_outcome(tx, p.plan_id, attempt, done)
     run = im.Assessment(lg, r.assessor, ensure_aware_utc(r.at), r.verdict_id,
                         evaluation=r.study.evaluation)  # fmt: skip
     rev, wrote = es.record(worker, assessor, tenant_id, r.registry, p.experiment_id,
