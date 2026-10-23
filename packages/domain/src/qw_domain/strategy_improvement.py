@@ -11,6 +11,10 @@
   the derived material hash and its payload the resolved defaults, so the T032
   ledger key equals the one `shadow.open_run` derives, and an equal set of
   defaults under a new id is the T044 `identical_artifact` relabel.
+- `SearchSpace` and `Dimension` have a strict stored form (`to_wire`/`from_wire`)
+  for the study input store (owner decisions 72 and 74); `content_hash` is
+  unchanged. `candidate_manifest` re-derives a candidate's manifest from the base,
+  the space and its payload and requires the candidate's bound hashes (decision 78).
 - `request_research_access` refuses reused trial ids and goes no further than the
   trial budget; `account` counts every trial and unrecorded access on the plan or
   in the family (failed, abandoned, other families, unregistered variants).
@@ -72,6 +76,7 @@ from qw_domain.research_data import (
 from qw_domain.shadow import ShadowBook, ShadowReport, ShadowRun, score
 from qw_domain.strategy_registry import (
     EvidenceState,
+    Parameter,
     ParamKind,
     ParamValue,
     StrategyManifest,
@@ -127,6 +132,37 @@ class Dimension:
         b = [None if x is None else str(x) for x in (self.minimum, self.maximum)]
         return [self.name, *b, list(self.allowed)]
 
+    def to_wire(self) -> dict[str, object]:
+        """The stored form: bounds as the decimal strings the hashed `wire` holds,
+        so one hash has one wire (5 and Decimal(5) store alike, and compare equal)."""
+        _, lo, hi, allowed = self.wire()
+        return {"name": self.name, "minimum": lo, "maximum": hi,
+                "allowed": allowed}  # fmt: skip
+
+    @classmethod
+    def from_wire(cls, w: object) -> "Dimension":
+        """Canonical input only: exact keys, both bounds null or both decimal
+        strings `str` gives back unchanged (no float, bool, `+`, spaces,
+        underscores or exponent respelling); bounds load as Decimal."""
+        keys = {"name", "minimum", "maximum", "allowed"}
+        if type(w) is not dict or set(w) != keys:
+            raise Error("dimension_wire", "an object with exactly the dimension keys")
+        allowed, bounds = w["allowed"], (w["minimum"], w["maximum"])
+        if type(allowed) is not list or not all(type(a) is str for a in allowed):
+            raise Error("dimension_wire", "allowed is a list of strings")
+        if bounds != (None, None) and not all(type(b) is str for b in bounds):
+            raise Error("dimension_wire", "bounds are both null or both strings")
+        try:
+            lo, hi = (None, None) if bounds == (None, None) else map(Decimal, bounds)
+            d = cls(w["name"], lo, hi, tuple(allowed))
+        except (ValueError, ArithmeticError, TypeError) as exc:
+            if isinstance(exc, Error):
+                raise
+            raise Error("dimension_wire", type(exc).__name__) from None
+        if d.to_wire() != w:
+            raise Error("dimension_wire", f"{d.name}: not the canonical wire form")
+        return d
+
 
 @dataclass(frozen=True, slots=True)
 class SearchSpace:
@@ -160,6 +196,35 @@ class SearchSpace:
                        self.dimensions), self.max_trials,
                        self.min_prospective_scored])  # fmt: skip
 
+    def to_wire(self) -> dict[str, object]:
+        """The stored form, dimensions in name order: `content_hash` ignores their
+        order, so one content has one wire."""
+        dims = sorted(self.dimensions, key=lambda d: d.name)
+        return {"space_id": self.space_id, "strategy_id": self.strategy_id,
+                "base_version": self.base_version,
+                "base_material_hash": self.base_material_hash,
+                "dimensions": [d.to_wire() for d in dims],
+                "max_trials": self.max_trials,
+                "min_prospective_scored": self.min_prospective_scored}  # fmt: skip
+
+    @classmethod
+    def from_wire(cls, w: object) -> "SearchSpace":
+        """Canonical input only: exact keys, JSON ints (never bools or floats) for
+        the counts, dimensions in name order; it must re-serialize to `w`."""
+        keys = {"space_id", "strategy_id", "base_version", "base_material_hash",
+                "dimensions", "max_trials", "min_prospective_scored"}  # fmt: skip
+        if type(w) is not dict or set(w) != keys:
+            raise Error("space_wire", "an object with exactly the search space keys")
+        if type(w["dimensions"]) is not list:
+            raise Error("space_wire", "dimensions must be a list")
+        s = cls(w["space_id"], w["strategy_id"], w["base_version"],
+                w["base_material_hash"],
+                tuple(Dimension.from_wire(d) for d in w["dimensions"]),
+                w["max_trials"], w["min_prospective_scored"])  # fmt: skip
+        if s.to_wire() != w:
+            raise Error("space_wire", f"{s.space_id}: not the canonical wire form")
+        return s
+
     def check_base(self, base: StrategyManifest) -> None:
         if (base.strategy_id, base.version, base.material_hash) != (
             self.strategy_id, self.base_version, self.base_material_hash
@@ -171,12 +236,17 @@ class SearchSpace:
             if p is None:
                 raise Error("unknown_parameter", d.name)
             numeric = p.kind in (ParamKind.INTEGER, ParamKind.DECIMAL)
-            values = (*(() if d.minimum is None else (d.minimum, d.maximum)),
-                      *d.allowed)  # fmt: skip
-            shaped = numeric == (d.minimum is not None) and (
+            bounds = [b for b in (d.minimum, d.maximum) if b is not None]
+            shaped = numeric == bool(bounds) and (
                 p.kind is ParamKind.CHOICE
             ) == bool(d.allowed)  # fmt: skip
-            if not shaped or any(p.check(v) is not None for v in values):
+            # Bounds compare by value (a stored space loads them as Decimal): inside
+            # the parameter's bounds, and whole numbers for an integer parameter.
+            if not shaped or not all(
+                p.minimum <= b <= p.maximum  # type: ignore[operator]
+                and (p.kind is not ParamKind.INTEGER or b == int(b))
+                for b in bounds
+            ) or any(p.check(a) is not None for a in d.allowed):  # fmt: skip
                 raise Error("dimension_bounds", d.name)
 
 
@@ -242,6 +312,49 @@ def strategy_candidate(
     if c.payload_hash != derived.config_hash({}):
         raise Error("payload_mismatch", candidate_id)
     return c
+
+
+def _parse(p: Parameter, text: str) -> ParamValue:
+    """A payload string as `p`'s type; only its canonical rendering is accepted."""
+    value: ParamValue
+    try:
+        if p.kind is ParamKind.INTEGER:
+            value = int(text)
+        elif p.kind is ParamKind.DECIMAL:
+            value = Decimal(text)
+        elif p.kind is ParamKind.BOOLEAN:
+            value = {"true": True, "false": False}[text]
+        else:
+            value = text
+    except (ValueError, ArithmeticError, KeyError):
+        raise Error("payload_mismatch", f"{p.name}={safe_repr(text)}") from None
+    if p.check(value) is not None:
+        raise Error("outside_search_space", f"{p.name}={safe_repr(text)}")
+    if replace(p, default=value).to_wire()[2] != text:
+        raise Error("payload_mismatch", f"{p.name}={safe_repr(text)} not canonical")
+    return value
+
+
+def candidate_manifest(
+    base: StrategyManifest, space: SearchSpace, candidate: im.Candidate
+) -> StrategyManifest:
+    """Re-derive the candidate's manifest (version = candidate id) from the base,
+    the space and the payload, and require the candidate's bound hashes (owner
+    decision 78: re-derived, never stored). Only defaults that differ from the
+    base reach `derive`, which refuses any undeclared key."""
+    if candidate.target is not im.Target.STRATEGY:
+        raise Error("target", candidate.candidate_id)
+    params = {p.name: p for p in base.parameters}
+    if set(candidate.payload) != set(params):
+        raise Error("payload_mismatch", candidate.candidate_id)
+    values = {n: _parse(params[n], t) for n, t in candidate.payload.items()
+              if t != _default(base, n)}  # fmt: skip
+    m = derive(base, space, values, candidate.candidate_id)
+    if (m.material_hash, m.config_hash({})) != (
+        candidate.artifact_hash, candidate.payload_hash
+    ):  # fmt: skip
+        raise Error("candidate_mismatch", candidate.candidate_id)
+    return m
 
 
 @dataclass(frozen=True, slots=True)

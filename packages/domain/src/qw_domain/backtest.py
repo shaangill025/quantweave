@@ -31,6 +31,9 @@ limited), §17, R040, R059, R065, R084.
   Bonferroni-widened z (owner decision 35). `run_promotion_trial` can add metrics
   the assessor run derived (`derived`, owner decision 46) to a completed trial;
   a name the backtest records itself is refused before the read.
+- `EvaluationProtocol` (with `CostModel`, `Baseline`, `DeclaredClaim`) has a strict
+  stored form whose body is exactly what `content_hash` digests (owner decision
+  72); `approved_by` in it is caller-asserted and unverified.
 LIMITATIONS: one instrument per evaluation; price series are caller-supplied, not
 yet part of the hashed dataset or its rights gate; no shorting, borrow, partial
 fills, volume limits or corporate actions; times are caller-supplied.
@@ -81,6 +84,20 @@ def _dec(value: object, what: str, *, positive: bool = False) -> Decimal:
     if not ok or value < 0 or (positive and value == 0):  # type: ignore[operator]
         raise ResearchError(what, "a finite non-negative Decimal is required")
     return value  # type: ignore[return-value]
+
+
+def _wire_dec(value: object, what: str) -> Decimal:
+    """A decimal string that `str` gives back unchanged (no float, no JSON number,
+    no `+`, spaces, underscores or other spelling of the same value)."""
+    if type(value) is not str:
+        raise ResearchError(what, "decimal strings are required")
+    try:
+        d = Decimal(value)
+    except InvalidOperation:
+        raise ResearchError(what, f"{value!r} is not a decimal") from None
+    if str(d) != value:
+        raise ResearchError(what, f"{value!r} is not a canonical decimal")
+    return d
 
 
 @dataclass(frozen=True, slots=True)
@@ -196,6 +213,18 @@ class CostModel:
                 "half_spread": str(self.half_spread),
                 "slippage_rate": str(self.slippage_rate)}  # fmt: skip
 
+    @classmethod
+    def from_wire(cls, w: object) -> Self:
+        """Exactly the three keys as decimal strings, exponent kept (`0.0010` stays
+        `0.0010`: the protocol hash digests `str(Decimal)`)."""
+        keys = ("commission_rate", "half_spread", "slippage_rate")
+        if type(w) is not dict or set(w) != set(keys):
+            raise ResearchError("costs_wire", "an object with exactly the cost keys")
+        c = cls(*(_wire_dec(w[k], "costs_wire") for k in keys))
+        if c.to_wire() != w:
+            raise ResearchError("costs_wire", "not the canonical wire form")
+        return c
+
 
 class BaselineKind(StrEnum):
     BUY_AND_HOLD = "buy_and_hold"
@@ -220,6 +249,29 @@ class Baseline:
         if type(self.cash_rate) is not Decimal or not self.cash_rate.is_finite():
             raise ResearchError("cash_rate", "a finite Decimal is required")
 
+    def to_wire(self) -> list[str | None]:
+        return [self.baseline_id, self.kind.value, self.series_id,
+                str(self.cash_rate)]  # fmt: skip
+
+    @classmethod
+    def from_wire(cls, w: object) -> Self:
+        """[id, kind, series id or null, cash rate as a decimal string]."""
+        if type(w) is not list or len(w) != 4:
+            raise ResearchError("baseline_wire", "four fields are required")
+        bid, kind, series, rate = w
+        if type(bid) is not str or type(kind) is not str or (
+            series is not None and type(series) is not str
+        ):  # fmt: skip
+            raise ResearchError("baseline_wire", "string fields are required")
+        try:
+            k = BaselineKind(kind)
+        except ValueError:
+            raise ResearchError("baseline_wire", "an unknown baseline kind") from None
+        b = cls(bid, k, series, _wire_dec(rate, "baseline_wire"))
+        if b.to_wire() != w:
+            raise ResearchError("baseline_wire", "not the canonical wire form")
+        return b
+
 
 class ClaimMetric(StrEnum):
     NET_MEAN = "net_mean_return"
@@ -242,6 +294,21 @@ class DeclaredClaim:
     def to_wire(self) -> dict[str, str | None]:
         return {"metric": self.metric.value, "direction": self.direction.value,
                 "baseline_id": self.baseline_id}  # fmt: skip
+
+    @classmethod
+    def from_wire(cls, w: object) -> Self:
+        if type(w) is not dict or set(w) != {"metric", "direction", "baseline_id"}:
+            raise ResearchError("claim_wire", "an object with exactly the claim keys")
+        bid = w["baseline_id"]
+        if bid is not None and type(bid) is not str:
+            raise ResearchError("claim_wire", "baseline_id is a string or null")
+        try:
+            c = cls(ClaimMetric(w["metric"]), Direction(w["direction"]), bid)
+        except (TypeError, ValueError):  # unhashable or unknown enum values
+            raise ResearchError("claim_wire", "unknown metric or direction") from None
+        if c.to_wire() != w:
+            raise ResearchError("claim_wire", "not the canonical wire form")
+        return c
 
 
 @dataclass(frozen=True, slots=True)
@@ -283,17 +350,45 @@ class EvaluationProtocol:
         ):
             raise ResearchError("claim", "a structured claim on a declared baseline")
 
-    @property
-    def content_hash(self) -> str:
-        return digest({
+    def to_wire(self) -> dict[str, Any]:
+        """The stored form, and exactly the body `content_hash` digests.
+        `approved_by` is carried as written: it is caller-asserted and unverified
+        (owner decision 72) until a step-up approval flow exists."""
+        return {
             "protocol_id": self.protocol_id, "plan_id": self.plan_id,
             "claim": self.claim.to_wire(), "costs": self.costs.to_wire(),
             "fill_lag_bars": self.fill_lag_bars, "hac_lags": self.hac_lags,
             "z": str(self.z), "declared_at": format_instant(self.declared_at),
             "approved_by": self.approved_by,
-            "baselines": [[b.baseline_id, b.kind.value, b.series_id, str(b.cash_rate)]
-                          for b in self.baselines],
-        })  # fmt: skip
+            "baselines": [b.to_wire() for b in self.baselines],
+        }  # fmt: skip
+
+    @classmethod
+    def from_wire(cls, w: object) -> Self:
+        """Canonical input only: exact keys, JSON ints (never bools or floats) for
+        the lags, decimal strings, a `Z` instant; it must re-serialize to `w`."""
+        keys = {"protocol_id", "plan_id", "claim", "costs", "fill_lag_bars",
+                "hac_lags", "z", "declared_at", "approved_by", "baselines"}  # fmt: skip
+        if type(w) is not dict or set(w) != keys:
+            raise ResearchError("protocol_wire", "an object with exactly the keys")
+        if type(w["baselines"]) is not list or type(w["declared_at"]) is not str:
+            raise ResearchError("protocol_wire", "baselines list, declared_at string")
+        try:
+            declared = parse_instant(w["declared_at"])
+        except InstantError as exc:
+            raise ResearchError("protocol_wire", type(exc).__name__) from None
+        p = cls(w["protocol_id"], w["plan_id"], DeclaredClaim.from_wire(w["claim"]),
+                CostModel.from_wire(w["costs"]), w["fill_lag_bars"], w["hac_lags"],
+                _wire_dec(w["z"], "protocol_wire"),
+                tuple(Baseline.from_wire(b) for b in w["baselines"]), declared,
+                w["approved_by"])  # fmt: skip
+        if p.to_wire() != w:
+            raise ResearchError("protocol_wire", "not the canonical wire form")
+        return p
+
+    @property
+    def content_hash(self) -> str:
+        return digest(self.to_wire())
 
 
 @dataclass(frozen=True, slots=True)
