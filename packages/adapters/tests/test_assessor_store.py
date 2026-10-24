@@ -608,6 +608,32 @@ def test_check_runtime_role_refuses_mixed_and_undeclared_logins(
                 pass
 
 
+def test_check_runtime_role_refuses_a_role_set_at_connect(
+    runtime_urls: dict[str, str], login_in: Callable[..., str]
+) -> None:
+    """A mixed login cannot pass as an exclusive one by setting `role` in its
+    connection options (current_user would be the group, session_user the mixed
+    login, and RESET ROLE would restore both groups); nor can a single-group login
+    connect under a role other than its own."""
+    cases: tuple[tuple[tuple[str, ...], tn.RuntimeRole], ...] = (
+        (("qw_app", "qw_ingest"), "qw_ingest"),
+        (("qw_worker", "qw_assessor"), "qw_assessor"),
+        (("qw_app", "qw_release"), "qw_release"),
+        (("qw_ingest",), "qw_ingest"),
+    )
+    for groups, role in cases:
+        url = make_conninfo(login_in(*groups), options=f"-c role={role}")
+        with psycopg.connect(url, autocommit=True) as c:  # the option takes effect
+            row = c.execute("SELECT current_user::text, session_user::text").fetchone()
+            assert row is not None and row[0] == role != row[1]
+        for declared in (None, role):
+            with (
+                pytest.raises(tn.TenancyError, match="session role"),
+                tn.runtime_connection(url, role=declared),
+            ):
+                pass
+
+
 # Owner decision 18: a promotion window whose holdout was scored for one plan is
 # never scored again for another plan of the same tenant, target and baseline.
 EARLY = Window(datetime(2021, 7, 1, tzinfo=UTC), datetime(2022, 1, 1, tzinfo=UTC))
