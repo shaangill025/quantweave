@@ -159,11 +159,16 @@ jobs:
           fi
           sudo python3 "$TOOL" digest "$dir" --expect "$pinned"
 
-  python:
+  python-tests:
     needs: postgres-image
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3]
     runs-on: ubuntu-24.04
-    # The DB-backed suite took 18.6 minutes on main (2026-10-23) and grows with
-    # each store; 35 leaves headroom without dropping any test.
+    # The suite took 30 minutes in one job on main (2026-10-24) and grows with each
+    # store, so it runs as four disjoint shards (tools/pytest_shard.py: every test
+    # file in exactly one shard); each shard has its own PostgreSQL service.
     timeout-minutes: 35
     permissions:
       contents: read
@@ -208,12 +213,50 @@ jobs:
             sudo apt-get update && sudo apt-get install -y --no-install-recommends libpq5
           }
           uv run python -c "import psycopg; print('libpq', psycopg.pq.version())"
+      - name: Partition check
+        run: python3 tools/pytest_shard.py --self-test
+      - name: pytest (shard ${{ matrix.shard }} of 4)
+        run: |
+          python3 tools/pytest_shard.py ${{ matrix.shard }} 4 > "$RUNNER_TEMP/shard.txt"
+          uv run pytest $(cat "$RUNNER_TEMP/shard.txt")
+
+  python:
+    # Static and spec checks; green only when every test shard passed (a skipped
+    # or failed shard fails this job, so it cannot read as success).
+    needs: python-tests
+    if: always()
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    env:
+      UV_PYTHON: "3.13"
+      UV_LOCKED: "1"
+    steps:
+      - name: All test shards passed
+        env:
+          SHARDS: ${{ needs.python-tests.result }}
+        run: test "$SHARDS" = success
+      # Third-party actions pinned by commit SHA (tag -> SHA read with git ls-remote).
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          version: "0.11.32"
+      - run: uv python install 3.13
+      - run: uv sync --locked
+      - name: libpq for psycopg (pure-Python build, system libpq)
+        run: |
+          dpkg -s libpq5 >/dev/null 2>&1 || {
+            sudo apt-get update && sudo apt-get install -y --no-install-recommends libpq5
+          }
+          uv run python -c "import psycopg; print('libpq', psycopg.pq.version())"
       - name: Lint and format
         run: |
           uv run ruff check .
           uv run ruff format --check .
       - run: uv run mypy --strict
-      - run: uv run pytest
       - run: uv run python tools/check_no_float.py
       - name: Spec and contract checks
         run: |

@@ -42,7 +42,7 @@ def _module(name: str, path: Path) -> Any:
 
 
 api = _module("qw_api_tests", ROOT / "apps/api/tests/test_api.py")
-ev = _module("qw_estore_tests",
+ev = _module("qw_evstore_tests",
              ROOT / "packages/adapters/tests/test_evidence_store.py")  # fmt: skip
 rs_tests = _module("qw_rstore_tests",
                    ROOT / "packages/adapters/tests/test_rights_store.py")  # fmt: skip

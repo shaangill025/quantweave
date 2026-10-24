@@ -157,6 +157,16 @@
       "note": "CI sets QW_TEST_DATABASE_URL to its postgres:16 service and QW_REQUIRE_DB=1, so an unavailable server fails instead of skipping. The local command skips with a reason when no server is available."
     },
     {
+      "id": "CHK-PYTEST-SHARD",
+      "purpose": "CI runs the pytest suite as four disjoint shards; every test file under the pytest testpaths lands in exactly one shard, and an empty or out-of-range shard is an error",
+      "command": "python3 tools/pytest_shard.py --self-test",
+      "configured": true,
+      "observed": {
+        "date": "2026-10-24",
+        "result": "PASS: 142 test files partition into 1 to 4 shards"
+      }
+    },
+    {
       "id": "CHK-TS-BUILD",
       "purpose": "Production build of apps/web (vite)",
       "command": "pnpm build",
