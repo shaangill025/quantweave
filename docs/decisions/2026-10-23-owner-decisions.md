@@ -419,3 +419,19 @@ below waives a test, gate or spec requirement. Numbering continues from
     dataset body, keeps a hashed record that it was purged, and makes later loads
     report dataset_purged. Deletion lands with the retention rules it depends on."
     Implemented by: T032 (refusal) now; T058 (purge) later.
+
+85. **Binding research rights without their check time.**
+    Question: "Decision 85: rights were bound into the request hash (and the
+    re-run digest) together with the time they were checked. Since decision 77
+    re-checks rights at the database clock on every load, that time differs on
+    every rebuild, so every assessor run would refuse as a mismatch and crash
+    re-runs would break decision 59. How should rights be bound?"
+    Selected label: "Bind the grant, not the time (Recommended)".
+    Option text as presented: "The request hash and re-run digest bind the
+    tenant, the terms (scope, jurisdiction, retention) and each feed's
+    research-use decision (feed and entitlement hashes), but not the check time.
+    Revocation or expiry is still refused at the database clock on every load
+    (decisions 75, 77); a changed entitlement is a mismatch. Why: it keeps
+    decision 77's DB-clock check as the only source of time and keeps re-runs
+    identical (decision 59)."
+    Implemented by: T044 (the assessor's store inputs provider).
