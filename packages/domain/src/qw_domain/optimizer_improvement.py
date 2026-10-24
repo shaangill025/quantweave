@@ -5,6 +5,9 @@
 installed head that is this experiment's assessed, evidenced self-change of it;
 `propose_self_change` goes through a `SelfProposer` port; T044 assesses (blocked
 until T007); `verify_recursion` re-executes both cycles and checks the lineage.
+Increment 2 (owner decisions 86, 89): `ReceiptProposer`, the free deterministic
+proposer that derives V1 from V0's cycle receipt alone, and `measure`, the
+assessor's run of V0 and V1 on the protected promotion fixture (`promotion_gain`).
 LIMITATIONS: in memory; times, actors, receipts and costs are caller-asserted, so
 verification is necessary, not sufficient; costs are not reserved in the T037 book.
 """
@@ -25,7 +28,7 @@ from qw_domain.instants import ensure_aware_utc
 from qw_domain.release import DeploymentLedger, Install
 from qw_domain.research_data import digest
 from qw_domain.sources import ID_PATTERN
-from qw_domain.trial_ledger import TrialLedger
+from qw_domain.trial_ledger import SplitPlan, TrialLedger
 
 
 class OptimizerError(ValueError):
@@ -148,13 +151,32 @@ def diff(a: OptimizerConfig, b: OptimizerConfig) -> tuple[str, ...]:
     return tuple(sorted(k for k in pa if pa[k] != pb[k]))
 
 
-def scorecard(scorecard_id: str) -> im.Scorecard:
+def scorecard(scorecard_id: str, max_cost: UsdBudget, limits: "Limits") -> (
+    im.Scorecard
+):  # fmt: skip
+    """Hard controls at zero; goals: an out-of-sample `promotion_gain` of at least 1
+    and a declared cycle cost within `max_cost`, which is positive and never above
+    the owner's monthly improvement cap in `limits`."""
+    if not isinstance(max_cost, UsdBudget) or not isinstance(limits, Limits):
+        raise TypeError("max_cost is a UsdBudget and limits are Limits")
+    if not 0 < max_cost.value <= limits.monthly_cap.value:
+        raise _E("cost_exceeds_limits", str(max_cost.value))
     t, d, z = im.Threshold, im.Direction, Decimal(0)
     hard = (*im.HARD_CONTROLS[OPT], *OPT_HARD)
     return im.Scorecard(scorecard_id, OPT, (
         *(t(m, d.AT_MOST, z, True) for m in hard),
-        t("dev_gain", d.AT_LEAST, Decimal(1), False),
+        t("promotion_gain", d.AT_LEAST, Decimal(1), False),  # assessor-measured
+        t("cost_usd", d.AT_MOST, max_cost.value, False),
     ))  # fmt: skip
+
+
+def _cost_bound(p: im.Protocol) -> Decimal:
+    """The protocol's cycle-cost goal; positive and within the owner's USD20 cap."""
+    bs = [t.bound for t in p.scorecard.thresholds if t.metric == "cost_usd"
+          and t.direction is im.Direction.AT_MOST]  # fmt: skip
+    if len(bs) != 1 or not 0 < bs[0] <= OWNER_IMPROVEMENT_CAP:
+        raise _E("cost_bound_missing", p.experiment_id)
+    return bs[0]
 
 
 def check_protocol(p: im.Protocol) -> None:
@@ -166,6 +188,15 @@ def check_protocol(p: im.Protocol) -> None:
             and t.direction is im.Direction.AT_MOST}  # fmt: skip
     if not held.issuperset(OPT_HARD):
         raise _E("control_missing", p.experiment_id)
+    ts = p.scorecard.thresholds
+    if any(t.metric == "dev_gain" for t in ts):  # producer-visible: never a goal
+        raise _E("dev_gain_goal", p.experiment_id)
+    gain = [t for t in ts if t.metric == "promotion_gain"]
+    if len(gain) != 1 or gain[0].hard or gain[0].bound < 1 or (
+        gain[0].direction is not im.Direction.AT_LEAST
+    ):  # fmt: skip
+        raise _E("gain_goal_missing", p.experiment_id)
+    _cost_bound(p)
 
 
 @dataclass(frozen=True, slots=True)
@@ -279,6 +310,13 @@ def _execute(
 ) -> tuple[tuple[Proposal, ...], str | None]:
     if dev.split is not ri.Split.DEVELOPMENT:
         raise _E("not_development", dev.fixture_id)
+    return _search(cfg, base, dev)
+
+
+def _search(
+    cfg: OptimizerConfig, base: ri.ResearchConfig, dev: ri.Fixture
+) -> tuple[tuple[Proposal, ...], str | None]:
+    """The fixed interpreter; callers choose the split (`_execute`, `measure`)."""
     floor, out, best = _score(base, dev), [], None
     moves = [(op, v.value) for op in cfg.operators for v in _FIELDS[op][1]
              if v is not getattr(base, _FIELDS[op][0])]  # fmt: skip
@@ -477,6 +515,53 @@ def propose_self_change(
     return SelfChange(c, new, diff(cur, new), limits.cost_per_proposal, at)
 
 
+def _reach(ops: Sequence[Operator]) -> int:  # moves a policy can make from any base
+    return sum(len(_FIELDS[o][1]) - 1 for o in ops)
+
+
+@dataclass(frozen=True, slots=True)
+class ReceiptProposer:
+    """The free, deterministic proposer (owner decision 89): V1 is derived from V0's
+    cycle receipt alone (its executed policy, proposals and selection), within the
+    closed knobs. No ids, times, costs or fixtures are read. The rules, from the
+    receipt's own facts:
+    R1 widen: operators V0 lacks are appended, in `Operator` order.
+    R2 order: if a proposal was selected, its operator goes first; otherwise the
+       operators V0 tried go after the ones it did not (stable).
+    R3 budget: if V0 spent its whole budget, the budget becomes every move the
+       widened operators can make (at most `MAX_PROPOSALS`).
+    R4 selection: if V0 stopped at its first improver with moves and budget left,
+       it becomes `best_of_budget`.
+    A result with V0's behaviour raises `no_change` (never a relabel); the payload
+    holds only the three knobs, so it cannot widen authority."""
+
+    def propose(self, current: OptimizerConfig, cycle: CycleReceipt) -> (
+        Mapping[str, str]
+    ):  # fmt: skip
+        cur, ps = cycle.config, cycle.proposals
+        if not cycle.runner_hash == cur.content_hash == current.content_hash:
+            raise _E("receipt_mismatch", cycle.cycle_id)
+        won = [p for p in ps if p.config_hash == cycle.selected]
+        if cycle.selected is not None and not won:
+            raise _E("receipt_mismatch", cycle.cycle_id)
+        ops = [*cur.operators, *(o for o in Operator if o not in cur.operators)]
+        if won:
+            ops = [won[0].knob, *(o for o in ops if o is not won[0].knob)]
+        else:
+            tried = {p.knob for p in ps}
+            ops = [o for o in ops if o not in tried] + [o for o in ops if o in tried]
+        budget, sel = cur.proposal_budget, cur.selection
+        if len(ps) == cur.proposal_budget:
+            budget = max(budget, min(MAX_PROPOSALS, _reach(ops)))
+        left = len(ps) < min(cur.proposal_budget, _reach(cur.operators))
+        if won and sel is Selection.FIRST_IMPROVING and left:
+            sel = Selection.BEST_OF_BUDGET
+        new = OptimizerConfig(cur.version_id, budget, tuple(ops), sel)
+        if new.content_hash == cur.content_hash:
+            raise _E("no_change", cycle.cycle_id)
+        return new.to_payload()
+
+
 def assess_self_change(
     reg: im.ExperimentRegistry, sc: SelfChange, ledger: TrialLedger,
     book: BudgetBook, assessor: im.Party, at: datetime, verdict_id: str,
@@ -487,6 +572,89 @@ def assess_self_change(
         raise _E("self_certification", assessor.actor_id)
     return im.assess(reg, p.experiment_id, sc.candidate.candidate_id, ledger, book,
                      assessor, at, verdict_id)  # fmt: skip
+
+
+def _picked(r: tuple[tuple[Proposal, ...], str | None], base: ri.ResearchConfig) -> (
+    ri.ResearchConfig
+):  # fmt: skip
+    pick = [p for p in r[0] if p.config_hash == r[1]]
+    return _variant(base, pick[0].knob, pick[0].value) if pick else base
+
+
+def measure(
+    protocol: im.Protocol, plan: SplitPlan, candidate: im.Candidate,
+    source: CycleReceipt, base: ri.ResearchConfig, dev: ri.Fixture,
+    fixture: ri.Fixture, limits: Limits, assessor: im.Party,
+) -> Mapping[str, Decimal]:  # fmt: skip
+    """The assessor's measurement of V1 (`candidate`) against V0 (the protocol
+    baseline, as executed in `source`, the cycle V1 was proposed from). Each policy
+    searches (runs its cycle) from `source`'s research base on `dev`, the
+    producer-visible development fixture `source` ran on; the config each selects
+    (the base when nothing is selected) is then scored on `fixture`, the protected
+    promotion fixture whose hash the T032 plan freezes. `promotion_gain` is V1's
+    out-of-sample score minus V0's, so a win that holds only on development data
+    does not count. `replayed_output` is 1 when V1's search equals V0's; the slots
+    cannot be swapped (`not_development`, `not_promotion`). `identical_relabels`
+    is 1 when the artifact is V0's; `threshold_changes` counts payload keys that
+    reach a protected control; `payload_invalid` is 1 when the payload is not the
+    artifact's full canonical knob set (V1 is then measured as V0: fail closed);
+    `cost_usd` is V1's declared worst-case cycle cost under the owner's limits, and
+    the protocol's cost goal may not exceed them (`cost_exceeds_limits`). The
+    numbers reach a verdict only through T044 `assess`, which stays
+    `sandbox_unqualified` here."""
+    p, rv = protocol, candidate.runtime_versions
+    check_protocol(p)
+    if (candidate.experiment_id, candidate.target) != (p.experiment_id, p.target):
+        raise _E("candidate_experiment", candidate.candidate_id)
+    if _is_optimizer(assessor, p.producer, rv.get("candidate_version")):
+        raise _E("self_certification", assessor.actor_id)
+    if assessor != p.assessor:
+        raise _E("assessor_not_registered", assessor.actor_id)
+    if im.plan_digest(plan) != p.plan_digest:
+        raise _E("test_access_changed", plan.plan_id)
+    if fixture.content_hash != plan.protocol_hash:
+        raise _E("answer_key_changed", fixture.fixture_id)
+    if fixture.split is not ri.Split.PROMOTION:
+        raise _E("not_promotion", fixture.fixture_id)
+    if fixture.evidence_class is not plan.dataset.evidence_class:
+        raise _E("evidence_class", fixture.evidence_class.value)
+    if dev.split is not ri.Split.DEVELOPMENT:
+        raise _E("not_development", dev.fixture_id)
+    if _cost_bound(p) > limits.monthly_cap.value:
+        raise _E("cost_exceeds_limits", p.experiment_id)
+    v0 = source.config
+    if not source.runner_hash == v0.content_hash == p.baseline_hash:
+        raise _E("baseline_hash", p.experiment_id)
+    if candidate.parent_id != v0.version_id:
+        raise _E("not_from_baseline", candidate.candidate_id)
+    if (rv.get("source_cycle"), rv.get("source_outputs")) != (
+        source.cycle_id, source.outputs_hash
+    ):  # fmt: skip
+        raise _E("source_cycle", candidate.candidate_id)
+    if base.content_hash != source.base_hash:
+        raise _E("base_mismatch", source.cycle_id)
+    if dev.content_hash != source.fixture_hash:
+        raise _E("source_fixture", dev.fixture_id)
+    knobs = {k: v for k, v in candidate.payload.items() if k in KNOBS}
+    stray = [k for k in candidate.payload if k not in KNOBS]
+    widening = [k for k in stray if any(w in k.lower().replace("-", "_")
+                                        for w in _WIDENING)]  # fmt: skip
+    try:
+        v1 = OptimizerConfig.from_payload(v0.version_id, knobs)
+        bound = v1.content_hash == candidate.artifact_hash and not stray
+    except OptimizerError:
+        v1, bound = v0, False
+    if not bound:
+        v1 = v0  # an unrunnable or unbound payload proves nothing: measured as V0
+    r0, r1 = _execute(v0, base, dev), _execute(v1, base, dev)  # the searches
+    gain = _score(_picked(r1, base), fixture) - _score(_picked(r0, base), fixture)
+    return MappingProxyType({
+        "promotion_gain": Decimal(gain), "replayed_output": Decimal(int(r1 == r0)),
+        "payload_invalid": Decimal(int(not bound)),
+        "identical_relabels": Decimal(int(candidate.artifact_hash == v0.content_hash)),
+        "threshold_changes": Decimal(len(widening)),
+        "cost_usd": limits.cost_per_proposal.value * v1.proposal_budget,
+    })  # fmt: skip
 
 
 def cycle_candidate(

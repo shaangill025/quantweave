@@ -34,9 +34,10 @@ V1_PAYLOAD = {"proposal_budget": "2", "operators": f"{DATE},{VAL}",
               "selection": "first_improving"}  # fmt: skip
 V1 = oi.OptimizerConfig.from_payload("opt-v1", V1_PAYLOAD)
 EXP = "exp-opt-1"
-GOOD = {t.metric: Decimal(2 if t.metric == "dev_gain" else 0)
-        for t in oi.scorecard("card-opt").thresholds}  # fmt: skip
 LIMITS = oi.Limits(2, 2, Usd("20.00"), Usd("0.50"))
+COST = Usd("2.00")  # SYNTHETIC per-cycle cost goal, within LIMITS
+GOOD = {t.metric: Decimal(2 if t.metric == "promotion_gain" else 0)
+        for t in oi.scorecard("card-opt", COST, LIMITS).thresholds}  # fmt: skip
 C0, SC_AT, V_AT, RUN = (T0 + timedelta(minutes=m) for m in (10, 20, 1440, 5760))
 
 
@@ -54,7 +55,8 @@ def optimizer_protocol(**kw: object) -> im.Protocol:
     args: dict[str, object] = {
         "experiment_id": EXP, "target": oi.OPT, "scope": im.Scope.INSTALLATION,
         "baseline_version": "opt-v0", "baseline_hash": V0.content_hash,
-        "scorecard": oi.scorecard("card-opt"), "sandbox_profile_id": "sandbox-synth",
+        "scorecard": oi.scorecard("card-opt", COST, LIMITS),
+        "sandbox_profile_id": "sandbox-synth",
         "budget_reservation_id": "bud-opt-1",
         "hypothesis": "SYNTHETIC: trying date rules first finds date defects sooner",
     } | kw  # fmt: skip
@@ -366,7 +368,7 @@ def test_recursion_negative_controls() -> None:
     assert gate(g3, d3) == ("assessment_skipped",)
     assert why(g=g3, d=d3) == ["assessment_skipped"]
     # B2: no evidence; approver is the producer or assessor; acts before the verdict
-    no_gain = {k: v for k, v in GOOD.items() if k != "dev_gain"}
+    no_gain = {k: v for k, v in GOOD.items() if k != "promotion_gain"}
     kws: tuple[dict[str, object], ...] = ({"trials": ()}, {"scores": no_gain})
     for kw in kws:
         assert lift(**kw) == ("verdict_without_evidence",)  # D3, D4
