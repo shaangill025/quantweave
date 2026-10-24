@@ -13,6 +13,7 @@ from __future__ import annotations
 import uuid
 from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass, replace
+from datetime import datetime, timedelta
 from functools import partial
 from typing import Any
 
@@ -21,10 +22,14 @@ import pytest
 import test_strategy_improvement as fx
 from ingest_rights_helper import qualified_registry
 from psycopg import errors
+from psycopg import sql as pgsql
+from psycopg.conninfo import make_conninfo
 from qw_adapters import assessor_run as ar
 from qw_adapters import assessor_store as ast
+from qw_adapters import dataset_store as dst
 from qw_adapters import experiment_store as es
 from qw_adapters import holdout_series_store as hs
+from qw_adapters import rights_store as rs
 from qw_adapters import strategy_implementations as sim
 from qw_adapters import tenancy as tn
 from qw_domain import improvement as im
@@ -32,7 +37,24 @@ from qw_domain import strategy_improvement as si
 from qw_domain.backtest import Strategy, TrialOutcome
 from qw_domain.budget import BudgetBook, Category
 from qw_domain.decimals import UsdBudget
+from qw_domain.filings import Fact
+from qw_domain.instants import ensure_aware_utc
 from qw_domain.research_data import ResearchDataset, ResearchRights
+from qw_domain.rights import (
+    EntitlementHistory,
+    EntitlementSource,
+    Evidence,
+    EvidenceKind,
+    FeedHistory,
+    FeedStatus,
+    Grant,
+    Provider,
+    Registry,
+    RightsProfile,
+    RightState,
+    Use,
+    UseScope,
+)
 from qw_domain.strategy_registry import ParamValue
 from qw_domain.trial_ledger import Outcome, Split, SplitPlan, TrialLedger
 from test_backtest import scripted
@@ -64,10 +86,14 @@ class World:  # the SYNTHETIC promotion fixtures of one real tenant
     book: BudgetBook
 
 
-def world(t: uuid.UUID) -> World:
+def world(t: uuid.UUID, rr: ResearchRights | None = None,
+          facts: tuple[Fact, ...] = (ORIGINAL,)) -> World:  # fmt: skip
+    """`rr` and `facts`: other rights and facts (test_store_inputs stores them)."""
     s = str(t)
-    rr = replace(rights(registry=qualified_registry((FEED,), tenant=s)), tenant_id=s)
-    ds = freeze(facts=(ORIGINAL,), events=DS.universe.events, rights=rr)
+    if rr is None:
+        rr = replace(rights(registry=qualified_registry((FEED,), tenant=s)),
+                     tenant_id=s)  # fmt: skip
+    ds = freeze(facts=facts, events=DS.universe.events, rights=rr)
     sp = plan(protocol_hash=fx.EVAL.content_hash, dataset=ds.manifest)
     p = fx.iproto(sandbox_profile_id="sbx-synth", scorecard=fx.NET, scope_id=s,
                   budget_reservation_id="bud-exp-1",
@@ -78,6 +104,65 @@ def world(t: uuid.UUID) -> World:
     return World(t, ds, rr, sp, reg, si.StrategyStudy(p, fx.SPACE, fx.EVAL, fx.BASE),
                  TrialLedger(s).register_plan(sp, ds),
                  si.HoldoutData(win, {"px-synth-1": win}), book)  # fmt: skip
+
+
+# Rights held in the rights store (promotion_run re-checks them at the read,
+# decisions 75 and 77). Knowledge times are the database clock (0013), and the
+# world's universe is known since 2020, so retention is the 100-year maximum.
+KEEP = dst.MAX_RETAIN
+TERMS = dst.DatasetTerms(UseScope.PERSONAL, "CA-ON", KEEP)
+PROVIDER = Provider("provider-synth", "SYNTHETIC provider")
+
+
+def clock(c: Conn) -> datetime:
+    """Just before the database clock (rights knowledge times must be known)."""
+    row = c.execute("SELECT clock_timestamp()").fetchone()
+    assert row is not None
+    return ensure_aware_utc(row[0]) - timedelta(seconds=30)
+
+
+def profile(at: datetime, until: datetime | None = None) -> RightsProfile:
+    permit = Evidence(EvidenceKind.PERMISSION, "synthetic-permit", at, "counsel-synth")
+
+    def grant(use: Use | None = None) -> Grant:
+        return Grant(RightState.GRANTED, permit, until or at + KEEP,
+                     KEEP if use is Use.RETENTION else None)  # fmt: skip
+
+    return RightsProfile({u: grant(u) for u in Use}, {UseScope.PERSONAL: grant()},
+                         {TERMS.jurisdiction: grant()})  # fmt: skip
+
+
+def feed(at: datetime) -> FeedHistory:
+    auth = Evidence(EvidenceKind.AUTH, "synthetic-auth", at)
+    work = Evidence(EvidenceKind.WORKLOAD, "synthetic-workload", at)
+    permit = Evidence(EvidenceKind.PERMISSION, "synthetic-permit", at, "counsel-synth")
+    return (FeedHistory.new(FEED, PROVIDER.provider_id)
+            .revise("synthetic_feed", frozenset(Use), profile(at), at)
+            .transition(FeedStatus.CONNECTED, "operator-synth", (auth,), at)
+            .transition(FeedStatus.QUALIFIED, "operator-synth", (work, permit),
+                        at))  # fmt: skip
+
+
+def entitlement(t: uuid.UUID, at: datetime) -> EntitlementHistory:
+    licence = EntitlementSource.INSTALLATION_LICENSE
+    return EntitlementHistory.new(str(t), FEED).revise(
+        licence, True, profile(at), None, at
+    )
+
+
+def stored_world(owner: Conn, t: uuid.UUID) -> World:
+    """`world` under rights the schema owner records now, its fact on the
+    recorded feed revision."""
+    at = clock(owner)
+    ent = entitlement(t, at)
+    rs.record_provider(owner, PROVIDER)
+    rs.record_feed(owner, feed(at))
+    with tn.tenant_transaction(owner, t) as tx:
+        rs.record_entitlement(tx, ent)
+    reg = Registry().with_provider(PROVIDER).with_feed(feed(at)).with_entitlement(ent)
+    rr = ResearchRights(reg, str(t), at, TERMS.scope, TERMS.jurisdiction, KEEP)
+    fh = reg.feeds[FEED].revisions[-1].content_hash
+    return world(t, rr, (replace(ORIGINAL, feed_hash=fh),))
 
 
 def research(w: World, lg: TrialLedger, n: int) -> TrialLedger:
@@ -153,11 +238,44 @@ def wrk(runtime_urls: dict[str, str]) -> Iterator[Conn]:
 
 
 @pytest.fixture
-def w(app_conn: Conn, asr: Conn, wrk: Conn) -> World:
-    """Series preregistered, then the experiment scheduled (its protocol frozen)."""
+def owner(database_url: str, runtime_urls: dict[str, str]) -> Iterator[Conn]:
+    """The schema owner's role: the only one that records rights (0013)."""
+    with psycopg.connect(database_url, autocommit=True) as c:
+        c.execute("SET ROLE qw_migrate")
+        yield c
+
+
+@pytest.fixture
+def ing(conn: Conn, database_url: str, runtime_urls: dict[str, str]) -> Iterator[Conn]:
+    """A real qw_ingest login (decision 83), the only writer of datasets."""
+    name = f"qwtest_ing_{uuid.uuid4().hex[:12]}"
+    conn.execute(pgsql.SQL("CREATE ROLE {} LOGIN NOBYPASSRLS IN ROLE qw_ingest"
+                           ).format(pgsql.Identifier(name)))  # fmt: skip
+    try:
+        url = make_conninfo(database_url, user=name)
+        with tn.runtime_connection(url, role="qw_ingest") as c:
+            yield c
+    finally:
+        conn.execute(pgsql.SQL("SELECT pg_terminate_backend(pid) FROM "
+                               "pg_stat_activity WHERE usename = {}"
+                               ).format(pgsql.Literal(name)))  # fmt: skip
+        conn.execute(pgsql.SQL("DROP ROLE {}").format(pgsql.Identifier(name)))
+
+
+def record_dataset(ing: Conn, w: World) -> None:
+    """qw_ingest freezes the world's dataset under `TERMS` (decisions 73 and 77)."""
+    with tn.tenant_transaction(ing, w.t) as tx:
+        dst.record(tx, w.ds, TERMS)
+
+
+@pytest.fixture
+def w(app_conn: Conn, asr: Conn, wrk: Conn, owner: Conn, ing: Conn) -> World:
+    """Rights recorded, the dataset frozen, series preregistered, then the
+    experiment scheduled (its protocol frozen)."""
     with tn.provision_tenant(app_conn) as tx:
         t = tx.tenant_id
-    w = world(t)
+    w = stored_world(owner, t)
+    record_dataset(ing, w)
     with tn.tenant_transaction(asr, t) as tx:
         hs.preregister(tx, w.plan.plan_id, "holdout", w.holdout.series)
         hs.preregister(tx, w.plan.plan_id, "px-synth-1", w.holdout.series)
@@ -294,6 +412,22 @@ def test_decision_42_refusals_before_the_read_change_nothing(
     assert counts(conn, w.t) == before
     run = go(wrk, asr, w)  # the read was kept for the real run
     assert (run.attempt, run.outcome.trial.outcome) == (1, Outcome.COMPLETED)
+
+
+def test_a_run_whose_dataset_is_not_stored_is_refused_before_the_read(
+    wrk: Conn, asr: Conn, conn: Conn, app_conn: Conn, owner: Conn
+) -> None:
+    with tn.provision_tenant(app_conn) as tx:
+        t = tx.tenant_id
+    w = stored_world(owner, t)  # rights stored, the dataset not
+    with tn.tenant_transaction(asr, w.t) as tx:
+        hs.preregister(tx, w.plan.plan_id, "holdout", w.holdout.series)
+        hs.preregister(tx, w.plan.plan_id, "px-synth-1", w.holdout.series)
+    es.record(wrk, asr, w.t, w.reg, EXP, "cand-1", w.plan, w.book,
+              im.Scheduled(EXP, "bud-exp-1"))  # fmt: skip
+    before = counts(conn, w.t)
+    assert code(lambda: go(wrk, asr, w)) == "dataset_missing"  # decision 77
+    assert counts(conn, w.t) == before
 
 
 def test_decision_42_a_record_that_could_not_follow_is_refused_first(
@@ -460,10 +594,19 @@ def test_decision_42_a_rerun_must_be_the_same_read(
                {"ledger": fx.rec(research(w, w.ledger, 2), 2,
                                  dataset_hash=w.ds.manifest.content_hash)},
                {"book": im.schedule(w.reg, (EXP,), BudgetBook.open(
-                   str(w.t), AT, CAPS), AT + fx.H)[0]}):  # fmt: skip
+                   str(w.t), AT, CAPS), AT + fx.H)[0]},
+               ):  # fmt: skip
         assert code(partial(go, wrk, asr, w, **kw)) == "rerun_mismatch", kw
         assert counts(conn, w.t) == before, kw
-    assert go(wrk, asr, w).attempt == 2  # the true re-run is still available
+    # other terms than the stored dataset's: refused at the read's rights check
+    # (decision 85), before the digest is compared
+    loose = replace(w.rights, retain_for=w.rights.retain_for // 2)
+    assert code(partial(go, wrk, asr, w, rights=loose)) == "request_mismatch"
+    assert counts(conn, w.t) == before
+    # the true re-run is still available; decision 77: its rights are checked at
+    # its own time of use, so the time is not in the input digest
+    later = replace(w.rights, at=w.rights.at + fx.H)
+    assert go(wrk, asr, w, rights=later).attempt == 2
 
 
 @pytest.mark.parametrize("where", ["record", "revision"])

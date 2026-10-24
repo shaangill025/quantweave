@@ -145,6 +145,23 @@ def test_tenant_transaction_refuses_open_transaction(database_url: str) -> None:
             pass
 
 
+@pytest.mark.db
+def test_tenant_transaction_snapshot_is_repeatable_read_and_read_only(
+    app_conn: Conn,
+) -> None:
+    t = uuid.uuid4()
+    q = (
+        "SELECT current_setting('transaction_isolation'), "
+        "current_setting('transaction_read_only'), current_setting('app.tenant_id')"
+    )
+    with tenant_transaction(app_conn, t, snapshot=True) as tx:
+        assert tx.conn.execute(q).fetchone() == ("repeatable read", "on", str(t))
+        with pytest.raises(errors.ReadOnlySqlTransaction), tx.conn.transaction():
+            tx.conn.execute("CREATE TEMP TABLE qw_probe (x int)")
+    with tenant_transaction(app_conn, t) as tx:  # the default is unchanged
+        assert tx.conn.execute(q).fetchone() == ("read committed", "off", str(t))
+
+
 # --- runtime roles ---
 
 

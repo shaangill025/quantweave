@@ -50,6 +50,7 @@ pg_admin_url, database_url = _harness.pg_admin_url, _harness.database_url
 conn, runtime_urls = _harness.conn, _harness.runtime_urls
 app_conn = _harness.app_conn
 run_tests = _load("qw_assessor_run_tests", _tests / "test_assessor_run.py")
+owner, ing = run_tests.owner, run_tests.ing
 pytestmark = pytest.mark.db
 Conn = psycopg.Connection[Any]
 NOW = Backoff(timedelta(0), timedelta(0))
@@ -67,12 +68,14 @@ def logins(runtime_urls: dict[str, str]) -> Iterator[tuple[Conn, Conn]]:
 
 
 @pytest.fixture
-def world(app_conn: Conn, logins: tuple[Conn, Conn]) -> Any:
-    """test_assessor_run's world: series preregistered, the experiment scheduled."""
+def world(app_conn: Conn, logins: tuple[Conn, Conn], owner: Conn, ing: Conn) -> Any:
+    """test_assessor_run's world: rights recorded, the dataset frozen, series
+    preregistered, the experiment scheduled."""
     wrk, asr = logins
     with tn.provision_tenant(app_conn) as tx:
         t = tx.tenant_id
-    w = run_tests.world(t)
+    w = run_tests.stored_world(owner, t)
+    run_tests.record_dataset(ing, w)
     with tn.tenant_transaction(asr, t) as tx:
         hs.preregister(tx, w.plan.plan_id, "holdout", w.holdout.series)
         hs.preregister(tx, w.plan.plan_id, "px-synth-1", w.holdout.series)
@@ -234,8 +237,9 @@ def test_the_store_source_runs_only_with_every_bound_input(
         jid = qa.submit_job(tx, run_tests.request(world))
     before = run_tests.counts(conn, world.t)
     lp = loop(logins, strategies=run_tests.REG)  # the default: STORE_SOURCE
-    assert lp.run_one() == (jid, JobState.FAILED)
-    assert state(wrk, world.t, jid) == (JobState.FAILED, "inputs_unavailable")
+    assert lp.run_one() == (jid, JobState.FAILED)  # it reads the input stores, and
+    # this world stored no search space (test_store_inputs stores every input)
+    assert state(wrk, world.t, jid) == (JobState.FAILED, "search_space_missing")
     other = run_tests.world(world.t)  # the same inputs, rebuilt: the hashes match
     wrong = qa.BoundInputs(world.study, world.reg.register_candidate(
         run_tests.fx.cand(run_tests.si.derive(run_tests.fx.BASE, run_tests.fx.SPACE,
@@ -349,7 +353,7 @@ def test_qw_assessor_holds_exactly_its_two_logins(
     assert qa.main(ok) == 0
     (lp,) = started
     assert lp.strategies is qa.STRATEGIES  # the built-in registry
-    assert lp.source is qa.STORE_SOURCE  # the request store, no bound inputs
+    assert lp.source is qa.STORE_SOURCE  # the request and input stores
 
 
 def test_qw_worker_refuses_to_start_with_the_assessor_login_configured(

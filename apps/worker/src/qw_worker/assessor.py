@@ -22,10 +22,15 @@ experiment and candidate it names (the request id is the verdict id), as
 `submit_job` writes it with the request in one qw_worker transaction (decision
 64). A `RequestSource` turns it into an `assessor_run.Request`: the default,
 `STORE_SOURCE`, loads the stored request (`request_missing` if there is none) and
-needs the inputs it binds by hash (decision 67) from an `InputsProvider`, called
-in the qw_assessor transaction that loaded the request; none of
-them has a store yet, so the default provider refuses (`inputs_unavailable`) and
-every run fails closed until they do. Then `promotion_run` runs,
+takes the inputs it binds by hash (decision 67) from an `InputsProvider`, called
+in the qw_assessor transaction that loaded the request (REPEATABLE READ, READ
+ONLY: one snapshot). The default,
+`STORE_INPUTS` (`store_inputs`), reads each from its store (decision 70: the
+registry log as of submit, the study inputs, the base manifest with the
+candidate's re-derived, the dataset with its rights at the database clock) and
+refuses a missing one under its own code; `check` then refuses any bound hash
+that differs (`request_mismatch`). Then
+`promotion_run` runs,
 outside any job transaction (it needs idle connections), and the job is
 completed. A refusal (any error with a short `code`: an invalid payload, a
 missing request, a decision 62 `blocked`, `rerun_used`, a conflict) fails the
@@ -37,7 +42,10 @@ already recorded (`run_recorded`) is completed. The lease is extended
 (`jobs.heartbeat`) after each committed phase of the run; a lost lease stops the
 run and records nothing (the reaper requeues it). LIMITATIONS: one phase longer
 than the lease (the evaluation) is still reaped and may run twice, bounded by
-decision 59; no publish target, purges or reaping here (the standard worker)."""
+decision 59; no publish target, purges or reaping here (the standard worker); a
+strategy candidate with evidence uses is refused at `bind` (`evidence_not_logged`:
+the run passes no evidence store); the registry log is hash-only, so dropping its
+latest entries is not detected (experiment_registry_store)."""
 
 from __future__ import annotations
 
@@ -50,13 +58,15 @@ import time
 import uuid
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
+from decimal import Decimal
 from functools import partial
 from types import FrameType
 
 from qw_adapters import assessment_request_store as ars
 from qw_adapters import assessor_run as ar
+from qw_adapters import dataset_store, strategy_store, study_store, tenancy
+from qw_adapters import experiment_registry_store as ers
 from qw_adapters import jobs as qj
-from qw_adapters import tenancy
 from qw_adapters.jobs import ClaimedJob, LeaseLost
 from qw_adapters.strategy_implementations import Implementations
 from qw_adapters.tenancy import Conn, TenantTx, tenant_transaction
@@ -71,7 +81,12 @@ from qw_domain.research_data import (
     ResearchRights,
     check_id,
 )
-from qw_domain.strategy_registry import StrategyRegistry
+from qw_domain.strategy_registry import (
+    ParamKind,
+    ParamValue,
+    StrategyManifest,
+    StrategyRegistry,
+)
 
 from qw_worker.config import WorkerSettings, settings_from_env
 
@@ -134,29 +149,102 @@ class BoundInputs:
     rights: ResearchRights
 
 
-# Called inside the qw_assessor transaction that loaded the request, so a
-# provider reads its input stores from the same snapshot.
+# Called inside the qw_assessor transaction that loaded the request, which is
+# REPEATABLE READ, READ ONLY: a provider reads its input stores from the request's
+# own snapshot and can write nothing.
 InputsProvider = Callable[[TenantTx, ars.StoredRequest], BoundInputs]
 
 
-def no_inputs(tx: TenantTx, stored: ars.StoredRequest) -> BoundInputs:
-    """No store holds these inputs yet (T032 and the research-data, search-space
-    and evaluation-protocol stores), so the assessor cannot obtain them: refuse."""
-    raise Refused("inputs_unavailable", "study, registry, strategies, dataset, rights")
+def _param(kind: ParamKind, wire: str) -> ParamValue:
+    if kind is ParamKind.INTEGER:
+        return int(wire)
+    if kind is ParamKind.DECIMAL:
+        return Decimal(wire)
+    if kind is ParamKind.BOOLEAN:
+        return {"true": True, "false": False}[wire]
+    return wire
 
 
-def store_source(inputs: InputsProvider = no_inputs) -> RequestSource:
+def candidate_manifest(base: StrategyManifest, space: si.SearchSpace,
+                       c: im.Candidate) -> StrategyManifest:  # fmt: skip
+    """Decision 78: the candidate's manifest re-derived from the stored base and
+    search space and its logged parameters; it must give the candidate's artifact
+    and payload hashes (the payload hash covers each parameter's canonical wire
+    form, so a non-canonical or extra parameter differs): `candidate_mismatch`."""
+    try:
+        was = base.resolve({})  # the base defaults; derive takes only changes
+        values = {p.name: _param(p.kind, c.payload[p.name]) for p in base.parameters}
+        m = si.derive(base, space, {k: v for k, v in values.items() if v != was[k]},
+                      c.candidate_id)  # fmt: skip
+        if (m.material_hash, m.config_hash({})) != (c.artifact_hash, c.payload_hash):
+            raise ValueError("re-derived")
+    except (ValueError, TypeError, KeyError, ArithmeticError):  # the domain errors
+        raise Refused("candidate_mismatch", c.candidate_id) from None
+    return m
+
+
+def store_inputs(tx: TenantTx, stored: ars.StoredRequest) -> BoundInputs:
+    """Every input `stored` binds by hash (decision 67), read from its store in the
+    request's own qw_assessor transaction; a missing one is refused under its code:
+    - the experiment registry, replayed as of the request's recorded time
+      (decision 71), so a later entry is not seen; it must hold the request's
+      protocol and candidate (`registry_missing`);
+    - the study: the protocol from that registry, its search space by
+      `mutation_space_hash` (`search_space_missing`), the evaluation protocol by
+      its plan's `protocol_hash` (`evaluation_protocol_missing`), the plan from the
+      stored ledger, and the base manifest by the reviewed reference's id and
+      version (decision 69; `strategy_missing`);
+    - the candidate manifest, re-derived (decision 78, `candidate_manifest`);
+    - the dataset the plan names (`dataset_missing`) and its rights, both from the
+      dataset store, which re-checks rights and retention at the database clock
+      (decisions 75 and 77: `rights_refused`, `retention_expired`); never a
+      caller's time. `promotion_run` checks them again at the read.
+    A store's or the domain's refusal keeps its code (a `database` fault stays
+    retryable). Each is located by what the request binds, never by a newer or a
+    similar record, and `store_source` then `check`s every bound hash
+    (`request_mismatch`, naming each that differs)."""
+    reg = ers.load(tx, str(tx.tenant_id), stored.recorded_at)
+    try:
+        p = reg.protocol(stored.experiment_id)
+        c = reg.candidate(stored.body["candidate_id"])
+    except im.ImprovementError as exc:
+        raise Refused("registry_missing", exc.code) from None
+    plan = stored.ledger.plan(p.plan_id)
+    h = p.mutation_space_hash
+    space = None if h is None else study_store.space(tx, h)
+    if space is None:
+        raise Refused("search_space_missing", str(h))
+    ev = study_store.evaluation(tx, plan.protocol_hash)
+    if ev is None:
+        raise Refused("evaluation_protocol_missing", plan.protocol_hash)
+    ref = stored.strategy
+    base = strategy_store.manifest(tx, ref.strategy_id, ref.version)
+    if base is None:
+        raise Refused("strategy_missing", f"{ref.strategy_id}@{ref.version}")
+    study = si.StrategyStudy(p, space.space, ev.protocol, base)
+    m = candidate_manifest(base, space.space, c)
+    found = dataset_store.load(tx, plan.dataset)
+    if found is None:
+        raise Refused("dataset_missing", plan.dataset.dataset_id)
+    return BoundInputs(study, reg, StrategyRegistry().register(base).register(m),
+                       found.dataset, found.rights)  # fmt: skip
+
+
+STORE_INPUTS: InputsProvider = store_inputs
+
+
+def store_source(inputs: InputsProvider = STORE_INPUTS) -> RequestSource:
     """The request as qw_worker submitted it (decisions 43 and 64): loaded from the
     request store as qw_assessor, rebuilt with `inputs` (called in that same
-    transaction), then `check`ed against the stored body and hashes
-    (`request_mismatch` on any difference)."""
+    REPEATABLE READ, READ ONLY transaction, so one snapshot), then `check`ed
+    against the stored body and hashes (`request_mismatch` on any difference)."""
 
     def get(assessor: Conn, tenant_id: uuid.UUID, job: AssessmentJob) -> ar.Request:
-        with tenant_transaction(assessor, tenant_id) as tx:
+        with tenant_transaction(assessor, tenant_id, snapshot=True) as tx:
             stored = ars.load(tx, job.experiment_id, job.request_id)
             if stored is None:
                 raise Refused("request_missing", job.request_id)
-            i = inputs(tx, stored)  # the same transaction and snapshot
+            i = inputs(tx, stored)  # the same snapshot
         b = stored.body
         r = ar.Request(
             i.study, i.registry, i.strategies, stored.ledger, b["candidate_id"],
@@ -170,7 +258,7 @@ def store_source(inputs: InputsProvider = no_inputs) -> RequestSource:
     return get
 
 
-STORE_SOURCE = store_source()
+STORE_SOURCE = store_source(STORE_INPUTS)
 
 
 def submit_job(tx: TenantTx, r: ar.Request) -> uuid.UUID:

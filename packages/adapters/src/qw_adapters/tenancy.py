@@ -76,13 +76,19 @@ class SessionPrincipal:
 
 
 @contextmanager
-def tenant_transaction(conn: Conn, tenant_id: uuid.UUID) -> Iterator[TenantTx]:
+def tenant_transaction(
+    conn: Conn, tenant_id: uuid.UUID, *, snapshot: bool = False
+) -> Iterator[TenantTx]:
+    """`snapshot`: REPEATABLE READ, READ ONLY, so every read sees one snapshot
+    and nothing can be written (the assessor's request rebuild)."""
     if type(tenant_id) is not uuid.UUID:
         raise TypeError("tenant_id must be a uuid.UUID derived by the server")
     if not conn.autocommit or conn.info.transaction_status != pq.TransactionStatus.IDLE:
         # Inside an outer transaction the setting would outlive this block.
         raise TenancyError("tenant_transaction needs an idle autocommit connection")
     with conn.transaction():
+        if snapshot:  # must be the transaction's first statement
+            conn.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
         conn.execute("SELECT set_config('app.tenant_id', %s, true)", (str(tenant_id),))
         yield TenantTx(conn, tenant_id)
 

@@ -16,8 +16,8 @@ assessor can load them:
   hashed: `approved_by` is whatever the caller wrote, unverified, until a step-up
   approval flow exists. `StoredEvaluation` carries the mark to the reader.
 Any other login is `forbidden` (the database refuses it). Times are the database
-clock. LIMITATIONS: nothing loads these in the assessor run yet (the wiring
-increment); the store does not check a space against its base manifest or a
+clock. The assessor run loads both (`qw_worker.assessor.store_inputs`).
+LIMITATIONS: the store does not check a space against its base manifest or a
 protocol against its plan (`StrategyStudy` and `check_plan` do, in the domain)."""
 
 from __future__ import annotations
