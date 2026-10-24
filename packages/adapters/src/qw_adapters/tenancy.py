@@ -433,10 +433,11 @@ def bootstrap_installation(
     return tx.tenant_id, user_id
 
 
-RuntimeRole = Literal["qw_app", "qw_worker", "qw_assessor", "qw_release"]
-_RUNTIME = ("qw_app", "qw_worker", "qw_assessor", "qw_release")
-_EXCLUSIVE = ("qw_assessor", "qw_release")  # decisions 17 and 45: never mixed
-_GROUPS = (*_RUNTIME, "qw_ingest")
+RuntimeRole = Literal["qw_app", "qw_worker", "qw_assessor", "qw_release", "qw_ingest"]
+_RUNTIME = ("qw_app", "qw_worker", "qw_assessor", "qw_release", "qw_ingest")
+# decisions 17, 45 and 83 (qw_ingest, the data-loading login): never mixed
+_EXCLUSIVE = ("qw_assessor", "qw_release", "qw_ingest")
+_GROUPS = _RUNTIME
 
 
 @contextmanager
@@ -451,10 +452,11 @@ def runtime_connection(
 
 def check_runtime_role(conn: Conn, role: RuntimeRole | None = None) -> None:
     """Refuse a connection that could bypass row level security or is not a member
-    of qw_app, qw_worker, qw_assessor or qw_release. Owner decision 17: a
+    of qw_app, qw_worker, qw_assessor, qw_release or qw_ingest. Owner decision 17: a
     qw_assessor login holds no other group of 0001; decision 45: neither does the
-    release operator's qw_release login. A declared `role` must be the login's only
-    one, so a mixed login cannot be the assessor or the operator and anything else."""
+    release operator's qw_release login; decision 83: nor a qw_ingest login. A
+    declared `role` must be the login's only one, so a mixed login cannot be the
+    assessor, the operator or the ingest login and anything else."""
     if role is not None and role not in _RUNTIME:
         raise TenancyError(f"unknown runtime role {role!r}")
     row = conn.execute(
