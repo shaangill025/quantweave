@@ -6,7 +6,11 @@ Any member reads the session tenant's experiments (forced RLS); unknown and fore
 ids are the same 404. Lists are C-02 keyset pages by id with the qw_api.reads HMAC
 cursor. Items are the project contract 0.6.0 `experiment`:
 `requires_human_promotion` true, `evaluation_receipt_ids` empty (no receipt store),
-`next_cycle_run_id` and `release_receipt_id` null (T051), `parent_optimizer_version`
+`release_receipt_id` null (T051), `next_cycle_run_id` the installed optimizer V1's
+next cycle from the experiment's verified `LineageReceipt` (T050) when one is given,
+else null (no route has one: the installation lineage store of owner decision 87 is
+later work; a lineage of another experiment is 409 `integrity`),
+`parent_optimizer_version`
 null except for the optimizer (named `none:parent_optimizer_version`). Each item
 carries its coverage: the stored `<kind>:<detail>` reasons the schema cannot carry
 (for example `blocked:sandbox_unqualified`, `evidence:synthetic_only`), `partial`
@@ -28,6 +32,11 @@ from typing import Annotated, Any
 from fastapi import APIRouter, Path, Request, Response
 from qw_adapters import experiment_store as store
 from qw_domain.improvement import ExperimentRecord
+from qw_domain.optimizer_improvement import (
+    LineageReceipt,
+    OptimizerError,
+    next_cycle_run_id,
+)
 
 from qw_api.app import ApiError
 from qw_api.policies import Reader
@@ -54,11 +63,17 @@ def _why(rec: ExperimentRecord) -> list[str]:
                                    else [])})  # fmt: skip
 
 
-def wire(rec: ExperimentRecord) -> dict[str, Any]:
+def wire(rec: ExperimentRecord, lineage: LineageReceipt | None = None) -> (
+    dict[str, Any]
+):  # fmt: skip
     body = {k: v for k, v in rec.wire().items() if k not in _INTERNAL}
+    try:
+        run = next_cycle_run_id(rec, lineage)
+    except OptimizerError:  # `lineage_binding`: the lineage is another experiment's
+        raise ApiError(409, "integrity", "Its lineage failed checks.") from None
     why = _why(rec)
     return {"id": rec.experiment_id, **body, "retest_of": rec.retest_of,
-            "evaluation_receipt_ids": [], "next_cycle_run_id": None,
+            "evaluation_receipt_ids": [], "next_cycle_run_id": run,
             "requires_human_promotion": rec.requires_human_promotion,
             "release_receipt_id": None,
             "coverage": {"status": "partial" if why else "complete",

@@ -12,6 +12,7 @@ import importlib.util
 import json
 import sys
 import uuid
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -23,7 +24,12 @@ from jsonschema import (  # type: ignore[import-untyped]
 )
 from qw_adapters import experiment_store as es
 from qw_api import experiments as ex
+from qw_api.app import ApiError
 from qw_domain import improvement as im
+from test_optimizer_improvement import (
+    gate_lifted_install,  # noqa: F401  (a pytest fixture, used by name)
+)
+from test_optimizer_lineage import lineage_receipt, optimizer_record
 
 ROOT = Path(__file__).parents[3]
 
@@ -271,3 +277,47 @@ def test_contract_0110_serves_the_lineage_link(
     login(world.client, "carol")  # another tenant sees neither end of the link
     assert world.client.get(URL).json()["items"] == []
     assert_problem(world.client.get(f"{URL}/exp-r"), 404, "not_found")
+
+
+@pytest.mark.usefixtures("gate_lifted_install")
+def test_next_cycle_run_id_is_served_from_bound_lineage() -> None:
+    """T050 increment 3, SYNTHETIC and GATE-LIFTED: given the experiment's lineage
+    receipt the item names the cycle the installed V1 ran next, and conforms as
+    `experiment_recursive.valid.json` does; the self-promotion shape of
+    `experiment_self_promotion.invalid.json` is refused. No route has a lineage
+    yet (decision 87's installation store), so served items stay null."""
+    reg, _, _, lin = lineage_receipt()
+    rec = optimizer_record(reg)
+    item = ex.wire(rec, lin)
+    assert item["next_cycle_run_id"] == "cycle-v1-1" == lin.claim.next_cycle.cycle_id
+    assert item["release_receipt_id"] is None  # T051 release receipts: not stored
+    assert valid(item)["target"] == "recursive_optimizer"
+    assert ex.wire(rec)["next_cycle_run_id"] is None  # no lineage: never invented
+    with pytest.raises(ApiError) as refused:  # another experiment's lineage
+        ex.wire(replace(rec, experiment_id="exp-opt-2"), lin)
+    assert (refused.value.status, refused.value.code) == (409, "integrity")
+    spec = ROOT / "docs/spec/contracts"
+    base = json.loads((spec / "schemas/experiment.schema.json").read_text())
+    check = Draft202012Validator(base, format_checker=FormatChecker())
+    manifest = json.loads((spec / "examples/manifest.json").read_text())["examples"]
+    shown = {e["path"]: e["expected_valid"] for e in manifest
+             if e["schema"] == "experiment"}  # fmt: skip
+    assert shown == {"experiment_recursive.valid.json": True,
+                     "experiment_self_promotion.invalid.json": False}  # fmt: skip
+    core = {k: item[k] for k in base["properties"]}
+    assert set(core) == set(base["required"])
+    examples = {p: json.loads((spec / "examples" / p).read_text()) for p in shown}
+    for path, ok in shown.items():
+        assert check.is_valid(examples[path]) is ok, path
+
+    def errs(body: dict[str, Any]) -> set[str]:
+        return {"/".join(map(str, e.absolute_path)) for e in check.iter_errors(body)}
+
+    # the base schema differs only by the 0.6.0 amended state `blocked` (T007 gate)
+    assert errs(core) == {"state"} and errs({**core, "state": "proposed"}) == set()
+    recursive = examples["experiment_recursive.valid.json"]
+    assert errs({**recursive, "next_cycle_run_id": item["next_cycle_run_id"]}) == set()
+    promoted = {"requires_human_promotion": False}  # the invalid example's change
+    assert errs({**core, "state": "proposed"} | promoted) == {
+        "requires_human_promotion"}  # fmt: skip
+    assert not EXPERIMENT.is_valid(item | promoted)
