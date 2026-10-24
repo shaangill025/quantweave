@@ -462,15 +462,21 @@ def check_runtime_role(conn: Conn, role: RuntimeRole | None = None) -> None:
     qw_assessor login holds no other group of 0001; decision 45: neither does the
     release operator's qw_release login; decision 83: nor a qw_ingest login. A
     declared `role` must be the login's only one, so a mixed login cannot be the
-    assessor, the operator or the ingest login and anything else."""
+    assessor, the operator or the ingest login and anything else. The checks are of
+    the login itself (session_user), and a connection whose role was changed (say
+    `options=-c role=...` at connect) is refused, so a mixed login cannot pass as
+    one of its groups and RESET ROLE back."""
     if role is not None and role not in _RUNTIME:
         raise TenancyError(f"unknown runtime role {role!r}")
     row = conn.execute(
         "SELECT r.rolsuper, r.rolbypassrls, pg_has_role(r.oid, 'qw_migrate', 'MEMBER'),"
         " ARRAY(SELECT g FROM unnest(%s::text[]) g WHERE pg_has_role(r.oid, g,"
-        " 'MEMBER')) FROM pg_catalog.pg_roles r WHERE r.rolname = current_user",
+        " 'MEMBER')), current_user = session_user FROM pg_catalog.pg_roles r"
+        " WHERE r.rolname = session_user",
         (list(_GROUPS),),
     ).fetchone()
+    if row is not None and not row[4]:
+        raise TenancyError("runtime connection runs under another session role")
     if row is None or row[0]:
         raise TenancyError("runtime connection is a superuser")
     if row[1] or row[2]:
