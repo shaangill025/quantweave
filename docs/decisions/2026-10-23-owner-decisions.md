@@ -435,3 +435,43 @@ below waives a test, gate or spec requirement. Numbering continues from
     decision 77's DB-clock check as the only source of time and keeps re-runs
     identical (decision 59)."
     Implemented by: T044 (the assessor's store inputs provider).
+
+86. **The optimizer's self-change artifact (T050).**
+    Question: "Decision 86 (T050): what form should the optimizer's self-change
+    (V0 → V1) take?"
+    Selected label: "Closed config policy (Recommended)".
+    Option text as presented: "V1 is a new optimizer search policy (budget,
+    operators, selection) with its own hash, as T050 increment 1 built. Why: it can
+    be assessed, cannot widen its own authority, and the code-improvement path
+    deliberately protects the improvement modules; changing how the optimizer
+    searches still meets the spec's 'improvement logic'."
+    Implemented by: T050.
+
+87. **Where optimizer experiments, cycles and releases are stored (T050).**
+    Question: "Decision 87 (T050): where should installation-wide optimizer
+    experiments, cycles and releases be stored?"
+    Selected label: "New installation tables (Recommended)".
+    Option text as presented: "Installation-scope tables: qw_assessor writes the
+    registry, qw_worker writes cycles, only maintainers/operators read them. Why:
+    the protocol check and the 0.6.0 contract already treat optimizer experiments
+    as installation objects; putting them in a tenant would mislabel their scope."
+    Implemented by: T050.
+
+88. **Rolling back the first installed optimizer (T050).**
+    Question: "Decision 88 (T050): if the first installed optimizer V1 is rolled
+    back, what happens?"
+    Selected label: "Back to frozen V0 (Recommended)".
+    Option text as presented: "Rollback returns to the frozen protocol baseline
+    V0, recording the rollback event. Why: V0 is the frozen, assessed baseline, so
+    the fallback is reversible and recursion can resume."
+    Implemented by: T050 and T051.
+
+89. **The proposer for the first-release recursion proof (T050).**
+    Question: "Decision 89 (T050): which proposer generates V1 for the
+    first-release proof?"
+    Selected label: "Deterministic now, LLM later (Recommended)".
+    Option text as presented: "A free, deterministic proposer derives V1 from V0's
+    stored cycle receipt (a real, distinct artifact); an LLM proposer through the
+    model gateway stays an unconfigured port. Why: an LLM proposer needs provider
+    spend and credentials, which require your specific authorization."
+    Implemented by: T050.
