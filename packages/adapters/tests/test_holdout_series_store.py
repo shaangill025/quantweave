@@ -337,8 +337,8 @@ def test_an_ingest_login_is_refused(
 ) -> None:
     prereg(asr, t, PLAN, "holdout", px(t))
     url = login_in("qw_ingest")
-    with pytest.raises(tn.TenancyError), tn.runtime_connection(url):
-        pass  # not a runtime login at all
+    with tn.runtime_connection(url, role="qw_ingest"):
+        pass  # a runtime login since decision 83, but not this table's
     with psycopg.connect(url, autocommit=True) as c:  # and the table refuses it
         for stmt in (
             "SELECT plan_id FROM app.holdout_series",

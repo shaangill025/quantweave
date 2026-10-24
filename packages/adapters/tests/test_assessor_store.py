@@ -585,9 +585,25 @@ def test_check_runtime_role_refuses_mixed_and_undeclared_logins(
             pass
     with (
         pytest.raises(tn.TenancyError, match="unknown"),
-        tn.runtime_connection(runtime_urls["qw_app"], role="qw_ingest"),  # type: ignore[arg-type]
+        tn.runtime_connection(runtime_urls["qw_app"], role="qw_bogus"),  # type: ignore[arg-type]
     ):
         pass
+    # Decision 83: qw_ingest is a declared runtime role, never mixed (as above)
+    ingest = login_in("qw_ingest")
+    with tn.runtime_connection(ingest, role="qw_ingest"), tn.runtime_connection(ingest):
+        pass
+    with pytest.raises(tn.TenancyError, match="exactly"), tn.runtime_connection(
+            ingest, role="qw_worker"):  # fmt: skip
+        pass
+    ingests: tuple[tn.RuntimeRole | None, ...] = (None, "qw_ingest")
+    for group in ("qw_app", "qw_worker", "qw_assessor", "qw_release"):
+        url = login_in("qw_ingest", group)
+        for declared in ingests:
+            with (
+                pytest.raises(tn.TenancyError, match="no other runtime role"),
+                tn.runtime_connection(url, role=declared),
+            ):
+                pass
 
 
 # Owner decision 18: a promotion window whose holdout was scored for one plan is
