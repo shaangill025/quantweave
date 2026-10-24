@@ -396,7 +396,9 @@ def test_decision_17_only_qw_assessor_writes_and_reads_assessor_tables(
         ("experiment_registry_entry", "SELECT"),
         ("experiment_registry_entry", "INSERT"),
         ("strategy_search_space", "SELECT"),  # 0045: decision 72
-        ("evaluation_protocol", "SELECT")} | {  # 0043: decisions 70 and 78
+        ("evaluation_protocol", "SELECT"),
+        ("research_dataset", "SELECT")} | {  # 0046: decision 73
+        # 0043: decisions 70 and 78
         (t, "SELECT") for t in (
             "strategy_manifest", "rights_provider", "rights_feed",
             "rights_feed_revision", "rights_feed_transition",
