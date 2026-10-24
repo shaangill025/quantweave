@@ -11,9 +11,11 @@ its request durably here until the run returns:
   hashes), `registry` (every experiment-registry entry's wire), `strategy_manifest`
   (the candidate manifest's material hash), `dataset` (its manifest content hash, which
   covers every record) and `rights` (defined here: the rights terms and the
-  research-use decision for each dataset feed at `rights.at`, so the registry is
-  bound by its effect on this dataset, not by its full body). The ids, time,
-  instrument and assessor party are stored as they are.
+  research-use decision for each dataset feed, so the registry is bound by its
+  effect on this dataset, not by its full body; decision 77: the run checks rights
+  at its own database-clock time of use, so `rights.at` is not bound, only the
+  decisions taken at it). The ids, time, instrument and assessor party are stored
+  as they are.
 - `submit(tx, request)`: qw_worker only (decision 64); one request per tenant,
   experiment and verdict id (`request_exists`), the ledger and protocol scoped to
   the session tenant (`tenant_mismatch`).
@@ -22,16 +24,16 @@ its request durably here until the run returns:
   `integrity`.
 - `check(stored, request)`: what the run calls before it acts; any difference is
   `request_mismatch`, naming the fields.
-Any other login is `forbidden` (the database refuses it). LIMITATIONS: nothing
-calls `load` or `check` yet (the wiring increment); the reference is resolved by
-the qw-assessor process's reviewed registry (`assessor.STRATEGIES`); decision
-43's caller-supplied marks go on the verdict record (decision 66), not here."""
+Any other login is `forbidden` (the database refuses it). The qw-assessor
+process (`qw_worker.assessor.STORE_SOURCE`) calls `load` and `check`; the reference
+is resolved by its reviewed registry (`assessor.STRATEGIES`); decision 43's
+caller-supplied marks go on the verdict record (decision 66), not here."""
 
 from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import datetime
 from typing import Any
 
 import psycopg
@@ -41,15 +43,11 @@ from qw_domain import strategy_improvement as si
 from qw_domain.budget import BudgetBook
 from qw_domain.instants import ensure_aware_utc, format_instant
 from qw_domain.research_data import (
-    RESEARCH_USES,
-    ResearchDataset,
-    ResearchRights,
     digest,
 )
-from qw_domain.rights import Use, check_use
 from qw_domain.trial_ledger import TrialLedger
 
-from qw_adapters.assessor_run import Request
+from qw_adapters.assessor_run import Request, rights_hash
 from qw_adapters.strategy_implementations import StrategyRef
 from qw_adapters.tenancy import TenantTx
 
@@ -82,25 +80,6 @@ def study_hash(s: si.StrategyStudy) -> str:
 def registry_hash(r: im.ExperimentRegistry) -> str:
     return digest(["experiment_registry", r.scope_id,
                    [[type(e).__name__, e.wire()] for e in r.entries]])  # fmt: skip
-
-
-def _us(d: timedelta) -> str:
-    return str(d // timedelta(microseconds=1))
-
-
-def rights_hash(r: ResearchRights, ds: ResearchDataset) -> str:
-    """The terms, and the decision `require_research_use` takes on each feed."""
-    uses = []
-    for feed in sorted(ds.manifest.sources):
-        for use in RESEARCH_USES:
-            keep = r.retain_for if use is Use.RETENTION else None
-            d = check_use(r.registry, r.tenant_id, feed, use, r.at, scope=r.scope,
-                          jurisdiction=r.jurisdiction, retain_for=keep)  # fmt: skip
-            uses.append([feed, use.value, d.allowed,
-                         [[x.code.value, x.subject] for x in d.reasons],
-                         d.feed_hash, d.entitlement_hash])  # fmt: skip
-    return digest(["research_rights", r.tenant_id, format_instant(r.at),
-                   r.scope.value, r.jurisdiction, _us(r.retain_for), uses])  # fmt: skip
 
 
 def describe(r: Request) -> dict[str, Any]:

@@ -121,6 +121,9 @@ def test_round_trip_keeps_ledger_book_strategy_and_input_hashes(
     }  # fmt: skip
     assert s.body["at"].endswith("Z") and s.body["book"] == w.book.to_wire()
     ars.check(s, r)  # the same inputs pass
+    # decision 77: rights are checked at the run's time of use, so the time alone
+    # is not bound (the terms and each feed's decision are)
+    ars.check(s, replace(r, rights=replace(w.rights, at=fx.AT_P)))
     assert load(asr, w.t, "v-other") is None
 
 
@@ -134,7 +137,8 @@ def test_round_trip_keeps_ledger_book_strategy_and_input_hashes(
         ("access_id", lambda w: {"access_id": "acc-q"}),
         ("assessor", lambda w: {"assessor": PRODUCER}),
         ("strategy", lambda w: {"strategy": _run.ref(_run.synth_held)}),
-        ("inputs.rights", lambda w: {"rights": replace(w.rights, at=fx.AT_P)}),
+        ("inputs.rights", lambda w: {"rights": replace(w.rights, jurisdiction="QC")}),
+        ("inputs.rights", lambda w: {"rights": replace(w.rights, retain_for=fx.H)}),
         ("inputs.rights", lambda w: {"rights": replace(w.rights, registry=Registry())}),
         (
             "inputs.registry",

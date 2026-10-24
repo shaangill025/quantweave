@@ -30,6 +30,13 @@ the evaluation. Decision 65: the request names its strategy code by `StrategyRef
 resolved through the process's reviewed registry before phase 0 (unregistered,
 changed or another strategy's code is refused), and the reference with its
 implementation hash is in the input digest, so changed code is `rerun_mismatch`.
+Decisions 75, 77 and 85: the rights are in the digest by their grant (terms and
+each feed's decision), not their check time; phase 1 re-loads the stored dataset
+and re-checks its rights, feed revisions and retention under its stored terms at
+the database clock just before the read is recorded (`rights_refused`,
+`retention_expired`, and `request_mismatch` for a changed grant, each refused
+before the read is spent), and the evaluation uses those rights. A reservation
+digested before this has the time in it, so its re-run is `rerun_mismatch`.
 The caller keeps the request (and its pre-read ledger) durably until a run
 returns, and persists the returned ledger.
 LIMITATIONS: the ledger and budget book are still the caller's (decision 43's
@@ -43,7 +50,7 @@ from __future__ import annotations
 import uuid
 from collections.abc import Callable
 from dataclasses import dataclass, replace
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from qw_domain import improvement as im
 from qw_domain import strategy_improvement as si
@@ -52,15 +59,18 @@ from qw_domain.budget import BudgetBook
 from qw_domain.identity import InstrumentId
 from qw_domain.instants import ensure_aware_utc, format_instant
 from qw_domain.research_data import (
+    RESEARCH_USES,
     ResearchDataset,
     ResearchError,
     ResearchRights,
     digest,
 )
+from qw_domain.rights import Use, check_use
 from qw_domain.strategy_registry import StrategyRegistry
 from qw_domain.trial_ledger import Access, TrialLedger
 
 from qw_adapters import assessor_store as ast
+from qw_adapters import dataset_store as dst
 from qw_adapters import experiment_store as es
 from qw_adapters import holdout_series_store as hs
 from qw_adapters.assessor_store import ExperimentStoreError
@@ -98,9 +108,31 @@ class Run:
     outcome: TrialOutcome
 
 
+def _us(d: timedelta) -> str:
+    return str(d // timedelta(microseconds=1))
+
+
+def rights_hash(r: ResearchRights, ds: ResearchDataset) -> str:
+    """Decision 85: the tenant, the terms and the decision `require_research_use`
+    takes on each feed at `r.at` (feed and entitlement hashes); not `r.at` itself
+    (decision 77: each run checks rights at its own time of use)."""
+    uses = []
+    for feed in sorted(ds.manifest.sources):
+        for use in RESEARCH_USES:
+            keep = r.retain_for if use is Use.RETENTION else None
+            d = check_use(r.registry, r.tenant_id, feed, use, r.at, scope=r.scope,
+                          jurisdiction=r.jurisdiction, retain_for=keep)  # fmt: skip
+            uses.append([feed, use.value, d.allowed,
+                         [[x.code.value, x.subject] for x in d.reasons],
+                         d.feed_hash, d.entitlement_hash])  # fmt: skip
+    return digest(["research_rights", r.tenant_id, r.scope.value, r.jurisdiction,
+                   _us(r.retain_for), uses])  # fmt: skip
+
+
 def _inputs(r: Request, p: im.Protocol, a: Access, data: si.HoldoutData) -> str:
     """The digest of everything the run and its verdict depend on; the code by
-    its reviewed implementation hash (decision 65)."""
+    its reviewed implementation hash (decision 65); the rights by `rights_hash`
+    (decision 85: their grant, not their check time)."""
     n = len(r.ledger.entries)
     c = r.registry.candidate(r.candidate_id)
     res = r.book.find(p.budget_reservation_id)
@@ -111,7 +143,7 @@ def _inputs(r: Request, p: im.Protocol, a: Access, data: si.HoldoutData) -> str:
         r.verdict_id, format_instant(r.at), n, r.ledger.checkpoint(n), a.to_wire(),
         [data.series.series_id, data.series.content_hash], series,
         r.dataset.manifest.content_hash, r.study.evaluation.content_hash,
-        [r.rights.tenant_id, format_instant(r.rights.at)],
+        rights_hash(r.rights, r.dataset),
         None if res is None else res.to_wire(), r.book.scope_id,
         [r.strategy.strategy_id, r.strategy.version, r.strategy.implementation_hash],
     ])  # fmt: skip
@@ -128,9 +160,8 @@ def _recorded(tx: TenantTx, eid: str, vid: str, cid: str) -> bool:
     return row is not None and row[0] > 0
 
 
-type Reserved = tuple[
-    int, Access, si.HoldoutData, si.StrategyStudy, im.ExperimentRegistry
-]
+type Reserved = tuple[int, Access, si.HoldoutData, si.StrategyStudy,
+                      im.ExperimentRegistry, ResearchRights]  # fmt: skip
 
 
 def _reserve(tx: TenantTx, r: Request) -> Reserved:
@@ -162,9 +193,29 @@ def _reserve(tx: TenantTx, r: Request) -> Reserved:
     if v is not None and v.decision is im.Decision.BLOCKED:  # decision 62
         raise ExperimentStoreError("blocked", ",".join(v.reasons))
     es.check_next(tx, rec)
+    rights = _rights_now(tx, r)  # decisions 75 and 77, at the read
     attempt = ast.reserve_read(tx, p, a, r.candidate_id, r.verdict_id,
                                _inputs(r, p, a, data))  # fmt: skip
-    return attempt, a, data, study, reg
+    return attempt, a, data, study, reg, rights
+
+
+def _rights_now(tx: TenantTx, r: Request) -> ResearchRights:
+    """The dataset's rights re-checked at the database clock, under the terms
+    stored with it (decision 77), in the transaction that records the read: a
+    revocation or expiry since the request was built is refused here
+    (`rights_refused`, `retention_expired`; `dataset_missing` with no stored
+    dataset), and so is a grant that changed but still allows the use, whose
+    `rights_hash` is no longer the one the request binds (decision 85:
+    `request_mismatch`), all before the read is spent. The evaluation uses them."""
+    try:
+        found = dst.load(tx, r.dataset.manifest)
+    except dst.DatasetStoreError as exc:
+        raise ExperimentStoreError(exc.code, str(exc)) from None
+    if found is None:
+        raise ExperimentStoreError("dataset_missing", r.dataset.manifest.dataset_id)
+    if rights_hash(found.rights, r.dataset) != rights_hash(r.rights, r.dataset):
+        raise ExperimentStoreError("request_mismatch", "inputs.rights")
+    return found.rights
 
 
 def promotion_run(worker: Conn, assessor: Conn, tenant_id: uuid.UUID, r: Request,
@@ -189,11 +240,11 @@ def promotion_run(worker: Conn, assessor: Conn, tenant_id: uuid.UUID, r: Request
     with tenant_transaction(assessor, tenant_id) as tx:  # phases 0 and 1
         tx.conn.execute("SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
                         (f"experiment:{tenant_id}",))  # fmt: skip
-        attempt, a, data, study, reg = _reserve(tx, r)
+        attempt, a, data, study, reg, rights = _reserve(tx, r)
     beat()
     # phase 2: the read is recorded; only now is the holdout data opened
     lg, out = si.holdout_run(study, reg, r.strategies, r.ledger, r.candidate_id,
-                             r.dataset, r.rights, data, build, r.assessor, r.at,
+                             r.dataset, rights, data, build, r.assessor, r.at,
                              r.access_id, r.trial_id)  # fmt: skip
     if lg.access(r.access_id).to_wire() != a.to_wire():
         raise ExperimentStoreError("read_mismatch", r.access_id)
