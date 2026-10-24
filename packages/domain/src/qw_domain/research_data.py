@@ -344,6 +344,10 @@ class ResearchDataset:
             DatasetManifest, FactBook, Universe
         ):  # fmt: skip
             raise ResearchError("dataset", "a manifest, a FactBook and a Universe")
+        feeds = {f.feed_id for f in self.facts.facts}
+        feeds |= {e.feed_id for e in self.universe.events}
+        if undeclared := feeds - m.sources.keys():  # every feed is rights-checked
+            raise ResearchError("undeclared_source", safe_repr(sorted(undeclared)))
         for f in self.facts.facts:
             _storable(f)
         # One stored form per dataset (decision 74 compares bytes): facts in canonical

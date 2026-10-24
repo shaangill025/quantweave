@@ -16,6 +16,7 @@ from decimal import Decimal
 from typing import Any
 
 import pytest
+from qw_domain import research_data as rd
 from qw_domain.filings import (
     Fact,
     FactBook,
@@ -346,12 +347,34 @@ def test_changing_any_single_fact_field_changes_the_content_hash(name: str) -> N
     changed = replace(ORIGINAL, **{name: FIELD_CHANGES[name]})
     assert changed != ORIGINAL
     assert ResearchDataset(ds.manifest, FactBook((ORIGINAL,)), ds.universe) == ds
-    with pytest.raises(ResearchError, match="integrity"):
-        ResearchDataset(ds.manifest, FactBook((changed,)), ds.universe)
+    book = FactBook((changed,))
+    assert rd._content_hash(ds.manifest, book, ds.universe) != ds.manifest.content_hash
+    why = "undeclared_source" if name == "feed_id" else "integrity"  # refused first
+    with pytest.raises(ResearchError, match=why):
+        ResearchDataset(ds.manifest, book, ds.universe)
     w = ds.to_wire()
     w["facts"] = [changed.to_wire()]
-    with pytest.raises(ResearchError, match="integrity"):
+    with pytest.raises(ResearchError, match=why):
         ResearchDataset.from_wire(via_json(w))
+
+
+def test_every_record_feed_must_be_a_declared_source() -> None:
+    """Hand-built datasets: a fact or a universe event from a feed outside the
+    manifest's sources is refused, also through the wire, so it can never skip the
+    rights check."""
+    ds = freeze(facts=(ORIGINAL,), events=EVENTS)
+    fact_b = replace(ORIGINAL, feed_id="feed-synth-b")
+    event_b = replace(EVENTS[0], feed_id="feed-synth-b")
+    for facts, events in (((fact_b,), EVENTS), ((ORIGINAL,), (event_b, *EVENTS[1:]))):
+        u = Universe("univ-synth", events)
+        m = replace(ds.manifest, content_hash=rd._content_hash(
+            ds.manifest, FactBook(facts), u))  # fmt: skip
+        with pytest.raises(ResearchError, match=r"undeclared_source.*feed-synth-b"):
+            ResearchDataset(m, FactBook(facts), u)
+        w = ds.to_wire() | {"manifest": m.to_wire(), "universe": u.to_wire(),
+                            "facts": FactBook(facts).to_wire()}  # fmt: skip
+        with pytest.raises(ResearchError, match="undeclared_source"):
+            ResearchDataset.from_wire(via_json(w))
 
 
 def test_moving_a_fact_to_another_instrument_changes_the_hash() -> None:
