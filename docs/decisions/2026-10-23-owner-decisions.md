@@ -394,3 +394,28 @@ below waives a test, gate or spec requirement. Numbering continues from
     the domain registry already enforces it, and there is no real data, so
     tightening now is free."
     Implemented by: T044 (the experiment registry log).
+
+83. **The qw_ingest login.**
+    Question: "Decision 83: should the qw_ingest database login (the role that
+    writes frozen research datasets) become a declared runtime role, used only on
+    its own the way the assessor and release logins are?"
+    Selected label: "Declare it, exclusive (Recommended)".
+    Option text as presented: "runtime_connection accepts role=\"qw_ingest\" and
+    refuses a login that also holds another runtime role. This is the same
+    isolation as the assessor and release logins, so the ingest process can never
+    also act as the app or the worker, and the store's tests use the normal
+    connection path."
+    Implemented by: T032 (the research dataset store) and tenancy.
+
+84. **Purging research datasets.**
+    Question: "Decision 84: the research dataset table is append-only, so an
+    expired or revoked dataset is refused on every load but its data is never
+    deleted. When should deletion (the dataset_purged state from decision 75)
+    come?"
+    Selected label: "Refuse now, purge in T058 (Recommended)".
+    Option text as presented: "Ship the store as built: expired and revoked
+    datasets are already refused (retention_expired, rights_refused). The privacy
+    and retention task (T058) adds an owner-run purge function that removes the
+    dataset body, keeps a hashed record that it was purged, and makes later loads
+    report dataset_purged. Deletion lands with the retention rules it depends on."
+    Implemented by: T032 (refusal) now; T058 (purge) later.
