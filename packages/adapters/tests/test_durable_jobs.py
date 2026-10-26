@@ -577,9 +577,12 @@ def test_security_definer_functions_are_hardened(conn: Conn) -> None:
         "WHERE a.privilege_type = 'EXECUTE' ORDER BY 1) FROM pg_proc p "
         "WHERE p.pronamespace = 'app'::regnamespace AND p.prosecdef ORDER BY 1"
     ).fetchall()
-    guards = (  # 0044, 0034 and 0046 triggers
+    guards = (  # 0044, 0034, 0047 and 0046 triggers
         "experiment_registry_entry_guard",
         "experiment_retest_guard",
+        "optimizer_cycle_guard",
+        "optimizer_lineage_guard",
+        "optimizer_registry_entry_guard",
         "research_dataset_guard",
     )
     guard = [r for r in rows if r[0] in guards]  # triggers, no EXECUTE grant
