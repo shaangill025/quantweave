@@ -498,3 +498,16 @@ below waives a test, gate or spec requirement. Numbering continues from
     the stored cycle receipts; the alternative is passing cycles in from the
     caller, which is the caller-asserted evidence the stores exist to remove."
     Implemented by: T050 (the installation optimizer stores).
+
+92. **Queueing installation-wide optimizer jobs (T050).**
+    Question: "Decision 92 (T050): optimizer assessment jobs are
+    installation-wide, but the durable job queue is per tenant (a job's tenant
+    only routes it). How should installation jobs be queued?"
+    Selected label: "Operator's tenant queue (Recommended)".
+    Option text as presented: "Installation jobs are enqueued in the installing
+    operator's tenant, which only routes them; the job payload and the
+    installation tables carry the real scope, and only the qw-assessor process
+    claims the kind. Why: reuses the reviewed queue, leasing, retries and
+    isolation with no new tables; the tenant gains no access to installation
+    data."
+    Implemented by: T050 (the assessor-run optimizer trial).
