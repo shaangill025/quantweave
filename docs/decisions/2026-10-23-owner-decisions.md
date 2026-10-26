@@ -475,3 +475,26 @@ below waives a test, gate or spec requirement. Numbering continues from
     model gateway stays an unconfigured port. Why: an LLM proposer needs provider
     spend and credentials, which require your specific authorization."
     Implemented by: T050.
+
+90. **Who reads the optimizer tables until a maintainer login exists (T050).**
+    Question: "Decision 90 (T050): decision 87 says only maintainers/operators
+    read the optimizer tables, but no maintainer database login exists yet. Who
+    reads them for now?"
+    Selected label: "qw_release for both, for now (Recommended)".
+    Option text as presented: "The existing release-operator login (qw_release)
+    reads the optimizer tables on behalf of both maintainers and operators until a
+    separate maintainer login is introduced. Why: no new role or credential is
+    needed now, and it is still never a tenant user."
+    Implemented by: T050 (the installation optimizer stores).
+
+91. **The assessor reads stored optimizer cycles (T050).**
+    Question: "Decision 91 (T050): the assessor must read V0's stored cycle to
+    measure V1 and verify the recursion, which needs qw_assessor read access to
+    the optimizer cycle table. Decision 87 listed only maintainers/operators as
+    readers. Grant the assessor read access?"
+    Selected label: "Yes, assessor reads cycles (Recommended)".
+    Option text as presented: "Grant qw_assessor SELECT on optimizer_cycle (still
+    no write). Why: independent assessment and recursion verification must read
+    the stored cycle receipts; the alternative is passing cycles in from the
+    caller, which is the caller-asserted evidence the stores exist to remove."
+    Implemented by: T050 (the installation optimizer stores).
