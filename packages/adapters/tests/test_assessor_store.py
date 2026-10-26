@@ -397,7 +397,11 @@ def test_decision_17_only_qw_assessor_writes_and_reads_assessor_tables(
         ("experiment_registry_entry", "INSERT"),
         ("strategy_search_space", "SELECT"),  # 0045: decision 72
         ("evaluation_protocol", "SELECT"),
-        ("research_dataset", "SELECT")} | {  # 0046: decision 73
+        ("research_dataset", "SELECT"),  # 0046: decision 73
+        ("optimizer_registry_entry", "SELECT"),  # 0047: decision 87
+        ("optimizer_registry_entry", "INSERT"),
+        ("optimizer_cycle", "SELECT"),  # 0047: decision 91
+        ("optimizer_lineage", "INSERT")} | {
         # 0043: decisions 70 and 78
         (t, "SELECT") for t in (
             "strategy_manifest", "rights_provider", "rights_feed",
