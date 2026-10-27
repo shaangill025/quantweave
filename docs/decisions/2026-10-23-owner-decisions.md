@@ -542,3 +542,29 @@ below waives a test, gate or spec requirement. Numbering continues from
     stays shut. Why: one cost control for every improvement path, enforced, not
     just declared."
     Implemented by: T050 (the measured optimizer verdict).
+
+95. **Who writes optimizer releases (T050).**
+    Question: "Decision 95 (T050): optimizer releases (prepared and signed V1
+    policies) have to be written to the release ledger by some database login.
+    Decision 90 only lets qw_release read the optimizer tables. Who writes
+    optimizer releases?"
+    Selected label: "qw_release writes them (Recommended)".
+    Option text as presented: "The release-operator login (qw_release, used by
+    the operator's release-admin tool) writes optimizer releases; the worker
+    login the optimizer runs as cannot. Why: the optimizer must never write its
+    own release, and qw_release is already the operator's separate,
+    step-up-protected login; no new role needed."
+    Implemented by: T050 (optimizer releases and rollback).
+
+96. **Rolling back a later optimizer install (T050).**
+    Question: "Decision 96 (T050): decision 88 sends the FIRST optimizer install
+    back to frozen V0 on rollback. If a later version (say V2, installed after V1
+    was rolled back) is also rolled back and no earlier release is usable, what
+    happens?"
+    Selected label: "Back to V0 every time (Recommended)".
+    Option text as presented: "Any optimizer rollback with no usable earlier
+    release returns to the frozen V0 baseline and records the event, so recursion
+    can always resume. Why: consistent with decision 88's reasoning (V0 is the
+    frozen, assessed baseline); otherwise one bad later install stops all
+    optimizer improvement until a manual migration."
+    Implemented by: T050 (optimizer releases and rollback).
