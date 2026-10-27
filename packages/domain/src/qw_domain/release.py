@@ -21,6 +21,13 @@ R030, R034, R039, R051, R076, R087, R092, R096, R099). Domain only, stdlib only.
   inside its range. Rollback appends an event; if no installed, verified, compatible
   prior release exists, a `Pause` with a structured reason is appended instead.
   Nothing is rewritten or downgraded, and no tenant is moved to another version.
+- T050 increment 7 (R076, owner decisions 88 and 96): a recursive-optimizer
+  candidate may be prepared, signed and recorded (`SIGNABLE_SANDBOX`), but
+  installing it stays refused (`sandbox_unqualified`) until T007 qualifies the
+  sandbox (QUAL17).
+  An optimizer rollback with no usable earlier release returns to the frozen
+  protocol baseline V0: a `Rollback` with no `to_release_id` is recorded, never a
+  `Pause`, and the component has no head, so `runner_authority` admits V0.
 LIMITATIONS: `Signer`/`Verifier` are protocols; only a test HMAC signer exists (in the
 tests). Production needs an asymmetric scheme (Ed25519) from a reviewed dependency,
 so operators hold public keys only (R096). Times, actor ids and step-up receipts
@@ -200,27 +207,46 @@ class ReleaseManifest:
         return ApprovalClass.USER_STRATEGY_ADOPTION.value in self.required_approvals
 
 
-def _target_gates(target: Target, approvals: Collection[str]) -> list[str]:
-    """Target gates shared by `prepare_release` and `verify_release`, so a signed
-    manifest that skipped preparation cannot pass a gate preparation enforces."""
+# Sandbox targets that may be prepared, signed and recorded before T007 qualifies
+# the sandbox; installing one stays refused (`_target_gates`). Code is not here.
+SIGNABLE_SANDBOX: frozenset[Target] = frozenset({Target.RECURSIVE_OPTIMIZER})
+# Owner decisions 88 and 96: with no usable earlier release, these roll back to
+# the frozen baseline (other targets pause, T051).
+BASELINE_ROLLBACK: frozenset[Target] = frozenset({Target.RECURSIVE_OPTIMIZER})
+
+
+def _release_gates(target: Target, approvals: Collection[str]) -> list[str]:
+    """Gates on preparing, signing and recording a release."""
     out = []
-    if target in SANDBOX_TARGETS:  # R076: T007 sandbox not qualified
+    if target in SANDBOX_TARGETS - SIGNABLE_SANDBOX:  # R076: T007 not qualified
         out.append("sandbox_unqualified")
     if ApprovalClass.MAINTAINER_RELEASE not in approvals:
         out.append("maintainer_release_not_required")
     return out
 
 
-def manifest_refusals(m: ReleaseManifest) -> list[str]:
-    """`prepare_release` invariants that the manifest alone can show. Self-approval,
-    scope and verdict order need the registry and are checked only when preparing.
-    A mistyped target or approval list is refused alone: nothing else can be read."""
+def _target_gates(target: Target, approvals: Collection[str]) -> list[str]:
+    """Install gates, re-checked by `verify_release` at install and on every replay,
+    so a signed manifest cannot pass a gate preparation enforces. Every sandbox
+    target is refused here while T007 is unqualified, the optimizer included."""
+    out = _release_gates(target, approvals)
+    if target in SIGNABLE_SANDBOX:  # R076: signable, never installable before T007
+        out.insert(0, "sandbox_unqualified")
+    return out
+
+
+def manifest_refusals(m: ReleaseManifest, *, installing: bool = True) -> list[str]:
+    """`prepare_release` invariants that the manifest alone can show, with the
+    install gates unless `installing` is False (recording a signed release).
+    Self-approval, scope and verdict order need the registry and are checked only
+    when preparing. A mistyped target or approval list is refused alone."""
     if not isinstance(m.target, Target):
         return ["target_type"]
     approvals = m.required_approvals
     if type(approvals) is not tuple or not all(isinstance(a, str) for a in approvals):
         return ["approvals_type"]  # a bare str would pass a substring `in` test
-    out = _target_gates(m.target, approvals)
+    gates = _target_gates if installing else _release_gates
+    out = gates(m.target, approvals)
     strategy = m.target is Target.STRATEGY
     absent = (m.strategy_version is None, m.strategy_material_hash is None)
     if absent != (not strategy, not strategy):  # strategy releases name both
@@ -245,7 +271,7 @@ def prepare_release(
     p = reg.protocol(c.experiment_id)
     if p.scope is not Scope.INSTALLATION:
         raise ReleaseError("tenant_scope", "private learning is not a shared release")
-    if gates := _target_gates(p.target, p.approvals):
+    if gates := _release_gates(p.target, p.approvals):
         raise ReleaseError(gates[0], p.target.value)
     verdicts = reg.verdicts(candidate_id)
     if not verdicts or verdicts[-1].decision is not Decision.ACCEPT_FOR_REVIEW:
@@ -305,12 +331,13 @@ def sign_release(m: ReleaseManifest, signer: Signer) -> SignedRelease:
 
 def verify_release(
     sr: SignedRelease, keys: Mapping[str, TrustedKey], at: datetime,
-    allow_test_keys: bool,
+    allow_test_keys: bool, *, installing: bool = True,
 ) -> list[str]:  # fmt: skip
     """Reasons the release cannot be trusted at `at`; empty when it verifies. A
-    validly signed manifest is still refused if it breaks a preparation gate."""
+    validly signed manifest is still refused if it breaks a preparation gate, and
+    an install gate unless `installing` is False (recording it, not running it)."""
     at, m = ensure_aware_utc(at), sr.manifest
-    out = manifest_refusals(m)
+    out = manifest_refusals(m, installing=installing)
     if out[:1] in (["target_type"], ["approvals_type"]):
         return out  # the manifest cannot be hashed or read further
     k = keys.get(sr.key_id)
@@ -433,7 +460,7 @@ class Rollback:
     event_id: str
     component: str
     from_release_id: str
-    to_release_id: str
+    to_release_id: str | None  # None: the frozen baseline (decisions 88, 96)
     operator_id: str
     step_up_receipt_id: str
     at: datetime
@@ -527,18 +554,23 @@ class DeploymentLedger:
             s.installs[m.release_id] = e
             s.step_ups.add(m.approval.step_up_receipt_id)
             s.head[m.component] = m.release_id
-        elif isinstance(e, Rollback):
-            src, dst = s.installs.get(e.from_release_id), s.installs.get(
-                e.to_release_id
-            )  # fmt: skip
+        elif isinstance(e, Rollback) and (to := e.to_release_id) is None:
+            if s.head.get(e.component) != e.from_release_id:  # decisions 88, 96
+                raise ReleaseError("rollback", e.event_id)
+            if why := self._baseline_refusals(e.component, at):
+                raise ReleaseError("rollback_target", ",".join(why))
+            s.withdrawn.add(e.from_release_id)
+            del s.head[e.component]  # the protocol baseline runs again
+        elif isinstance(e, Rollback) and to is not None:
+            src, dst = s.installs.get(e.from_release_id), s.installs.get(to)
             if src is None or dst is None or s.head.get(e.component) != (
                 e.from_release_id
             ) or dst.release.manifest.component != e.component:  # fmt: skip
                 raise ReleaseError("rollback", e.event_id)
-            if why := self._unusable(e.to_release_id, at):
+            if why := self._unusable(to, at):
                 raise ReleaseError("rollback_target", ",".join(why))
             s.withdrawn.add(e.from_release_id)
-            s.head[e.component] = e.to_release_id
+            s.head[e.component] = to
         elif isinstance(e, Pause):
             if s.head.get(e.component) != e.release_id or not e.reasons:
                 raise ReleaseError("pause", e.event_id)
@@ -547,6 +579,23 @@ class DeploymentLedger:
             raise ReleaseError("event", type(e).__name__)
         s.step_ups.add(e.step_up_receipt_id)
         s.last_at = at
+
+    def _baseline_refusals(self, component: str, at: datetime) -> list[str]:
+        """Why the component's head cannot roll back to its frozen baseline at `at`:
+        only a `BASELINE_ROLLBACK` target with no usable earlier release can
+        (decisions 88 and 96)."""
+        s = self._s
+        head = s.head.get(component)
+        if head is None:
+            return ["nothing_installed"]
+        m, out = s.installs[head].release.manifest, []
+        if m.target not in BASELINE_ROLLBACK:
+            out.append("no_frozen_baseline")
+        if any(i.release.manifest.component == component and rid != head
+               and not self._unusable(rid, at)
+               for rid, i in s.installs.items()):  # fmt: skip
+            out.append("earlier_release_usable")
+        return out
 
     def _unusable(self, release_id: str, at: datetime) -> list[str]:
         s = self._s
@@ -623,7 +672,8 @@ class DeploymentLedger:
         """Withdraw the component's head for an earlier installed, verified and
         schema-compatible release. Without one, append a `Pause` with the reasons;
         the head is suspended and no record is changed. An explicit target that
-        cannot run is refused instead."""
+        cannot run is refused instead. An optimizer with no usable earlier
+        release rolls back to the frozen baseline instead (decisions 88, 96)."""
         _id(event_id, "event_id")
         at = ensure_aware_utc(at)
         head = self._s.head.get(component)
@@ -645,6 +695,10 @@ class DeploymentLedger:
                                              operator_id, step_up, at),
                                     strategies)  # fmt: skip
             why += [f"{rid}:{r}" for r in bad]
+        if to_release_id is None and not self._baseline_refusals(component, at):
+            return self._append(Rollback(event_id, component, head, None,
+                                         operator_id, step_up, at),
+                                strategies)  # fmt: skip
         return self._append(Pause(event_id, component, head, tuple(why),
                                   operator_id, step_up, at), strategies)  # fmt: skip
 

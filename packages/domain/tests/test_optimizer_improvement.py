@@ -1,7 +1,8 @@
 """Recursive optimizer improvement (T050 increment 1). All data, keys and proposers
 are SYNTHETIC and deterministic; expected values are hand-computed. Records marked
-GATE-LIFTED stand in for what T044 `assess`, T051 `prepare_release` and T051
-`install` refuse for an optimizer target (T007 sandbox unqualified): `lifted()`
+GATE-LIFTED stand in for what T044 `assess` and T051 `install` refuse for an
+optimizer target (T007 sandbox unqualified; `prepare_release` needs the verdict
+T044 blocks, test_optimizer_release covers it from increment 7): `lifted()`
 hand-builds the verdict and release, and the `gate_lifted_install` fixture lifts the
 install gate. The real path is tested separately and stops at `sandbox_unqualified`.
 """
@@ -285,7 +286,7 @@ def test_real_gates_stop_the_path_before_v1_runs() -> None:
     assert (v.decision, v.reasons, dict(v.scores)) == (
         im.Decision.BLOCKED, ("sandbox_unqualified",), {})  # fmt: skip
     reg = reg.record_verdict(v)
-    with pytest.raises(rl.ReleaseError, match="sandbox_unqualified"):
+    with pytest.raises(rl.ReleaseError, match="not_accepted"):  # T044 blocked it
         rl.prepare_release(reg, "cand-opt-1", "rel-opt-1", rl.Compatibility(1, 1, 1),
                            approval())  # fmt: skip
     want = ("not_installed", "not_accepted:blocked", "sandbox_unqualified")

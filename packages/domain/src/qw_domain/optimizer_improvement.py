@@ -573,8 +573,9 @@ def runner_authority(
     deployment: DeploymentLedger, at: datetime, *,
     accept_synthetic_evidence: bool = False,
 ) -> str | Blocked:  # fmt: skip
-    """Who may run `cfg` now: the protocol baseline while nothing is installed,
-    else only the installed head that is this experiment's accepted self-change.
+    """Who may run `cfg` now: the protocol baseline while nothing is installed
+    (again after a rollback to it, decisions 88 and 96, which leaves no
+    head), else only the installed head that is this experiment's accepted self-change.
     `accept_synthetic_evidence` is for tests only."""
     p, h = reg.protocol(experiment_id), cfg.content_hash
     check_protocol(p)

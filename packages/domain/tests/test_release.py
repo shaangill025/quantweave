@@ -167,9 +167,10 @@ def _forged(target: im.Target) -> im.ExperimentRegistry:
 
 def test_sandboxed_and_tenant_only_targets_cannot_be_signed() -> None:
     compat = rl.Compatibility(1, 1, 1)
-    for target in im.SANDBOX_TARGETS:  # R076: T007 unqualified, no stubbed pass
+    for target in im.SANDBOX_TARGETS - rl.SIGNABLE_SANDBOX:  # R076: T007 unqualified
         with pytest.raises(rl.ReleaseError, match="sandbox_unqualified"):
             rl.prepare_release(_forged(target), "cand-1", "r", compat, approval())
+    assert {im.Target.RECURSIVE_OPTIMIZER} == rl.SIGNABLE_SANDBOX  # T050 inc. 7
     with pytest.raises(rl.ReleaseError, match="maintainer_release_not_required"):
         rl.prepare_release(_forged(im.Target.PERSONAL_ADAPTATION), "cand-1", "r",
                            compat, approval())  # fmt: skip
