@@ -568,3 +568,16 @@ below waives a test, gate or spec requirement. Numbering continues from
     frozen, assessed baseline); otherwise one bad later install stops all
     optimizer improvement until a manual migration."
     Implemented by: T050 (optimizer releases and rollback).
+
+97. **How the optimizer cycle job checks the bootstrap tenant (T050).**
+    Question: "Decision 97 (T050): the new optimizer cycle job runs in the
+    ordinary worker (qw_worker, the cycle writer per decision 87), and must check
+    the job came from the bootstrap tenant before reading anything (decision 93).
+    Decision 93 only granted that one-column read to the assessor. How should the
+    worker check it?"
+    Selected label: "Same one-column read (Recommended)".
+    Option text as presented: "Grant qw_worker the same read-only access to just
+    the bootstrap tenant id column that qw_assessor has. Why: the narrowest grant
+    that lets the worker refuse other tenants before any read; it reveals only the
+    bootstrap tenant's id, which the job's own tenant already is when allowed."
+    Implemented by: T050 (the optimizer cycle job).
