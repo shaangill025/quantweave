@@ -401,7 +401,8 @@ def test_decision_17_only_qw_assessor_writes_and_reads_assessor_tables(
         ("optimizer_registry_entry", "SELECT"),  # 0047: decision 87
         ("optimizer_registry_entry", "INSERT"),
         ("optimizer_cycle", "SELECT"),  # 0047: decision 91
-        ("optimizer_lineage", "INSERT")} | {
+        ("optimizer_lineage", "INSERT"),
+        ("installation_bootstrap", "SELECT")} | {  # 0048: decision 93
         # 0043: decisions 70 and 78
         (t, "SELECT") for t in (
             "strategy_manifest", "rights_provider", "rights_feed",
