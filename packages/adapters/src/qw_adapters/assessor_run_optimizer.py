@@ -13,11 +13,10 @@ and 91): the strategy promotion's pattern (`assessor_run`) at installation scope
   `trial` takes no port), T044's sandbox gate over `measure`'s metrics: for the
   optimizer target it is `sandbox_unqualified` until T007 qualifies its sandbox,
   so a real trial records nothing;
-- past that gate (`_after_gate`) it needs the inputs (the plan, V0's research base
-  and development fixture, which must hash to the stored cycle's, the protected
-  promotion fixture bound to the plan, the owner's limits), which no store
-  provides yet, and the run log, which `trial` passes durably
-  (`optimizer_store.RunLog`, 0049). Without inputs it is
+- past that gate (`_after_gate`) it needs the inputs (`stored_inputs`: the plan's
+  0051 promotion fixture, then V0's development inputs and the owner's limits,
+  which no store holds: `dev_inputs_unstored`) and the run log, which `trial`
+  passes durably (`optimizer_store.RunLog`, 0049). Without inputs it is
   `trial_inputs_unavailable`, without a log `run_log_unavailable`, before any
   read. With them:
   `check_measure` refuses every input fault, then decisions 42 and 59 reserve the
@@ -27,10 +26,8 @@ and 91): the strategy promotion's pattern (`assessor_run`) at installation scope
   differs); `assess` gives the verdict and qw_assessor appends it to the registry
   (decision 87).
 `beat` (the job lease heartbeat) runs after each recorded phase.
-LIMITATIONS: no protected optimizer fixture store exists (0039 is a tenant table
-keyed to a tenant's assessor protocol), so the post-gate path runs only in
-GATE-LIFTED tests, which call the private `_before_gate` and `_after_gate` with
-test-only inputs; the request's `at` and assessor are the caller's,
+LIMITATIONS: the post-gate path completes only in GATE-LIFTED tests (private
+phases, a test-only `Development`); the request's `at` and assessor are the caller's,
 checked against the registry; decisions 92 and 93 (only the bootstrap tenant's
 job runs; tenants see one generic code) are the qw-assessor loop's, before this
 module is called (`qw_worker.assessor`)."""
@@ -50,6 +47,7 @@ from qw_domain.instants import ensure_aware_utc, format_instant, parse_instant
 from qw_domain.research_data import check_id, digest
 from qw_domain.trial_ledger import SplitPlan
 
+from qw_adapters import optimizer_fixture_store as ofs
 from qw_adapters import optimizer_store as os_
 from qw_adapters.tenancy import Conn, TenancyError, check_runtime_role
 
@@ -108,6 +106,9 @@ class Inputs:
 
 # (request, protocol, V0's stored cycle) -> the inputs; none exists in production
 InputsProvider = Callable[[Request, im.Protocol, oi.CycleReceipt], Inputs]
+# V0's cycle -> its research base, dev fixture and limits (GATE-LIFTED tests only)
+Development = Callable[[oi.CycleReceipt], tuple[ri.ResearchConfig, ri.Fixture,
+                                                oi.Limits]]  # fmt: skip
 # (registry, experiment, candidate, measurement or None, assessor, at, verdict id)
 Assess = Callable[[im.ExperimentRegistry, str, str, oi.Measured | None, im.Party,
                    datetime, str], im.Verdict]  # fmt: skip
@@ -132,6 +133,26 @@ class Run:
 
 
 measured_assess: Assess = oi.assess_measured  # the gate and verdict; no port
+
+
+def stored_inputs(conn: Conn, development: Development | None = None,
+                  ) -> InputsProvider:  # fmt: skip
+    """The plan's 0051 fixture, then V0's development inputs, which must hash to
+    the stored cycle's (`dev_inputs_mismatch`); a missing one is never replaced."""
+
+    def get(r: Request, p: im.Protocol, cycle: oi.CycleReceipt) -> Inputs:
+        got = ofs.load(conn, r.installation_id, p.plan_id)
+        if got is None:
+            raise TrialError("trial_inputs_unavailable", f"no fixture for {p.plan_id}")
+        if development is None:
+            raise TrialError("dev_inputs_unstored", "no store holds them")
+        base, dev, limits = development(cycle)
+        if (base.content_hash, dev.content_hash) != (cycle.base_hash,
+                                                     cycle.fixture_hash):  # fmt: skip
+            raise TrialError("dev_inputs_mismatch", cycle.cycle_id)
+        return Inputs(got[0], base, dev, got[1], limits)
+
+    return get
 
 
 def inputs_digest(r: Request, p: im.Protocol, c: im.Candidate, cycle: oi.CycleReceipt,
@@ -176,12 +197,12 @@ def _now(conn: Conn) -> datetime:
 def trial(assessor: Conn, r: Request, beat: Callable[[], object] = lambda: None,
           ) -> Run:  # fmt: skip
     """Run `r` as the independent assessor. No port can be passed: the gate is the
-    module's `measured_assess`, the run log is the durable one, and no inputs
-    exist, so past the gate it fails closed (`trial_inputs_unavailable`)."""
+    module's `measured_assess`, the run log is the durable one, and the inputs are
+    the stores' (`stored_inputs`), so past the gate it fails closed."""
     reg, p, c, cycle = _before_gate(assessor, r, measured_assess)
     log = os_.RunLog(assessor, r.installation_id)
-    return _after_gate(assessor, r, beat, reg, p, c, cycle, None, log,
-                       measured_assess)  # fmt: skip
+    return _after_gate(assessor, r, beat, reg, p, c, cycle, stored_inputs(assessor),
+                       log, measured_assess)  # fmt: skip
 
 
 def _before_gate(assessor: Conn, r: Request, assess: Assess) -> tuple[

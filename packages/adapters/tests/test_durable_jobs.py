@@ -581,6 +581,7 @@ def test_security_definer_functions_are_hardened(conn: Conn) -> None:
         "experiment_registry_entry_guard",
         "experiment_retest_guard",
         "optimizer_cycle_guard",
+        "optimizer_cycle_protocol_guard",  # 0051
         "optimizer_lineage_guard",
         "optimizer_registry_entry_guard",
         "optimizer_run_guard",

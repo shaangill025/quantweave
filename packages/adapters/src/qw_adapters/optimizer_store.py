@@ -12,14 +12,15 @@ and re-parses the strict domain wire; any mismatch is `integrity`.
   a domain refusal keeps its code; an entry identical to a logged one writes
   nothing. `load(conn, installation_id, as_of)` (qw_assessor, qw_release): the
   registry of every entry recorded at or before `as_of`, chain re-checked.
-- `append_cycle(conn, installation_id, experiment_id, receipt)` (qw_worker,
+- `append_cycle(conn, installation_id, experiment_id, receipt, protocol)` (qw_worker,
   without SELECT; the refusal codes tell it whether a cycle id, receipt,
   time or runner was taken or wrong): the strict `CycleReceipt` wire under a
   store-issued `cycle_ref` and the DB clock. The database refuses a duplicate
   (`duplicate`), a receipt time not
   within 60 s before the recording or before the experiment's latest cycle
   (`back_dated`) and any runner but the logged protocol's frozen baseline
-  (`runner_not_baseline`). `load_cycles` (qw_release, qw_assessor) returns them
+  (`runner_not_baseline`) or a `protocol` it ran under that is not the logged one
+  (0051, `protocol_mismatch`). `load_cycles` (qw_release, qw_assessor) returns them
   in recording order, failing closed for the whole experiment (`integrity`) if any
   row does not re-hash or re-parse.
 - `append_lineage(conn, installation_id, receipt)` (qw_assessor, no SELECT): only a
@@ -61,7 +62,7 @@ _COLS = ("seq", "kind", "entry_id", "body", "recorded_at", "prev_hash", "event_h
 _REFUSALS = frozenset({"clock", "registry_moved", "back_dated", "runner_not_baseline",
                        "not_logged", "attempt_moved", "rerun_mismatch", "rerun_used",
                        "not_evaluating", "run_reserved", "run_recorded",
-                       "not_reserved"})  # fmt: skip
+                       "not_reserved", "protocol_mismatch"})  # fmt: skip
 MAX_ATTEMPTS = 4  # the reservation and three re-runs (decision 59)
 _BAD = (ValueError, TypeError, KeyError, ResearchError)
 
@@ -206,10 +207,12 @@ def cycle_hash(installation: str, experiment: str, ref: uuid.UUID, body: object,
 
 
 def append_cycle(conn: Conn, installation_id: str, experiment_id: str,
-                 receipt: oi.CycleReceipt) -> StoredCycle:  # fmt: skip
-    """Store a cycle receipt (qw_worker, blind) at the database clock."""
-    if type(receipt) is not oi.CycleReceipt:
-        raise TypeError("a domain CycleReceipt is required")
+                 receipt: oi.CycleReceipt, protocol: im.Protocol,
+                 ) -> StoredCycle:  # fmt: skip
+    """Store a cycle receipt (qw_worker, blind) at the database clock, with the
+    protocol it ran under (0051 refuses one that is not the logged protocol)."""
+    if type(receipt) is not oi.CycleReceipt or type(protocol) is not im.Protocol:
+        raise TypeError("a domain CycleReceipt and Protocol are required")
     w, ref = receipt.wire(), uuid.uuid4()
     with conn.transaction():
         at = _now(conn)
@@ -218,6 +221,7 @@ def append_cycle(conn: Conn, installation_id: str, experiment_id: str,
             "experiment_id": experiment_id, "cycle_id": receipt.cycle_id,
             "runner_hash": receipt.runner_hash, "authority": receipt.authority,
             "body": Jsonb(w), "receipt_hash": w["receipt_hash"], "recorded_at": at,
+            "protocol": Jsonb(protocol.wire()),
             "event_hash": cycle_hash(installation_id, experiment_id, ref, w, at),
         })  # fmt: skip
     return StoredCycle(ref, receipt, at)

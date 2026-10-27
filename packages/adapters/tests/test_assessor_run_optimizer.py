@@ -74,7 +74,7 @@ def stored_world(asr: Conn, wrk: Conn) -> aro.Request:
     r0 = oi.run_cycle("cycle-v0-db", V0, reg, EXP, deployment(), BASE, DEV, LIMITS,
                       (), now(wrk))  # fmt: skip
     assert isinstance(r0, oi.CycleReceipt), r0
-    os_.append_cycle(wrk, INST, EXP, r0)
+    os_.append_cycle(wrk, INST, EXP, r0, MP)
     sc = oi.propose_self_change("cand-opt-1", "opt-v1", r0, reg, EXP, RP, LIMITS, (),
                                 r0.at)  # fmt: skip
     assert isinstance(sc, oi.SelfChange), sc
