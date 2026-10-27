@@ -89,13 +89,14 @@ STUDY_TABLES = ("strategy_search_space", "evaluation_protocol")
 # 0046, test_dataset_store
 RESEARCH_TABLES = ("research_dataset",)
 # 0047, test_optimizer_store (installation scope: per-role policies, no tenant)
-# 0049, test_optimizer_run_log
+# 0049, test_optimizer_run_log; 0051, test_optimizer_fixture_store
 OPTIMIZER_TABLES = (
     "optimizer_registry_entry",
     "optimizer_cycle",
     "optimizer_lineage",
     "optimizer_run",
     "optimizer_run_outcome",
+    "optimizer_promotion_fixture",
 )
 
 

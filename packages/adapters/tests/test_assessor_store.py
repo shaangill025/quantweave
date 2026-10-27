@@ -405,7 +405,9 @@ def test_decision_17_only_qw_assessor_writes_and_reads_assessor_tables(
         ("installation_bootstrap", "SELECT"),  # 0048: decision 93
         ("optimizer_run", "SELECT"), ("optimizer_run", "INSERT"),  # 0049
         ("optimizer_run_outcome", "SELECT"),
-        ("optimizer_run_outcome", "INSERT")} | {
+        ("optimizer_run_outcome", "INSERT"),
+        ("optimizer_promotion_fixture", "SELECT"),  # 0051
+        ("optimizer_promotion_fixture", "INSERT")} | {
         # 0043: decisions 70 and 78
         (t, "SELECT") for t in (
             "strategy_manifest", "rights_provider", "rights_feed",

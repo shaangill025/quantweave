@@ -31,6 +31,7 @@ from test_optimizer_improvement import (
     gate_lifted_install,  # noqa: F401  (a pytest fixture, used by name)
 )
 from test_optimizer_lineage import lineage_receipt
+from test_optimizer_measure import MP
 from test_release import deployment
 from test_research_improvement import BASE, DEV
 from test_research_improvement import protocol as research_protocol
@@ -38,6 +39,7 @@ from test_research_improvement import protocol as research_protocol
 pytestmark = [pytest.mark.db, pytest.mark.usefixtures("gate_lifted_install")]
 Conn = psycopg.Connection[Any]
 INST = "tenant-synth-a"  # the fixtures' installation scope id (SYNTHETIC)
+P = MP  # the protocol `logged` logs (lineage_receipt's registry)
 TABLES = ("optimizer_registry_entry", "optimizer_cycle", "optimizer_lineage")
 ROLES = ("qw_app", "qw_worker", "qw_assessor", "qw_release", "qw_ingest")
 E = os_.OptimizerStoreError
@@ -200,7 +202,7 @@ def test_exact_privileges_hardened_guards_and_forbidden_logins(
             assert code(partial(os_.append, who, INST, reg.entries[0])) == "forbidden"
             assert code(partial(os_.load, who, INST, now(who))) == "forbidden"
         for who in (app, asr, rel):
-            assert code(partial(os_.append_cycle, who, INST, EXP, r)) == "forbidden"
+            assert code(partial(os_.append_cycle, who, INST, EXP, r, P)) == "forbidden"
         for who in (app, wrk, rel):
             assert code(partial(os_.append_lineage, who, INST, lin)) == "forbidden"
         for who in (app, wrk):
@@ -220,25 +222,25 @@ def test_exact_privileges_hardened_guards_and_forbidden_logins(
 def test_cycles_round_trip_and_refuse_duplicates_back_dating_and_forged_runners(
     asr: Conn, wrk: Conn, rel: Conn, conn: Conn
 ) -> None:
-    assert code(lambda: os_.append_cycle(wrk, INST, EXP, v0(wrk))) == (
+    assert code(lambda: os_.append_cycle(wrk, INST, EXP, v0(wrk), P)) == (
         "runner_not_baseline"
     )  # no logged protocol: no baseline to run
     logged(asr)
     old = v0(wrk, "cycle-db-0", now(wrk) - timedelta(minutes=2))  # no later cycle
-    assert code(lambda: os_.append_cycle(wrk, INST, EXP, old)) == "back_dated"
+    assert code(lambda: os_.append_cycle(wrk, INST, EXP, old, P)) == "back_dated"
     r = v0(wrk)
-    s = os_.append_cycle(wrk, INST, EXP, r)
+    s = os_.append_cycle(wrk, INST, EXP, r, P)
     assert os_.load_cycles(rel, INST, EXP) == (s,) and s.receipt.wire() == r.wire()
     assert os_.load_cycles(asr, INST, EXP) == (s,)  # decision 91
     assert os_.load_cycles(rel, INST, "exp-other") == ()
-    assert code(lambda: os_.append_cycle(wrk, INST, EXP, r)) == "duplicate"
+    assert code(lambda: os_.append_cycle(wrk, INST, EXP, r, P)) == "duplicate"
     later = v0(wrk)
     assert later.cycle_id == r.cycle_id and code(
-        lambda: os_.append_cycle(wrk, INST, EXP, later)) == "duplicate"  # fmt: skip
+        lambda: os_.append_cycle(wrk, INST, EXP, later, P)) == "duplicate"  # fmt: skip
     for at in (now(wrk) - timedelta(minutes=2), r.at - timedelta(microseconds=1),
                now(wrk) + timedelta(minutes=1)):  # fmt: skip
         bad = replace(r, cycle_id="cycle-db-2", at=at)
-        assert code(partial(os_.append_cycle, wrk, INST, EXP, bad)) == "back_dated"
+        assert code(partial(os_.append_cycle, wrk, INST, EXP, bad, P)) == "back_dated"
     v1, vx = V1, replace(r.config, version_id="opt-vx")  # vx: V0's hash, renamed
     forged = [  # (config, authority): each differs from the baseline in one way more
         (v1, "release:rel-opt-1"),  # the installed V1 claim: not checkable yet
@@ -256,16 +258,17 @@ def test_cycles_round_trip_and_refuse_duplicates_back_dating_and_forged_runners(
             authority=auth,
             at=now(wrk),
         )
-        assert code(partial(os_.append_cycle, wrk, INST, EXP, f)) == (
+        assert code(partial(os_.append_cycle, wrk, INST, EXP, f, P)) == (
             "runner_not_baseline"), i  # fmt: skip
-    assert code(lambda: os_.append_cycle(wrk, INST, "exp-other", replace(
-        r, cycle_id="cycle-db-3", at=now(wrk)))) == "runner_not_baseline"  # fmt: skip
-    nxt = os_.append_cycle(wrk, INST, EXP, v0(wrk, "cycle-db-4"))
+    other = replace(r, cycle_id="cycle-db-3", at=now(wrk))
+    assert code(lambda: os_.append_cycle(wrk, INST, "exp-other", other, P)) == (
+        "runner_not_baseline")  # fmt: skip
+    nxt = os_.append_cycle(wrk, INST, EXP, v0(wrk, "cycle-db-4"), P)
     assert [x.receipt.cycle_id for x in os_.load_cycles(rel, INST, EXP)] == [
         "cycle-db-1", "cycle-db-4"] and nxt.cycle_ref != s.cycle_ref  # fmt: skip
     assert count(conn, "optimizer_cycle") == 2
     with pytest.raises(TypeError):
-        os_.append_cycle(wrk, INST, EXP, r.wire())  # type: ignore[arg-type]
+        os_.append_cycle(wrk, INST, EXP, r.wire(), P)  # type: ignore[arg-type]
 
 
 def test_lineage_loads_unverified_and_verify_lineage_accepts_it(
@@ -307,7 +310,7 @@ def test_db_clock_window_refusals(
         if table == "optimizer_registry_entry":
             got = code(partial(os_.append, asr, INST, reg.entries[0]))
         elif table == "optimizer_cycle":
-            got = code(partial(os_.append_cycle, wrk, INST, EXP, r))
+            got = code(partial(os_.append_cycle, wrk, INST, EXP, r, P))
         else:
             got = code(partial(os_.append_lineage, asr, INST, lin))
         assert got == "clock", shift
@@ -318,7 +321,7 @@ def test_append_only_for_every_login_and_the_owner(
     asr: Conn, wrk: Conn, rel: Conn, conn: Conn
 ) -> None:
     _, _, _, lin = logged(asr)
-    os_.append_cycle(wrk, INST, EXP, v0(wrk))
+    os_.append_cycle(wrk, INST, EXP, v0(wrk), P)
     os_.append_lineage(asr, INST, lin)
     for t in TABLES:
         for stmt in (f"UPDATE app.{t} SET body = body", f"DELETE FROM app.{t}",
@@ -418,7 +421,7 @@ def test_tampering_on_read_is_integrity(
     asr: Conn, wrk: Conn, rel: Conn, conn: Conn, table: str, change: str
 ) -> None:
     _, _, _, lin = logged(asr)
-    os_.append_cycle(wrk, INST, EXP, v0(wrk))
+    os_.append_cycle(wrk, INST, EXP, v0(wrk), P)
     os_.append_lineage(asr, INST, lin)
     with conn.transaction():
         conn.execute("SET LOCAL session_replication_role = replica")
@@ -438,17 +441,18 @@ def test_tampering_on_read_is_integrity(
         assert code(lambda: os_.load_lineage(rel, inst, lid)) == "integrity"
 
 
-def raw_cycle(c: Conn, body: Any) -> None:
+def raw_cycle(c: Conn, body: Any, p: im.Protocol = P) -> None:
     """A direct qw_worker insert that skips the store; its columns are the body's,
     so only `optimizer_cycle_wire` can refuse a well-keyed one."""
     cid = body["cycle_id"]
     c.execute("INSERT INTO app.optimizer_cycle (cycle_ref, installation_id, "
               "experiment_id, cycle_id, runner_hash, authority, body, receipt_hash, "
-              "recorded_at, event_hash) VALUES (gen_random_uuid(), %s, %s, %s, %s, "
-              "%s, %s, %s, clock_timestamp(), repeat('0', 64))",
+              "recorded_at, event_hash, protocol) VALUES (gen_random_uuid(), %s, %s, "
+              "%s, %s, %s, %s, %s, clock_timestamp(), repeat('0', 64), %s)",
               (INST, EXP, cid, body.get("runner_hash", "a" * 64),
                body.get("authority", "baseline:opt-v0"), Jsonb(body),
-               body.get("receipt_hash", "b" * 64)))  # fmt: skip
+               body.get("receipt_hash", "b" * 64),
+               Jsonb(p.wire())))  # fmt: skip
 
 
 def test_a_raw_worker_insert_of_a_malformed_cycle_is_refused(
@@ -472,6 +476,9 @@ def test_a_raw_worker_insert_of_a_malformed_cycle_is_refused(
     for b in bad:
         with pytest.raises(errors.CheckViolation, match="optimizer_cycle_wire"):
             raw_cycle(wrk, b)
+    forged = replace(P, hypothesis="SYNTHETIC: forged", plan_id="plan-forged")
+    with pytest.raises(errors.CheckViolation, match="protocol_mismatch"):
+        raw_cycle(wrk, w, forged)  # 0051: not the protocol it is logged under
     wrk.execute("SET TimeZone = 'America/New_York'")  # the session cannot shift it
     wrk.execute("SET DateStyle = 'SQL, DMY'")
     raw_cycle(wrk, w)  # the canonical wire is accepted, read as UTC
@@ -508,9 +515,9 @@ def test_concurrent_appends_serialize_on_the_installation_locks(
          partial(os_.append, installation_id=INST, e=reg.entries[1])),
         # a cycle racing an earlier-dated one: the guard sees the later one
         ("qw_worker", wrk, partial(os_.append_cycle, installation_id=INST,
-                                   experiment_id=EXP, receipt=late),
+                                   experiment_id=EXP, receipt=late, protocol=P),
          partial(os_.append_cycle, installation_id=INST, experiment_id=EXP,
-                 receipt=early)),
+                 receipt=early, protocol=P)),
     ]  # fmt: skip
     for role, holder, first, second in races:
         with holder.transaction():  # the first append holds its lock until commit
@@ -545,27 +552,21 @@ def test_receipt_and_lineage_hashes_are_unique_per_installation(
 ) -> None:
     _, _, _, lin = logged(asr)
     r = v0(wrk)
-    os_.append_cycle(wrk, INST, EXP, r)
+    os_.append_cycle(wrk, INST, EXP, r, P)
     os_.append_lineage(asr, INST, lin)
     cl, other = lin.claim, "inst-2"  # a second installation logging the same ids
     raw_entry(
         asr,
         1,
         None,
-        {
-            "experiment_id": EXP,
-            "target": "recursive_optimizer",
-            "scope": "installation",
-            "scope_id": other,
-            "baseline_hash": r.runner_hash,
-            "baseline_version": r.runner_version,
-        },
+        replace(P, scope_id=other).wire(),  # type: ignore[arg-type]
         inst=other,
     )
     raw_entry(asr, 2, "0" * 64, {"verdict_id": cl.verdict_id, "experiment_id": EXP,
               "candidate_id": cl.candidate_id}, inst=other)  # fmt: skip
-    assert os_.append_cycle(wrk, other, EXP, r).receipt == r
+    q = replace(P, scope_id=other)
+    assert os_.append_cycle(wrk, other, EXP, r, q).receipt == r
     os_.append_lineage(asr, other, lin)
-    assert code(lambda: os_.append_cycle(wrk, other, EXP, r)) == "duplicate"
+    assert code(lambda: os_.append_cycle(wrk, other, EXP, r, q)) == "duplicate"
     assert code(lambda: os_.append_lineage(asr, other, lin)) == "duplicate"
     assert os_.load_lineage(rel, other, cl.lineage_id) == cl

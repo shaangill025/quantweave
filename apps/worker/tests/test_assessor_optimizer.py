@@ -188,13 +188,13 @@ def test_without_a_bootstrap_row_every_optimizer_job_is_refused(
     monkeypatch.setattr(aro, "trial", spy(calls))
     t, r = tenant(app_conn), ot.stored_world(asr, wrk)
     assert qa.bootstrap_tenant(asr) is None
-    grants = conn.execute(  # 0048: one column, to qw_assessor alone
+    grants = conn.execute(  # 0048 and 0051: one column, to these two alone
         "SELECT r, a.attname FROM unnest(%s::text[]) r CROSS JOIN pg_attribute a "
         "WHERE a.attrelid = 'app.installation_bootstrap'::regclass AND a.attnum > 0 "
         "AND has_column_privilege(r, a.attrelid, a.attnum, 'SELECT')",
         (["qw_worker", "qw_assessor", "qw_release", "qw_ingest"],),
     ).fetchall()
-    assert grants == [("qw_assessor", "tenant_id")]
+    assert sorted(grants) == [("qw_assessor", "tenant_id"), ("qw_worker", "tenant_id")]
     jid = submit(wrk, t, r)
     assert loop(logins).run_one() == (jid, JobState.FAILED)
     assert (state(wrk, t, jid), calls) == ((JobState.FAILED, "installation_scope"),
