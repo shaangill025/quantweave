@@ -34,6 +34,13 @@ id and no qw_app privilege (0029); tenant adoptions stay in `strategy_store`.
 - Owner decision 45, the read: `history` serves qw_app, which holds no privilege
   on these tables, through 0037's member-only SECURITY DEFINER reads; the
   deployment's tenant list never leaves the database (its hash is checked there).
+- T050 increment 7 (`0050_optimizer_release.sql`; R076, R092): a recursive-optimizer
+  release is recorded only by the operator login (qw_release, owner decision 95),
+  never by qw_worker, under which the optimizer runs; `record_release` checks the
+  preparation gates only, and every install, rollback or pause naming it is refused
+  (`sandbox_unqualified`) by the domain and by 0050 until T007 qualifies. The
+  domain's rollback to a frozen baseline (decisions 88, 96) is not stored:
+  `baseline_rollback_unstored` (fail closed) until the post-QUAL17 gate migration.
 LIMITATIONS: verdicts are the caller's registry (T044 N3, marked caller-supplied
 per decision 33): the assessor store holds tenant-scope protocols only, and an
 installation-scope release cannot cite one. Keys, adoptions (step-up reuse across
@@ -236,7 +243,8 @@ def record_release(conn: Conn, registry: im.ExperimentRegistry,
         conn.execute("SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
                      (f"release_id:{m.release_id}",))  # fmt: skip
         trusted = stored_keys(conn) if keys is None else keys
-        if why := rl.verify_release(sr, trusted, _now(conn), allow_test_keys):
+        if why := rl.verify_release(sr, trusted, _now(conn), allow_test_keys,
+                                    installing=False):  # fmt: skip
             raise ReleaseStoreError(why[0], ",".join(why))
         stored = _release(conn, m.release_id)
         if stored is not None:
@@ -433,6 +441,8 @@ def _event_values(deployment_id: str, seq: int, e: rl.Event, schema: int,
     if isinstance(e, rl.Install):
         m = e.release.manifest
         v |= {"kind": "install", "component": m.component, "release_id": m.release_id}
+    elif isinstance(e, rl.Rollback) and e.to_release_id is None:  # decision 96
+        raise ReleaseStoreError("baseline_rollback_unstored", e.event_id)
     elif isinstance(e, rl.Rollback):
         v |= {"kind": "rollback", "component": e.component,
               "release_id": e.from_release_id,
