@@ -2,19 +2,20 @@
 87 and 91). Real non-superuser logins (`runtime_connection(url, role=...)`): the
 qw_assessor login reads the registry and V0's stored cycle, which qw_worker wrote.
 SYNTHETIC data only (the T050 domain fixtures). The real path ends at
-`sandbox_unqualified`; tests marked GATE-LIFTED inject `lifted_assess` (the verdict
-T044 `assess` refuses to build), the inputs and an in-memory run log, none of
-which production passes, so nothing here is release proof."""
+`sandbox_unqualified`; tests marked GATE-LIFTED inject `lifted_assess` (the
+production `oi.assess_measured` with T044's sandbox gate lifted for that call
+only), the inputs and an in-memory or the durable run log; production passes no
+inputs and cannot lift the gate, so nothing here is release proof."""
 
 from __future__ import annotations
 
 import inspect
 from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta
 from decimal import Decimal
 from functools import partial
-from types import MappingProxyType
 from typing import Any
 
 import psycopg
@@ -108,22 +109,25 @@ class MemoryLog:
         self.done[plan_id] = (attempt, digest_)
 
 
+@contextmanager
+def gate_lifted() -> Iterator[None]:
+    """GATE-LIFTED SYNTHETIC: T044's sandbox gate lifted for the optimizer target,
+    inside this block of this test process only (T007 is not qualified)."""
+    saved = im.SANDBOX_TARGETS
+    im.SANDBOX_TARGETS = saved - {oi.OPT}
+    try:
+        yield
+    finally:
+        im.SANDBOX_TARGETS = saved
+
+
 def lifted_assess(reg: im.ExperimentRegistry, eid: str, cid: str,
-                  scores: Any, assessor: im.Party, at: datetime,
+                  m: oi.Measured | None, assessor: im.Party, at: datetime,
                   vid: str) -> im.Verdict:  # fmt: skip
-    """GATE-LIFTED SYNTHETIC: the verdict T044 `assess` refuses to build for the
-    optimizer, from `measure`'s metrics (as the domain tests' `lifted()`)."""
-    p, c = reg.protocol(eid), reg.candidate(cid)
-    why: tuple[str, ...] = ("not_measured",)
-    if scores is not None:
-        why = tuple(f"goal:{t.metric}" for t in p.scorecard.thresholds
-                    if not t.passes(scores[t.metric]))  # fmt: skip
-    d = im.Decision.REJECT if why else im.Decision.ACCEPT_FOR_REVIEW
-    if scores is None:
-        d = im.Decision.INSUFFICIENT
-    return im.Verdict(vid, eid, cid, c.content_hash, p.content_hash, assessor, d, why,
-                      MappingProxyType(dict(scores or {})), ("trial-lifted-1",), (),
-                      ("gate_lifted_synthetic",), at)  # fmt: skip
+    """GATE-LIFTED SYNTHETIC: the production verdict, `oi.assess_measured`, with
+    the sandbox gate lifted for this call."""
+    with gate_lifted():
+        return oi.assess_measured(reg, eid, cid, m, assessor, at, vid)
 
 
 def inputs(seen: list[str] | None = None, **kw: Any) -> aro.InputsProvider:
@@ -135,7 +139,7 @@ def inputs(seen: list[str] | None = None, **kw: Any) -> aro.InputsProvider:
     return get
 
 
-def lifted(asr: Conn, r: aro.Request, log: MemoryLog,
+def lifted(asr: Conn, r: aro.Request, log: aro.RunLog,
            beat: Callable[[], object] = lambda: None,
            assess: aro.Assess = lifted_assess, **kw: Any) -> aro.Run:  # fmt: skip
     """GATE-LIFTED: `trial`'s two private phases with the test-only ports (`kw`:
@@ -173,12 +177,13 @@ def test_the_real_trial_is_blocked_before_any_read_and_records_nothing(
 ) -> None:
     before, log, seen = entries(conn), MemoryLog(), list[str]()
     assert code(lambda: aro.trial(asr, world)) == "sandbox_unqualified"
-    # even with every port injected, T044 `assess` blocks before any input or read
-    assert code(lambda: lifted(asr, world, log, assess=aro.t044_assess,
+    # even with every port injected, the gate blocks before any input or read
+    assert code(lambda: lifted(asr, world, log, assess=aro.measured_assess,
                                seen=seen)) == "sandbox_unqualified"  # fmt: skip
     assert (seen, log.runs, log.done, entries(conn)) == ([], {}, {}, before)
-    v = aro.t044_assess(os_.load(asr, INST, now(asr)), EXP, "cand-opt-1", None,
-                        ASSESSOR, world.at, "v-x")  # fmt: skip
+    assert aro.measured_assess is oi.assess_measured
+    v = aro.measured_assess(os_.load(asr, INST, now(asr)), EXP, "cand-opt-1", None,
+                            ASSESSOR, world.at, "v-x")  # fmt: skip
     assert (v.decision, v.reasons) == (im.Decision.BLOCKED, ("sandbox_unqualified",))
     # past the gate (GATE-LIFTED), the missing ports fail closed before any read
     reg, p, c, cycle = aro._before_gate(asr, world, lifted_assess)
@@ -203,7 +208,7 @@ def test_trial_takes_no_port_and_fails_closed_past_the_gate(
     with the module's `t044_assess` replaced, no inputs or run log exist."""
     assert list(inspect.signature(aro.trial).parameters) == ["assessor", "r", "beat"]
     before = entries(conn)
-    monkeypatch.setattr(aro, "t044_assess", lifted_assess)
+    monkeypatch.setattr(aro, "measured_assess", lifted_assess)
     assert code(lambda: aro.trial(asr, world)) == "trial_inputs_unavailable"
     assert entries(conn) == before
 
@@ -240,15 +245,13 @@ def test_gate_lifted_trial_writes_its_verdict_and_reruns_reuse_the_read(
     asr: Conn, conn: Conn, runtime_urls: dict[str, str], world: aro.Request
 ) -> None:
     """GATE-LIFTED SYNTHETIC: a crash after the reservation, then decision 42's
-    re-run under the recorded read and inputs; the verdict is appended once."""
-    log, before, plan = MemoryLog(), entries(conn), MP.plan_id
+    re-run under the recorded read and inputs; the verdict is appended once, on
+    the durable log (0049 refuses a deciding verdict without a run)."""
+    log, before, plan = os_.RunLog(asr, INST), entries(conn), MP.plan_id
     with pytest.raises(Crash):
         lifted(asr, world, log, crash_on(1))  # after the reservation, before reading
-    assert ([a for a, _ in log.runs[plan]], log.done, entries(conn)) == (
-        [1],
-        {},
-        before,
-    )
+    assert (len(log.attempts(plan)), log.outcome(plan), entries(conn)) == (
+        1, None, before)  # fmt: skip
     # an input fault is refused before the read; a changed input is not a re-run
     assert code(lambda: lifted(asr, world, log, dev=FIXTURE)) == "not_development"
     later = replace(world, at=world.at + timedelta(seconds=1))
@@ -261,7 +264,8 @@ def test_gate_lifted_trial_writes_its_verdict_and_reruns_reuse_the_read(
         2, True, im.Decision.ACCEPT_FOR_REVIEW)  # fmt: skip
     assert run.metrics["promotion_gain"] >= Decimal(1)
     first, second = log.attempts(plan)
-    assert first == second and log.done[plan][0] == 2 and entries(conn) == before + 1
+    assert first == second and log.outcome(plan) is not None  # by attempt 2 (run)
+    assert entries(conn) == before + 1
     for c in login(runtime_urls, "qw_release"):
         got = os_.load(c, INST, now(c)).verdicts("cand-opt-1")
         assert [v.wire() for v in got] == [run.verdict.wire()]

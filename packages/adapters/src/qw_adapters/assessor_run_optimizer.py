@@ -9,14 +9,17 @@ and 91): the strategy promotion's pattern (`assessor_run`) at installation scope
   candidate, else `duplicate`);
 - decision 62: `assess` with nothing measured; a certain BLOCKED is refused before
   any input is loaded or read is recorded (`sandbox_unqualified`, or `blocked`).
-  T044 `assess` (`t044_assess`, fixed: `trial` takes no port) gives exactly that
-  for the optimizer target until T007 qualifies its sandbox, so a real trial
-  records nothing;
-- past that gate (`_after_gate`) it needs two ports no store provides yet: the
-  inputs (the plan, V0's research base and development fixture, which must hash to
-  the stored cycle's, the protected promotion fixture bound to the plan, the
-  owner's limits) and the run log (`RunLog`). Without either it is
-  `trial_inputs_unavailable` or `run_log_unavailable`, before any read. With them:
+  The gate and the verdict are `oi.assess_measured` (`measured_assess`, fixed:
+  `trial` takes no port), T044's sandbox gate over `measure`'s metrics: for the
+  optimizer target it is `sandbox_unqualified` until T007 qualifies its sandbox,
+  so a real trial records nothing;
+- past that gate (`_after_gate`) it needs the inputs (the plan, V0's research base
+  and development fixture, which must hash to the stored cycle's, the protected
+  promotion fixture bound to the plan, the owner's limits), which no store
+  provides yet, and the run log, which `trial` passes durably
+  (`optimizer_store.RunLog`, 0049). Without inputs it is
+  `trial_inputs_unavailable`, without a log `run_log_unavailable`, before any
+  read. With them:
   `check_measure` refuses every input fault, then decisions 42 and 59 reserve the
   read (attempt 1, then at most three re-runs under the same read and `inputs`
   digest: `rerun_mismatch`, `rerun_used`); `measure` opens the promotion fixture;
@@ -24,12 +27,10 @@ and 91): the strategy promotion's pattern (`assessor_run`) at installation scope
   differs); `assess` gives the verdict and qw_assessor appends it to the registry
   (decision 87).
 `beat` (the job lease heartbeat) runs after each recorded phase.
-LIMITATIONS: no durable installation-scope run log or protected optimizer fixture
-store exists (0038/0040 and 0039 are tenant tables keyed to a tenant's assessor
-protocol), so the post-gate path runs only in GATE-LIFTED tests, which call the
-private `_before_gate` and `_after_gate` with test-only ports;
-T044 `assess` scores ledger trials, not `measure`'s metrics, so even with T007 it
-could not accept an optimizer; the request's `at` and assessor are the caller's,
+LIMITATIONS: no protected optimizer fixture store exists (0039 is a tenant table
+keyed to a tenant's assessor protocol), so the post-gate path runs only in
+GATE-LIFTED tests, which call the private `_before_gate` and `_after_gate` with
+test-only inputs; the request's `at` and assessor are the caller's,
 checked against the registry; decisions 92 and 93 (only the bootstrap tenant's
 job runs; tenants see one generic code) are the qw-assessor loop's, before this
 module is called (`qw_worker.assessor`)."""
@@ -45,16 +46,15 @@ from typing import Protocol
 from qw_domain import improvement as im
 from qw_domain import optimizer_improvement as oi
 from qw_domain import research_improvement as ri
-from qw_domain.budget import BudgetBook, BudgetCaps
-from qw_domain.decimals import UsdBudget
 from qw_domain.instants import ensure_aware_utc, format_instant, parse_instant
 from qw_domain.research_data import check_id, digest
-from qw_domain.trial_ledger import SplitPlan, TrialLedger
+from qw_domain.trial_ledger import SplitPlan
 
 from qw_adapters import optimizer_store as os_
 from qw_adapters.tenancy import Conn, TenancyError, check_runtime_role
 
-MAX_ATTEMPTS = 4  # the reservation and three re-runs (decision 59)
+MAX_ATTEMPTS = os_.MAX_ATTEMPTS  # the reservation and three re-runs (decision 59)
+Reservation = os_.Reservation  # decision 42's write-ahead record of the plan's read
 _KEYS = ("installation_id", "experiment_id", "candidate_id", "source_cycle_id",
          "verdict_id", "assessor", "at")  # fmt: skip
 
@@ -108,18 +108,9 @@ class Inputs:
 
 # (request, protocol, V0's stored cycle) -> the inputs; none exists in production
 InputsProvider = Callable[[Request, im.Protocol, oi.CycleReceipt], Inputs]
-# (registry, experiment, candidate, metrics or None, assessor, at, verdict id)
-Assess = Callable[[im.ExperimentRegistry, str, str, Mapping[str, Decimal] | None,
-                   im.Party, datetime, str], im.Verdict]  # fmt: skip
-
-
-@dataclass(frozen=True, slots=True)
-class Reservation:  # decision 42's write-ahead record of the plan's one read
-    experiment_id: str
-    candidate_id: str
-    verdict_id: str
-    fixture_hash: str  # the read: the plan's promotion fixture
-    inputs: str  # the digest of every input the trial and verdict depend on
+# (registry, experiment, candidate, measurement or None, assessor, at, verdict id)
+Assess = Callable[[im.ExperimentRegistry, str, str, oi.Measured | None, im.Party,
+                   datetime, str], im.Verdict]  # fmt: skip
 
 
 class RunLog(Protocol):
@@ -140,16 +131,7 @@ class Run:
     metrics: Mapping[str, Decimal]
 
 
-def t044_assess(reg: im.ExperimentRegistry, eid: str, cid: str,
-                scores: Mapping[str, Decimal] | None, assessor: im.Party,
-                at: datetime, vid: str) -> im.Verdict:  # fmt: skip
-    """T044 `assess`. No installation ledger or budget store exists, so it gets an
-    empty ledger and an unauthorised zero book: it can never accept, and for the
-    optimizer target it is BLOCKED (`sandbox_unqualified`) before reading either."""
-    zero = UsdBudget(Decimal(0))
-    book = BudgetBook.open(reg.scope_id, at, BudgetCaps(zero, zero, None))
-    return im.assess(reg, eid, cid, TrialLedger(reg.scope_id), book, assessor, at,
-                     vid, scores)  # fmt: skip
+measured_assess: Assess = oi.assess_measured  # the gate and verdict; no port
 
 
 def inputs_digest(r: Request, p: im.Protocol, c: im.Candidate, cycle: oi.CycleReceipt,
@@ -194,10 +176,12 @@ def _now(conn: Conn) -> datetime:
 def trial(assessor: Conn, r: Request, beat: Callable[[], object] = lambda: None,
           ) -> Run:  # fmt: skip
     """Run `r` as the independent assessor. No port can be passed: the gate is the
-    module's `t044_assess`, and no inputs or run log exist, so past the gate it
-    fails closed (`trial_inputs_unavailable`)."""
-    reg, p, c, cycle = _before_gate(assessor, r, t044_assess)
-    return _after_gate(assessor, r, beat, reg, p, c, cycle, None, None, t044_assess)
+    module's `measured_assess`, the run log is the durable one, and no inputs
+    exist, so past the gate it fails closed (`trial_inputs_unavailable`)."""
+    reg, p, c, cycle = _before_gate(assessor, r, measured_assess)
+    log = os_.RunLog(assessor, r.installation_id)
+    return _after_gate(assessor, r, beat, reg, p, c, cycle, None, log,
+                       measured_assess)  # fmt: skip
 
 
 def _before_gate(assessor: Conn, r: Request, assess: Assess) -> tuple[
@@ -231,7 +215,7 @@ def _after_gate(assessor: Conn, r: Request, beat: Callable[[], object],
                 reg: im.ExperimentRegistry, p: im.Protocol, c: im.Candidate,
                 cycle: oi.CycleReceipt, inputs: InputsProvider | None,
                 log: RunLog | None, assess: Assess) -> Run:  # fmt: skip
-    """Only GATE-LIFTED tests reach this with ports."""
+    """Only GATE-LIFTED tests reach this with inputs."""
     if inputs is None:
         raise TrialError("trial_inputs_unavailable", "no protected fixture store")
     if log is None:
@@ -250,7 +234,7 @@ def _after_gate(assessor: Conn, r: Request, beat: Callable[[], object],
     )
     record_outcome(log, p.plan_id, attempt, done)
     beat()
-    v = assess(reg, p.experiment_id, c.candidate_id, metrics, r.assessor, r.at,
-               r.verdict_id)  # fmt: skip
+    v = assess(reg, p.experiment_id, c.candidate_id, oi.Measured(i.plan, metrics),
+               r.assessor, r.at, r.verdict_id)  # fmt: skip
     _, wrote = os_.append(assessor, r.installation_id, v)
     return Run(v, wrote, attempt, metrics)

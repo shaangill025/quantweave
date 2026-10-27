@@ -85,8 +85,20 @@ def logged(asr: Conn) -> tuple[im.ExperimentRegistry, Any, im.Candidate,
                                oi.LineageReceipt]:  # fmt: skip
     reg, lg, nxt, lin = lineage_receipt()
     for e in reg.entries:
-        assert os_.append(asr, INST, e)[1]
+        assert put(asr, e)[1]
     return reg, lg, nxt, lin
+
+
+def put(asr: Conn, e: im.Entry) -> tuple[Any, bool]:
+    """Append `e`; a deciding verdict follows its run and outcome (0049)."""
+    if type(e) is im.Verdict:
+        plan = os_.load(asr, INST, now(asr)).protocol(e.experiment_id).plan_id
+        log = os_.RunLog(asr, INST)
+        r = os_.Reservation(e.experiment_id, e.candidate_id, e.verdict_id, "a" * 64,
+                            "b" * 64)  # fmt: skip
+        log.reserve(plan, 1, r)
+        log.put_outcome(plan, 1, "c" * 64)
+    return os_.append(asr, INST, e)
 
 
 def v0(c: Conn, cid: str = "cycle-db-1", at: datetime | None = None) -> oi.CycleReceipt:
@@ -121,7 +133,7 @@ def test_registry_chain_round_trips_and_refuses_what_the_domain_refuses(
     os_.append(asr, INST, c)
     assert code(lambda: os_.append(asr, INST, replace(v, assessor=p.producer))) == (
         "assessor_mismatch")  # fmt: skip
-    os_.append(asr, INST, v)
+    put(asr, v)
     for who in (asr, rel):
         got = os_.load(who, INST, now(who))
         assert [e.wire() for e in got.entries] == [e.wire() for e in reg.entries]
@@ -141,7 +153,7 @@ def test_registry_chain_round_trips_and_refuses_what_the_domain_refuses(
 def test_a_re_hashed_registry_forgery_that_breaks_the_chain_is_integrity(
     asr: Conn, rel: Conn, conn: Conn, change: str
 ) -> None:
-    log = [os_.append(asr, INST, e)[0] for e in lineage_receipt()[0].entries]
+    log = [put(asr, e)[0] for e in lineage_receipt()[0].entries]
     x, prev = log[2], log[1]
     seq, ph, at = x.seq, prev.event_hash, x.recorded_at
     if change == "seq":
@@ -326,6 +338,8 @@ def raw_entry(c: Conn, seq: int, prev: str | None, body: dict[str, str], *,
               inst: str = INST, at: str = "clock_timestamp()") -> None:  # fmt: skip
     """A direct qw_assessor insert that skips the store (event hash "0" * 64)."""
     kind = "verdict" if "verdict_id" in body else "protocol"
+    if kind == "verdict":  # 0049: a deciding verdict needs a run
+        body = {"decision": "blocked"} | body
     eid = body.get("verdict_id", body.get("experiment_id"))
     c.execute("INSERT INTO app.optimizer_registry_entry (installation_id, seq, kind, "
               "entry_id, body, recorded_at, prev_hash, event_hash) VALUES (%s, %s, "

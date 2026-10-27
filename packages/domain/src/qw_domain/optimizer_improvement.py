@@ -11,6 +11,8 @@ assessor's run of V0 and V1 on the protected promotion fixture (`promotion_gain`
 Increment 3: strict `CycleReceipt` and `LineageReceipt` wire forms; `lineage` records
 the spec's recursive-lineage fields once `verify_recursion` passes, and
 `next_cycle_run_id` gives the experiment schema field from it (null without one).
+Increment 6: `assess_measured`, the optimizer verdict from `measure`'s metrics,
+behind T044's sandbox gate (`sandbox_unqualified` until T007 qualifies).
 LIMITATIONS: in memory; times, actors, receipts and costs are caller-asserted, so
 verification is necessary, not sufficient; costs are not reserved in the T037 book.
 """
@@ -34,7 +36,7 @@ from qw_domain.instants import (
     parse_instant,
 )
 from qw_domain.release import DeploymentLedger, Install
-from qw_domain.research_data import digest
+from qw_domain.research_data import EvidenceClass, digest
 from qw_domain.sources import ID_PATTERN
 from qw_domain.trial_ledger import SplitPlan, TrialLedger
 
@@ -795,8 +797,9 @@ def measure(
     artifact's full canonical knob set (V1 is then measured as V0: fail closed);
     `cost_usd` is V1's declared worst-case cycle cost under the owner's limits, and
     the protocol's cost goal may not exceed them (`cost_exceeds_limits`). The
-    numbers reach a verdict only through T044 `assess`, which stays
-    `sandbox_unqualified` here. Every refusal is `check_measure`'s."""
+    numbers reach a verdict only through `assess_measured`, which stays
+    `sandbox_unqualified` while T007 is unqualified. Every refusal is
+    `check_measure`'s."""
     check_measure(protocol, plan, candidate, source, base, dev, fixture, limits,
                   assessor)  # fmt: skip
     v0 = source.config
@@ -820,6 +823,72 @@ def measure(
         "threshold_changes": Decimal(len(widening)),
         "cost_usd": limits.cost_per_proposal.value * v1.proposal_budget,
     })  # fmt: skip
+
+
+@dataclass(frozen=True, slots=True)
+class Measured:  # an assessor run's measurement: the plan it read, `measure`'s metrics
+    plan: SplitPlan
+    metrics: Mapping[str, Decimal]
+
+
+def assess_measured(
+    reg: im.ExperimentRegistry, experiment_id: str, candidate_id: str,
+    measured: Measured | None, assessor: im.Party, at: datetime, verdict_id: str,
+) -> im.Verdict:  # fmt: skip
+    """The optimizer verdict from `measure`'s metrics (T044 `assess` scores ledger
+    trials). In order: `check_assessor`; T044's gate on `im.SANDBOX_TARGETS`
+    (BLOCKED `sandbox_unqualified`); `assessed_before_freeze`; `not_measured`;
+    another plan (BLOCKED `test_access_changed`); missing, non-finite or negative
+    hard metrics (INSUFFICIENT); a failed threshold (REJECT, hard first, never
+    offset); else ACCEPT_FOR_REVIEW, with its limitations."""
+    _id(verdict_id, "verdict_id")
+    at = ensure_aware_utc(at)
+    p, c = reg.protocol(experiment_id), reg.candidate(candidate_id)
+    check_assessor(p, c, assessor)
+    if measured is not None and (type(measured) is not Measured or any(
+        type(v) is not Decimal for v in measured.metrics.values())):  # fmt: skip
+        raise TypeError("a Measured with Decimal metrics is required")
+    scores: dict[str, Decimal] = {}
+    used: list[str] = []
+    limits: list[str] = []
+
+    def verdict(decision: im.Decision, *reasons: str) -> im.Verdict:
+        return im.Verdict(verdict_id, experiment_id, candidate_id, c.content_hash,
+                          p.content_hash, assessor, decision, reasons,
+                          MappingProxyType(scores), tuple(used), (), tuple(limits),
+                          at)  # fmt: skip
+
+    if p.target in im.SANDBOX_TARGETS:  # T044's gate: T007 not qualified
+        return verdict(im.Decision.BLOCKED, "sandbox_unqualified")
+    if at < max(p.registered_at, c.created_at):
+        return verdict(im.Decision.INSUFFICIENT, "assessed_before_freeze")
+    if measured is None:
+        return verdict(im.Decision.INSUFFICIENT, "not_measured")
+    plan = measured.plan
+    if plan.plan_id != p.plan_id or im.plan_digest(plan) != p.plan_digest:
+        return verdict(im.Decision.BLOCKED, "test_access_changed")
+    if plan.dataset.evidence_class is EvidenceClass.SYNTHETIC:
+        limits.append("synthetic_only")
+    limits += ["no_multiple_testing_adjustment", "declared_costs_not_reserved"]
+    used.append(f"measured:{p.plan_id}")
+    scores.update(measured.metrics)
+    cards = p.scorecard.thresholds
+    missing = [f"metric_missing:{t.metric}" for t in cards if t.metric not in scores]
+    if missing:
+        return verdict(im.Decision.INSUFFICIENT, *missing)
+    bad = [
+        f"metric_invalid:{t.metric}"
+        for t in cards
+        if not scores[t.metric].is_finite() or (t.hard and scores[t.metric] < 0)
+    ]
+    if bad:  # finite, and violation counts are never negative
+        return verdict(im.Decision.INSUFFICIENT, *bad)
+    reasons = [f"{'hard' if t.hard else 'goal'}:{t.metric}"
+               for t in sorted(cards, key=lambda t: not t.hard)
+               if not t.passes(scores[t.metric])]  # fmt: skip
+    if reasons:
+        return verdict(im.Decision.REJECT, *reasons)
+    return verdict(im.Decision.ACCEPT_FOR_REVIEW)
 
 
 def cycle_candidate(

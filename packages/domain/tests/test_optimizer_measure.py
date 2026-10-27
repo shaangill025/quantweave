@@ -6,7 +6,7 @@ lifts the gates only through `lifted()` and the `gate_lifted_install` fixture.
 """
 
 from dataclasses import replace
-from datetime import date
+from datetime import date, datetime, timedelta
 from decimal import Decimal
 from itertools import permutations
 
@@ -368,3 +368,124 @@ def test_protocol_requires_the_out_of_sample_goal() -> None:
     _, sc = derived()
     with pytest.raises(oi.OptimizerError, match="gain_goal_missing"):
         measure(sc.candidate, protocol=missing[1])
+
+
+@pytest.fixture
+def gate_lifted_assess(monkeypatch: pytest.MonkeyPatch) -> None:
+    """GATE-LIFTED SYNTHETIC: T044's sandbox gate lifted for the optimizer target,
+    in this test only (T007 is not qualified)."""
+    monkeypatch.setattr(im, "SANDBOX_TARGETS", im.SANDBOX_TARGETS - {oi.OPT})
+
+
+def measured(m: dict[str, Decimal] | None, assessor: im.Party = ASSESSOR,
+             p: object = PLAN, at: datetime = V_AT) -> im.Verdict:  # fmt: skip
+    reg, sc = derived()
+    got = None if m is None else oi.Measured(p, m)  # type: ignore[arg-type]
+    return oi.assess_measured(
+        reg, EXP, sc.candidate.candidate_id, got, assessor, at, "verdict-measured-1"
+    )
+
+
+def test_the_measured_verdict_stays_sandbox_gated_and_refuses_self_assessment() -> (
+    None
+):  # fmt: skip
+    m = measure(derived()[1].candidate)
+    for x in (None, m):
+        v = measured(x)
+        assert (v.decision, v.reasons, dict(v.scores), v.trial_ids) == (
+            im.Decision.BLOCKED, ("sandbox_unqualified",), {}, ())  # fmt: skip
+    for who, why in ((PRODUCER, "self_certification"),
+                     (replace(ASSESSOR, version="opt-v1"), "self_certification"),
+                     (replace(ASSESSOR, family_id=PRODUCER.family_id),
+                      "self_certification"),
+                     (replace(ASSESSOR, actor_id="assessor-x"),
+                      "assessor_not_registered")):  # fmt: skip
+        with pytest.raises(oi.OptimizerError, match=why):
+            measured(m, who)
+
+
+@pytest.mark.usefixtures("gate_lifted_assess")
+def test_gate_lifted_measured_verdict_accepts_rejects_and_fails_closed() -> None:
+    """GATE-LIFTED SYNTHETIC: the verdict from `measure`'s metrics (2, 0, 0, 0, 0,
+    1.50 above) against MP's scorecard; necessary checks, not release proof."""
+    reg, sc = derived()
+    m = measure(sc.candidate)
+    v = measured(m)
+    assert (v.decision, v.reasons, dict(v.scores), v.trial_ids) == (
+        im.Decision.ACCEPT_FOR_REVIEW, (), m, ("measured:plan-synth-1",))  # fmt: skip
+    assert v.limitations == ("synthetic_only", "no_multiple_testing_adjustment",
+                             "declared_costs_not_reserved")  # fmt: skip
+    assert reg.record_verdict(v).verdicts(sc.candidate.candidate_id) == (v,)
+    for goal, value in (("promotion_gain", D("0.9")), ("cost_usd", D("2.01"))):
+        got = measured(m | {goal: value})
+        assert (got.decision, got.reasons) == (im.Decision.REJECT, (f"goal:{goal}",))
+    hard = [t.metric for t in MP.scorecard.thresholds if t.hard]
+    assert {"replayed_output", "payload_invalid", "identical_relabels",
+            "threshold_changes"} <= set(hard)  # fmt: skip
+    for h in hard:  # a hard failure is never offset by a better goal
+        got = measured(m | {h: D(1), "promotion_gain": D(9)})
+        assert (got.decision, got.reasons) == (im.Decision.REJECT, (f"hard:{h}",)), h
+    got = measured(m | {hard[0]: D(1), "promotion_gain": D(0)})
+    assert got.reasons == (f"hard:{hard[0]}", "goal:promotion_gain")
+    gone = {k: x for k, x in m.items() if k != "cost_usd"}
+    assert measured(gone).reasons == ("metric_missing:cost_usd",)
+    assert measured(m | {hard[0]: D(-1)}).reasons == (f"metric_invalid:{hard[0]}",)
+    assert measured(None).reasons == ("not_measured",)
+    for x in (D("Infinity"), D("-Infinity")):
+        assert measured(m | {"promotion_gain": x}).reasons == (
+            "metric_invalid:promotion_gain",)  # fmt: skip
+    early = sc.candidate.created_at - timedelta(microseconds=1)  # T044's time order
+    got = measured(m, at=early)
+    assert (got.decision, got.reasons) == (im.Decision.INSUFFICIENT,
+                                           ("assessed_before_freeze",))  # fmt: skip
+    other = replace(PLAN, plan_id="plan-synth-other")
+    for p in (other, replace(PLAN, max_promotion_accesses=2)):
+        got = measured(m, p=p)
+        assert (got.decision, got.reasons) == (im.Decision.BLOCKED,
+                                               ("test_access_changed",))  # fmt: skip
+    with pytest.raises(oi.OptimizerError, match="self_certification"):
+        measured(m, PRODUCER)  # lifted or not, an optimizer never assesses
+    with pytest.raises(TypeError):
+        measured(m | {"cost_usd": 1.5})  # type: ignore[arg-type]
+    with pytest.raises(TypeError):
+        oi.assess_measured(reg, EXP, sc.candidate.candidate_id, m,  # type: ignore[arg-type]
+                           ASSESSOR, V_AT, "v-x")  # fmt: skip
+
+
+def test_no_source_rebinds_the_sandbox_gate() -> None:
+    """The gate is lifted only by tests (`gate_lifted_assess`, `gate_lifted`): no
+    `src/` file assigns `SANDBOX_TARGETS` or `measured_assess` beyond their one
+    definition, or names them in `setattr`, `global` or `del`."""
+    import ast
+    from pathlib import Path
+
+    names, root = {"SANDBOX_TARGETS", "measured_assess"}, Path(__file__).parents[3]
+    files = [*root.glob("packages/*/src/**/*.py"), *root.glob("apps/*/src/**/*.py")]
+
+    def hits(n: ast.AST) -> bool:
+        if isinstance(n, ast.Name | ast.Attribute) and isinstance(
+            n.ctx, ast.Store | ast.Del
+        ):
+            return (n.id if isinstance(n, ast.Name) else n.attr) in names
+        if isinstance(n, ast.Global | ast.Nonlocal):
+            return bool(names & set(n.names))
+        if isinstance(n, ast.Call) and isinstance(n.func, ast.Name):
+            return n.func.id in {"setattr", "delattr"} and any(
+                isinstance(a, ast.Constant) and a.value in names for a in n.args
+            )
+        return False
+
+    found = sorted(
+        str(f.relative_to(root))
+        for f in files
+        for n in ast.walk(ast.parse(f.read_text(), str(f)))
+        if hits(n)
+    )
+    probe = "a.SANDBOX_TARGETS = 1\nsetattr(a, 'measured_assess', 1)\n"
+    probe += "def f():\n    global SANDBOX_TARGETS"
+    assert sum(map(hits, ast.walk(ast.parse(probe)))) == 3  # the detector detects
+    assert len(files) > 100
+    assert found == [  # each name's one definition
+        "packages/adapters/src/qw_adapters/assessor_run_optimizer.py",
+        "packages/domain/src/qw_domain/improvement.py",
+    ], found
