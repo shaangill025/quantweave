@@ -17,14 +17,22 @@ registered here with its implementation hash.
 
 Jobs: `AssessorLoop` claims kind `assessment.promotion` from the experiment pool
 (priority `experiment`; ordinary workers have no handler for it, so they never
-claim it). The payload is `AssessmentJob`: the tenant's request id with the
-experiment and candidate it names (the request id is the verdict id), as
-`submit_job` writes it with the request in one qw_worker transaction (decision
-64). A `RequestSource` turns it into an `assessor_run.Request`: the default,
-`STORE_SOURCE`, loads the stored request (`request_missing` if there is none) and
-takes the inputs it binds by hash (decision 67) from an `InputsProvider`, called
-in the qw_assessor transaction that loaded the request (REPEATABLE READ, READ
-ONLY: one snapshot). The default,
+claim it), and kind `assessment.optimizer` (T050): an installation-scope
+`assessor_run_optimizer.Request` that `assessor_run_optimizer.trial` (which takes
+no port: it ends at decision 62's `sandbox_unqualified`) runs on the qw_assessor
+login alone; the job's tenant only routes it (decision 92). Decision 93: a job
+whose tenant is not the installation's bootstrap tenant (`bootstrap_tenant`; none
+for a hosted edition) is refused before any registry read (`installation_scope`),
+and every trial refusal shows the tenant only `optimizer_refused` (the real code
+is logged); `database` and uncoded faults still retry. The promotion payload
+is `AssessmentJob`: the tenant's request id with the experiment and candidate it
+names (the request id is the verdict id), as `submit_job` writes it with the
+request in one qw_worker transaction (decision 64). A `RequestSource` turns it
+into an `assessor_run.Request`: the default, `STORE_SOURCE`, loads the stored
+request (`request_missing` if there is none) and takes the inputs it binds by
+hash (decision 67) from an `InputsProvider`, called in the qw_assessor
+transaction that loaded the request (REPEATABLE READ, READ ONLY: one snapshot).
+The default,
 `STORE_INPUTS` (`store_inputs`), reads each from its store (decision 70: the
 registry log as of submit, the study inputs, the base manifest with the
 candidate's re-derived, the dataset with its rights at the database clock) and
@@ -64,6 +72,7 @@ from types import FrameType
 
 from qw_adapters import assessment_request_store as ars
 from qw_adapters import assessor_run as ar
+from qw_adapters import assessor_run_optimizer as aro
 from qw_adapters import dataset_store, strategy_store, study_store, tenancy
 from qw_adapters import experiment_registry_store as ers
 from qw_adapters import jobs as qj
@@ -80,6 +89,7 @@ from qw_domain.research_data import (
     ResearchError,
     ResearchRights,
     check_id,
+    digest,
 )
 from qw_domain.strategy_registry import (
     ParamKind,
@@ -92,6 +102,7 @@ from qw_worker.config import WorkerSettings, settings_from_env
 
 log = logging.getLogger("qw_worker.assessor")
 KIND = "assessment.promotion"
+OPT_KIND = "assessment.optimizer"
 ASSESSOR_URL = "QW_ASSESSOR_DATABASE_URL"
 # Decision 65: the reviewed strategy implementations. Empty: nothing runs yet.
 STRATEGIES = Implementations(())
@@ -271,6 +282,29 @@ def submit_job(tx: TenantTx, r: ar.Request) -> uuid.UUID:
     return jid
 
 
+def bootstrap_tenant(assessor: Conn) -> uuid.UUID | None:
+    """The installation's bootstrap tenant (0004; 0048 lets qw_assessor read its
+    one column): the operator's tenant for self-hosted (decision 93); None when
+    there is no row (a hosted edition, until it has its own binding)."""
+    row = assessor.execute(
+        "SELECT tenant_id FROM app.installation_bootstrap"
+    ).fetchone()
+    return None if row is None else uuid.UUID(str(row[0]))
+
+
+# what an optimizer refusal may still show the tenant (decision 93): the retried
+# faults, which say nothing about the registry, and the completion of a recorded run
+_OPT_PASS = frozenset({"database", "run_recorded"})
+
+
+def submit_optimizer_job(tx: TenantTx, r: aro.Request) -> uuid.UUID:
+    """Enqueue `r` (any login that may enqueue in `tx`'s tenant), idempotent on it."""
+    body = r.to_payload()
+    jid, _ = qj.enqueue(tx, OPT_KIND, digest(["optimizer_trial", body]),
+                        Priority.EXPERIMENT, body)  # type: ignore[arg-type]  # fmt: skip
+    return jid
+
+
 def _refusal(exc: Exception) -> str | None:
     code = getattr(exc, "code", None)
     return code if isinstance(code, str) and _CODE.fullmatch(code) else None
@@ -289,20 +323,13 @@ class AssessorLoop:
 
     def run_one(self) -> tuple[uuid.UUID, JobState | None] | None:
         s = self.settings
-        job = qj.claim(self.worker, s.worker_name, Pool.EXPERIMENT, s.lease, (KIND,))
+        job = qj.claim(self.worker, s.worker_name, Pool.EXPERIMENT, s.lease,
+                       (KIND, OPT_KIND))  # fmt: skip
         if job is None:
             return None
         code, retryable = "", False
         try:
-            spec = AssessmentJob.from_payload(job.payload)
-            r = self.source(self.assessor, job.tenant_id, spec)
-            if (r.study.protocol.experiment_id, r.candidate_id) != (
-                spec.experiment_id, spec.candidate_id
-            ):  # fmt: skip
-                raise Refused("request_mismatch", spec.request_id)
-            beat = partial(qj.heartbeat, self.worker, job, s.lease)
-            ar.promotion_run(self.worker, self.assessor, job.tenant_id, r,
-                             self.strategies, beat)  # fmt: skip
+            self._run(job, partial(qj.heartbeat, self.worker, job, s.lease))
         except LeaseLost:  # another claim may own the job now: record nothing
             log.warning("job %s lost its lease during the run", job.id)
             return job.id, None
@@ -318,6 +345,38 @@ class AssessorLoop:
                 log.exception("job %s: the assessment failed", job.id)
                 code, retryable = "assessment_failed", True
         return job.id, self._finish(job, code, retryable)
+
+    def _run(self, job: ClaimedJob, beat: Callable[[], object]) -> None:
+        if job.kind == OPT_KIND:
+            self._optimizer(job, beat)
+            return
+        spec = AssessmentJob.from_payload(job.payload)
+        r = self.source(self.assessor, job.tenant_id, spec)
+        if (r.study.protocol.experiment_id, r.candidate_id) != (
+            spec.experiment_id, spec.candidate_id
+        ):  # fmt: skip
+            raise Refused("request_mismatch", spec.request_id)
+        ar.promotion_run(self.worker, self.assessor, job.tenant_id, r,
+                         self.strategies, beat)  # fmt: skip
+
+    def _optimizer(self, job: ClaimedJob, beat: Callable[[], object]) -> None:
+        """Decisions 92 and 93: only the bootstrap tenant's job runs, refused before
+        any registry read (`installation_scope`); every refusal of the trial shows
+        the tenant only `optimizer_refused`, its real code and detail logged here."""
+        if bootstrap_tenant(self.assessor) != job.tenant_id:
+            log.warning("job %s: tenant %s is not the installation's operator tenant",
+                        job.id, job.tenant_id)  # fmt: skip
+            raise Refused("installation_scope")
+        try:
+            aro.trial(self.assessor, aro.Request.from_payload(job.payload), beat)
+        except LeaseLost:
+            raise
+        except Exception as exc:
+            code = _refusal(exc)
+            if code is None or code in _OPT_PASS:
+                raise
+            log.warning("job %s: optimizer trial refused: %s", job.id, exc)
+            raise Refused("optimizer_refused") from None
 
     def _finish(self, job: ClaimedJob, code: str, retryable: bool) -> JobState | None:
         try:

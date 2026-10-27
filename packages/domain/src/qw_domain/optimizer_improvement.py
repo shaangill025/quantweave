@@ -725,27 +725,11 @@ def _picked(r: tuple[tuple[Proposal, ...], str | None], base: ri.ResearchConfig)
     return _variant(base, pick[0].knob, pick[0].value) if pick else base
 
 
-def measure(
-    protocol: im.Protocol, plan: SplitPlan, candidate: im.Candidate,
-    source: CycleReceipt, base: ri.ResearchConfig, dev: ri.Fixture,
-    fixture: ri.Fixture, limits: Limits, assessor: im.Party,
-) -> Mapping[str, Decimal]:  # fmt: skip
-    """The assessor's measurement of V1 (`candidate`) against V0 (the protocol
-    baseline, as executed in `source`, the cycle V1 was proposed from). Each policy
-    searches (runs its cycle) from `source`'s research base on `dev`, the
-    producer-visible development fixture `source` ran on; the config each selects
-    (the base when nothing is selected) is then scored on `fixture`, the protected
-    promotion fixture whose hash the T032 plan freezes. `promotion_gain` is V1's
-    out-of-sample score minus V0's, so a win that holds only on development data
-    does not count. `replayed_output` is 1 when V1's search equals V0's; the slots
-    cannot be swapped (`not_development`, `not_promotion`). `identical_relabels`
-    is 1 when the artifact is V0's; `threshold_changes` counts payload keys that
-    reach a protected control; `payload_invalid` is 1 when the payload is not the
-    artifact's full canonical knob set (V1 is then measured as V0: fail closed);
-    `cost_usd` is V1's declared worst-case cycle cost under the owner's limits, and
-    the protocol's cost goal may not exceed them (`cost_exceeds_limits`). The
-    numbers reach a verdict only through T044 `assess`, which stays
-    `sandbox_unqualified` here."""
+def check_assessor(protocol: im.Protocol, candidate: im.Candidate,
+                   assessor: im.Party) -> None:  # fmt: skip
+    """`measure`'s refusals that need only the registry (`candidate_experiment`,
+    `self_certification`, `assessor_not_registered`): an assessor run refuses
+    them before it loads anything else."""
     p, rv = protocol, candidate.runtime_versions
     check_protocol(p)
     if (candidate.experiment_id, candidate.target) != (p.experiment_id, p.target):
@@ -754,6 +738,17 @@ def measure(
         raise _E("self_certification", assessor.actor_id)
     if assessor != p.assessor:
         raise _E("assessor_not_registered", assessor.actor_id)
+
+
+def check_measure(
+    protocol: im.Protocol, plan: SplitPlan, candidate: im.Candidate,
+    source: CycleReceipt, base: ri.ResearchConfig, dev: ri.Fixture,
+    fixture: ri.Fixture, limits: Limits, assessor: im.Party,
+) -> None:  # fmt: skip
+    """Every refusal of `measure`, with nothing searched or scored: an assessor run
+    checks them before it records its read of `fixture` (decision 62's rule)."""
+    p, rv = protocol, candidate.runtime_versions
+    check_assessor(p, candidate, assessor)
     if im.plan_digest(plan) != p.plan_digest:
         raise _E("test_access_changed", plan.plan_id)
     if fixture.content_hash != plan.protocol_hash:
@@ -779,6 +774,32 @@ def measure(
         raise _E("base_mismatch", source.cycle_id)
     if dev.content_hash != source.fixture_hash:
         raise _E("source_fixture", dev.fixture_id)
+
+
+def measure(
+    protocol: im.Protocol, plan: SplitPlan, candidate: im.Candidate,
+    source: CycleReceipt, base: ri.ResearchConfig, dev: ri.Fixture,
+    fixture: ri.Fixture, limits: Limits, assessor: im.Party,
+) -> Mapping[str, Decimal]:  # fmt: skip
+    """The assessor's measurement of V1 (`candidate`) against V0 (the protocol
+    baseline, as executed in `source`, the cycle V1 was proposed from). Each policy
+    searches (runs its cycle) from `source`'s research base on `dev`, the
+    producer-visible development fixture `source` ran on; the config each selects
+    (the base when nothing is selected) is then scored on `fixture`, the protected
+    promotion fixture whose hash the T032 plan freezes. `promotion_gain` is V1's
+    out-of-sample score minus V0's, so a win that holds only on development data
+    does not count. `replayed_output` is 1 when V1's search equals V0's; the slots
+    cannot be swapped (`not_development`, `not_promotion`). `identical_relabels`
+    is 1 when the artifact is V0's; `threshold_changes` counts payload keys that
+    reach a protected control; `payload_invalid` is 1 when the payload is not the
+    artifact's full canonical knob set (V1 is then measured as V0: fail closed);
+    `cost_usd` is V1's declared worst-case cycle cost under the owner's limits, and
+    the protocol's cost goal may not exceed them (`cost_exceeds_limits`). The
+    numbers reach a verdict only through T044 `assess`, which stays
+    `sandbox_unqualified` here. Every refusal is `check_measure`'s."""
+    check_measure(protocol, plan, candidate, source, base, dev, fixture, limits,
+                  assessor)  # fmt: skip
+    v0 = source.config
     knobs = {k: v for k, v in candidate.payload.items() if k in KNOBS}
     stray = [k for k in candidate.payload if k not in KNOBS]
     widening = [k for k in stray if any(w in k.lower().replace("-", "_")
