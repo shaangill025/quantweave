@@ -511,3 +511,19 @@ below waives a test, gate or spec requirement. Numbering continues from
     isolation with no new tables; the tenant gains no access to installation
     data."
     Implemented by: T050 (the assessor-run optimizer trial).
+
+93. **Identifying the installing operator's tenant (T050).**
+    Question: "Decision 93 (T050): to apply decision 92 (only the installing
+    operator's tenant may queue optimizer jobs), the system needs to know which
+    tenant that is, and nothing records it today. How should the operator tenant
+    be identified?"
+    Selected label: "Bootstrap tenant + generic errors (Recommended)".
+    Option text as presented: "For self-hosted, the installation's bootstrap
+    tenant (the first tenant created at install) is the operator tenant; the
+    assessor process gets read access to that one row, and a job from any other
+    tenant is refused before any registry read. Also, every optimizer refusal
+    shows only one generic code in the tenant-visible job error, with detail kept
+    in the assessor log. Hosted gets its own binding later. Why: uses an
+    existing, owner-created record, adds one narrow grant, and removes the
+    registry oracle now."
+    Implemented by: T050 (the assessor-run optimizer trial).
