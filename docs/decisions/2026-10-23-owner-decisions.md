@@ -527,3 +527,18 @@ below waives a test, gate or spec requirement. Numbering continues from
     existing, owner-created record, adds one narrow grant, and removes the
     registry oracle now."
     Implemented by: T050 (the assessor-run optimizer trial).
+
+94. **Reserving the optimizer verdict's cost (T050).**
+    Question: "Decision 94 (T050): the optimizer's measured verdict currently
+    records its costs as declared but not reserved (the deterministic proposer
+    from decision 89 spends nothing). Strategy promotions instead require the
+    cost to be reserved in a budget book first. What should the optimizer verdict
+    require once the sandbox gate can open?"
+    Selected label: "Reserve in a budget book (Recommended)".
+    Option text as presented: "Before an optimizer verdict can accept, its
+    declared worst-case cost is reserved against your monthly improvement cap
+    (USD20) in a durable budget book, like strategy promotions; until that store
+    exists the verdict stays marked 'declared_costs_not_reserved' and the gate
+    stays shut. Why: one cost control for every improvement path, enforced, not
+    just declared."
+    Implemented by: T050 (the measured optimizer verdict).
