@@ -27,6 +27,10 @@ and re-parses the strict domain wire; any mismatch is `integrity`.
   a logged protocol and verdict (`not_logged`); a second under its id or hash is
   `duplicate`. `load_lineage` (qw_release) returns an `UnverifiedLineage`, never
   a `LineageReceipt`: the caller runs `verify_lineage`.
+- `RunLog(conn, installation_id)` (qw_assessor; 0049): the trial's durable run log
+  (decisions 42, 59, 60). Writes take the `optimizer:<installation>` lock and
+  verify the plan's rows first; 0049's guards give the refusals. `put_outcome`
+  keeps the first digest (`verdict_conflict` for another). Reads: `integrity`.
 A database refusal of the clock window is `clock`; any other login is `forbidden`.
 LIMITATIONS: hash-only, unkeyed and unsigned (dropping the latest rows is not
 detected); an installed V1's cycles cannot be stored (0029 refuses an optimizer
@@ -55,7 +59,10 @@ from qw_adapters.experiment_registry_store import _PARSE, Head, LogEntry, _ident
 Conn = psycopg.Connection[Any]
 _COLS = ("seq", "kind", "entry_id", "body", "recorded_at", "prev_hash", "event_hash")
 _REFUSALS = frozenset({"clock", "registry_moved", "back_dated", "runner_not_baseline",
-                       "not_logged"})  # fmt: skip
+                       "not_logged", "attempt_moved", "rerun_mismatch", "rerun_used",
+                       "not_evaluating", "run_reserved", "run_recorded",
+                       "not_reserved"})  # fmt: skip
+MAX_ATTEMPTS = 4  # the reservation and three re-runs (decision 59)
 _BAD = (ValueError, TypeError, KeyError, ResearchError)
 
 
@@ -275,3 +282,100 @@ def load_lineage(conn: Conn, installation_id: str, lineage_id: str,
     except _BAD as exc:
         raise OptimizerStoreError("integrity", type(exc).__name__) from None
     return u
+
+
+@dataclass(frozen=True, slots=True)
+class Reservation:  # decision 42's write-ahead record of the plan's one read
+    experiment_id: str
+    candidate_id: str
+    verdict_id: str
+    fixture_hash: str  # the read: the plan's promotion fixture
+    inputs: str  # the digest of every input the trial and verdict depend on
+
+
+def run_hash(installation: str, plan_id: str, attempt: int, r: Reservation,
+             at: datetime) -> str:  # fmt: skip
+    return digest(["optimizer_run", installation, plan_id, attempt, r.experiment_id,
+                   r.candidate_id, r.verdict_id, r.fixture_hash, r.inputs,
+                   format_instant(at)])  # fmt: skip
+
+
+def outcome_hash(installation: str, plan_id: str, attempt: int, d: str,
+                 at: datetime) -> str:  # fmt: skip
+    return digest(["optimizer_run_outcome", installation, plan_id, attempt, d,
+                   format_instant(at)])  # fmt: skip
+
+
+@dataclass(frozen=True, slots=True)
+class RunLog:
+    """The installation's durable optimizer run log (qw_assessor); each call is
+    one transaction, and each write re-checks under the installation lock."""
+
+    conn: Conn
+    installation_id: str
+
+    def attempts(self, plan_id: str) -> tuple[Reservation, ...]:
+        rows = _rows(self.conn, "SELECT * FROM app.optimizer_run WHERE "
+                     "installation_id = %s AND plan_id = %s ORDER BY attempt",
+                     self.installation_id, plan_id)  # fmt: skip
+        out = []
+        try:
+            for n, r in enumerate(rows, 1):  # attempts 1..n, each hash-bound
+                x = Reservation(r["experiment_id"], r["candidate_id"],
+                                r["verdict_id"], r["fixture_hash"],
+                                r["inputs_digest"])  # fmt: skip
+                at = ensure_aware_utc(r["recorded_at"])
+                if r["attempt"] != n or r["event_hash"] != run_hash(
+                    self.installation_id, plan_id, n, x, at
+                ):  # fmt: skip
+                    raise ValueError(f"attempt {r['attempt']}")
+                out.append(x)
+        except _BAD as exc:
+            raise OptimizerStoreError("integrity", type(exc).__name__) from None
+        return tuple(out)
+
+    def reserve(self, plan_id: str, attempt: int, r: Reservation) -> None:
+        """The guard (0049) refuses all but the next attempt repeating the first;
+        the log it extends is verified first, under the same lock."""
+        inst = self.installation_id
+        with self.conn.transaction():
+            at = _now(self.conn, f"optimizer:{inst}")
+            self.attempts(plan_id)
+            _insert(self.conn, "optimizer_run", {
+                "installation_id": inst, "plan_id": plan_id, "attempt": attempt,
+                "experiment_id": r.experiment_id, "candidate_id": r.candidate_id,
+                "verdict_id": r.verdict_id, "fixture_hash": r.fixture_hash,
+                "inputs_digest": r.inputs, "recorded_at": at,
+                "event_hash": run_hash(inst, plan_id, attempt, r, at)})  # fmt: skip
+
+    def outcome(self, plan_id: str) -> str | None:
+        rows = _rows(self.conn, "SELECT * FROM app.optimizer_run_outcome WHERE "
+                     "installation_id = %s AND plan_id = %s",
+                     self.installation_id, plan_id)  # fmt: skip
+        if not rows:
+            return None
+        r = rows[0]
+        try:
+            at = ensure_aware_utc(r["recorded_at"])
+            if r["event_hash"] != outcome_hash(self.installation_id, plan_id,
+                                               r["attempt"], r["outcome_digest"],
+                                               at):  # fmt: skip
+                raise ValueError(plan_id)
+        except _BAD as exc:
+            raise OptimizerStoreError("integrity", type(exc).__name__) from None
+        return str(r["outcome_digest"])
+
+    def put_outcome(self, plan_id: str, attempt: int, digest_: str) -> None:
+        inst = self.installation_id
+        with self.conn.transaction():
+            at = _now(self.conn, f"optimizer:{inst}")
+            got = self.outcome(plan_id)
+            if got is not None:
+                if got != digest_:
+                    raise OptimizerStoreError("verdict_conflict", plan_id)
+                return
+            _insert(self.conn, "optimizer_run_outcome", {
+                "installation_id": inst, "plan_id": plan_id, "attempt": attempt,
+                "outcome_digest": digest_, "recorded_at": at,
+                "event_hash": outcome_hash(inst, plan_id, attempt, digest_, at),
+            })  # fmt: skip

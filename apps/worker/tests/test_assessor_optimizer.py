@@ -247,7 +247,7 @@ def test_gate_lifted_job_retries_a_crash_and_completes_a_redelivery(
     """GATE-LIFTED SYNTHETIC: a crash after the reservation is retried; the retry
     re-runs under the recorded read; a redelivered recorded run completes."""
     (wrk, _), (t, r) = logins, world
-    log, before = ot.MemoryLog(), ot.entries(conn)
+    log, before = os_.RunLog(logins[1], ot.INST), ot.entries(conn)  # durable (0049)
     jid = submit(wrk, t, r)
     monkeypatch.setattr(aro, "trial", lifted(log, crash=True))
     assert loop(logins).run_one() == (jid, JobState.QUEUED)
