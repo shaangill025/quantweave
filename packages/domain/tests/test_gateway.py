@@ -13,7 +13,14 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 from qw_domain import rights as rg
-from qw_domain.budget import BudgetBook, BudgetCaps, BudgetError, Category, Status
+from qw_domain.budget import (
+    MAX_DEADLINE,
+    BudgetBook,
+    BudgetCaps,
+    BudgetError,
+    Category,
+    Status,
+)
 from qw_domain.decimals import UsdBudget as Usd
 from qw_domain.gateway import (
     Admission,
@@ -203,6 +210,12 @@ def test_budget_refusals_are_typed() -> None:
     pricey = route(rates=Rates(Usd("30000"), Usd("0"), "rate-c"))
     # 2 x 4000 x 30000 / 1e6 = USD240 > USD100
     assert "budget:inference_cap" in refused(request(), pricey)
+    # deadline = at + wall x attempts (20 s x 2) + grace: past MAX_DEADLINE it is
+    # a typed budget denial; exactly at it, the request is admitted
+    late = replace(ctx(), reconcile_grace=MAX_DEADLINE)
+    assert "budget:deadline_too_far" in refused(request(), route(), context=late)
+    edge = replace(ctx(), reconcile_grace=MAX_DEADLINE - timedelta(seconds=40))
+    assert isinstance(admit(request(), (route(),), edge, book(), AT), Admission)
 
 
 def test_fallback_needs_an_explicit_permission_naming_the_route() -> None:
