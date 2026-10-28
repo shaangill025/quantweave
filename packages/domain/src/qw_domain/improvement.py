@@ -719,6 +719,22 @@ def _bound(p: Protocol, r: Reservation) -> bool:
     )
 
 
+def reservation_gap(p: Protocol, book: BudgetBook | None, scope_id: str | None,
+                    at: datetime | None = None) -> str | None:  # fmt: skip
+    """Why `book` does not hold `p`'s frozen reservation, open, for `scope_id`
+    (`budget_not_reserved`, `reservation_terms_mismatch`; with `at`, also
+    `reservation_expired` at or after its deadline); None when it does. `assess`
+    passes no `at` (status only, as before)."""
+    r = None if book is None or book.scope_id != scope_id else (
+        book.find(p.budget_reservation_id))  # fmt: skip
+    if r is None or r.status is not Status.RESERVED:
+        return "budget_not_reserved"
+    if not _bound(p, r):
+        return "reservation_terms_mismatch"
+    expired = at is not None and ensure_aware_utc(at) >= r.deadline
+    return "reservation_expired" if expired else None
+
+
 def schedule(
     registry: ExperimentRegistry, queue: Sequence[str], book: BudgetBook, at: datetime
 ) -> tuple[BudgetBook, tuple[Scheduled | Deferred, ...]]:
@@ -790,11 +806,8 @@ def assess(
     blocked = []
     if assessor != p.assessor:
         blocked.append("assessor_not_registered")
-    r = book.find(p.budget_reservation_id)
-    if book.scope_id != p.scope_id or r is None or r.status is not Status.RESERVED:
-        blocked.append("budget_not_reserved")
-    elif not _bound(p, r):
-        blocked.append("reservation_terms_mismatch")
+    if gap := reservation_gap(p, book, p.scope_id):
+        blocked.append(gap)
     try:
         plan = ledger.plan(p.plan_id)
     except ResearchError:

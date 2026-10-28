@@ -50,6 +50,7 @@ lifted_assess: aro.Assess = ot.lifted_assess
 login: Callable[[dict[str, str], tn.RuntimeRole], Iterator[Conn]] = ot.login
 now: Callable[[Conn], datetime] = ot.now
 stored_world: Callable[[Conn, Conn], aro.Request] = ot.stored_world
+operator: Callable[..., object] = ot.operator
 pytestmark = pytest.mark.db
 TABLES = ("optimizer_run", "optimizer_run_outcome")
 GUARDS = ("optimizer_run_guard()", "optimizer_run_outcome_guard()",
@@ -65,8 +66,9 @@ def asr(runtime_urls: dict[str, str]) -> Iterator[Conn]:
 
 
 @pytest.fixture
-def world(asr: Conn, runtime_urls: dict[str, str]) -> aro.Request:
+def world(asr: Conn, conn: Conn, runtime_urls: dict[str, str]) -> aro.Request:
     for wrk in login(runtime_urls, "qw_worker"):  # closed once the world is stored
+        operator(conn, wrk)  # MP's reservation in the bootstrap book (decision 98)
         r = stored_world(asr, wrk)
     return r
 
@@ -80,7 +82,8 @@ def count(conn: Conn, table: str) -> int:
 def verdict(asr: Conn, vid: str = "verdict-opt-db-1") -> im.Verdict:
     """An INSUFFICIENT verdict of the world's candidate (nothing measured)."""
     return lifted_assess(os_.load(asr, INST, now(asr)), EXP, "cand-opt-1", None,
-                         ASSESSOR, now(asr), vid)  # fmt: skip
+                         *aro.operator_book(asr, MP), ASSESSOR, now(asr),
+                         vid)  # fmt: skip
 
 
 def raw_run(c: Conn, attempt: int, plan: str = PLAN, at: str = "clock_timestamp()",

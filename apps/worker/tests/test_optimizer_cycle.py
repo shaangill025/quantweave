@@ -1,11 +1,13 @@
 """The `optimizer.cycle` job and the GATE-LIFTED recursion chain on the real stores
-(T050 increment 8): real logins, SYNTHETIC data, test-only HMAC keys."""
+(T050 increments 8 and 9: the job reserves the verdict's cost, decision 98): real
+logins, SYNTHETIC data and authorizations, test-only HMAC keys."""
 
 from __future__ import annotations
 
 import importlib.util
 import logging
 import sys
+import time
 import uuid
 from collections.abc import Iterator
 from dataclasses import replace
@@ -18,6 +20,7 @@ import psycopg
 import pytest
 import test_release as tr
 from qw_adapters import assessor_run_optimizer as aro
+from qw_adapters import budget_store as bs
 from qw_adapters import jobs as qj
 from qw_adapters import optimizer_fixture_store as ofs
 from qw_adapters import optimizer_store as os_
@@ -77,13 +80,26 @@ def logins(runtime_urls: dict[str, str]) -> Iterator[tuple[Conn, Conn, Conn]]:
         yield w, a, r
 
 
-def setup(logins: tuple[Conn, Conn, Conn]) -> None:
+def setup(logins: tuple[Conn, Conn, Conn], p: im.Protocol = MP) -> None:
     """The operator preregisters the fixture, logs the protocol and records the
     deployment (no install can be stored)."""
     _, asr, rel = logins
     assert ofs.preregister(asr, INST, PLAN, FIXTURE)
-    os_.append(asr, INST, MP)
+    os_.append(asr, INST, p)
     assert rs.record_deployment(rel, DEP)
+
+
+def operator(app_conn: Conn, conn: Conn) -> uuid.UUID:
+    """The bootstrap tenant, with the owner's SYNTHETIC spending authorization."""
+    t: uuid.UUID = tenant(app_conn, bootstrap=True)
+    ot.authorize(conn, t)
+    return t
+
+
+def held(wrk: Conn, t: uuid.UUID) -> bs.StoredBook | None:
+    """`t`'s book holding MP's reservation (qw_worker reads its own tenant)."""
+    with tn.tenant_transaction(wrk, t) as tx:
+        return bs.holding(tx, MP.budget_reservation_id)
 
 
 def job(cid: str = "cycle-v0-job", **kw: Any) -> oc.CycleJob:
@@ -106,11 +122,11 @@ def tick(wrk: Conn, n: int = 10) -> list[tuple[uuid.UUID, JobState | None]]:
 
 
 def test_the_cycle_job_stores_a_baseline_cycle(
-    logins: tuple[Conn, Conn, Conn], app_conn: Conn
+    logins: tuple[Conn, Conn, Conn], app_conn: Conn, conn: Conn
 ) -> None:
     wrk, asr, _ = logins
     setup(logins)
-    t = tenant(app_conn, bootstrap=True)
+    t = operator(app_conn, conn)
     jid = submit(wrk, t, job())
     assert submit(wrk, t, job()) == jid  # idempotent on the payload
     assert (
@@ -128,6 +144,48 @@ def test_the_cycle_job_stores_a_baseline_cycle(
     assert r.at <= s.recorded_at
     assert oc.CycleJob.from_payload(job().to_payload()).to_payload() == (
         job().to_payload())  # fmt: skip
+    first = held(wrk, t)  # decision 98: reserved before the cycle, committed with it
+    assert first is not None and first.book.scope_id == str(t)
+    res = first.book.get(MP.budget_reservation_id)
+    assert (res.category.value, res.reserved, res.provider_account_ref,
+            res.max_output_tokens, res.status.value, res.deadline - res.created_at) == (
+        "improvement", MP.max_cost, MP.provider_account_ref, MP.max_output_tokens,
+        "reserved", MP.max_duration)  # fmt: skip
+    assert res.created_at <= r.at
+    jid = submit(wrk, t, job("cycle-v0-again"))  # another cycle: the same reservation
+    assert tick(wrk) == [(jid, JobState.SUCCEEDED)]
+    assert held(wrk, t) == first and len(os_.load_cycles(asr, INST, EXP)) == 2
+
+
+def test_no_authorization_refuses_before_anything_is_measured(
+    logins: tuple[Conn, Conn, Conn], app_conn: Conn, conn: Conn,
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture,
+) -> None:  # fmt: skip
+    """No owner-recorded authorization: a typed refusal, no book, no cycle; other
+    budget refusals (here `deadline_too_far`) roll back the same way."""
+    wrk, asr, _ = logins
+    setup(logins)
+    t, runs = tenant(app_conn, bootstrap=True), list[object]()
+    real = oi.run_cycle
+
+    def spy(*a: Any, **k: Any) -> Any:
+        runs.append(a)
+        return real(*a, **k)
+
+    monkeypatch.setattr(oi, "run_cycle", spy)
+    jid = submit(wrk, t, job())
+    with caplog.at_level(logging.WARNING, "qw_worker.optimizer_cycle"):
+        assert tick(wrk) == [(jid, JobState.FAILED)]
+    assert state(wrk, t, jid) == (JobState.FAILED, "optimizer_refused")
+    assert "optimizer cycle refused: no_authorization" in caplog.text
+    assert (runs, held(wrk, t), os_.load_cycles(asr, INST, EXP)) == ([], None, ())
+    ot.authorize(conn, t)
+    long = replace(MP, max_duration=timedelta(days=8))  # past MAX_DEADLINE
+    jid = submit(wrk, t, job("cycle-v0-long", protocol=long))
+    with caplog.at_level(logging.WARNING, "qw_worker.optimizer_cycle"):
+        assert tick(wrk) == [(jid, JobState.FAILED)]
+    assert "optimizer cycle refused: deadline_too_far" in caplog.text
+    assert (runs, held(wrk, t)) == ([], None)
 
 
 def test_the_entry_point_registers_the_cycle_handler(
@@ -163,11 +221,11 @@ def test_another_tenant_or_a_hosted_edition_is_refused_before_any_read(
 
 def test_refusals_are_generic_and_faults_retry(
     logins: tuple[Conn, Conn, Conn], app_conn: Conn, monkeypatch: pytest.MonkeyPatch,
-    caplog: pytest.LogCaptureFixture,
+    caplog: pytest.LogCaptureFixture, conn: Conn,
 ) -> None:  # fmt: skip
     wrk, asr, _ = logins
     setup(logins)
-    t = tenant(app_conn, bootstrap=True)
+    t = operator(app_conn, conn)
     v1 = oi.OptimizerConfig.from_payload("opt-v1", V1R.to_payload())
     cases: list[tuple[object, str]] = [
         ({"cycle_id": "x"}, "payload_invalid: exactly"),
@@ -182,6 +240,9 @@ def test_refusals_are_generic_and_faults_retry(
         (job(protocol=replace(MP, hypothesis="SYNTHETIC: x")), "protocol_mismatch"),
         (job(protocol=replace(MP, producer=replace(MP.producer, route_id="route-x"))),
          "protocol_mismatch"),
+        # forged terms are reserved first, then refused and rolled back with it
+        (job(protocol=replace(MP, max_cost=MP.max_cost + MP.max_cost)),
+         "protocol_mismatch"),
     ]  # fmt: skip
     for payload, detail in cases:
         caplog.clear()
@@ -190,8 +251,12 @@ def test_refusals_are_generic_and_faults_retry(
             assert tick(wrk) == [(jid, JobState.FAILED)], detail
         assert state(wrk, t, jid) == (JobState.FAILED, "optimizer_refused"), detail
         assert f"optimizer cycle refused: {detail}" in caplog.text, detail
+    assert held(wrk, t) is None  # every refusal rolled its reservation back
     jid = submit(wrk, t, job())
     assert tick(wrk) == [(jid, JobState.SUCCEEDED)]
+    stored = held(wrk, t)
+    assert stored is not None  # the frozen terms, not a forged job's
+    assert stored.book.get(MP.budget_reservation_id).reserved == MP.max_cost
     jid = submit(wrk, t, job(cid=job().cycle_id, limits=replace(LIMITS, max_depth=1)))
     assert tick(wrk) == [(jid, JobState.FAILED)]  # 0047: the cycle id is taken
     assert state(wrk, t, jid) == (JobState.FAILED, "optimizer_refused")
@@ -206,17 +271,52 @@ def test_refusals_are_generic_and_faults_retry(
     with tn.tenant_transaction(wrk, t) as tx:
         shown = {r[0] for r in tx.conn.execute("SELECT last_error FROM app.job")}
     assert shown <= SHOWN and len(os_.load_cycles(asr, INST, EXP)) == 1
+    assert held(wrk, t) == stored  # retries and refusals never re-reserve
+
+
+def test_a_cycle_after_the_reservation_window_is_refused(
+    logins: tuple[Conn, Conn, Conn], app_conn: Conn, conn: Conn,
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture,
+) -> None:  # fmt: skip
+    """Review fix 1: one reservation per experiment (`max_duration` window); a
+    cycle after its deadline is refused (`reservation_expired`) before anything
+    is measured, and nothing is re-reserved. SYNTHETIC 2-second window."""
+    wrk, asr, _ = logins
+    short = replace(MP, max_duration=timedelta(seconds=2))
+    setup(logins, short)
+    t = operator(app_conn, conn)
+    jid = submit(wrk, t, job(protocol=short))
+    assert tick(wrk) == [(jid, JobState.SUCCEEDED)]
+    first = held(wrk, t)
+    assert first is not None
+    deadline = first.book.get(MP.budget_reservation_id).deadline
+    runs = list[object]()
+    real = oi.run_cycle
+
+    def spy(*a: Any, **k: Any) -> Any:
+        runs.append(a)
+        return real(*a, **k)
+
+    monkeypatch.setattr(oi, "run_cycle", spy)
+    time.sleep(max(0.0, (deadline - now(wrk)).total_seconds()) + 0.2)
+    jid = submit(wrk, t, job("cycle-v0-late", protocol=short))
+    with caplog.at_level(logging.WARNING, "qw_worker.optimizer_cycle"):
+        assert tick(wrk) == [(jid, JobState.FAILED)]
+    assert state(wrk, t, jid) == (JobState.FAILED, "optimizer_refused")
+    assert "optimizer cycle refused: reservation_expired" in caplog.text
+    assert (runs, held(wrk, t)) == ([], first)
+    assert len(os_.load_cycles(asr, INST, EXP)) == 1
 
 
 @pytest.mark.usefixtures("gate_lifted_install")
 def test_gate_lifted_recursion_chain_on_the_stores(
-    logins: tuple[Conn, Conn, Conn], app_conn: Conn
+    logins: tuple[Conn, Conn, Conn], app_conn: Conn, conn: Conn
 ) -> None:
     """GATE-LIFTED SYNTHETIC. Production keeps every gate: the trial's
     `sandbox_unqualified`, 0050's install refusal and 0047's baseline-only cycles."""
     wrk, asr, rel = logins
     setup(logins)
-    t = tenant(app_conn, bootstrap=True)
+    t = operator(app_conn, conn)
     jid = submit(wrk, t, job())
     assert tick(wrk) == [(jid, JobState.SUCCEEDED)]  # 1. V0's cycle, by the job
     (s0,) = os_.load_cycles(asr, INST, EXP)
@@ -230,6 +330,8 @@ def test_gate_lifted_recursion_chain_on_the_stores(
     req = aro.Request(INST, EXP, "cand-opt-1", r0.cycle_id, "verdict-opt-1",
                       ASSESSOR, now(asr))  # fmt: skip
     assert ot.code(lambda: aro.trial(asr, req)) == "sandbox_unqualified"  # real
+    book, scope = aro.operator_book(asr, MP)  # the job's reservation (decision 98)
+    assert scope == str(t) and book == held(wrk, t).book  # type: ignore[union-attr]
     b, p, c, cyc = aro._before_gate(asr, req, ot.lifted_assess)  # 3. measured
     run = aro._after_gate(asr, req, lambda: None, b, p, c, cyc,
                           aro.stored_inputs(asr, lambda x: (BASE, DEV, LIMITS)),
@@ -292,4 +394,4 @@ def test_gate_lifted_recursion_chain_on_the_stores(
     assert got == lin and got.claim.v0_cycle == r0
     assert got.claim.next_cycle.cycle_id == "cycle-v1-1"
     assert got.claim.verdict_id == "verdict-opt-1"
-    assert "declared_costs_not_reserved" in got.claim.verdict_limitations
+    assert "declared_costs_not_reserved" not in got.claim.verdict_limitations

@@ -1,13 +1,25 @@
-"""The `optimizer.cycle` job (T050 increment 8; decisions 87, 92, 93, 97): an
-experiment-pool worker on qw_worker runs one optimizer cycle on the development
-fixture and stores it. `handle`: a job from any tenant but the bootstrap one (or
-with no bootstrap row: hosted) is `installation_scope` before any read; then the
-strict `CycleJob` payload (the protocol as logged: qw_worker cannot read the
-registry); the deployment head (`release_store.load`), from which `run_cycle`
-derives `runner_authority` (the baseline until 0050 admits an install); the
-cycle at the DB clock; `append_cycle` in the job's transaction, where 0047 and
-0051 admit only the logged baseline under the logged protocol. Coded refusals
-fail as `optimizer_refused` (the code is logged); `database` retries.
+"""The `optimizer.cycle` job (T050 increments 8, 9; decisions 87, 92 to 94, 97,
+98): an experiment-pool worker on qw_worker runs one optimizer cycle on the
+development fixture and stores it. `handle`: a job from any tenant but the
+bootstrap one (or with no bootstrap row: hosted) is `installation_scope` before
+any read; then the strict `CycleJob` payload (the protocol as logged: qw_worker
+cannot read the registry); the deployment head (`release_store.load`), from
+which `run_cycle` derives `runner_authority` (the baseline until 0050 admits an
+install). Decision 98: before the cycle measures anything, the protocol's
+frozen worst case (`budget_reservation_id`, `max_cost`, provider account, token
+bound; deadline the DB clock + `max_duration`, as `im.schedule`) is reserved in
+the bootstrap tenant's book (`budget_store.reserve_once`: a same-id retry
+changes nothing). The reservation is per experiment, not per cycle, as in
+`im.schedule` (one per protocol, never re-reserved): `max_cost` is the worst case
+of the whole experiment within its `max_duration`, so every cycle of it runs
+only inside that window, and one after the deadline, in this month or a later
+one, is refused (`reservation_expired`). Then the cycle at the DB clock and
+`append_cycle` in the job's transaction, where 0047 and 0051 admit only the
+logged baseline under the logged protocol, so the reservation commits with the
+cycle or not at all. Coded refusals (budget ones too: `no_authorization`,
+`improvement_cap`, `reservation_expired`, ...) fail as `optimizer_refused` (the
+code is logged); `database`, `stale_version` and `stale_clock` retry as
+`database`.
 LIMITATIONS: no history (qw_worker cannot read cycles), so patience and the cap
 see one cycle; the base, dev fixture (evidence class unchecked) and limits are
 the operator's."""
@@ -20,6 +32,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from types import MappingProxyType
 
+from qw_adapters import budget_store as bs
 from qw_adapters import jobs as qj
 from qw_adapters import optimizer_fixture_store as ofs
 from qw_adapters import optimizer_store as os_
@@ -42,6 +55,7 @@ _KEYS = ("installation_id", "experiment_id", "cycle_id", "deployment_id",
          "protocol", "runner", "base", "dev", "limits")  # fmt: skip
 _BAD = (ValueError, TypeError, KeyError, IndexError, ResearchError,
         im.ImprovementError)  # fmt: skip
+_RETRY = frozenset({"database", "stale_version", "stale_clock"})
 
 
 class CycleRefused(Exception):
@@ -110,9 +124,20 @@ def bootstrap_tenant(conn: Conn) -> uuid.UUID | None:
     return None if row is None else uuid.UUID(str(row[0]))
 
 
-def run(conn: Conn, j: CycleJob) -> os_.StoredCycle:
-    """One cycle of `j`'s runner under the deployment head, stored (qw_worker)."""
-    p = j.protocol
+def reserve(tx: TenantTx, p: im.Protocol) -> bs.StoredBook:
+    """Decision 98: `p`'s frozen worst case, reserved once in `tx`'s tenant's book."""
+    row = tx.conn.execute("SELECT clock_timestamp()").fetchone()
+    assert row is not None
+    at = ensure_aware_utc(row[0])
+    return bs.reserve_once(tx, p.budget_reservation_id, p.max_cost,
+                           p.provider_account_ref, p.max_output_tokens, at,
+                           at + p.max_duration)  # fmt: skip
+
+
+def run(tx: TenantTx, j: CycleJob) -> os_.StoredCycle:
+    """One cycle of `j`'s runner under the deployment head, its cost reserved
+    first, stored (qw_worker, in the bootstrap tenant's transaction)."""
+    conn, p = tx.conn, j.protocol
     if (p.scope, p.scope_id, p.target, p.experiment_id) != (
         im.Scope.INSTALLATION, j.installation_id, oi.OPT, j.experiment_id
     ):  # fmt: skip
@@ -124,6 +149,7 @@ def run(conn: Conn, j: CycleJob) -> os_.StoredCycle:
     ledger = rs.load(conn, j.deployment_id)
     if ledger is None:
         raise CycleRefused("deployment_unknown", j.deployment_id)
+    reserve(tx, p)
     row = conn.execute("SELECT clock_timestamp()").fetchone()
     assert row is not None
     r = oi.run_cycle(j.cycle_id, j.runner, reg, j.experiment_id, ledger, j.base,
@@ -139,12 +165,13 @@ def handle(tx: TenantTx, job: ClaimedJob) -> None:
                     job.id, job.tenant_id)  # fmt: skip
         raise HandlerFailed("installation_scope", retryable=False)
     try:
-        run(tx.conn, CycleJob.from_payload(job.payload))
+        run(tx, CycleJob.from_payload(job.payload))
     except Exception as exc:
         code = getattr(exc, "code", None)
         if not isinstance(code, str):
             raise
-        if code == "database":
+        if code in _RETRY:
+            log.warning("job %s: optimizer cycle retried: %s", job.id, exc)
             raise HandlerFailed("database", retryable=True) from None
         log.warning("job %s: optimizer cycle refused: %s", job.id, exc)
         raise HandlerFailed("optimizer_refused", retryable=False) from None

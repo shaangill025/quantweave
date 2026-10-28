@@ -1,5 +1,5 @@
 """The durable budget book (`0052_budget_book.sql`; T037; spec §10, §11, §15;
-T008 F-18; decision 94 will reserve the optimizer verdict's cost here). One
+T008 F-18; decisions 94 and 98 reserve the optimizer verdict's cost here). One
 `BudgetBook` per tenant and UTC month, its scope the session tenant id (the
 gateway's `req.tenant_id == book.scope_id`), written only by compare-and-set:
 - `load(tx, period)`: the book or None; every read re-hashes the row and
@@ -18,26 +18,43 @@ gateway's `req.tenant_id == book.scope_id`), written only by compare-and-set:
   (`stale_clock`: reload and retry; a row-lock wait can cause it).
 - `expire_due(tx, period)`: `BudgetBook.expire_due` at the database clock as one
   step (installed at `version + 1`; the domain counts one per expiry).
+- `reserve_once(tx, ...)`: one reservation, never twice: the latest book holding
+  its id is returned unchanged if the domain's same-id retry accepts it (else
+  that refusal's code) and its deadline is after `at` (else
+  `reservation_expired`: a later cycle or month never reuses a lapsed window,
+  and nothing re-reserves the id); otherwise it is reserved in `at`'s month,
+  the book opened from `PILOT` and the tenant's latest owner-recorded
+  authorization (`no_authorization` if none), by `install`, retried on
+  `stale_version`; a domain refusal is its code (`inference_cap`, ...).
 No retry resets a reservation, deadline or cost. Every call needs the open
 `tenant_transaction` of `tx` (`tenant_transaction`); only qw_app and qw_worker
-may (`forbidden`)."""
+may (`forbidden`). `operator_holding(conn, id)` is qw_assessor's one read (0053,
+decision 98): in one statement, the bootstrap tenant's id and its latest book
+holding `id`."""
 
 from __future__ import annotations
 
+import uuid
 from dataclasses import dataclass, replace
 from datetime import datetime
+from types import MappingProxyType
 from typing import Any
 
 import psycopg
 from psycopg import pq
 from psycopg.types.json import Jsonb
-from qw_domain.budget import BudgetBook, BudgetCaps, BudgetError
+from qw_domain.budget import BudgetBook, BudgetCaps, BudgetError, Category, period_of
+from qw_domain.decimals import UsdBudget
 from qw_domain.instants import ensure_aware_utc
 from qw_domain.research_data import digest
 
-from qw_adapters.tenancy import TenantTx
+from qw_adapters.tenancy import Conn, TenantTx
 
 _COLS = ("scope_id", "period", "version", "book", "book_hash", "updated_at")
+# `budgets_and_slos.json`'s caps (0052's CHECK holds the same; a test pins both)
+PILOT = MappingProxyType({"pilot_monthly_usd": "100.00",
+                          "improvement_monthly_usd_max": "20.00"})  # fmt: skip
+_CAS_TRIES = 3
 
 
 class BudgetStoreError(Exception):
@@ -109,6 +126,90 @@ def load(tx: TenantTx, period: str) -> StoredBook | None:
     except psycopg.Error as exc:
         raise _database(exc) from None
     return None if row is None else _parse(tx, scope, period, row)
+
+
+def holding(tx: TenantTx, reservation_id: str) -> StoredBook | None:
+    """The session tenant's latest book holding `reservation_id`, or None."""
+    scope = _tenant(tx)
+    try:
+        row = tx.conn.execute(
+            f"SELECT {', '.join(_COLS)} FROM app.budget_book WHERE tenant_id = %s "
+            "AND book -> 'reservations' @> %s ORDER BY period DESC LIMIT 1",
+            (tx.tenant_id, Jsonb([{"reservation_id": reservation_id}])),
+        ).fetchone()
+    except psycopg.Error as exc:
+        raise _database(exc) from None
+    return None if row is None else _parse(tx, scope, row[1], row)
+
+
+def operator_holding(conn: Conn, reservation_id: str) -> tuple[
+    uuid.UUID | None, StoredBook | None
+]:  # fmt: skip
+    """qw_assessor (0053), one statement: the bootstrap tenant (None: no row,
+    hosted) and its latest book holding `reservation_id` (None if none),
+    re-verified as `load` does; a book of another scope is `integrity`."""
+    try:
+        row = conn.execute(
+            f"SELECT tenant_id, {', '.join(_COLS)} FROM app.budget_book_operator(%s)",
+            (reservation_id,),
+        ).fetchone()
+    except psycopg.Error as exc:
+        raise _database(exc) from None
+    if row is None:
+        return None, None
+    t = uuid.UUID(str(row[0]))
+    if row[1] is None:
+        return t, None
+    tx = TenantTx(conn, t)  # only names the scope the row must have
+    return t, _parse(tx, str(t), row[2], row[1:])
+
+
+def _caps(tx: TenantTx) -> BudgetCaps:
+    """`PILOT` with the tenant's latest owner-recorded authorization."""
+    try:
+        row = tx.conn.execute(
+            "SELECT authorization_ref FROM app.budget_authorization WHERE "
+            "tenant_id = %s ORDER BY recorded_at DESC, authorization_ref LIMIT 1",
+            (tx.tenant_id,),
+        ).fetchone()
+    except psycopg.Error as exc:
+        raise _database(exc) from None
+    if row is None:
+        raise BudgetStoreError("no_authorization", "none recorded for the tenant")
+    return BudgetCaps.from_config(PILOT, authorization_ref=row[0])
+
+
+def reserve_once(
+    tx: TenantTx, reservation_id: str, amount: UsdBudget, provider_account_ref: str,
+    max_output_tokens: int, at: datetime, deadline: datetime,
+    category: Category = Category.IMPROVEMENT,
+) -> StoredBook:  # fmt: skip
+    """Reserve these terms once (module docstring); the stored book holding it."""
+    terms = (reservation_id, category, amount, provider_account_ref,
+             max_output_tokens, at, deadline)  # fmt: skip
+    try:
+        if (held := holding(tx, reservation_id)) is not None:
+            _, refusal = held.book.reserve(*terms)  # unchanged, or a refusal
+            if refusal is not None:
+                raise BudgetStoreError(refusal.code, refusal.detail)
+            if held.book.get(reservation_id).deadline <= ensure_aware_utc(at):
+                raise BudgetStoreError("reservation_expired", held.book.period)
+            return held
+        for _ in range(_CAS_TRIES):
+            stored = load(tx, period_of(at))
+            if stored is None or stored.book.caps.authorization_ref is None:
+                stored = open_book(tx, at, _caps(tx))
+            new, refusal = stored.book.reserve(*terms)
+            if refusal is not None:
+                raise BudgetStoreError(refusal.code, refusal.detail)
+            try:
+                return install(tx, new, stored.book.version)
+            except BudgetStoreError as exc:
+                if exc.code != "stale_version":
+                    raise
+    except (BudgetError, TypeError) as exc:
+        raise BudgetStoreError("invalid", type(exc).__name__) from None
+    raise BudgetStoreError("stale_version", reservation_id)
 
 
 def open_book(tx: TenantTx, at: datetime, caps: BudgetCaps) -> StoredBook:
