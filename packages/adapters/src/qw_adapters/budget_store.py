@@ -32,7 +32,8 @@ No retry resets a reservation, deadline or cost. Every call needs the open
 `tenant_transaction` of `tx` (`tenant_transaction`); only qw_app and qw_worker
 may (`forbidden`). `operator_holding(conn, id)` is qw_assessor's one read (0053,
 decision 98): in one statement, the bootstrap tenant's id and its latest book
-holding `id`."""
+holding `id`. `overdue_tenants(conn)` is qw_worker's one cross-tenant read (0054,
+decision 100): only the ids of tenants with an overdue `reserved` reservation."""
 
 from __future__ import annotations
 
@@ -57,6 +58,7 @@ _COLS = ("scope_id", "period", "version", "book", "book_hash", "updated_at")
 PILOT = MappingProxyType({"pilot_monthly_usd": "100.00",
                           "improvement_monthly_usd_max": "20.00"})  # fmt: skip
 _CAS_TRIES = 3
+OVERDUE_PAGE = 500  # 0054's LIMIT
 
 
 class BudgetStoreError(Exception):
@@ -164,6 +166,28 @@ def operator_holding(conn: Conn, reservation_id: str) -> tuple[
         return t, None
     tx = TenantTx(conn, t)  # only names the scope the row must have
     return t, _parse(tx, str(t), row[2], row[1:])
+
+
+def overdue_tenants(conn: Conn) -> list[uuid.UUID]:
+    """qw_worker (0054): every tenant whose book holds a `reserved` reservation
+    due at the database clock, ascending, keyset-paged `OVERDUE_PAGE` at a time
+    until a short page (each page its own statement on `conn`). Ids that do not
+    strictly ascend are `integrity` (the paging could otherwise repeat)."""
+    out: list[uuid.UUID] = []
+    after: uuid.UUID | None = None
+    while True:
+        try:
+            rows = conn.execute(
+                "SELECT t FROM app.budget_overdue_tenants(%s::uuid) t", (after,)
+            ).fetchall()
+        except psycopg.Error as exc:
+            raise _database(exc) from None
+        for (t,) in rows:
+            if type(t) is not uuid.UUID or (after is not None and t <= after):
+                raise BudgetStoreError("integrity", "the overdue ids do not ascend")
+            out.append(after := t)
+        if len(rows) < OVERDUE_PAGE:
+            return out
 
 
 def _caps(tx: TenantTx) -> BudgetCaps:

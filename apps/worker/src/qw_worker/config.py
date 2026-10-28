@@ -38,7 +38,10 @@ class WorkerSettings:
     """`pool`: a worker serves one pool (experiments never run on standard workers).
     `jobs_per_tick` / `relay_per_tick` bound one iteration; every relayed event is
     published and marked in its own transaction. `purge_every` schedules the
-    retention purges against the database clock."""
+    retention purges against the database clock; `budget_sweep_every` the
+    budget-sweep timer of a standard-pool worker (owner decision 100), at most
+    an hour so an overdue reservation is queued for its sweep within the hour
+    after its tenant's last sweep slot."""
 
     worker_name: str
     pool: Pool = Pool.STANDARD
@@ -50,6 +53,7 @@ class WorkerSettings:
     job_backoff: Backoff = DEFAULT_BACKOFF
     relay_backoff: Backoff = RELAY_BACKOFF
     purge_every: timedelta = timedelta(hours=1)
+    budget_sweep_every: timedelta = timedelta(minutes=5)
     outbox_retention: timedelta = DEFAULT_WINDOWS[Window.OUTBOX]
     inbox_retention: timedelta = DEFAULT_WINDOWS[Window.INBOX]
     idempotency_retention: timedelta = DEFAULT_WINDOWS[Window.IDEMPOTENCY]
@@ -73,6 +77,8 @@ class WorkerSettings:
             raise ValueError("relay_max_attempts must be 1..100")
         if not timedelta(minutes=1) <= self.purge_every <= timedelta(days=1):
             raise ValueError("purge_every must be in [1 minute, 1 day]")
+        if not timedelta(minutes=1) <= self.budget_sweep_every <= timedelta(hours=1):
+            raise ValueError("budget_sweep_every must be in [1 minute, 1 hour]")
         for name, window, least in (
             ("outbox_retention", self.outbox_retention, OUTBOX_RETENTION_MIN),
             ("inbox_retention", self.inbox_retention, INBOX_RETENTION_MIN),
@@ -91,6 +97,8 @@ _ENV: Mapping[str, tuple[str, timedelta | None]] = {
     "QW_WORKER_JOBS_PER_TICK": ("jobs_per_tick", None),
     "QW_WORKER_RELAY_PER_TICK": ("relay_per_tick", None),
     "QW_WORKER_PURGE_EVERY_MINUTES": ("purge_every", timedelta(minutes=1)),
+    "QW_WORKER_BUDGET_SWEEP_EVERY_MINUTES": ("budget_sweep_every",
+                                             timedelta(minutes=1)),
     "QW_WORKER_OUTBOX_RETENTION_DAYS": ("outbox_retention", timedelta(days=1)),
     "QW_WORKER_INBOX_RETENTION_DAYS": ("inbox_retention", timedelta(days=1)),
     "QW_WORKER_IDEMPOTENCY_RETENTION_HOURS": (

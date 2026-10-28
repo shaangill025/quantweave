@@ -18,12 +18,16 @@ month, the job fails with its swept months kept (`keep_effects`): retryable as
 else `budget_refused` (`integrity`, `forbidden`, ...; not retried).
 `submit(tx)`: the idempotent enqueue for `tx`'s tenant, one job per hour of the
 database clock (`input_revision` `expire_due:<slot>`).
-GAP: no scheduler calls `submit` yet. Nothing in the job layer recurs, and
-qw_worker cannot list tenants under RLS, so until a per-tenant scheduler exists
-(an operator cron or a future recurring-job mechanism, T025), a sweep runs only
-when something enqueues it; between sweeps an overdue reservation stays
-`reserved` and keeps holding its amount (fail-closed: it blocks spend, never
-frees it early)."""
+`schedule(conn)` (owner decision 100, T037 increment 5): the timer step. It
+lists the tenants with an overdue `reserved` reservation through 0054's
+qw_worker-only lister (ids only) on the worker's own connection, then calls
+`submit` in each listed tenant's transaction. One tenant's failure is logged
+(its exception type only) and the others go on. A repeat in the same hour
+queues nothing new. `timer(every)` wraps it for the worker loop; the
+standard-pool entry point runs it every `budget_sweep_every` (default 5
+minutes). A reservation that falls due after its tenant's sweep slot of the
+hour is queued at the first timer step of the next hour: freed within about
+an hour plus one interval plus the queue's latency."""
 
 from __future__ import annotations
 
@@ -31,16 +35,17 @@ import logging
 import re
 import uuid
 from collections.abc import Mapping
+from datetime import timedelta
 from types import MappingProxyType
 
 from qw_adapters import budget_store as bs
 from qw_adapters import jobs as qj
 from qw_adapters.jobs import ClaimedJob
-from qw_adapters.tenancy import TenantTx
+from qw_adapters.tenancy import Conn, TenantTx, tenant_transaction
 from qw_domain.instants import ensure_aware_utc
 from qw_domain.jobs import Priority
 
-from qw_worker.loop import Handler, HandlerFailed
+from qw_worker.loop import Handler, HandlerFailed, Timer
 
 log = logging.getLogger("qw_worker.budget_sweep")
 KIND = "budget.expire_due"
@@ -56,6 +61,30 @@ def submit(tx: TenantTx) -> tuple[uuid.UUID, bool]:
     slot = ensure_aware_utc(row[0]).strftime("%Y-%m-%dT%H")
     return qj.enqueue(tx, KIND, f"expire_due:{slot}", Priority.SAFETY,
                       {"slot": slot})  # fmt: skip
+
+
+def schedule(conn: Conn) -> tuple[list[uuid.UUID], list[tuple[uuid.UUID, str]]]:
+    """Queue this hour's sweep for every listed tenant: (the ids of newly queued
+    jobs, the (tenant, exception type) of each tenant that failed). A failure
+    to list raises (the loop logs it and tries again one interval later)."""
+    queued: list[uuid.UUID] = []
+    failed: list[tuple[uuid.UUID, str]] = []
+    for t in bs.overdue_tenants(conn):
+        try:
+            with tenant_transaction(conn, t) as tx:
+                jid, created = submit(tx)
+        except Exception as exc:  # one tenant never stops the rest
+            log.warning("budget sweep for tenant %s not queued: %s", t,
+                        type(exc).__name__)  # fmt: skip
+            failed.append((t, type(exc).__name__))
+            continue
+        if created:
+            queued.append(jid)
+    return queued, failed
+
+
+def timer(every: timedelta) -> Timer:
+    return Timer(KIND, every, schedule)
 
 
 def _month(tx: TenantTx, period: str) -> bs.StoredBook | None:
