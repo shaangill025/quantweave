@@ -25,7 +25,7 @@ Stdlib only.
 
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, replace
-from datetime import datetime
+from datetime import datetime, timedelta
 from enum import StrEnum
 
 from qw_domain.decimals import UsdBudget, safe_repr
@@ -33,6 +33,9 @@ from qw_domain.instants import ensure_aware_utc, format_instant, parse_instant
 from qw_domain.sources import ID_PATTERN
 
 ZERO = UsdBudget(0)
+# Longest reservation deadline (0052 holds the same bound; chosen in T037, the spec
+# names none): a reservation must reconcile within it.
+MAX_DEADLINE = timedelta(days=7)
 
 
 class BudgetError(ValueError):
@@ -356,6 +359,8 @@ class BudgetBook:
             return self, Refusal("spending_not_authorized")
         if period_of(at) != self.period:
             return self, Refusal("wrong_period", period_of(at))
+        if deadline - at > MAX_DEADLINE:
+            return self, Refusal("deadline_too_far", format_instant(deadline))
         if self.summary().available < amount:
             return self, Refusal("inference_cap", self.summary().available.to_wire())
         if category is Category.IMPROVEMENT and (

@@ -12,6 +12,7 @@ import pytest
 from hypothesis import given, settings
 from hypothesis import strategies as st
 from qw_domain.budget import (
+    MAX_DEADLINE,
     BudgetBook,
     BudgetCaps,
     BudgetError,
@@ -100,6 +101,15 @@ def test_an_overrun_is_recorded_not_hidden_and_blocks_new_reservations() -> None
     b = b.dispatched("r-1", AT).settle("r-1", Usd("100.5"), AT + WAIT)
     assert b.summary().available == Usd("-0.5")
     assert code(reserve(b, "r-2", "0.000001")) == "inference_cap"
+
+
+def test_a_deadline_beyond_max_deadline_is_refused() -> None:
+    far = AT + MAX_DEADLINE
+    for end, want in (
+        (far, None),
+        (far + timedelta(microseconds=1), "deadline_too_far"),
+    ):
+        assert code(book().reserve("r", M, Usd("1"), ACCT, 1, AT, end)) == want
 
 
 def test_unanswered_call_keeps_its_reservation_then_expires_at_worst_case() -> None:
