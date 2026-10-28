@@ -597,15 +597,22 @@ def test_security_definer_functions_are_hardened(conn: Conn) -> None:
                         ["search_path=pg_catalog"], ["qw_app", "qw_migrate"])
                        for n in ("deployment", "events", "keys", "releases",
                                  "revocations")]  # fmt: skip
-    budget = [r for r in rows if r[0] == "budget_book_operator"]  # 0053, decision 98
+    budget = [r for r in rows if r[0].startswith("budget_")]
     assert budget == [
         (
-            "budget_book_operator",
+            "budget_book_operator",  # 0053, decision 98
             "qw_migrate",
             True,
             ["search_path=pg_catalog"],
             ["qw_assessor", "qw_migrate"],
-        )
+        ),
+        (
+            "budget_overdue_tenants",  # 0054, decision 100
+            "qw_migrate",
+            True,
+            ["search_path=pg_catalog"],
+            ["qw_migrate", "qw_worker"],
+        ),
     ]
     jobs = [r for r in rows if not r[0].startswith("throttle_")
             and r not in guard + history + budget]  # fmt: skip

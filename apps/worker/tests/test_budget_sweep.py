@@ -1,4 +1,5 @@
-"""The `budget.expire_due` job (T037 increment 4) on a real PostgreSQL 16: the
+"""The `budget.expire_due` job (T037 increment 4) and its timer (increment 5,
+owner decision 100: 0054's lister) on a real PostgreSQL 16: the
 sweep runs as the non-owner, NOBYPASSRLS qw_worker login in each tenant's
 transaction; qw_app is the other writer; the superuser `conn` records the
 owner's authorizations (as qw_migrate) and observes lock waits. Tenants, ids,
@@ -9,6 +10,7 @@ from __future__ import annotations
 
 import contextlib
 import importlib.util
+import logging
 import time
 import uuid
 from collections.abc import Callable
@@ -19,8 +21,11 @@ from typing import Any
 
 import psycopg
 import pytest
+from psycopg import sql
+from psycopg.conninfo import make_conninfo
 from psycopg.types.json import Jsonb
 from qw_adapters import budget_store as bs
+from qw_adapters import jobs as qj
 from qw_adapters import tenancy as tn
 from qw_adapters.jobs import ClaimedJob
 from qw_domain.budget import BudgetBook, BudgetCaps, Category, Status, period_of
@@ -29,7 +34,7 @@ from qw_domain.instants import ensure_aware_utc
 from qw_domain.jobs import Backoff, JobState, Priority
 from qw_worker import budget_sweep as sw
 from qw_worker.config import WorkerSettings
-from qw_worker.loop import HandlerFailed, Worker
+from qw_worker.loop import HandlerFailed, Timer, Worker
 
 _path = Path(__file__).parents[3] / "packages" / "adapters" / "tests" / "conftest.py"
 _spec = importlib.util.spec_from_file_location("qw_pg_harness_sweep", _path)
@@ -39,6 +44,7 @@ _spec.loader.exec_module(_harness)
 pg_admin_url, database_url = _harness.pg_admin_url, _harness.database_url
 conn, runtime_urls = _harness.conn, _harness.runtime_urls
 app_conn, worker_conn = _harness.app_conn, _harness.worker_conn
+assessor_conn, release_conn = _harness.assessor_conn, _harness.release_conn
 
 Conn = psycopg.Connection[Any]
 REF = "SYNTHETIC-owner-auth-1"
@@ -385,3 +391,261 @@ def test_a_stale_version_once_reloads_and_sweeps_every_open_month(
     monkeypatch.setattr(bs, "expire_due", once)
     assert sw.sweep(FAKE) == ([], [])
     assert seen == ["2026-09", "2026-09", "2026-10"]
+
+
+# --- the budget-sweep timer (owner decision 100, T037 increment 5; 0054) ---
+
+
+def clear_of_hour_turn(c: Conn) -> None:
+    """The timer's idempotency is per DB-clock hour: start at least 30 s before
+    an hour boundary (waiting out at most 30 s), never skip."""
+    now = clock(c)
+    turn = now.replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)
+    if turn - now < timedelta(seconds=30):
+        wait_until(c, turn + timedelta(seconds=1))
+
+
+def overdue_fixture(app: Conn, su: Conn) -> tuple[list[uuid.UUID], datetime]:
+    """Tenants a and b (an overdue reservation each; a also one not yet due), c
+    (not yet due), d (expired), e (released and settled), f (an empty book) and
+    g (no book). Returns ([a, b] sorted, the overdue deadline), after it."""
+    at = clock(app)
+    near_month_turn(at)
+    due, later = at + timedelta(seconds=4), at + timedelta(hours=1)
+    a, b, c, d, e, f, _g = (tenant(app, su) for _ in range(7))
+    step(app, a, reserved("SYNTHETIC-r1", R, "15", at, due), at)
+    step(app, a, reserved("SYNTHETIC-r2", R, "5", at, later), clock(app))
+    step(app, b, reserved("SYNTHETIC-r1", IMP, "20", at, due), at)
+    step(app, c, reserved("SYNTHETIC-r1", R, "15", at, later), at)
+    for go in (reserved("SYNTHETIC-r1", R, "15", at, due),
+               lambda x: x.dispatched("SYNTHETIC-r1", at)):  # fmt: skip
+        step(app, d, go, clock(app))
+    for go in (reserved("SYNTHETIC-r1", R, "15", at, due),
+               reserved("SYNTHETIC-r2", R, "5", at, due),
+               lambda x: x.release("SYNTHETIC-r1"),
+               lambda x: x.dispatched("SYNTHETIC-r2", at),
+               lambda x: x.settle("SYNTHETIC-r2", Usd("1"), at)):  # fmt: skip
+        step(app, e, go, clock(app))
+    step(app, f, lambda x: x, at)
+    wait_until(app, due)
+    _, failed = call(app, d, sw.sweep)  # d's reservation is now `expired`
+    assert failed == []
+    assert book(app, d, at).get("SYNTHETIC-r1").status is Status.EXPIRED
+    return sorted([a, b]), due
+
+
+@pytest.mark.db
+def test_the_lister_returns_exactly_the_tenants_with_an_overdue_reservation(
+    app_conn: Conn, worker_conn: Conn, conn: Conn
+) -> None:
+    """Not a not-yet-due, expired, released or settled reservation, an empty
+    book or no book; last month's overdue book counts; only ids come back."""
+    due_ones, _ = overdue_fixture(app_conn, conn)
+    assert bs.overdue_tenants(worker_conn) == due_ones
+    h = tenant(app_conn, conn)
+    last_month(conn, h, clock(app_conn))  # due, undispatched, last month
+    every = sorted([*due_ones, h])
+    assert bs.overdue_tenants(worker_conn) == every
+    with tn.tenant_transaction(worker_conn, due_ones[0]) as tx:  # a context
+        got = tx.conn.execute("SELECT * FROM app.budget_overdue_tenants(NULL)")
+        assert [r[0] for r in got.fetchall()] == every  # changes nothing
+    cur = worker_conn.execute("SELECT * FROM app.budget_overdue_tenants(NULL)")
+    assert [d.name for d in cur.description or []] == ["budget_overdue_tenants"]
+    assert [r[0] for r in cur.fetchall()] == every  # one uuid column, nothing else
+    after = worker_conn.execute("SELECT * FROM app.budget_overdue_tenants(%s)",
+                                (every[0],)).fetchall()  # fmt: skip
+    assert [r[0] for r in after] == every[1:]  # keyset: strictly greater ids
+    # without a tenant context qw_worker still reads no book directly (0052)
+    row = worker_conn.execute("SELECT count(*) FROM app.budget_book").fetchone()
+    assert row == (0,)
+
+
+@pytest.mark.db
+def test_the_lister_pages_past_its_bound_in_ascending_order(
+    worker_conn: Conn, conn: Conn
+) -> None:
+    """1001 tenants with an overdue reservation (written as the owner, triggers
+    off): the lister's pages are 500, 500 and 1 ids, ascending, none repeated;
+    the adapter returns all 1001."""
+    now = clock(conn)
+    at = now - timedelta(hours=1)
+    base = reserved("SYNTHETIC-r1", IMP, "5", at, now - timedelta(seconds=1))(
+        BudgetBook.open("SCOPE", at, CAPS))  # fmt: skip
+    with conn.transaction():
+        conn.execute("SET LOCAL session_replication_role = replica")
+        ids = [r[0] for r in conn.execute(
+            "INSERT INTO app.tenant (id) SELECT gen_random_uuid() "
+            "FROM generate_series(1, 1001) RETURNING id").fetchall()]  # fmt: skip
+        conn.execute(
+            "INSERT INTO app.budget_book (tenant_id, scope_id, period, version, "
+            "book, book_hash) SELECT t, t::text, %s, %s, "
+            "replace(%s::text, 'SCOPE', t::text)::jsonb, repeat('0', 64) "
+            "FROM unnest(%s::uuid[]) t",
+            (base.period, base.version, Jsonb(base.to_wire()), ids),
+        )
+    pages: list[list[uuid.UUID]] = []
+    after: uuid.UUID | None = None
+    while not pages or pages[-1]:
+        pages.append([r[0] for r in worker_conn.execute(
+            "SELECT * FROM app.budget_overdue_tenants(%s::uuid)",
+            (after,)).fetchall()])  # fmt: skip
+        after = pages[-1][-1] if pages[-1] else after
+    assert [len(p) for p in pages] == [500, 500, 1, 0]
+    assert [t for p in pages for t in p] == sorted(ids)
+    assert bs.OVERDUE_PAGE == 500
+    assert bs.overdue_tenants(worker_conn) == sorted(ids)
+
+
+@pytest.mark.db
+def test_only_qw_worker_may_list_and_nobody_else_gains_access(
+    app_conn: Conn, worker_conn: Conn, assessor_conn: Conn, release_conn: Conn,
+    conn: Conn, database_url: str,
+) -> None:  # fmt: skip
+    due_ones, _ = overdue_fixture(app_conn, conn)
+    ingest = f"qwtest_ingest_{uuid.uuid4().hex[:12]}"
+    conn.execute(sql.SQL("CREATE ROLE {} LOGIN NOBYPASSRLS IN ROLE qw_ingest"
+                         ).format(sql.Identifier(ingest)))  # fmt: skip
+    try:
+        with psycopg.connect(make_conninfo(database_url, user=ingest),
+                             autocommit=True) as ing:  # fmt: skip
+            for c in (app_conn, assessor_conn, release_conn, ing):
+                with pytest.raises(bs.BudgetStoreError) as exc:
+                    bs.overdue_tenants(c)
+                assert exc.value.code == "forbidden"
+                with pytest.raises(psycopg.errors.InsufficientPrivilege):
+                    c.execute("SELECT app.budget_overdue_tenants(NULL)")
+                with pytest.raises(bs.BudgetStoreError):  # the timer step too
+                    sw.schedule(c)
+    finally:
+        conn.execute(sql.SQL("SELECT pg_terminate_backend(pid) FROM "
+                             "pg_stat_activity WHERE usename = {}").format(
+            sql.Literal(ingest)))  # fmt: skip
+        conn.execute(sql.SQL("DROP ROLE {}").format(sql.Identifier(ingest)))
+    # the owner may execute it, but a qw_migrate session whose login is not a
+    # qw_worker member sees nothing: 0054's policy admits only worker logins
+    with conn.transaction():
+        conn.execute("SET LOCAL SESSION AUTHORIZATION qw_migrate")
+        got = conn.execute("SELECT * FROM app.budget_overdue_tenants(NULL)")
+        assert got.fetchall() == []
+        row = conn.execute("SELECT count(*) FROM app.budget_book").fetchone()
+        assert row == (0,)
+    assert bs.overdue_tenants(worker_conn) == due_ones
+    pol = conn.execute(
+        "SELECT policyname, roles::text, cmd FROM pg_policies WHERE schemaname = "
+        "'app' AND tablename = 'budget_book' ORDER BY 1").fetchall()  # fmt: skip
+    assert pol == [("operator_read", "{qw_migrate}", "SELECT"),
+                   ("overdue_list", "{qw_migrate}", "SELECT"),
+                   ("tenant_isolation", "{public}", "ALL")]  # fmt: skip
+
+
+def only(tick: Any) -> tuple[str, list[uuid.UUID], list[tuple[uuid.UUID, str]]]:
+    """The one timer result of a tick: (name, queued job ids, failures)."""
+    assert len(tick.timed) == 1
+    name, result = tick.timed[0]
+    queued, failed = result
+    return name, queued, failed
+
+
+@pytest.mark.db
+def test_the_timer_queues_one_sweep_per_tenant_and_the_worker_frees_them(
+    app_conn: Conn, worker_conn: Conn, conn: Conn
+) -> None:
+    clear_of_hour_turn(app_conn)
+    (a, b), due = overdue_fixture(app_conn, conn)
+    sweeps = sw.timer(timedelta(minutes=5))
+    worker = Worker(worker_conn, SETTINGS, handlers=sw.HANDLERS, timers=[sweeps])
+    first = worker.tick()  # the claims run before the timer: nothing queued yet
+    name, queued, failed = only(first)
+    assert (first.jobs, name, len(queued), failed) == ([], sw.KIND, 2, [])
+    assert sw.schedule(worker_conn) == ([], [])  # same hour: nothing new
+    second = worker.tick()  # the timer is not due again for 5 minutes
+    assert sorted(second.jobs) == sorted((j, JobState.SUCCEEDED) for j in queued)
+    assert second.timed == []
+    books = [book(worker_conn, t, due) for t in (a, b)]
+    assert [x.get("SYNTHETIC-r1").status for x in books] == [Status.RELEASED] * 2
+    # the one not-yet-due reservation (fixture tenant a) stays reserved
+    assert [r.status for x in books if (r := x.find("SYNTHETIC-r2"))] == [
+        Status.RESERVED]  # fmt: skip
+    assert bs.overdue_tenants(worker_conn) == []
+    again = Worker(worker_conn, SETTINGS, handlers=sw.HANDLERS, timers=[sweeps])
+    assert again.tick().timed == [(sw.KIND, ([], []))]
+    for t in (a, b):  # exactly one sweep job per tenant this hour
+        with tn.tenant_transaction(worker_conn, t) as tx:
+            row = tx.conn.execute("SELECT count(*) FROM app.job WHERE kind = %s",
+                                  (sw.KIND,)).fetchone()  # fmt: skip
+        assert row == (1,)
+
+
+@pytest.mark.db
+def test_one_tenants_failure_does_not_stop_the_others(
+    app_conn: Conn, worker_conn: Conn, conn: Conn,
+    caplog: pytest.LogCaptureFixture,
+) -> None:  # fmt: skip
+    """b's slot already holds a different job (a conflicting enqueue): b's
+    `submit` raises IdempotencyConflict, which is logged, and a and h are still
+    queued and swept. A timer that raises is logged and the next one runs."""
+    clear_of_hour_turn(app_conn)
+    (a, b), due = overdue_fixture(app_conn, conn)
+    h, now = tenant(app_conn, conn), clock(app_conn)
+    step(app_conn, h, reserved("SYNTHETIC-r1", R, "5", now,
+                               now + timedelta(seconds=1)), now)  # fmt: skip
+    wait_until(app_conn, now + timedelta(seconds=1))
+    slot = clock(app_conn).strftime("%Y-%m-%dT%H")
+    with tn.tenant_transaction(app_conn, b) as tx:
+        qj.enqueue(tx, sw.KIND, f"expire_due:{slot}", Priority.SAFETY,
+                   {"slot": "SYNTHETIC"})  # fmt: skip
+    with caplog.at_level(logging.WARNING, "qw_worker"):
+        queued, failed = sw.schedule(worker_conn)
+    assert (len(queued), failed) == (2, [(b, "IdempotencyConflict")])
+    assert f"budget sweep for tenant {b} not queued: IdempotencyConflict" in (
+        caplog.text)  # fmt: skip
+
+    def boom(c: Conn) -> object:
+        raise RuntimeError("SYNTHETIC")
+
+    worker = Worker(worker_conn, SETTINGS, handlers=sw.HANDLERS,
+                    timers=[Timer("synthetic.boom", timedelta(minutes=1), boom),
+                            sw.timer(timedelta(minutes=5))])  # fmt: skip
+    with caplog.at_level(logging.ERROR, "qw_worker"):
+        tick = worker.tick()  # the conflicting job fails; a and h are swept
+    assert "timer synthetic.boom failed" in caplog.text
+    assert only(tick) == (sw.KIND, [], [(b, "IdempotencyConflict")])
+    assert sorted(s for _, s in tick.jobs if s) == [
+        JobState.FAILED, JobState.SUCCEEDED, JobState.SUCCEEDED]  # fmt: skip
+    for t, status in ((a, Status.RELEASED), (h, Status.RELEASED),
+                      (b, Status.RESERVED)):  # fmt: skip
+        assert book(worker_conn, t, due).get("SYNTHETIC-r1").status is status
+    assert bs.overdue_tenants(worker_conn) == [b]
+
+
+def test_timer_settings_are_bounded() -> None:
+    for bad in (timedelta(seconds=59), timedelta(minutes=61)):
+        with pytest.raises(ValueError):
+            WorkerSettings("synthetic-w", budget_sweep_every=bad)
+    with pytest.raises(ValueError):
+        Timer("synthetic.t", timedelta(0), lambda c: None)
+    t = Timer("synthetic.t", timedelta(minutes=1), lambda c: None)
+    with pytest.raises(ValueError):
+        Worker(FAKE.conn, SETTINGS, timers=[t, t])
+    assert WorkerSettings("synthetic-w").budget_sweep_every == timedelta(minutes=5)
+
+
+@pytest.mark.db
+def test_the_entry_point_runs_the_timer_on_the_standard_pool_only(
+    runtime_urls: dict[str, str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from qw_worker import __main__ as entry
+
+    started: list[Worker] = []
+    monkeypatch.setattr(Worker, "run", lambda w, max_ticks=None: started.append(w))
+    monkeypatch.setattr(entry, "install_signal_handlers", lambda worker: None)
+    monkeypatch.setenv("QW_DATABASE_URL", runtime_urls["qw_worker"])
+    monkeypatch.delenv("QW_ASSESSOR_DATABASE_URL", raising=False)
+    monkeypatch.setenv("QW_WORKER_BUDGET_SWEEP_EVERY_MINUTES", "7")
+    assert entry.main() == 0
+    monkeypatch.setenv("QW_WORKER_POOL", "experiment")
+    assert entry.main() == 0
+    assert [[(t.name, t.every, t.run) for t in w.timers] for w in started] == [
+        [(sw.KIND, timedelta(minutes=7), sw.schedule)], []]  # fmt: skip
+    monkeypatch.setenv("QW_WORKER_BUDGET_SWEEP_EVERY_MINUTES", "61")
+    assert entry.main() == 2

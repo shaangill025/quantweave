@@ -11,7 +11,12 @@
    more than one publish. Without one the relay is off: events stay pending (never
    marked published, so never purged). No transport ships; adding one (network,
    email, broker) needs explicit owner authorisation;
-5. the retention purges, when `purge_every` has passed on the database clock.
+5. the retention purges, when `purge_every` has passed on the database clock;
+6. each injected `Timer` whose `every` has passed on the database clock (the
+   same schedule as the purges; first run on the first tick). A timer's error
+   is logged and the loop goes on; its next run is one `every` later. The
+   standard-pool entry point injects the budget-sweep timer (owner decision
+   100, `budget_sweep.schedule`).
 
 A worker claims only the kinds in its handler registry (`0021_job_pick_kinds.sql`):
 any other kind stays queued, untouched, for a worker that handles it, and an empty
@@ -31,7 +36,7 @@ import logging
 import signal
 import time
 import uuid
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from types import FrameType, MappingProxyType
@@ -77,6 +82,20 @@ def database_clock(conn: Conn) -> Clock:
     return now
 
 
+@dataclass(frozen=True, slots=True)
+class Timer:
+    """Periodic cross-tenant work on the worker's own connection: `run(conn)`
+    every `every` of the database clock; its result is recorded in `Tick.timed`."""
+
+    name: str
+    every: timedelta
+    run: Callable[[Conn], object]
+
+    def __post_init__(self) -> None:
+        if not timedelta(seconds=1) <= self.every <= timedelta(days=1):
+            raise ValueError("a timer's every must be in [1 s, 1 day]")
+
+
 @dataclass
 class Tick:
     expired: list[uuid.UUID] = field(default_factory=list)
@@ -84,6 +103,7 @@ class Tick:
     jobs: list[tuple[uuid.UUID, JobState | None]] = field(default_factory=list)
     relayed: list[tuple[uuid.UUID, Relayed]] = field(default_factory=list)
     purged: Purged | None = None
+    timed: list[tuple[str, object]] = field(default_factory=list)  # name, result
 
     @property
     def busy(self) -> bool:
@@ -98,6 +118,7 @@ class Worker:
         *,
         handlers: Mapping[str, Handler] = HANDLERS,
         publish: Publisher | None = None,
+        timers: Sequence[Timer] = (),
         clock: Clock | None = None,
         sleep: Sleep = lambda wait: time.sleep(wait.total_seconds()),
     ) -> None:
@@ -108,6 +129,10 @@ class Worker:
         self.sleep = sleep
         self.stopping = False
         self._last_purge: datetime | None = None
+        self.timers = tuple(timers)
+        if len({t.name for t in self.timers}) != len(self.timers):
+            raise ValueError("timer names must be unique")
+        self._last_timer: dict[str, datetime] = {}
 
     def request_stop(self) -> None:
         self.stopping = True
@@ -145,6 +170,15 @@ class Worker:
                 else s.idempotency_retention,
             )  # fmt: skip
             self._last_purge = now
+        for timer in self.timers:
+            last = self._last_timer.get(timer.name)
+            if self.stopping or (last is not None and now - last < timer.every):
+                continue
+            self._last_timer[timer.name] = now  # an error waits a full `every`
+            try:
+                out.timed.append((timer.name, timer.run(self.conn)))
+            except Exception:
+                log.exception("timer %s failed", timer.name)
         return out
 
     def run(self, max_ticks: int | None = None) -> int:

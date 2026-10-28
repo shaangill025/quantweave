@@ -6,7 +6,10 @@ login at startup); it refuses to start at all when QW_ASSESSOR_DATABASE_URL is s
 (owner decision 40: only `qw-assessor` holds the assessor login); settings from
 `settings_from_env`. Handlers: `optimizer_cycle.HANDLERS` (kind `optimizer.cycle`,
 claimed only by an experiment-pool worker, QW_WORKER_POOL=experiment) and
-`budget_sweep.HANDLERS` (kind `budget.expire_due`, standard pool). No publish
+`budget_sweep.HANDLERS` (kind `budget.expire_due`, standard pool). A
+standard-pool worker also runs the budget-sweep timer (owner decision 100) every
+`budget_sweep_every` (QW_WORKER_BUDGET_SWEEP_EVERY_MINUTES, default 5); an
+experiment-pool worker runs no timer. No publish
 target is passed, so the outbox relay is off and events stay pending: a real
 transport needs explicit owner authorisation.
 """
@@ -16,6 +19,7 @@ import os
 import sys
 
 from qw_adapters import tenancy
+from qw_domain.jobs import Pool
 
 from qw_worker import budget_sweep, optimizer_cycle
 from qw_worker.config import settings_from_env
@@ -40,7 +44,9 @@ def main() -> int:
     try:
         with tenancy.runtime_connection(conninfo, role="qw_worker") as conn:
             handlers = {**optimizer_cycle.HANDLERS, **budget_sweep.HANDLERS}
-            worker = Worker(conn, settings, handlers=handlers,
+            timers = ((budget_sweep.timer(settings.budget_sweep_every),)
+                      if settings.pool is Pool.STANDARD else ())  # fmt: skip
+            worker = Worker(conn, settings, handlers=handlers, timers=timers,
                             publish=None)  # relay off (above)  # fmt: skip
             install_signal_handlers(worker)
             worker.run()
