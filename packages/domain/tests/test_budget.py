@@ -103,6 +103,48 @@ def test_an_overrun_is_recorded_not_hidden_and_blocks_new_reservations() -> None
     assert code(reserve(b, "r-2", "0.000001")) == "inference_cap"
 
 
+HUGE = Usd("99999999999999")  # the largest whole UsdBudget
+
+
+def overrun(n: int, cat: Category = Category.RESEARCH) -> BudgetBook:
+    """`n` USD1 reservations, each settled at the absurd report HUGE."""
+    b = book()
+    for i in range(n):  # reserved first: an overrun blocks new reservations
+        b, why = reserve(b, f"r-{i}", "1", cat)
+        assert why is None
+    for i in range(n):
+        b = b.dispatched(f"r-{i}", AT).settle(f"r-{i}", HUGE, AT + WAIT)
+    return b
+
+
+@pytest.mark.parametrize("n", [2, 3])
+@pytest.mark.parametrize("cat", [Category.RESEARCH, IMP])
+def test_absurd_overruns_saturate_the_summary_and_refuse_typed(
+    n: int, cat: Category
+) -> None:
+    """Review fix: n * HUGE (199999999999998, 299999999999997) exceeds
+    UsdBudget's 14 integer digits; the totals are exact sums, the summary shows
+    the bound (99999999999999.999999) and says so, and every new reservation is
+    the typed cap refusal, never a DecimalValueError."""
+    b = overrun(n, cat)
+    bound = Usd("99999999999999.999999")
+    for s in (b.summary(), b.summary(cat)):
+        assert (s.spent, s.reserved, s.available, s.saturated) == (
+            bound, Usd("0"), -bound, True)  # fmt: skip
+    assert b.summary(M if cat is IMP else IMP).saturated  # the shared cap's free
+    for c in (M, IMP):
+        assert reserve(b, "r-new", "0.000001", c) == (
+            b, Refusal("inference_cap", "-99999999999999.999999"))  # fmt: skip
+    assert b.expire_due(AT + WAIT) is b  # nothing open: the sweep is a no-op
+
+
+def test_one_absurd_overrun_is_exact_and_not_saturated() -> None:
+    s = overrun(1).summary()  # 100 - 99999999999999 = -99999999999899
+    assert (s.spent, s.available, s.saturated) == (
+        HUGE, Usd("-99999999999899"), False)  # fmt: skip
+    assert book().summary().saturated is False
+
+
 def test_a_deadline_beyond_max_deadline_is_refused() -> None:
     far = AT + MAX_DEADLINE
     for end, want in (

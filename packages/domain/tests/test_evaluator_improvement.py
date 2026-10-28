@@ -17,7 +17,7 @@ from qw_domain import evaluator_improvement as ei
 from qw_domain import improvement as im
 from qw_domain import researcher as rs
 from qw_domain import trial_ledger as tl
-from qw_domain.budget import BudgetBook, BudgetCaps
+from qw_domain.budget import BudgetBook, BudgetCaps, Category
 from qw_domain.decimals import UsdBudget as Usd
 from qw_domain.evidence import ClaimKind, EvidenceStore, Reading, SourceKind
 from qw_domain.feedback import Purpose
@@ -231,6 +231,32 @@ def test_evaluator_policy_knobs_change_the_computed_outcome() -> None:
     assert out.outcome.why is rs.Why.MODEL_FAILED
     assert [r.finished_at - r.dispatched_at for r in out.runs] == [2 * S, 2 * S]
     assert out.book.summary().reserved.value > 0
+
+
+def test_cost_uses_exact_totals_never_a_saturated_summary(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """T037 increment 4 review: each case's book carries two absurd settled
+    reports (USD99999999999999 each), so its summary saturates; the cost metric
+    is the exact sum: 7 cases x 199999999999998 = 1399999999999986."""
+    huge = Usd("99999999999999")
+    absurd = BudgetBook.open(SCOPE, T0, CAPS)
+    for rid in ("x-1", "x-2"):
+        absurd, why = absurd.reserve(rid, Category.RESEARCH, Usd("1"), "acct-synth",
+                                     1, T0, T0 + timedelta(minutes=5))  # fmt: skip
+        assert why is None
+    for rid in ("x-1", "x-2"):
+        absurd = absurd.dispatched(rid, T0).settle(rid, huge, T0)
+    assert absurd.summary().saturated
+    real = ei.replay
+    monkeypatch.setattr(ei, "replay", lambda p, case, rig: replace(
+        real(p, case, rig), book=absurd))  # fmt: skip
+    pr = protocol(BASE)
+    m = measured(cand(HELPFUL, pr), pr)
+    assert len(CASES) == 7
+    want = Decimal("1399999999999986")
+    assert (m["cost_usd"], m["baseline_cost_usd"], m["cost_increase_usd"]) == (
+        want, want, Decimal(0))  # fmt: skip
 
 
 def test_control_is_frozen_and_any_tamper_is_rejected_before_the_key_is_read() -> None:
