@@ -581,3 +581,31 @@ below waives a test, gate or spec requirement. Numbering continues from
     that lets the worker refuse other tenants before any read; it reveals only the
     bootstrap tenant's id, which the job's own tenant already is when allowed."
     Implemented by: T050 (the optimizer cycle job).
+
+98. **Who reserves the optimizer's cost, and how the assessor checks it (T050, T037).**
+    Question: "Decision 98 (T050/T037): Before an optimizer verdict can accept,
+    its worst-case cost must be reserved in a budget book (decision 94). The new
+    book is per tenant, and the optimizer is installation-level. Who reserves the
+    cost, and how does the independent assessor confirm the reservation? Today
+    the assessor role has no access to budget books."
+    Selected label: "Worker reserves, assessor reads (Recommended)".
+    Option text as presented: "The optimizer.cycle worker job reserves the cost
+    in the operator's (bootstrap) tenant book, using the reservation id frozen in
+    the protocol. The assessor gets read-only access to that one tenant's book
+    and refuses to accept unless the reservation exists with the frozen terms.
+    Why: it mirrors strategy promotions; the assessor stays read-only and
+    independent (as in decisions 91 and 97), and the worker that spends is the
+    one that reserves."
+    Implemented by: T050 (the measured optimizer verdict), T037 (budget book).
+
+99. **Longest a budget reservation may stay open (T037).**
+    Question: "Decision 99 (T037): No spec or config limit exists for how long a
+    budget reservation may stay open before it expires and is charged in full.
+    The store now refuses deadlines more than 7 days after the reservation. Keep
+    that limit?"
+    Selected label: "Keep 7 days (Recommended)".
+    Option text as presented: "Keep the 7-day maximum. Model calls take seconds
+    to minutes, and improvement experiments are bounded by their protocol's
+    max_duration. 7 days leaves room for slow reconciliation without letting a
+    stale reservation hold the monthly cap for weeks."
+    Implemented by: T037 (`MAX_DEADLINE` in the domain and migration 0052).
