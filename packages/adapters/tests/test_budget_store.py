@@ -629,3 +629,171 @@ def test_max_deadline_is_one_bound_in_the_domain_and_0052() -> None:
     line = "max_deadline CONSTANT interval := interval '7 days';  -- MAX_DEADLINE"
     assert line in sql and sql.count("interval '7 days'") == 1
     assert timedelta(days=7) == MAX_DEADLINE
+
+
+def reserve_once(conn: Conn, t: uuid.UUID, rid: str = "SYNTHETIC-opt-1",
+                 amount: str = "5", **kw: Any) -> bs.StoredBook:  # fmt: skip
+    """`budget_store.reserve_once` as the `optimizer.cycle` job calls it (0053's
+    increment): improvement, a SYNTHETIC account, a 2-hour deadline."""
+    at = clock(conn)
+    args: dict[str, Any] = {"reservation_id": rid, "amount": Usd(amount),
+        "provider_account_ref": "SYNTHETIC-acct-1", "max_output_tokens": 100,
+        "at": at, "deadline": at + timedelta(hours=2)} | kw  # fmt: skip
+    return call(conn, t, lambda tx: bs.reserve_once(tx, **args))
+
+
+def test_reserve_once_reserves_once_and_refuses_with_typed_codes(
+    tenant: Callable[..., uuid.UUID], conn: Conn, worker_conn: Conn,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:  # fmt: skip
+    """Decision 98's reservation path, SYNTHETIC amounts hand-computed: USD5 of
+    the USD20 improvement cap, then a same-id retry that changes nothing."""
+    bare = tenant(None)  # no owner-recorded authorization
+    assert code(partial(reserve_once, worker_conn, bare)) == "no_authorization"
+    assert load(worker_conn, bare, clock(worker_conn)) is None  # nothing opened
+    t = tenant()
+    first = reserve_once(worker_conn, t)
+    r = first.book.get("SYNTHETIC-opt-1")
+    assert (first.book.version, first.book.caps.authorization_ref) == (1, REF)
+    assert (r.category, r.reserved, r.status, r.max_output_tokens) == (
+        Category.IMPROVEMENT, Usd("5"), Status.RESERVED, 100)  # fmt: skip
+    again = reserve_once(worker_conn, t)  # the same id and terms: unchanged
+    assert again == first and again.book.get("SYNTHETIC-opt-1") == r  # same times
+    for kw, want in (({"amount": "6"}, "duplicate_reservation"),
+                     ({"rid": "SYNTHETIC-opt-2", "amount": "15.000001"},
+                      "improvement_cap"),
+                     ({"rid": "SYNTHETIC-opt-3", "amount": "95.000001",
+                       "category": Category.RESEARCH}, "inference_cap"),
+                     ({"rid": "SYNTHETIC-opt-4", "deadline": clock(worker_conn)
+                       + MAX_DEADLINE + timedelta(minutes=1)}, "deadline_too_far"),
+                     ({"rid": "SYNTHETIC-opt-5", "deadline": clock(worker_conn)
+                       - timedelta(minutes=1)}, "invalid")):  # fmt: skip
+        assert code(partial(reserve_once, worker_conn, t, **kw)) == want, kw
+    assert load(worker_conn, t, clock(worker_conn)) == first  # nothing changed
+    real, lost = bs.install, [True]
+
+    def stale_once(*a: Any) -> bs.StoredBook:  # another writer won the first CAS
+        if lost[0]:
+            lost[0] = False
+            raise bs.BudgetStoreError("stale_version", "SYNTHETIC")
+        return real(*a)
+
+    monkeypatch.setattr(bs, "install", stale_once)
+    got = reserve_once(worker_conn, t, "SYNTHETIC-opt-6")
+    assert got.book.version == 2 and len(got.book.reservations) == 2 and not lost[0]
+    monkeypatch.undo()
+    released = install(worker_conn, t, got.book.release("SYNTHETIC-opt-6"), 2)
+    assert code(partial(reserve_once, worker_conn, t, "SYNTHETIC-opt-6")) == (
+        "reservation_closed")  # a released id is never reserved again  # fmt: skip
+    assert load(worker_conn, t, clock(worker_conn)).book == released  # type: ignore[union-attr]
+    late = tenant(None)  # a book opened before the owner recorded the authorization
+    opened(worker_conn, late, clock(worker_conn), UNAUTHORIZED)
+    assert code(partial(reserve_once, worker_conn, late)) == "no_authorization"
+    record(conn, late, "SYNTHETIC-owner-auth-2")
+    caps = reserve_once(worker_conn, late).book.caps  # authorized, then reserved
+    assert caps == replace(CAPS, authorization_ref="SYNTHETIC-owner-auth-2")
+
+
+def test_pilot_caps_are_the_spec_configuration() -> None:
+    import json
+    from decimal import Decimal
+    from pathlib import Path
+
+    spec = Path(__file__).parents[3] / "docs/spec/config/budgets_and_slos.json"
+    cfg = json.loads(spec.read_text())
+    caps = BudgetCaps.from_config(bs.PILOT, authorization_ref=None)
+    assert (caps.inference.value, caps.improvement.value) == (
+        Decimal(cfg["pilot_monthly_usd"]),
+        Decimal(cfg["improvement_monthly_usd_max"]),
+    )
+    assert (caps.inference.to_wire(), caps.improvement.to_wire()) == ("100", "20")
+
+
+def test_the_assessor_reads_only_the_bootstrap_book_and_writes_nothing(
+    tenant: Callable[..., uuid.UUID], conn: Conn, app_conn: Conn,
+    worker_conn: Conn, assessor_conn: Conn, release_conn: Conn,
+) -> None:  # fmt: skip
+    """0053 (decision 98): qw_assessor's one read is, in one statement, the
+    bootstrap tenant and its latest book holding a reservation id; no table
+    privilege on either 0052 table; the owner's policy admits only that read."""
+    t, u = tenant(), tenant()
+    rid, only_u = "SYNTHETIC-opt-1", "SYNTHETIC-u-only"
+    mine = reserve_once(worker_conn, t)
+    reserve_once(worker_conn, u)
+    reserve_once(worker_conn, u, only_u)
+    read = partial(bs.operator_holding, assessor_conn)
+    assert read(rid) == (None, None)  # no bootstrap row (hosted): nothing
+    conn.execute("INSERT INTO app.installation_bootstrap (tenant_id) VALUES (%s)",
+                 (t,))  # fmt: skip
+    assert read(rid) == (t, mine)
+    assert read(only_u) == (t, None)  # only another tenant holds it
+    for c in (app_conn, worker_conn, release_conn):
+        assert code(partial(bs.operator_holding, c, rid)) == "forbidden"
+    with tn.tenant_transaction(assessor_conn, u) as tx:  # u's context changes nothing
+        assert bs.operator_holding(tx.conn, rid) == (t, mine)
+        assert bs.operator_holding(tx.conn, only_u) == (t, None)
+    # 0053's owner policy admits nothing to a qw_migrate session whose login is
+    # not a qw_assessor member (here: the migration role itself, NOBYPASSRLS)
+    with conn.transaction():
+        conn.execute("SET LOCAL SESSION AUTHORIZATION qw_migrate")
+        row = conn.execute("SELECT count(*) FROM app.budget_book").fetchone()
+    assert row == (0,)
+    stmts = ("SELECT 1 FROM app.budget_book", "SELECT 1 FROM app.budget_authorization",
+             "INSERT INTO app.budget_book (tenant_id, scope_id, period, version, "
+             "book, book_hash) SELECT o.tenant_id, o.scope_id, '2099-01', 0, "
+             "o.book, o.book_hash FROM app.budget_book_operator('SYNTHETIC-opt-1') o",
+             "UPDATE app.budget_book SET version = version + 1",
+             "DELETE FROM app.budget_book", "TRUNCATE app.budget_book",
+             "INSERT INTO app.budget_authorization (tenant_id, authorization_ref) "
+             "SELECT tenant_id, 'SYN-z' FROM app.installation_bootstrap",
+             "UPDATE app.budget_authorization SET authorization_ref = 'Z'",
+             "DELETE FROM app.budget_authorization",
+             "TRUNCATE app.budget_authorization")  # fmt: skip
+    for stmt in stmts:
+        for tid in (t, u):
+            with pytest.raises(errors.InsufficientPrivilege), \
+                    tn.tenant_transaction(assessor_conn, tid):  # fmt: skip
+                assessor_conn.execute(stmt)
+    assert load(worker_conn, t, clock(worker_conn)) == mine  # nothing was written
+
+
+def test_reserve_once_never_reuses_a_lapsed_reservation(
+    tenant: Callable[..., uuid.UUID], conn: Conn, worker_conn: Conn
+) -> None:
+    """Review fix 1: a held reservation whose deadline is at or before `at` is
+    `reservation_expired` (it stays RESERVED: nothing expires an undispatched
+    one), whether the retry comes later this month or in a later month; nothing
+    is re-reserved and no new book is opened."""
+    t = tenant()
+    short = reserve_once(worker_conn, t, deadline=clock(worker_conn)
+                         + timedelta(seconds=1))  # fmt: skip
+    deadline = short.book.get("SYNTHETIC-opt-1").deadline
+    time.sleep(max(0.0, (deadline - clock(worker_conn)).total_seconds()) + 0.2)
+    assert code(partial(reserve_once, worker_conn, t)) == "reservation_expired"
+    assert load(worker_conn, t, clock(worker_conn)) == short  # unchanged
+    # a reservation from last month's book (written as the owner, triggers off:
+    # 0052 opens only the current month), retried this month
+    u, now_ = tenant(), clock(worker_conn)
+    last = now_.replace(day=1, hour=0, minute=0, second=0, microsecond=0) - (
+        timedelta(hours=12))  # fmt: skip
+    old, refusal = BudgetBook.open(str(u), last, CAPS).reserve(
+        "SYNTHETIC-opt-1",
+        Category.IMPROVEMENT,
+        Usd("5"),
+        "SYNTHETIC-acct-1",
+        100,
+        last,
+        last + timedelta(hours=2),
+    )
+    assert refusal is None
+    wire = old.to_wire()
+    with conn.transaction():
+        conn.execute("SET LOCAL session_replication_role = replica")
+        conn.execute("INSERT INTO app.budget_book (tenant_id, scope_id, period, "
+                     "version, book, book_hash) VALUES (%s, %s, %s, %s, %s, %s)",
+                     (u, str(u), old.period, old.version, Jsonb(wire),
+                      bs.book_hash(tn.TenantTx(conn, u), wire)))  # fmt: skip
+    assert call(worker_conn, u, lambda tx: bs.holding(tx, "SYNTHETIC-opt-1")) is not (
+        None)  # the store loads it  # fmt: skip
+    assert code(partial(reserve_once, worker_conn, u)) == "reservation_expired"
+    assert load(worker_conn, u, now_) is None  # no book opened this month

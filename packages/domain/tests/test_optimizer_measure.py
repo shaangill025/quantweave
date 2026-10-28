@@ -15,9 +15,10 @@ from qw_domain import improvement as im
 from qw_domain import optimizer_improvement as oi
 from qw_domain import release as rl
 from qw_domain import research_improvement as ri
+from qw_domain.budget import BudgetBook, Category
 from qw_domain.decimals import UsdBudget as Usd
 from qw_domain.research_data import EvidenceClass
-from test_improvement import ASSESSOR, PRODUCER, book
+from test_improvement import ASSESSOR, CAPS, PRODUCER, book
 from test_optimizer_improvement import (
     BEST,
     COST,
@@ -377,21 +378,42 @@ def gate_lifted_assess(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(im, "SANDBOX_TARGETS", im.SANDBOX_TARGETS - {oi.OPT})
 
 
+OPERATOR = "operator-tenant-synth"  # the bootstrap tenant's id (decision 98)
+R_AT = V_AT - timedelta(hours=1)  # reserved by the cycle job; open past V_AT
+
+
+def reserved(scope: str = OPERATOR, **kw: object) -> BudgetBook:
+    """SYNTHETIC: the operator's book holding MP's frozen reservation (`kw`: other
+    terms), as the `optimizer.cycle` job reserves it."""
+    terms: dict[str, object] = {
+        "reservation_id": MP.budget_reservation_id, "category": Category.IMPROVEMENT,
+        "amount": MP.max_cost, "provider_account_ref": MP.provider_account_ref,
+        "max_output_tokens": MP.max_output_tokens, "at": R_AT,
+        "deadline": R_AT + MP.max_duration} | kw  # fmt: skip
+    b, refusal = BudgetBook.open(scope, R_AT, CAPS).reserve(**terms)  # type: ignore[arg-type]
+    assert refusal is None, refusal
+    return b
+
+
+RESERVED = reserved()
+
+
 def measured(m: dict[str, Decimal] | None, assessor: im.Party = ASSESSOR,
-             p: object = PLAN, at: datetime = V_AT) -> im.Verdict:  # fmt: skip
+             p: object = PLAN, at: datetime = V_AT,
+             b: BudgetBook | None = RESERVED,
+             scope: str | None = OPERATOR) -> im.Verdict:  # fmt: skip
     reg, sc = derived()
     got = None if m is None else oi.Measured(p, m)  # type: ignore[arg-type]
-    return oi.assess_measured(
-        reg, EXP, sc.candidate.candidate_id, got, assessor, at, "verdict-measured-1"
-    )
+    return oi.assess_measured(reg, EXP, sc.candidate.candidate_id, got, b, scope,
+                              assessor, at, "verdict-measured-1")  # fmt: skip
 
 
 def test_the_measured_verdict_stays_sandbox_gated_and_refuses_self_assessment() -> (
     None
 ):  # fmt: skip
     m = measure(derived()[1].candidate)
-    for x in (None, m):
-        v = measured(x)
+    for x, b in ((None, RESERVED), (m, RESERVED), (m, None)):  # the gate is first
+        v = measured(x, b=b)
         assert (v.decision, v.reasons, dict(v.scores), v.trial_ids) == (
             im.Decision.BLOCKED, ("sandbox_unqualified",), {}, ())  # fmt: skip
     for who, why in ((PRODUCER, "self_certification"),
@@ -413,8 +435,8 @@ def test_gate_lifted_measured_verdict_accepts_rejects_and_fails_closed() -> None
     v = measured(m)
     assert (v.decision, v.reasons, dict(v.scores), v.trial_ids) == (
         im.Decision.ACCEPT_FOR_REVIEW, (), m, ("measured:plan-synth-1",))  # fmt: skip
-    assert v.limitations == ("synthetic_only", "no_multiple_testing_adjustment",
-                             "declared_costs_not_reserved")  # fmt: skip
+    assert v.limitations == ("synthetic_only", "no_multiple_testing_adjustment")
+    assert "declared_costs_not_reserved" not in oi.LIMITATIONS  # decision 94
     assert reg.record_verdict(v).verdicts(sc.candidate.candidate_id) == (v,)
     for goal, value in (("promotion_gain", D("0.9")), ("cost_usd", D("2.01"))):
         got = measured(m | {goal: value})
@@ -449,7 +471,51 @@ def test_gate_lifted_measured_verdict_accepts_rejects_and_fails_closed() -> None
         measured(m | {"cost_usd": 1.5})  # type: ignore[arg-type]
     with pytest.raises(TypeError):
         oi.assess_measured(reg, EXP, sc.candidate.candidate_id, m,  # type: ignore[arg-type]
-                           ASSESSOR, V_AT, "v-x")  # fmt: skip
+                           RESERVED, OPERATOR, ASSESSOR, V_AT, "v-x")  # fmt: skip
+    with pytest.raises(TypeError):
+        measured(m, b=RESERVED.to_wire())  # type: ignore[arg-type]
+
+
+@pytest.mark.usefixtures("gate_lifted_assess")
+def test_gate_lifted_measured_verdict_needs_the_operators_frozen_reservation() -> (
+    None
+):  # fmt: skip
+    """GATE-LIFTED SYNTHETIC (decisions 94, 98): as `im.assess`, BLOCKED unless the
+    operator's book holds the protocol's reservation, open, on its frozen terms;
+    checked before the freeze time and the measurement."""
+    m = measure(derived()[1].candidate)
+    rid = MP.budget_reservation_id
+    not_reserved: list[tuple[BudgetBook | None, str | None]] = [
+        (None, OPERATOR), (RESERVED, None), (RESERVED, "tenant-other"),
+        (reserved("tenant-other"), OPERATOR),
+        (reserved(reservation_id="bud-x"), OPERATOR),
+        (RESERVED.release(rid), OPERATOR),
+    ]  # fmt: skip
+    for b, scope in not_reserved:
+        for x in (m, None):
+            got = measured(x, b=b, scope=scope, at=SC_AT)  # before the freeze, too
+            assert (got.decision, got.reasons, got.trial_ids) == (
+                im.Decision.BLOCKED, ("budget_not_reserved",), ()), b  # fmt: skip
+    mismatched = [reserved(amount=Usd("4.99")), reserved(category=Category.RESEARCH),
+                  reserved(provider_account_ref="provider-acct-other"),
+                  reserved(max_output_tokens=MP.max_output_tokens + 1)]  # fmt: skip
+    for b in mismatched:
+        got = measured(m, b=b)
+        assert (got.decision, got.reasons) == (
+            im.Decision.BLOCKED, ("reservation_terms_mismatch",)), b  # fmt: skip
+    sent = RESERVED.dispatched(rid, R_AT)  # dispatched, still reserved: accepted
+    assert measured(m, b=sent).decision is im.Decision.ACCEPT_FOR_REVIEW
+    deadline = RESERVED.get(rid).deadline  # still RESERVED, but its window is over
+    for at, want in (
+        (deadline - timedelta(microseconds=1), ()),
+        (deadline, ("reservation_expired",)),
+        (deadline + timedelta(days=40), ("reservation_expired",)),
+    ):
+        assert measured(m, at=at).reasons == want, at  # a later month, too
+    # `im.assess` (strategies) passes no time: status and terms only, unchanged
+    assert im.reservation_gap(MP, RESERVED, OPERATOR) is None
+    assert im.reservation_gap(MP, RESERVED, OPERATOR, deadline) == (
+        "reservation_expired")  # fmt: skip
 
 
 def test_no_source_rebinds_the_sandbox_gate() -> None:

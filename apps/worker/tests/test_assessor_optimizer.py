@@ -69,10 +69,15 @@ def tenant(app_conn: Conn, bootstrap: bool = False) -> uuid.UUID:
 
 
 @pytest.fixture
-def world(app_conn: Conn, logins: tuple[Conn, Conn]) -> tuple[uuid.UUID, aro.Request]:
-    """The bootstrap tenant routes the jobs (decisions 92, 93)."""
+def world(app_conn: Conn, conn: Conn, logins: tuple[Conn, Conn]) -> tuple[
+    uuid.UUID, aro.Request
+]:  # fmt: skip
+    """The bootstrap tenant routes the jobs (decisions 92, 93) and holds the
+    protocol's frozen reservation in its book (decision 98)."""
     t = tenant(app_conn, bootstrap=True)
     wrk, asr = logins
+    ot.authorize(conn, t)
+    ot.reserve_in(wrk, t)
     return t, ot.stored_world(asr, wrk)
 
 

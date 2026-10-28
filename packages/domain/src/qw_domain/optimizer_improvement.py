@@ -13,8 +13,10 @@ the spec's recursive-lineage fields once `verify_recursion` passes, and
 `next_cycle_run_id` gives the experiment schema field from it (null without one).
 Increment 6: `assess_measured`, the optimizer verdict from `measure`'s metrics,
 behind T044's sandbox gate (`sandbox_unqualified` until T007 qualifies).
+Increment 9 (decisions 94, 98): it also needs the protocol's frozen reservation,
+open, in the operator's (bootstrap) tenant book, as `im.assess` does.
 LIMITATIONS: in memory; times, actors, receipts and costs are caller-asserted, so
-verification is necessary, not sufficient; costs are not reserved in the T037 book.
+verification is necessary, not sufficient.
 """
 
 from collections.abc import Collection, Mapping, Sequence
@@ -52,8 +54,7 @@ OPT = im.Target.RECURSIVE_OPTIMIZER
 COMPONENT = f"{OPT.value}:{OPT.value}"  # T051 prepare_release component naming
 OWNER_IMPROVEMENT_CAP = Decimal("20")  # USD per month (spec §11, personal pilot)
 MAX_PROPOSALS = 8
-LIMITATIONS = ("in_memory", "caller_asserted_times", "declared_costs_not_reserved",
-               "receipts_unauthenticated")  # fmt: skip
+LIMITATIONS = ("in_memory", "caller_asserted_times", "receipts_unauthenticated")
 SYNTHETIC = frozenset({"synthetic_only", "gate_lifted_synthetic"})
 OPT_HARD = ("replayed_output", "payload_invalid")
 
@@ -834,14 +835,19 @@ class Measured:  # an assessor run's measurement: the plan it read, `measure`'s 
 
 def assess_measured(
     reg: im.ExperimentRegistry, experiment_id: str, candidate_id: str,
-    measured: Measured | None, assessor: im.Party, at: datetime, verdict_id: str,
+    measured: Measured | None, book: BudgetBook | None, operator_scope: str | None,
+    assessor: im.Party, at: datetime, verdict_id: str,
 ) -> im.Verdict:  # fmt: skip
     """The optimizer verdict from `measure`'s metrics (T044 `assess` scores ledger
     trials). In order: `check_assessor`; T044's gate on `im.SANDBOX_TARGETS`
-    (BLOCKED `sandbox_unqualified`); `assessed_before_freeze`; `not_measured`;
-    another plan (BLOCKED `test_access_changed`); missing, non-finite or negative
-    hard metrics (INSUFFICIENT); a failed threshold (REJECT, hard first, never
-    offset); else ACCEPT_FOR_REVIEW, with its limitations."""
+    (BLOCKED `sandbox_unqualified`); decisions 94 and 98: `book` must be the
+    operator's (bootstrap) tenant's, `operator_scope` (None: no such tenant), and
+    hold the protocol's frozen reservation, open and before its deadline at `at`
+    (`im.reservation_gap`: BLOCKED `budget_not_reserved`,
+    `reservation_terms_mismatch` or `reservation_expired`); `assessed_before_freeze`;
+    `not_measured`; another plan (BLOCKED `test_access_changed`); missing,
+    non-finite or negative hard metrics (INSUFFICIENT); a failed threshold (REJECT,
+    hard first, never offset); else ACCEPT_FOR_REVIEW, with its limitations."""
     _id(verdict_id, "verdict_id")
     at = ensure_aware_utc(at)
     p, c = reg.protocol(experiment_id), reg.candidate(candidate_id)
@@ -849,6 +855,8 @@ def assess_measured(
     if measured is not None and (type(measured) is not Measured or any(
         type(v) is not Decimal for v in measured.metrics.values())):  # fmt: skip
         raise TypeError("a Measured with Decimal metrics is required")
+    if book is not None and type(book) is not BudgetBook:
+        raise TypeError("a BudgetBook or None is required")
     scores: dict[str, Decimal] = {}
     used: list[str] = []
     limits: list[str] = []
@@ -861,6 +869,8 @@ def assess_measured(
 
     if p.target in im.SANDBOX_TARGETS:  # T044's gate: T007 not qualified
         return verdict(im.Decision.BLOCKED, "sandbox_unqualified")
+    if gap := im.reservation_gap(p, book, operator_scope, at):
+        return verdict(im.Decision.BLOCKED, gap)
     if at < max(p.registered_at, c.created_at):
         return verdict(im.Decision.INSUFFICIENT, "assessed_before_freeze")
     if measured is None:
@@ -870,7 +880,7 @@ def assess_measured(
         return verdict(im.Decision.BLOCKED, "test_access_changed")
     if plan.dataset.evidence_class is EvidenceClass.SYNTHETIC:
         limits.append("synthetic_only")
-    limits += ["no_multiple_testing_adjustment", "declared_costs_not_reserved"]
+    limits.append("no_multiple_testing_adjustment")
     used.append(f"measured:{p.plan_id}")
     scores.update(measured.metrics)
     cards = p.scorecard.thresholds

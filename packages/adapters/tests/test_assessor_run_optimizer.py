@@ -1,6 +1,7 @@
 """The assessor-run optimizer trial (T050 increment 5; decisions 39 to 43, 59 to 62,
 87 and 91). Real non-superuser logins (`runtime_connection(url, role=...)`): the
-qw_assessor login reads the registry and V0's stored cycle, which qw_worker wrote.
+qw_assessor login reads the registry and V0's stored cycle, which qw_worker wrote,
+and (increment 9, decision 98) the operator's book through 0053's reader.
 SYNTHETIC data only (the T050 domain fixtures). The real path ends at
 `sandbox_unqualified`; tests marked GATE-LIFTED inject `lifted_assess` (the
 production `oi.assess_measured` with T044's sandbox gate lifted for that call
@@ -10,6 +11,8 @@ inputs and cannot lift the gate, so nothing here is release proof."""
 from __future__ import annotations
 
 import inspect
+import time
+import uuid
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
@@ -21,10 +24,13 @@ from typing import Any
 import psycopg
 import pytest
 from qw_adapters import assessor_run_optimizer as aro
+from qw_adapters import budget_store as bs
 from qw_adapters import optimizer_store as os_
 from qw_adapters import tenancy as tn
 from qw_domain import improvement as im
 from qw_domain import optimizer_improvement as oi
+from qw_domain.budget import BudgetBook
+from qw_domain.decimals import UsdBudget
 from qw_domain.instants import ensure_aware_utc
 from test_improvement import ASSESSOR, PRODUCER
 from test_optimizer_improvement import EXP, LIMITS, V0
@@ -37,6 +43,7 @@ pytestmark = pytest.mark.db
 Conn = psycopg.Connection[Any]
 INST = "tenant-synth-a"  # the fixtures' installation scope id (SYNTHETIC)
 E = aro.TrialError
+REF = "SYNTHETIC-owner-auth-opt"
 
 
 def login(urls: dict[str, str], role: tn.RuntimeRole) -> Iterator[Conn]:
@@ -83,8 +90,44 @@ def stored_world(asr: Conn, wrk: Conn) -> aro.Request:
                        ASSESSOR, now(asr))  # fmt: skip
 
 
+def authorize(conn: Conn, t: uuid.UUID) -> None:
+    """The owner records a SYNTHETIC spending authorization (qw_migrate, 0052)."""
+    with conn.transaction():
+        conn.execute("SET LOCAL ROLE qw_migrate")
+        conn.execute("INSERT INTO app.budget_authorization (tenant_id, "
+                     "authorization_ref) VALUES (%s, %s)", (t, REF))  # fmt: skip
+
+
+def reserve_in(wrk: Conn, t: uuid.UUID, p: im.Protocol = MP,
+               amount: UsdBudget | None = None,
+               window: timedelta | None = None) -> bs.StoredBook:  # fmt: skip
+    """qw_worker reserves `p`'s frozen terms (or another `amount`; a shorter
+    `window` than `max_duration`) in `t`'s book, as the cycle job does (98)."""
+    with tn.tenant_transaction(wrk, t) as tx:
+        at = now(wrk)
+        return bs.reserve_once(tx, p.budget_reservation_id, amount or p.max_cost,
+                               p.provider_account_ref, p.max_output_tokens, at,
+                               at + (window or p.max_duration))  # fmt: skip
+
+
+def operator(conn: Conn, wrk: Conn, *, bootstrap: bool = True,
+             reserve: bool = True) -> uuid.UUID:  # fmt: skip
+    """A SYNTHETIC tenant, recorded as the bootstrap (operator's) one (0004), with
+    the owner's authorization and MP's frozen reservation in its book."""
+    with tn.provision_tenant(conn) as tx:
+        t = tx.tenant_id
+    if bootstrap:
+        conn.execute("INSERT INTO app.installation_bootstrap (tenant_id) VALUES (%s)",
+                     (t,))  # fmt: skip
+    authorize(conn, t)
+    if reserve:
+        reserve_in(wrk, t)
+    return t
+
+
 @pytest.fixture
-def world(asr: Conn, wrk: Conn) -> aro.Request:
+def world(asr: Conn, wrk: Conn, conn: Conn) -> aro.Request:
+    operator(conn, wrk)
     return stored_world(asr, wrk)
 
 
@@ -122,12 +165,13 @@ def gate_lifted() -> Iterator[None]:
 
 
 def lifted_assess(reg: im.ExperimentRegistry, eid: str, cid: str,
-                  m: oi.Measured | None, assessor: im.Party, at: datetime,
+                  m: oi.Measured | None, book: BudgetBook | None, scope: str | None,
+                  assessor: im.Party, at: datetime,
                   vid: str) -> im.Verdict:  # fmt: skip
     """GATE-LIFTED SYNTHETIC: the production verdict, `oi.assess_measured`, with
-    the sandbox gate lifted for this call."""
+    the sandbox gate lifted for this call (the book is the trial's own read)."""
     with gate_lifted():
-        return oi.assess_measured(reg, eid, cid, m, assessor, at, vid)
+        return oi.assess_measured(reg, eid, cid, m, book, scope, assessor, at, vid)
 
 
 def inputs(seen: list[str] | None = None, **kw: Any) -> aro.InputsProvider:
@@ -183,7 +227,8 @@ def test_the_real_trial_is_blocked_before_any_read_and_records_nothing(
     assert (seen, log.runs, log.done, entries(conn)) == ([], {}, {}, before)
     assert aro.measured_assess is oi.assess_measured
     v = aro.measured_assess(os_.load(asr, INST, now(asr)), EXP, "cand-opt-1", None,
-                            ASSESSOR, world.at, "v-x")  # fmt: skip
+                            *aro.operator_book(asr, MP), ASSESSOR, world.at,
+                            "v-x")  # fmt: skip
     assert (v.decision, v.reasons) == (im.Decision.BLOCKED, ("sandbox_unqualified",))
     # past the gate (GATE-LIFTED), the missing ports fail closed before any read
     reg, p, c, cycle = aro._before_gate(asr, world, lifted_assess)
@@ -292,6 +337,62 @@ def test_gate_lifted_reruns_are_capped_and_a_changed_outcome_conflicts(
     assert len(log.attempts(plan)) == aro.MAX_ATTEMPTS
     assert code(lambda: lifted(asr, world, log)) == "rerun_used"
     assert entries(conn) == before  # no verdict was ever appended
+
+
+def test_gate_lifted_trial_is_blocked_without_the_operators_frozen_reservation(
+    asr: Conn, wrk: Conn, conn: Conn
+) -> None:
+    """GATE-LIFTED SYNTHETIC (decisions 94, 98): no bootstrap tenant, a bootstrap
+    tenant with no reservation (another tenant holds one), the frozen id on other
+    terms, then released: each is `blocked` before any input or read."""
+    r, log, seen, before = stored_world(asr, wrk), MemoryLog(), list[str](), (
+        entries(conn))  # fmt: skip
+    rid = MP.budget_reservation_id
+
+    def blocked(why: str) -> None:
+        with pytest.raises(E) as e:
+            lifted(asr, r, log, seen=seen)
+        assert (e.value.code, str(e.value)) == ("blocked", f"blocked: {why}")
+        assert code(lambda: aro.trial(asr, r)) == "sandbox_unqualified"  # real
+
+    blocked("budget_not_reserved")  # hosted: no bootstrap row
+    assert aro.operator_book(asr, MP) == (None, None)
+    other = operator(conn, wrk, bootstrap=False)  # another tenant holds the id
+    t = operator(conn, wrk, reserve=False)
+    blocked("budget_not_reserved")
+    assert aro.operator_book(asr, MP) == (None, str(t))
+    held = reserve_in(wrk, t, amount=UsdBudget("4.99"))  # the frozen id, other terms
+    blocked("reservation_terms_mismatch")
+    with tn.tenant_transaction(wrk, t) as tx:
+        bs.install(tx, held.book.release(rid), held.book.version)
+    blocked("budget_not_reserved")  # released
+    book, scope = aro.operator_book(asr, MP)
+    assert scope == str(t) and book is not None and book.scope_id == str(t)
+    assert book != reserve_in(wrk, other).book  # never another tenant's
+    assert (seen, log.runs, log.done, entries(conn)) == ([], {}, {}, before)
+
+
+def test_a_reservation_past_its_deadline_is_refused_before_any_read(
+    asr: Conn, wrk: Conn, conn: Conn
+) -> None:
+    """GATE-LIFTED SYNTHETIC (review fix 1): the reservation is still RESERVED
+    (nothing expires an undispatched one), but its window is over at the database
+    clock: `reservation_expired`, though the request's own `at` is earlier."""
+    t = operator(conn, wrk, reserve=False)
+    r, log, seen, before = stored_world(asr, wrk), MemoryLog(), list[str](), (
+        entries(conn))  # fmt: skip
+    held = reserve_in(wrk, t, window=timedelta(seconds=2))  # after the request
+    deadline = held.book.get(MP.budget_reservation_id).deadline
+    assert r.at < deadline
+    time.sleep(max(0.0, (deadline - now(asr)).total_seconds()) + 0.2)
+    assert code(lambda: lifted(asr, r, log, seen=seen)) == "reservation_expired"
+    assert code(lambda: aro.operator_book(asr, MP)) == "reservation_expired"
+    late = replace(r, at=deadline)  # the domain gate on the verdict's own time
+    got = lifted_assess(os_.load(asr, INST, now(asr)), EXP, "cand-opt-1", None,
+                        held.book, str(t), ASSESSOR, late.at, "v-x")  # fmt: skip
+    assert (got.decision, got.reasons) == (im.Decision.BLOCKED,
+                                           ("reservation_expired",))  # fmt: skip
+    assert (seen, log.runs, log.done, entries(conn)) == ([], {}, {}, before)
 
 
 def test_the_request_round_trips_its_payload_and_refuses_malformed_ones() -> None:

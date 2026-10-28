@@ -53,12 +53,14 @@ def asr(runtime_urls: dict[str, str]) -> Iterator[Conn]:
     yield from login(runtime_urls, "qw_assessor")
 
 
-def world(asr: Conn, runtime_urls: dict[str, str], fixture: bool = True,
-          ) -> aro.Request:  # fmt: skip
-    """The fixture preregistered (or not), then increment 5's stored world."""
+def world(asr: Conn, conn: Conn, runtime_urls: dict[str, str],
+          fixture: bool = True) -> aro.Request:  # fmt: skip
+    """The fixture preregistered (or not), MP's reservation in the bootstrap book
+    (decision 98), then increment 5's stored world."""
     if fixture:
         assert ofs.preregister(asr, INST, PLAN, FIXTURE)
     for wrk in login(runtime_urls, "qw_worker"):
+        orl.operator(conn, wrk)
         r: aro.Request = orl.stored_world(asr, wrk)
     return r
 
@@ -214,7 +216,7 @@ def test_the_real_trial_is_blocked_before_reading_the_stored_fixture(
     asr: Conn, conn: Conn, runtime_urls: dict[str, str],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:  # fmt: skip
-    r, reads = world(asr, runtime_urls), list[str]()
+    r, reads = world(asr, conn, runtime_urls), list[str]()
     real = ofs.load
 
     def spy(*a: Any) -> Any:
@@ -246,7 +248,7 @@ def test_gate_lifted_trial_reads_the_stored_fixture_and_accepts(
 ) -> None:
     """GATE-LIFTED SYNTHETIC: the promotion fixture comes from 0051; development
     inputs that do not hash to the stored cycle's are refused before any read."""
-    r, before = world(asr, runtime_urls), orl.entries(conn)
+    r, before = world(asr, conn, runtime_urls), orl.entries(conn)
     other: list[Callable[[oi.CycleReceipt], Any]] = [
         lambda c: (replace(BASE, top_k=1), DEV, LIMITS),
         lambda c: (BASE, replace(DEV, fixture_id="fixture-synth-dev-2"), LIMITS),
@@ -257,7 +259,7 @@ def test_gate_lifted_trial_reads_the_stored_fixture_and_accepts(
     run = gate_lifted(asr, r)
     assert (run.attempt, run.wrote, run.verdict.decision) == (
         1, True, im.Decision.ACCEPT_FOR_REVIEW)  # fmt: skip
-    assert "declared_costs_not_reserved" in run.verdict.limitations  # decision 94
+    assert "declared_costs_not_reserved" not in run.verdict.limitations  # 94, 98
     assert os_.RunLog(asr, INST).attempts(MP.plan_id)[0].fixture_hash == (
         FIXTURE.content_hash)  # the stored fixture was the read  # fmt: skip
     assert orl.entries(conn) == before + 1

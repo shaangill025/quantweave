@@ -1,5 +1,5 @@
-"""The assessor-run optimizer trial (T050; owner decisions 39 to 43, 59 to 62, 87
-and 91): the strategy promotion's pattern (`assessor_run`) at installation scope.
+"""The assessor-run optimizer trial (T050; owner decisions 39 to 43, 59 to 62, 87,
+91, 94 and 98): the strategy promotion's pattern (`assessor_run`) at installation scope.
 `trial` runs in the qw-assessor process on its qw_assessor login only (decision
 40; any other login is `assessor_login`), never as the producer:
 - it loads the optimizer registry (protocol, candidate) and V0's stored cycle
@@ -9,6 +9,12 @@ and 91): the strategy promotion's pattern (`assessor_run`) at installation scope
   candidate, else `duplicate`);
 - decision 62: `assess` with nothing measured; a certain BLOCKED is refused before
   any input is loaded or read is recorded (`sandbox_unqualified`, or `blocked`).
+  Decisions 94 and 98: every `assess` gets the operator's book (`operator_book`:
+  in one 0053 call, the bootstrap tenant and its latest book holding the
+  protocol's reservation), so without that reservation, open, on the frozen terms
+  and before its deadline, the trial is `blocked` before any read; a deadline at
+  or before the database clock is `reservation_expired` (the request's `at` is
+  the caller's, so the clock is checked too).
   The gate and the verdict are `oi.assess_measured` (`measured_assess`, fixed:
   `trial` takes no port), T044's sandbox gate over `measure`'s metrics: for the
   optimizer target it is `sandbox_unqualified` until T007 qualifies its sandbox,
@@ -43,10 +49,12 @@ from typing import Protocol
 from qw_domain import improvement as im
 from qw_domain import optimizer_improvement as oi
 from qw_domain import research_improvement as ri
+from qw_domain.budget import BudgetBook
 from qw_domain.instants import ensure_aware_utc, format_instant, parse_instant
 from qw_domain.research_data import check_id, digest
 from qw_domain.trial_ledger import SplitPlan
 
+from qw_adapters import budget_store as bs
 from qw_adapters import optimizer_fixture_store as ofs
 from qw_adapters import optimizer_store as os_
 from qw_adapters.tenancy import Conn, TenancyError, check_runtime_role
@@ -109,9 +117,11 @@ InputsProvider = Callable[[Request, im.Protocol, oi.CycleReceipt], Inputs]
 # V0's cycle -> its research base, dev fixture and limits (GATE-LIFTED tests only)
 Development = Callable[[oi.CycleReceipt], tuple[ri.ResearchConfig, ri.Fixture,
                                                 oi.Limits]]  # fmt: skip
-# (registry, experiment, candidate, measurement or None, assessor, at, verdict id)
-Assess = Callable[[im.ExperimentRegistry, str, str, oi.Measured | None, im.Party,
-                   datetime, str], im.Verdict]  # fmt: skip
+# (registry, experiment, candidate, measurement or None, the operator's book or
+# None, its scope or None, assessor, at, verdict id)
+Assess = Callable[[im.ExperimentRegistry, str, str, oi.Measured | None,
+                   BudgetBook | None, str | None, im.Party, datetime, str],
+                  im.Verdict]  # fmt: skip
 
 
 class RunLog(Protocol):
@@ -188,6 +198,21 @@ def record_outcome(log: RunLog, plan_id: str, attempt: int, d: str) -> None:
         raise TrialError("verdict_conflict", "the trial outcome differs")
 
 
+def operator_book(assessor: Conn, p: im.Protocol) -> tuple[BudgetBook | None,
+                                                          str | None]:  # fmt: skip
+    """Decision 98: the bootstrap tenant's latest book holding `p`'s reservation
+    and that tenant's id, in one 0053 call; (None, None) with no bootstrap row.
+    A held reservation whose deadline is at or before the database clock is
+    `reservation_expired`."""
+    t, got = bs.operator_holding(assessor, p.budget_reservation_id)
+    if got is None:
+        return None, None if t is None else str(t)
+    r = got.book.get(p.budget_reservation_id)
+    if r.deadline <= _now(assessor):
+        raise TrialError("reservation_expired", got.book.period)
+    return got.book, str(t)
+
+
 def _now(conn: Conn) -> datetime:
     row = conn.execute("SELECT clock_timestamp()").fetchone()
     assert row is not None
@@ -224,7 +249,8 @@ def _before_gate(assessor: Conn, r: Request, assess: Assess) -> tuple[
               if s.receipt.cycle_id == r.source_cycle_id]  # fmt: skip
     if not cycles:
         raise TrialError("cycle_missing", r.source_cycle_id)
-    dry = assess(reg, eid, cid, None, r.assessor, r.at, r.verdict_id)
+    dry = assess(reg, eid, cid, None, *operator_book(assessor, p), r.assessor, r.at,
+                 r.verdict_id)  # fmt: skip
     if dry.decision is im.Decision.BLOCKED:  # decision 62: certain before the read
         code = "sandbox_unqualified" if "sandbox_unqualified" in dry.reasons else (
             "blocked")  # fmt: skip
@@ -256,6 +282,7 @@ def _after_gate(assessor: Conn, r: Request, beat: Callable[[], object],
     record_outcome(log, p.plan_id, attempt, done)
     beat()
     v = assess(reg, p.experiment_id, c.candidate_id, oi.Measured(i.plan, metrics),
-               r.assessor, r.at, r.verdict_id)  # fmt: skip
+               *operator_book(assessor, p), r.assessor, r.at,
+               r.verdict_id)  # the book as it is now  # fmt: skip
     _, wrote = os_.append(assessor, r.installation_id, v)
     return Run(v, wrote, attempt, metrics)
