@@ -15,6 +15,10 @@ Spec §10/§15 budgets, §11 improvement cap, config `budgets_and_slos.json`, sc
   later report may still settle it.
 - A charge belongs to the month of its reservation, whenever the usage report
   arrives (pending owner/spec confirmation of the billing-month rule).
+- Totals are exact `Decimal` sums (any number of absurd reported overruns), so
+  the cap checks never overflow `UsdBudget`; `summary()` saturates a total
+  beyond `UsdBudget`'s bound at that bound and says so (`saturated`), so
+  arithmetic on totals uses the exact `totals()`.
 - The book is immutable and versioned: `apply` installs a new book by
   compare-and-set on `version`; persistence does it in one transaction.
 - `BudgetBook.to_wire`/`from_wire` keep every field (a reservation's
@@ -26,9 +30,10 @@ Stdlib only.
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta
+from decimal import Decimal, localcontext
 from enum import StrEnum
 
-from qw_domain.decimals import UsdBudget, safe_repr
+from qw_domain.decimals import DOMAIN_CONTEXT, UsdBudget, safe_repr
 from qw_domain.instants import ensure_aware_utc, format_instant, parse_instant
 from qw_domain.sources import ID_PATTERN
 
@@ -36,6 +41,15 @@ ZERO = UsdBudget(0)
 # Longest reservation deadline (0052 holds the same bound; chosen in T037, the spec
 # names none): a reservation must reconcile within it.
 MAX_DEADLINE = timedelta(days=7)
+# The largest magnitude a `UsdBudget` holds (14 integer digits, scale 6).
+USD_BOUND = Decimal(10) ** UsdBudget.INT_DIGITS - Decimal(1).scaleb(-UsdBudget.SCALE)
+
+
+def saturate(x: Decimal) -> tuple[UsdBudget, bool]:
+    """`x` as a `UsdBudget`, clamped to +-`USD_BOUND`; True if it was clamped."""
+    if abs(x) > USD_BOUND:
+        return UsdBudget(USD_BOUND.copy_sign(x)), True
+    return UsdBudget(x.copy_abs() if x.is_zero() else x), False
 
 
 class BudgetError(ValueError):
@@ -249,6 +263,7 @@ class Summary:  # openapi `BudgetSummary`
     reserved: UsdBudget
     spent: UsdBudget
     available: UsdBudget  # negative after a reported overrun
+    saturated: bool = False  # a total beyond UsdBudget's bound, shown at the bound
 
 
 def _open(r: Reservation, *allowed: Status) -> Reservation:
@@ -309,21 +324,37 @@ class BudgetBook:
             raise BudgetError("unknown", safe_repr(reservation_id))
         return r
 
+    def totals(self, category: Category | None = None) -> tuple[Decimal, Decimal]:
+        """Exact (reserved, spent) sums, unbounded by `UsdBudget`: for any
+        arithmetic on the totals (a `summary()` may saturate)."""
+        reserved = spent = Decimal(0)
+        with localcontext(DOMAIN_CONTEXT):
+            for r in self.reservations:
+                if category is None or r.category is category:
+                    held, used = r.charge
+                    reserved, spent = reserved + held.value, spent + used.value
+        return reserved, spent
+
+    def _available(self, category: Category | None) -> Decimal:
+        """Exact headroom: the inference cap's, and for improvement the lesser
+        of that and its own cap's."""
+        reserved, spent = self.totals(None)
+        with localcontext(DOMAIN_CONTEXT):
+            free = self.caps.inference.value - reserved - spent
+            if category is Category.IMPROVEMENT:
+                held, used = self.totals(category)
+                free = min(self.caps.improvement.value - held - used, free)
+        return free
+
     def summary(self, category: Category | None = None) -> Summary:
         """Totals for the book, or one category. Every category but improvement
         draws on the shared inference cap, so its `available` is the book's."""
-        reserved = spent = ZERO
-        for r in self.reservations:
-            if category is None or r.category is category:
-                held, used = r.charge
-                reserved, spent = reserved + held, spent + used
-        if category is Category.IMPROVEMENT:
-            cap = self.caps.improvement
-            free = min(cap - reserved - spent, self.summary().available)
-        else:
-            cap = self.caps.inference
-            free = self.summary().available if category else cap - reserved - spent
-        return Summary(category, cap, reserved, spent, free)
+        imp = category is Category.IMPROVEMENT
+        cap = self.caps.improvement if imp else self.caps.inference
+        (reserved, a), (spent, b), (free, c) = (
+            saturate(x) for x in (*self.totals(category), self._available(category))
+        )
+        return Summary(category, cap, reserved, spent, free, a or b or c)
 
     def _with(self, r: Reservation) -> "BudgetBook":
         rid, old = r.reservation_id, self.reservations
@@ -361,10 +392,10 @@ class BudgetBook:
             return self, Refusal("wrong_period", period_of(at))
         if deadline - at > MAX_DEADLINE:
             return self, Refusal("deadline_too_far", format_instant(deadline))
-        if self.summary().available < amount:
-            return self, Refusal("inference_cap", self.summary().available.to_wire())
+        if (free := self._available(None)) < amount.value:  # exact: never overflows
+            return self, Refusal("inference_cap", saturate(free)[0].to_wire())
         if category is Category.IMPROVEMENT and (
-            self.summary(category).available < amount
+            self._available(category) < amount.value
         ):
             return self, Refusal("improvement_cap")
         return self._with(new), None

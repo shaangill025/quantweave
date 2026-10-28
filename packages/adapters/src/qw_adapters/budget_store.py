@@ -18,6 +18,8 @@ gateway's `req.tenant_id == book.scope_id`), written only by compare-and-set:
   (`stale_clock`: reload and retry; a row-lock wait can cause it).
 - `expire_due(tx, period)`: `BudgetBook.expire_due` at the database clock as one
   step (installed at `version + 1`; the domain counts one per expiry).
+  `open_periods(tx)`: the months whose book holds a reservation still
+  `reserved` (the `budget.expire_due` job sweeps each, T037 increment 4).
 - `reserve_once(tx, ...)`: one reservation, never twice: the latest book holding
   its id is returned unchanged if the domain's same-id retry accepts it (else
   that refusal's code) and its deadline is after `at` (else
@@ -300,6 +302,21 @@ def install(tx: TenantTx, new: BudgetBook, expected_version: int) -> StoredBook:
     if stored is None or stored.book != new:
         raise BudgetStoreError("integrity", "the installed book differs")
     return stored
+
+
+def open_periods(tx: TenantTx) -> list[str]:
+    """The session tenant's months, oldest first, whose book holds a reservation
+    still `reserved` (a later month's book never holds an earlier month's)."""
+    _tenant(tx)
+    try:
+        rows = tx.conn.execute(
+            "SELECT period FROM app.budget_book WHERE tenant_id = %s AND "
+            "book -> 'reservations' @> %s ORDER BY period",
+            (tx.tenant_id, Jsonb([{"status": "reserved"}])),
+        ).fetchall()
+    except psycopg.Error as exc:
+        raise _database(exc) from None
+    return [str(r[0]) for r in rows]
 
 
 def expire_due(tx: TenantTx, period: str) -> StoredBook | None:

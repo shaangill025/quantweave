@@ -31,6 +31,7 @@ from qw_domain import optimizer_improvement as oi
 from qw_domain import release as rl
 from qw_domain.jobs import Backoff, JobState, Pool, Priority
 from qw_worker import __main__ as entry
+from qw_worker import budget_sweep as sweep
 from qw_worker import optimizer_cycle as oc
 from qw_worker.config import WorkerSettings
 from qw_worker.loop import Worker
@@ -196,7 +197,8 @@ def test_the_entry_point_registers_the_cycle_handler(
     monkeypatch.setattr(entry, "install_signal_handlers", lambda worker: None)
     monkeypatch.setenv("QW_DATABASE_URL", runtime_urls["qw_worker"])
     monkeypatch.delenv("QW_ASSESSOR_DATABASE_URL", raising=False)
-    assert entry.main() == 0 and dict(started[0].handlers) == {oc.KIND: oc.handle}
+    assert entry.main() == 0 and dict(started[0].handlers) == {
+        oc.KIND: oc.handle, sweep.KIND: sweep.handle}  # fmt: skip
 
 
 def test_another_tenant_or_a_hosted_edition_is_refused_before_any_read(

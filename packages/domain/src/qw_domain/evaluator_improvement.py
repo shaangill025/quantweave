@@ -543,8 +543,8 @@ def measure(
                 fa += ok and x in should_block
                 orj += not ok and x not in should_block
                 micros += sum(_micros(y.finished_at - y.dispatched_at) for y in r.runs)
-                s = r.book.summary()
-                cost += s.reserved.value + s.spent.value  # unknown outcomes held
+                held, used = r.book.totals()  # exact: a summary may saturate
+                cost += held + used  # unknown outcomes held
                 unverified += _unverified(r)
         return fa, orj, micros, cost, unverified
 

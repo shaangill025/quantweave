@@ -3,7 +3,8 @@
 1. `expire_overdue`: queued jobs past their start-by deadline become `expired`;
 2. `reap_expired`: running jobs whose lease ran out are requeued or dead-lettered;
 3. up to `jobs_per_tick` claims from the worker's pool, each run by the handler
-   registered for its kind in a tenant transaction that also marks it succeeded;
+   registered for its kind in a tenant transaction that also marks it succeeded
+   (or, for `HandlerFailed(..., keep_effects=True)`, failed with its writes kept);
 4. only when a publish target is injected: up to `relay_per_tick` outbox events,
    each published and marked in its own transaction (`relay_outbox(limit=1)`), so a
    crash republishes at most the event in flight and no row lock is held across
@@ -53,11 +54,17 @@ HANDLERS: Mapping[str, Handler] = MappingProxyType({})
 
 
 class HandlerFailed(Exception):
-    """Raised by a handler to fail its attempt with a short code."""
+    """Raised by a handler to fail its attempt with a short code. By default the
+    attempt's writes roll back; `keep_effects=True` commits them with the
+    failure in the job's one transaction (a handler whose completed units are
+    each idempotent and isolated in savepoints, so a retry redoes only the rest)."""
 
-    def __init__(self, code: str, *, retryable: bool) -> None:
+    def __init__(
+        self, code: str, *, retryable: bool, keep_effects: bool = False
+    ) -> None:
         super().__init__(check_error_code(code))
         self.code, self.retryable = code, retryable
+        self.keep_effects = keep_effects
 
 
 def database_clock(conn: Conn) -> Clock:
@@ -161,7 +168,14 @@ class Worker:
         if handler is not None:
             try:
                 with tenant_transaction(self.conn, job.tenant_id) as tx:
-                    handler(tx, job)
+                    try:
+                        handler(tx, job)
+                    except HandlerFailed as exc:
+                        if not exc.keep_effects:
+                            raise
+                        return job.id, qj.fail(tx, job, exc.code,
+                                               retryable=exc.retryable,
+                                               backoff=s.job_backoff)  # fmt: skip
                     qj.complete(tx, job)
                 return job.id, JobState.SUCCEEDED
             except LeaseLost:

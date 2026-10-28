@@ -761,9 +761,9 @@ def test_reserve_once_never_reuses_a_lapsed_reservation(
     tenant: Callable[..., uuid.UUID], conn: Conn, worker_conn: Conn
 ) -> None:
     """Review fix 1: a held reservation whose deadline is at or before `at` is
-    `reservation_expired` (it stays RESERVED: nothing expires an undispatched
-    one), whether the retry comes later this month or in a later month; nothing
-    is re-reserved and no new book is opened."""
+    `reservation_expired` (it stays RESERVED until a `budget.expire_due` sweep
+    releases it), whether the retry comes later this month or in a later month;
+    nothing is re-reserved and no new book is opened."""
     t = tenant()
     short = reserve_once(worker_conn, t, deadline=clock(worker_conn)
                          + timedelta(seconds=1))  # fmt: skip
