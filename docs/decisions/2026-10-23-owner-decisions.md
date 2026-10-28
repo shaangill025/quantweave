@@ -609,3 +609,17 @@ below waives a test, gate or spec requirement. Numbering continues from
     max_duration. 7 days leaves room for slow reconciliation without letting a
     stale reservation hold the monthly cap for weeks."
     Implemented by: T037 (`MAX_DEADLINE` in the domain and migration 0052).
+
+100. **How the budget expiry sweep is scheduled (T037, T025).**
+    Question: "Decision 100 (T037/T025): The new budget sweep job expires overdue
+    reservations so they stop holding your monthly caps, but nothing starts it
+    yet. The worker can't see which tenants exist (row-level security), so it
+    can't queue a sweep per tenant. How should the sweep be scheduled?"
+    Selected label: "Narrow lister + worker timer (Recommended)".
+    Option text as presented: "Add one locked-down database function, callable
+    only by the worker, that returns just the ids of tenants with an overdue
+    reservation (nothing else). A timer in the worker calls it every few minutes
+    and queues one sweep job per listed tenant (idempotent per hour). Why:
+    overdue money is freed within the hour for every tenant, and the worker
+    learns only which tenants have something to sweep."
+    Implemented by: T037 (budget expiry sweep), T025 (durable jobs).
