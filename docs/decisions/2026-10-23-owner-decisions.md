@@ -706,3 +706,60 @@ below waives a test, gate or spec requirement. Numbering continues from
     Implemented by: a post-first-release increment on the strategy/model
     improvement path (T047), after a T009 dependency review. Not first-release
     scope.
+
+106. **The API's web server and start command (T060, T009).**
+    Question: "Decision 106 (T060/T009): The API has no web server to run it. The
+    locked dependencies include no ASGI server, and nothing starts the API
+    process from configuration. Which server, and how is it started?"
+    Selected label: "uvicorn + qw-api command (Recommended)".
+    Option text as presented: "After a T009-style dependency review, add
+    uvicorn with an exact version pin and no optional extras (BSD-3-Clause
+    licence). Add a `qw-api` command that builds the API's settings from the
+    environment. Secret values are read only from files (e.g.
+    QW_SECRET_KEY_FILE), and secrets passed inline in the environment are
+    refused. Why: uvicorn is the most widely used, smallest-footprint server
+    for this framework. File-only secrets keep keys out of environment dumps
+    and process listings."
+    Implemented by: T009 (dependency review), T060 (API entry point).
+
+107. **Supplying secrets in the self-hosted edition before T037 (T060).**
+    Question: "Decision 107 (T060): Until the secrets store (T037) exists, how
+    should the self-hosted edition supply database passwords and app keys?"
+    Selected label: "Per-service files (Recommended)".
+    Option text as presented: "Database passwords go in PostgreSQL passfiles,
+    and app keys in mounted *_FILE secrets. There is one file set per service,
+    readable only by that service's user (mode 0600), and no shared key is
+    baked into any image. The receipt records plainly that these files are
+    unencrypted on the host disk until T037/T062 add encryption at rest. Why:
+    no code change for the database side, nothing in environment variables or
+    images, and each service sees only its own secrets."
+    Implemented by: T060 (container profiles); encryption at rest stays open
+    for T037/T062.
+
+108. **First-time database setup on a fresh install (T060, T009).**
+    Question: "Decision 108 (T060/T009): On a fresh install, the first migration
+    creates the database roles and needs a PostgreSQL superuser, and the login
+    accounts for each role must also be created. Earlier receipts say the
+    migration login must not be a superuser at runtime. Who does the
+    first-time setup?"
+    Selected label: "One-shot superuser init (Recommended)".
+    Option text as presented: "A one-time `db-init` job runs as the PostgreSQL
+    superuser through the official image's init mechanism. It applies the
+    first migration and creates one non-superuser login per role, with
+    passwords read from mounted files. After that, a `migrate-once` job runs
+    later migrations as the non-superuser qw_migrate login. Nothing at runtime
+    holds superuser. Why: superuser is used once, at install, and never by a
+    running service."
+    Implemented by: T060 (db-init, migrate-once and a `qw-migrate` command).
+
+109. **Building and serving the web app in the self-hosted edition (T060).**
+    Question: "Decision 109 (T060): How should the web app be built and served
+    in the self-hosted edition?"
+    Selected label: "Built in Node, served by API (Recommended)".
+    Option text as presented: "Mirror and pin a Node image by digest for the
+    build step only, as with the Python image (decision 13). The API process
+    serves the built files using the framework's built-in static file support,
+    which is already a locked dependency. Why: no extra runtime server or
+    image to secure, and the page and API share one origin, which keeps the
+    security rules (CSRF, allowed origins) simple."
+    Implemented by: T060 (container profiles).
