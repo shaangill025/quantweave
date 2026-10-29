@@ -48,12 +48,13 @@ from fastapi import APIRouter, Path, Query, Request, Response
 from qw_adapters import journal_store as js
 from qw_adapters import pause_store, policy_store
 from qw_adapters import proposal_store as pst
+from qw_domain import ledger_wire as lw
 from qw_domain import proposals as dp
 from qw_domain.decimals import Money
 from qw_domain.instants import ensure_aware_utc, format_instant
-from qw_domain.journal import Entry, Journal, materialize
+from qw_domain.journal import Journal, materialize
 from qw_domain.policy import PolicyHistory
-from qw_domain.postings import EventKind, Holding, UnitAccount
+from qw_domain.postings import Holding
 from qw_domain.risk import Side
 from qw_domain.risk_pauses import PauseBook
 
@@ -303,58 +304,11 @@ def read_proposal(
     return Response(json.dumps(view).encode(), 200, media_type="application/json")
 
 
-# Journal kinds on the ledger_event wire. A reversal is the spec's correction
-# (spec §4: corrections use reversals/superseding events); the mapping is named
-# per item in coverage. A kind missing here is a 500, never a dropped event.
-# Identity map on purpose: it exists so a new EventKind fails closed (500).
-KINDS = {k.value: k.value for k in EventKind if k is not EventKind.REVERSAL}
-MAPPED = {EventKind.REVERSAL.value: "correction"}
+# Journal kinds on the ledger_event wire (a reversal is the spec's correction) and
+# the item itself live in qw_domain.ledger_wire, which the T057 export shares.
+KINDS, ledger_item = lw.KINDS, lw.item
 LEDGER_REASONS = ["unavailable:lot_policy_id",
                   "unreconciled:status_is_journal_acceptance"]  # fmt: skip
-
-
-def _line(account: str, commodity: str, amount: str) -> dict[str, str]:
-    return {"book_account": account, "commodity": commodity, "amount": amount}
-
-
-def ledger_item(
-    tenant: str, entry: Entry, reversed_ids: set[str]
-) -> tuple[dict[str, Any], list[str]]:
-    """One journal event on the wire. Money lines keep their currency as commodity
-    (an instrument sub-ledger is `<book_account>:<instrument>`); unit lines use the
-    instrument id as commodity; never summed across commodities."""
-    e, why = entry.event, []
-    kind = KINDS.get(e.kind.value)
-    if kind is None:
-        kind = MAPPED[e.kind.value]
-        why.append(f"mapped:{e.event_id}/kind={e.kind.value}->{kind}")
-    postings = [
-        _line(p.account.value if p.instrument_id is None
-              else f"{p.account.value}:{p.instrument_id.to_wire()}",
-              p.amount.currency, p.amount.amount.to_wire())
-        for p in e.money
-    ] + [_line(u.account.value, u.instrument_id.to_wire(), u.quantity.to_wire())
-         for u in e.units]  # fmt: skip
-    moves = [{"instrument_id": u.instrument_id.to_wire(),
-              "quantity": u.quantity.to_wire()}
-             for u in e.units if u.account is UnitAccount.POSITION]  # fmt: skip
-    notes = [] if e.fee is None else [f"fee:{e.fee.amount.to_wire()} {e.fee.currency}"]
-    notes.append(f"lot_policy:{e.lot_policy}")
-    if e.supersedes is not None:
-        notes.append(f"supersedes:{e.supersedes}")
-    key = (f"reversal/{e.reverses}" if e.reverses is not None
-           else f"record/{e.source.source_id}/{e.source.record_id}")  # fmt: skip
-    return {
-        "id": e.event_id, "account_id": e.account_id, "tenant_id": tenant,
-        "kind": kind, "effective_at": format_instant(e.effective_at),
-        "recorded_at": format_instant(entry.recorded_at),
-        "source_id": e.source.source_id, "source_record_id": e.source.record_id,
-        "idempotency_key": key,
-        "status": "reversed" if e.event_id in reversed_ids else "accepted",
-        "reverses_event_id": e.reverses, "postings": postings,
-        "instrument_movements": moves, "lot_policy_id": None,
-        "economic_annotations": notes,
-    }, why  # fmt: skip
 
 
 @router.get("/accounts/{account_id}/ledger")

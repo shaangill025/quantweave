@@ -45,6 +45,11 @@ class TenancyError(Exception):
     """Tenant context, session token or runtime role is unusable."""
 
 
+class SnapshotRequired(TenancyError):
+    """A whole-tenant read (a T057 export) outside one REPEATABLE READ, READ ONLY
+    transaction, where concurrent commits could give an inconsistent section."""
+
+
 class MembershipRole(StrEnum):
     TENANT_OWNER = "tenant_owner"
     TENANT_MEMBER = "tenant_member"
@@ -91,6 +96,17 @@ def tenant_transaction(
             conn.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
         conn.execute("SELECT set_config('app.tenant_id', %s, true)", (str(tenant_id),))
         yield TenantTx(conn, tenant_id)
+
+
+def require_snapshot(tx: TenantTx) -> None:
+    """Raise `SnapshotRequired` unless `tx` is `tenant_transaction(snapshot=True)`'s
+    kind: REPEATABLE READ and READ ONLY, as the server reports them."""
+    row = tx.conn.execute(
+        "SELECT current_setting('transaction_isolation'), "
+        "current_setting('transaction_read_only')"
+    ).fetchone()
+    if row != ("repeatable read", "on"):
+        raise SnapshotRequired(f"export needs a read-only snapshot, not {row}")
 
 
 @contextmanager

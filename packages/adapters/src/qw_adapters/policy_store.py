@@ -20,18 +20,14 @@ Policy ids are server-made UUIDs (C-07). Decimal values stay decimal strings in 
 from __future__ import annotations
 
 import uuid
-from collections.abc import Mapping
 from datetime import UTC, datetime, timedelta
-from typing import Any
 
 import psycopg
 from psycopg.types.json import Jsonb
 from qw_domain import policy as dp
-from qw_domain.decimals import Money, MoneyAmount, Ratio
 from qw_domain.instants import ensure_aware_utc
-from qw_domain.onboarding import Allocation, Limit, LimitMetric, SizingScope
 
-from qw_adapters.tenancy import TenantTx
+from qw_adapters.tenancy import TenantTx, require_snapshot
 
 MAX_STEP_UP_WINDOW = timedelta(hours=1)  # the 0009 trigger's bound
 _EPOCH = datetime(1970, 1, 1, tzinfo=UTC)
@@ -48,56 +44,10 @@ def step_up_receipt_id(session_id: uuid.UUID, step_up_at: datetime) -> str:
     return f"{session_id}.{micros}"
 
 
-def _scope(s: SizingScope) -> dict[str, str | None]:
-    return {
-        "account_id": s.account_id,
-        "currency": s.currency,
-        "sleeve_id": s.sleeve_id,
-    }
-
-
-def _limit(w: Mapping[str, Any]) -> Limit:
-    value = w["value"]
-    amount = (
-        Ratio.from_wire(value) if w["unit"] == "ratio" else MoneyAmount.from_wire(value)
-    )
-    scope = SizingScope(w["account_id"], w["currency"], w["sleeve_id"])
-    return Limit(LimitMetric(w["metric"]), amount, w["unit"], w["denominator"],
-                 w["window"], scope)  # fmt: skip
-
-
-def draft_to_json(d: dp.DraftPolicy) -> dict[str, Any]:
-    return {
-        "tenant_id": d.tenant_id, "synthetic": d.synthetic,
-        "schema": d.response_schema_version,
-        "fields": [[f.name, f.value if isinstance(f.value, str) else list(f.value),
-                    list(f.sources)] for f in d.fields],
-        "limits": [x.to_wire() for x in d.limits],
-        "allocations": [_scope(a.scope) | {"amount": a.amount.to_wire()}
-                        for a in d.allocations],
-        "conflicts": [[c.code.value, list(c.sources), c.blocking, c.detail]
-                      for c in d.conflicts],
-        "exclusions": [[e.subject, e.reason.value] for e in d.exclusions],
-        "warnings": list(d.retained_warnings),
-    }  # fmt: skip
-
-
-def draft_from_json(j: Mapping[str, Any]) -> dp.DraftPolicy:
-    return dp.DraftPolicy(
-        tenant_id=j["tenant_id"], synthetic=j["synthetic"],
-        response_schema_version=j["schema"],
-        fields=tuple(dp.InferredField(n, v if isinstance(v, str) else tuple(v),
-                                      tuple(s)) for n, v, s in j["fields"]),
-        limits=tuple(_limit(w) for w in j["limits"]),
-        allocations=tuple(Allocation(
-            SizingScope(a["account_id"], a["currency"], a["sleeve_id"]),
-            Money.from_wire(a["amount"])) for a in j["allocations"]),
-        conflicts=tuple(dp.Conflict(dp.ConflictCode(c), tuple(s), b, t)
-                        for c, s, b, t in j["conflicts"]),
-        exclusions=tuple(dp.Exclusion(s, dp.ConflictCode(r))
-                         for s, r in j["exclusions"]),
-        retained_warnings=tuple(j["warnings"]),
-    )  # fmt: skip
+# The persisted version content is the domain's draft wire (moved to qw_domain.policy
+# for the T057 export check); these names are kept for callers.
+draft_to_json, draft_from_json, _limit = (dp.draft_to_json, dp.draft_from_json,
+                                          dp.limit_from_wire)  # fmt: skip
 
 
 def _lock(tx: TenantTx, policy_id: uuid.UUID) -> None:
@@ -245,3 +195,27 @@ def _insert_receipt(
          Jsonb([[e.subject, e.reason.value] for e in r.exclusions]),
          r.acknowledgement_text, r.receipt_hash),
     )  # fmt: skip
+
+
+def export_policies(tx: TenantTx, page: int = 500) -> list[dict[str, object]]:
+    """The T057 `policy/policies.json` section: every version of every policy of the
+    tenant (RLS and `tx.tenant_id`), by policy id then version, each as stored
+    (`content` is the draft wire its `content_hash` covers). Each policy is read
+    through `load`, so every content and receipt hash is recomputed and a tampered row
+    raises `PolicyStoreError("integrity")`. Adoption receipts (principal, step-up
+    receipt, acknowledgement, signing time) and `created_by` are approval or
+    identity material and are never exported; the destination re-adopts. Read-only;
+    it runs only in a snapshot transaction (`tenancy.SnapshotRequired` otherwise)."""
+    require_snapshot(tx)
+    rows: list[dict[str, object]] = []
+    after = None
+    while ids := list_policy_ids(tx, page, after):
+        for policy_id in ids:
+            history = load(tx, policy_id)
+            assert history is not None  # listed in this transaction
+            rows += [{"policy_id": str(policy_id), "version": v.version,
+                      "content_hash": v.content_hash, "label": v.draft.label,
+                      "content": dp.draft_to_json(v.draft)}
+                     for v in history.versions]  # fmt: skip
+        after = ids[-1]
+    return rows

@@ -738,7 +738,7 @@
       "requirements": "R006,R013,R036,R051,R052,R087,R096,R097",
       "deliverable": "Implement manifest export/import, compatible state migration and reconnect procedure.",
       "verification": "Round-trip preserves compatible state and reports omitted licensed evidence; zip traversal/secret tests.",
-      "status": "Not started",
+      "status": "In progress",
       "size": "M",
       "release_required": "Yes"
     },
