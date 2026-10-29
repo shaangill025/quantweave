@@ -333,6 +333,53 @@ def test_registry_rejections() -> None:
         MappedInterval("SYN-WS", T0.replace(tzinfo=None))
 
 
+E_ACUTE = "\N{LATIN SMALL LETTER E WITH ACUTE}"
+DISPLAY_OK = (
+    "Interactive Brokers", "TFSA - Self-directed", "A", "x" * 80, "RRSP (spousal) #2",
+    f"Cr{E_ACUTE}dit Agricole", f"Soci{E_ACUTE}t{E_ACUTE} G{E_ACUTE}n{E_ACUTE}rale",
+    "Caisse Desjardins \N{LATIN CAPITAL LETTER E WITH ACUTE}pargne", E_ACUTE * 80,
+    "\N{LATIN CAPITAL LETTER A WITH GRAVE}\N{LATIN CAPITAL LETTER O WITH DIAERESIS}"
+    "\N{LATIN CAPITAL LETTER O WITH STROKE}\N{LATIN SMALL LETTER O WITH DIAERESIS}"
+    "\N{LATIN SMALL LETTER O WITH STROKE}\N{LATIN SMALL LETTER Y WITH DIAERESIS}"
+    "\N{LATIN CAPITAL LETTER A WITH MACRON}\N{LATIN SMALL LETTER LONG S}",
+)  # fmt: skip
+NOT_NFC = ("Cre\N{COMBINING ACUTE ACCENT}dit", "e\N{COMBINING DOT BELOW}",
+           "\N{ANGSTROM SIGN}")  # fmt: skip
+DISPLAY_BAD = (
+    "", " ", " IB", "IB ", "Interactive  Brokers", "a" * 81, E_ACUTE * 81, "IB\tX",
+    "IB\n", "IB\x7f", "IB\x1bX", "Interactive\N{NO-BREAK SPACE}Brokers",
+    "IB\N{THIN SPACE}X", "\N{CYRILLIC CAPITAL LETTER BYELORUSSIAN-UKRAINIAN I}B",
+    "\N{GREEK CAPITAL LETTER ALPHA}B", "IB\N{ZERO WIDTH SPACE}",
+    "IB\N{LEFT-TO-RIGHT MARK}", "\N{ZERO WIDTH NO-BREAK SPACE}IB",
+    "I\N{SOFT HYPHEN}B", "\N{FULLWIDTH LATIN CAPITAL LETTER I}B",
+    "2\N{MULTIPLICATION SIGN}3", "2\N{DIVISION SIGN}3",
+    "\N{INVERTED QUESTION MARK}", "\N{LATIN SMALL LETTER B WITH STROKE}",
+    "\N{LATIN CAPITAL LETTER A WITH DOT BELOW}", "x\N{COMBINING ACUTE ACCENT}",
+    "\N{COMBINING ACUTE ACCENT}", 7, None,
+)  # fmt: skip
+
+
+def test_institution_and_account_type_are_bounded_display_text() -> None:
+    """Decisions 102 and 103: NFC words of printable ASCII and accented Latin
+    letters with single spaces, 1 to 80 characters; ids and references keep their
+    stricter patterns."""
+    for ok in DISPLAY_OK:
+        a = UnderlyingAccount("SYN-WS", TENANT, ok, ok, "CAD")
+        assert (a.institution, a.account_type) == (ok, ok)
+    for bad, want in [*((b, None) for b in DISPLAY_BAD),
+                      *((b, "not_nfc") for b in NOT_NFC)]:  # fmt: skip
+        for field in ("institution", "account_type"):
+            inst, atype = (bad, "cash") if field == "institution" else ("IB", bad)
+            with pytest.raises(ScopeError) as err:
+                UnderlyingAccount("SYN-WS", TENANT, inst, atype, "CAD")  # type: ignore[arg-type]
+            assert err.value.code == (want or field), (bad, field)
+    for field in ("SYN WS", "SYN-WS "):
+        with pytest.raises(ScopeError, match="account_id"):
+            UnderlyingAccount(field, TENANT, "IB", "cash", "CAD")
+        with pytest.raises(ScopeError, match="account_ref"):
+            snap("SYN-BROKER", field, {})
+
+
 def test_foreign_tenant_snapshot_is_refused() -> None:
     m = registry()
     m.add_account(acct("SYN-X", tenant="SYN-T2"))
