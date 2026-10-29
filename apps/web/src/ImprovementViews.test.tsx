@@ -204,8 +204,9 @@ describe("approval separation", () => {
     for (const [path, init] of f.mock.calls) {
       expect(init?.method ?? "GET").toBe("GET");
       expect(init?.body).toBeUndefined();
-      expect(path).toMatch(/^\/api\/v1\/(capabilities|experiments\?limit=200)$/);
+      expect(path).toMatch(/^\/api\/v1\/(capabilities|experiments\?limit=200|releases\?limit=200|deployment\/events\?limit=200|session\/approval-classes|budgets\?limit=200)$/);
     }
+    expect(new Set(f.mock.calls.map(([p]) => p)).size).toBe(6);
   });
 });
 

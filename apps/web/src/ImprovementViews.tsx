@@ -1,8 +1,10 @@
 // Improvement and governance view (spec 13, spec 11; T055 increment 1). Read-only: the API
 // serves no promote, approve, install, adopt or rollback operation, so none is rendered, and
 // this view only sends GET requests. The server stays the authority for every approval.
-// Data: GET /capabilities and GET /experiments (project contract 0.6.0: each item names its reasons).
+// Data: GET /capabilities and GET /experiments (project contract 0.6.0: each item names its reasons),
+// plus the read-only governance panels of GovernanceViews (releases, events, approval classes, budgets).
 import type { Loaded } from "./api";
+import { Approvals, Budgets, Releases } from "./GovernanceViews";
 import { CoverageReasons, More, Resource, Retrieved, Tag, Unavailable, humanize, lookup } from "./labels";
 import { TARGETS, isCapabilities, isExperimentPage, type Capabilities, type Experiment, type Target } from "./reads";
 import type { ViewProps } from "./ResearchViews";
@@ -128,8 +130,9 @@ export function Improvement({ env }: ViewProps) {
         {opt.kind === "closed" && <li>The real path is blocked: {opt.reasons.map((r) => <code key={r}>{r} </code>)}</li>}
         {opt.kind === "unknown" && <li>The real path cannot be checked: <Unavailable reason={opt.reason} /></li>}
         <li>
-          This app cannot verify the lineage receipts: no served operation reads the signed promotion receipt, the installed
-          V1 hash or the next-cycle runner receipt. Recorded fields below are not proof.
+          This app cannot verify the lineage receipts: no served operation reads the promotion receipt or the next-cycle
+          runner receipt; the release panel&apos;s hashes are the server&apos;s report, not verified here. Recorded fields below
+          are not proof.
         </li>
       </ul>
 
@@ -198,12 +201,16 @@ export function Improvement({ env }: ViewProps) {
         approvals; a chat reply or planning delegation is none of them. The server decides who may act; this page only
         reflects what it serves.
       </p>
+      <Approvals env={env} />
+      <Releases env={env} />
+      <Budgets env={env} />
 
       <h2>Limitations</h2>
       <ul aria-label="Improvement limitations">
         <li>Scorecards, verdicts, assessment access records and failed trial details are not served: an experiment names its evaluation receipts by id only.</li>
-        <li>Experiment budgets are served as a reservation id only; amounts and spend are not shown.</li>
-        <li>Release, installation, adoption and rollback history is not served.</li>
+        <li>Budgets are served per tenant and UTC month; an experiment names only its reservation id, so no per-experiment amount or spend is shown.</li>
+        <li>Release signatures are checked by the server at read time; this app does not verify them. Promotion receipts are not stored, and approver, key and operator identities are withheld.</li>
+        <li>Release, event and budget lists show their first page only.</li>
         <li>Only code and optimizer improvement have a served improvement gate. Research, evaluator and strategy are checked against a related user-facing feature only, and user adaptation against none, so their recorded states cannot be verified here.</li>
         <li>Only the first page of experiments is read.</li>
       </ul>

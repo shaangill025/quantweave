@@ -30,10 +30,13 @@ export function Resource<T>({
   label,
   state,
   children,
+  notFound,
 }: {
   label: string;
   state: Loaded<T> | undefined;
   children: (data: T, retrievedAt: Date) => ReactNode;
+  /** What a 404 means for this read, when it is not "this build does not serve it". */
+  notFound?: ReactNode;
 }) {
   if (state === undefined) return <p role="status">Loading {label}…</p>;
   if (state.status === "failed") {
@@ -43,7 +46,7 @@ export function Resource<T>({
           {label}: <Unavailable reason={state.code} /> {state.detail}
         </p>
         {state.code === "not_found" && (
-          <p>Not connected: this API build does not serve {label.toLowerCase()} yet.</p>
+          <p>{notFound ?? <>Not connected: this API build does not serve {label.toLowerCase()} yet.</>}</p>
         )}
         {state.correlationId && <p>Correlation id {state.correlationId}</p>}
       </div>
