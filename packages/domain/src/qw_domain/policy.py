@@ -16,12 +16,13 @@ Stdlib only.
 
 import hashlib
 import json
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
 from enum import StrEnum
+from typing import Any
 
-from qw_domain.decimals import Ratio
+from qw_domain.decimals import Money, MoneyAmount, Ratio
 from qw_domain.instants import ensure_aware_utc, format_instant, require_date
 from qw_domain.onboarding import (
     NOT_SURE,
@@ -417,6 +418,59 @@ class PolicyHistory:
         return PolicyHistory(
             self.policy_id, self.tenant_id, self.versions, (*self.receipts, receipt)
         )
+
+
+def _scope(s: SizingScope) -> dict[str, str | None]:
+    return {
+        "account_id": s.account_id,
+        "currency": s.currency,
+        "sleeve_id": s.sleeve_id,
+    }
+
+
+def limit_from_wire(w: Mapping[str, Any]) -> Limit:
+    value = w["value"]
+    amount = (
+        Ratio.from_wire(value) if w["unit"] == "ratio" else MoneyAmount.from_wire(value)
+    )
+    scope = SizingScope(w["account_id"], w["currency"], w["sleeve_id"])
+    return Limit(LimitMetric(w["metric"]), amount, w["unit"], w["denominator"],
+                 w["window"], scope)  # fmt: skip
+
+
+def draft_to_json(d: DraftPolicy) -> dict[str, Any]:
+    """The persisted version content (policy_store `content`, the T057
+    `policy/policies.json` section); `draft_from_json` is its inverse."""
+    return {
+        "tenant_id": d.tenant_id, "synthetic": d.synthetic,
+        "schema": d.response_schema_version,
+        "fields": [[f.name, f.value if isinstance(f.value, str) else list(f.value),
+                    list(f.sources)] for f in d.fields],
+        "limits": [x.to_wire() for x in d.limits],
+        "allocations": [_scope(a.scope) | {"amount": a.amount.to_wire()}
+                        for a in d.allocations],
+        "conflicts": [[c.code.value, list(c.sources), c.blocking, c.detail]
+                      for c in d.conflicts],
+        "exclusions": [[e.subject, e.reason.value] for e in d.exclusions],
+        "warnings": list(d.retained_warnings),
+    }  # fmt: skip
+
+
+def draft_from_json(j: Mapping[str, Any]) -> DraftPolicy:
+    return DraftPolicy(
+        tenant_id=j["tenant_id"], synthetic=j["synthetic"],
+        response_schema_version=j["schema"],
+        fields=tuple(InferredField(n, v if isinstance(v, str) else tuple(v),
+                                   tuple(s)) for n, v, s in j["fields"]),
+        limits=tuple(limit_from_wire(w) for w in j["limits"]),
+        allocations=tuple(Allocation(
+            SizingScope(a["account_id"], a["currency"], a["sleeve_id"]),
+            Money.from_wire(a["amount"])) for a in j["allocations"]),
+        conflicts=tuple(Conflict(ConflictCode(c), tuple(s), b, t)
+                        for c, s, b, t in j["conflicts"]),
+        exclusions=tuple(Exclusion(s, ConflictCode(r)) for s, r in j["exclusions"]),
+        retained_warnings=tuple(j["warnings"]),
+    )  # fmt: skip
 
 
 def _missing_for(

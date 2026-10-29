@@ -7,7 +7,18 @@ the ZIP container is `qw_adapters.export_archive`.
   are hash-checked (`.json` ones also scanned) and reported, never loaded.
 - Open sections have a structure: the T052 learned-state files (closed key sets per
   record type, `unknown_field`) and `research/evidence.json` (contract Evidence).
-  The others are `section_not_ready` until each store's export function and schema.
+- Tenant sections (increment 2) are exact key sets (`unknown_field`,
+  `field_missing`), scanned first (`float`), every row the manifest's scope
+  (`scope_mismatch`) and re-verified (`malformed`):
+  - `financial/journal.json`: contract LedgerEvent rows (`qw_domain.ledger_wire`),
+    rebuilt, re-encoded exactly and replayed per account. No observation, claimed
+    execution, prediction or virtual record has a field there;
+  - `policy/policies.json`: each stored version (`policy_id`, `version`,
+    `content_hash`, `label` and the draft `content`, `qw_domain.policy`), its hash
+    recomputed and versions replayed. Adoption receipts, acceptance and step-up
+    material are never exported (the `approval` omission).
+  Accounts, watchlists and tombstones are `section_not_ready` until each store's
+  export function and schema.
 - The value scan refuses high-confidence secret formats only (defence in depth).
 - Only `build_export` and `licensed_evidence` make an `ExportBundle` or a
   `LicensedDecision`; their constructors raise. A decision records each item's T021
@@ -17,10 +28,11 @@ the ZIP container is `qw_adapters.export_archive`.
   is not its decided feed, and a denied id in any string value (`_mentions`).
 - GATE for the export route/job: `at` and `created_at` come from the server clock.
 - Import results are inert: nothing is adopted, activated or reauthorized.
-LIMITATIONS: no other store is exported or re-imported; no account mapping, migration
-or reconnection; hashes are integrity, not authenticity; import does not bind the
-source scope to the destination tenant; free-text fields can carry what the scan
-misses; T052 field values are checked by the T052 importer.
+LIMITATIONS: other stores are not exported and nothing is re-imported; no account
+mapping, migration or reconnection; hashes are integrity, not authenticity; import
+does not bind the source scope to the destination tenant; free-text fields can carry
+what the scan misses; T052 field values are checked by the T052 importer; source
+observations (`source_record`) are not a section, so they are not exported.
 """
 
 import base64
@@ -37,7 +49,9 @@ from typing import Any, NoReturn, cast
 
 from qw_domain import feedback as fb
 from qw_domain import learned_state as ls
+from qw_domain import ledger_wire as lw
 from qw_domain import personal_adaptation as pa
+from qw_domain import policy as dp
 from qw_domain import rights
 from qw_domain.decimals import safe_repr
 from qw_domain.instants import InstantError, format_instant, parse_instant
@@ -47,14 +61,15 @@ FORMAT_VERSION = COMPATIBILITY_VERSION = "qw-export-1.0"
 READER = (1, 0)
 MANIFEST_PATH = "manifest.json"
 EVIDENCE_PATH = "research/evidence.json"
+JOURNAL_PATH, POLICIES_PATH = "financial/journal.json", "policy/policies.json"
 MAX_PATH, MAX_DEPTH = 255, 32
 DECISION_MAX_AGE = timedelta(minutes=10)
 CLASSES = frozenset({"financial", "policy", "research", "private_learning", "audit",
                      "metadata"})  # fmt: skip
 SECTIONS: Mapping[str, str] = MappingProxyType({  # path -> ManifestFile content_class
-    "financial/journal.json": "financial",
+    JOURNAL_PATH: "financial",
     "financial/accounts.json": "financial",
-    "policy/policies.json": "policy",
+    POLICIES_PATH: "policy",
     "research/watchlists.json": "research",
     EVIDENCE_PATH: "research",
     "audit/tombstones.json": "audit",
@@ -105,7 +120,21 @@ EVIDENCE_KEYS = frozenset({  # contract Evidence + project contract 0.3.0 covera
     "retention_class", "instrument_ids", "coverage"})  # fmt: skip
 _AVAILABILITY = frozenset({"available", "restricted", "redacted", "deleted",
                            "unavailable"})  # fmt: skip
-OPEN_SECTIONS = frozenset({*ls.PATHS, EVIDENCE_PATH})
+# Tenant sections: every object has exactly its shape's keys.
+_LEDGER: Shape = {**_leaves(*lw.KEYS), "postings": _leaves(*lw.POSTING_KEYS),
+                  "instrument_movements": _leaves(*lw.MOVEMENT_KEYS)}  # fmt: skip
+_LIMIT = _leaves("metric", "value", "unit", "denominator", "account_id", "currency",
+                 "sleeve_id", "window")  # Limit.to_wire  # fmt: skip
+_DRAFT: Shape = {  # qw_domain.policy.draft_to_json
+    **_leaves("tenant_id", "synthetic", "schema", "fields", "conflicts", "exclusions",
+              "warnings"), "limits": _LIMIT,
+    "allocations": {**_leaves("account_id", "currency", "sleeve_id"),
+                    "amount": _leaves("amount", "currency")}}  # fmt: skip
+_VERSION_ROW: Shape = {**_leaves("policy_id", "version", "content_hash", "label"),
+                       "content": _DRAFT}  # fmt: skip
+TENANT_SECTIONS: Mapping[str, Shape] = {JOURNAL_PATH: _LEDGER,
+                                        POLICIES_PATH: _VERSION_ROW}  # fmt: skip
+OPEN_SECTIONS = frozenset({*ls.PATHS, EVIDENCE_PATH, *TENANT_SECTIONS})
 # "-----BEGIN" and "-----begin" in base64 at each of the 3 byte offsets
 _B64_PEM = ("LS0tLS1CRUdJT", "tLS0tQkVHSU", "LS0tLUJFR0lO", "LS0tLS1iZWdpb",
             "tLS0tYmVnaW", "LS0tLWJlZ2lu")  # fmt: skip
@@ -166,6 +195,8 @@ class Refusal(StrEnum):
     DUPLICATE_KEY = "duplicate_key"
     TOO_DEEP = "too_deep"
     UNKNOWN_FIELD = "unknown_field"
+    FIELD_MISSING = "field_missing"
+    SCOPE_MISMATCH = "scope_mismatch"
     SECRET_VALUE = "secret_value"
     OMISSION = "omission"
     DECISION = "decision"
@@ -283,8 +314,9 @@ def scan(body: object) -> list[str]:
     return found
 
 
-def _conform(x: object, shape: Shape | None, where: str) -> None:
-    """Every object under `x` uses only its shape's keys; no object under a leaf."""
+def _conform(x: object, shape: Shape | None, where: str, exact: bool = False) -> None:
+    """Every object under `x` uses only its shape's keys (all of them when `exact`);
+    no object under a leaf."""
     stack: list[tuple[object, Shape | None, str]] = [(x, shape, where)]
     while stack:
         v, s, at = stack.pop()
@@ -293,6 +325,8 @@ def _conform(x: object, shape: Shape | None, where: str) -> None:
         elif isinstance(v, dict):
             if s is None or not set(v) <= set(s):
                 raise _refuse(Refusal.UNKNOWN_FIELD, f"{at}: {sorted(v)}")
+            if exact and set(v) != set(s):
+                raise _refuse(Refusal.FIELD_MISSING, f"{at}: {sorted(set(s) - set(v))}")
             stack.extend((y, s[k], f"{at}.{k}") for k, y in v.items())
 
 
@@ -341,11 +375,52 @@ def evidence_ids(body: object) -> list[str]:
     return ids_
 
 
-def check_section(path: str, body: object) -> list[str]:
-    """The structural allowlist for an open section, then the secret scan. Returns
-    its string values."""
+def _journal(rows: list[dict[str, Any]], scope_id: str | None) -> None:
+    if any(r["tenant_id"] != scope_id for r in rows):
+        raise _refuse(Refusal.SCOPE_MISMATCH, JOURNAL_PATH)
+    try:
+        lw.parse_section(rows)
+    except lw.WireError as e:
+        raise _refuse(Refusal.MALFORMED, f"{JOURNAL_PATH}: {e}") from None
+
+
+def _policies(rows: list[dict[str, Any]], scope_id: str | None) -> None:
+    """Each version's content rebuilds a draft whose hash, label and wire are the
+    row's, and replays as the next version of its policy."""
+    seen: dict[str, dp.PolicyHistory] = {}
+    for n, r in enumerate(rows):
+        content = r["content"]
+        if not isinstance(content, dict) or content["tenant_id"] != scope_id:
+            raise _refuse(Refusal.SCOPE_MISMATCH, f"{POLICIES_PATH}: row {n}")
+        try:
+            pid = r["policy_id"]
+            d = dp.draft_from_json(content)
+            h = seen.get(pid) or dp.PolicyHistory.new(pid, content["tenant_id"])
+            seen[pid] = nxt = h.propose(d)
+            ok = (nxt is not h and type(r["version"]) is int
+                  and type(content["synthetic"]) is bool  # the label hides 1 vs true
+                  and nxt.versions[-1].version == r["version"]
+                  and d.content_hash == r["content_hash"] and d.label == r["label"]
+                  and canonical(dp.draft_to_json(d)) == canonical(content))  # fmt: skip
+        except (KeyError, TypeError, ValueError, ArithmeticError, AttributeError):
+            ok = False
+        if not ok:
+            raise _refuse(Refusal.MALFORMED, f"{POLICIES_PATH}: row {n}")
+
+
+def check_section(path: str, body: object, scope_id: str | None = None) -> list[str]:
+    """The structural allowlist for an open section, then the secret scan (a tenant
+    section is scanned first and its rows must be `scope_id`'s). Returns its string
+    values."""
     if path not in OPEN_SECTIONS:
         raise _refuse(Refusal.SECTION_NOT_READY, path)
+    if path in TENANT_SECTIONS:
+        values = scan(body)
+        rows = _rows(body, path)
+        for r in rows:
+            _conform(r, TENANT_SECTIONS[path], path, exact=True)
+        (_journal if path == JOURNAL_PATH else _policies)(rows, scope_id)
+        return values
     if path == EVIDENCE_PATH:
         evidence_ids(body)  # exact keys and types
     for r in _rows(body, path) if path != EVIDENCE_PATH else ():
@@ -675,7 +750,7 @@ def build_export(
     for path, body in sections.items():
         if path not in SECTIONS:
             raise _refuse(Refusal.SECTION_UNKNOWN, path)
-        values += check_section(path, body)
+        values += check_section(path, body, scope_id)
         files[path] = canonical(body)
     if hit := _mentions(values, licensed.denied if licensed else frozenset()):
         raise _refuse(Refusal.EVIDENCE_OMITTED, hit)
@@ -738,7 +813,7 @@ def verify_import(manifest_raw: bytes, files: Mapping[str, bytes]) -> ImportRepo
         if f.content_class != known:
             raise _refuse(Refusal.CLASS_MISMATCH, f.path)
         data[f.path] = body = parse_json(raw, f.path)
-        values += check_section(f.path, body)
+        values += check_section(f.path, body, m.scope_id)
     omitted = frozenset(o.evidence_id for o in m.omissions if o.evidence_id)
     if hit := _mentions(values, omitted):
         raise _refuse(Refusal.EVIDENCE_OMITTED, hit)

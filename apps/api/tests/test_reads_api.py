@@ -31,8 +31,8 @@ from qw_adapters import journal_store as js
 from qw_adapters import pause_store
 from qw_adapters import simulation_store as ss
 from qw_adapters import tenancy as tn
-from qw_api import reads
 from qw_api.reads import KINDS, horizon, ledger_item, position
+from qw_domain import ledger_wire
 from qw_domain.corporate_actions import PositiveRatio, SourceRef, Split
 from qw_domain.decimals import Money, PositiveQuantity, Price, Quantity
 from qw_domain.identity import InstrumentId
@@ -528,10 +528,10 @@ def test_an_unmapped_journal_kind_fails_closed(
     event, and the problem body names no kind, id or detail."""
     ids = seed_ledger(world)
     login(world.client, "bob")
-    monkeypatch.setattr(reads, "KINDS", {k: v for k, v in reads.KINDS.items()
-                                         if k != "deposit"})  # fmt: skip
-    monkeypatch.setattr(reads, "MAPPED", {k: v for k, v in reads.MAPPED.items()
-                                          if k != "deposit"})  # fmt: skip
+    for name in ("KINDS", "MAPPED"):  # the wire lives in qw_domain.ledger_wire
+        kinds = getattr(ledger_wire, name)
+        monkeypatch.setattr(ledger_wire, name, {k: v for k, v in kinds.items()
+                                                if k != "deposit"})  # fmt: skip
     body = assert_problem(ledger(world), 500, "internal_error")
     text = json.dumps(body)
     for leak in ("deposit", "KeyError", ACCT, *ids.values()):
