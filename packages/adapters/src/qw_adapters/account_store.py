@@ -44,6 +44,11 @@ owner decisions 101, 102 and 103).
   `cash_basis`: the one basis every currency shares, only for a `reconciled`
   account, else `unknown`. No snapshot store exists yet (T014/T017), so callers
   pass the snapshots they hold; with none, cash_basis is `unknown`.
+- `export_accounts(tx)` (T057 increment 4) is the `financial/accounts.json`
+  section: every stored row of the four tables, in primary key order, as
+  `qw_domain.account_wire` encodes it, after `_load` re-verified every seal and
+  chain and replayed the map. Read-only; only in a snapshot transaction
+  (`tenancy.require_snapshot`). Derived fields are not exported (account_wire).
 - Errors: `forbidden` (no grant: only qw_app writes, qw_app and qw_worker read),
   `tenant` (a domain value of another tenant), `database`, `integrity`, and the
   domain `ScopeError` codes.
@@ -51,7 +56,6 @@ owner decisions 101, 102 and 103).
 
 from __future__ import annotations
 
-import hashlib
 import unicodedata
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, replace
@@ -61,8 +65,8 @@ from typing import Any, Literal, get_args
 
 import psycopg
 from psycopg.types.json import Jsonb
+from qw_domain import account_wire as aw
 from qw_domain.instants import ensure_aware_utc, format_instant
-from qw_domain.research_data import digest
 from qw_domain.sources import (
     AccountView,
     MappedInterval,
@@ -76,11 +80,11 @@ from qw_domain.sources import (
     consolidate,
 )
 
-from qw_adapters.tenancy import TenantTx
+from qw_adapters.tenancy import TenantTx, require_snapshot
 
 __all__ = ["MAX_INTERVALS", "AccountRecord", "AccountState", "AccountStoreError",
            "AnalysisScope", "Registry", "SourceRecord", "account_from_text",
-           "add_source", "archive_account", "load", "read_accounts",
+           "add_source", "archive_account", "export_accounts", "load", "read_accounts",
            "register_account", "remap", "seal"]  # fmt: skip
 
 type AnalysisScope = Literal["complete_declared", "partial_declared", "hypothetical"]
@@ -89,7 +93,7 @@ type ContractStatus = Literal["active", "archived", "conflicted"]
 type ContractCashBasis = Literal[
     "broker_available", "reconciled_ledger", "user_reported", "unknown"
 ]
-MAX_INTERVALS = 1000  # per revision; 0055's CHECK holds the same
+MAX_INTERVALS = aw.MAX_INTERVALS  # per revision; 0055's CHECK holds the same
 
 
 class AccountStoreError(Exception):
@@ -144,39 +148,28 @@ class AccountState:
         return self.view.sizing_blocked or self.record.lifecycle == "archived"
 
 
-def _intervals_json(ivs: Sequence[MappedInterval]) -> list[dict[str, Any]]:
-    return [{"account_id": i.account_id, "valid_from": format_instant(i.valid_from),
-             "valid_to": None if i.valid_to is None else format_instant(i.valid_to)}
-            for i in ivs]  # fmt: skip
-
-
-def seal(content_hash: str, recorded_at: datetime) -> str:
-    """0055's row_hash: sha256 over `<content_hash>|<format_instant(recorded_at)>`."""
-    text = f"{content_hash}|{format_instant(recorded_at)}"
-    return hashlib.sha256(text.encode()).hexdigest()
+_intervals_json = aw.intervals_json
+seal = aw.seal  # 0055's row_hash; the twin of its guard
 
 
 def _account_content(tx: TenantTx, a: UnderlyingAccount, name: str, scope: str) -> str:
-    return digest(["account", str(tx.tenant_id), a.account_id, name, a.institution,
-                   a.account_type, a.base_currency, scope])  # fmt: skip
+    return aw.account_content(str(tx.tenant_id), a, name, scope)
 
 
 def _source_content(tx: TenantTx, s: Source, provider: str) -> str:
-    return digest(["data_source", str(tx.tenant_id), s.source_id, s.kind.value,
-                   provider])  # fmt: skip
+    return aw.source_content(str(tx.tenant_id), s, provider)
 
 
 def _revision_content(
     tx: TenantTx, sid: str, ref: str, rev: int, ivs: Sequence[MappedInterval],
     previous: str | None,
 ) -> str:  # fmt: skip
-    return digest(["source_mapping_revision", str(tx.tenant_id), sid, ref, rev,
-                   _intervals_json(ivs), previous])  # fmt: skip
+    return aw.revision_content(str(tx.tenant_id), sid, ref, rev, ivs, previous)
 
 
 def _lifecycle_content(tx: TenantTx, aid: str, rev: int, life: str,
                        previous: str) -> str:  # fmt: skip
-    return digest(["account_revision", str(tx.tenant_id), aid, rev, life, previous])
+    return aw.lifecycle_content(str(tx.tenant_id), aid, rev, life, previous)
 
 
 def _lock(tx: TenantTx, shared: bool) -> None:
@@ -222,11 +215,51 @@ def load(tx: TenantTx, known_as_of: datetime | None = None) -> Registry:
     return _load(tx, known_as_of)
 
 
-def _load(tx: TenantTx, known_as_of: datetime | None) -> Registry:
+type Raw = tuple[list[tuple[Any, ...]], ...]
+
+
+def _read(tx: TenantTx) -> Raw:
+    return (_rows(tx, _ACCOUNTS), _rows(tx, _SOURCES), _rows(tx, _REVISIONS),
+            _rows(tx, _LIFECYCLE))  # fmt: skip
+
+
+# account_wire's lists: the raw tuple's index and the SELECT's columns
+_WIRE = (("accounts", 0, ("account_id", "name", "broker", "account_type",
+                          "reporting_currency", "analysis_scope", "recorded_at",
+                          "content_hash", "row_hash")),
+         ("account_revisions", 3, ("account_id", "revision", "lifecycle",
+                                   "recorded_at", "previous_hash", "content_hash",
+                                   "row_hash")),
+         ("sources", 1, ("source_id", "kind", "provider", "recorded_at",
+                         "content_hash", "row_hash")),
+         ("mappings", 2, ("source_id", "account_ref", "revision", "intervals",
+                          "recorded_at", "previous_hash", "content_hash",
+                          "row_hash")))  # fmt: skip
+
+
+def export_accounts(tx: TenantTx) -> dict[str, list[dict[str, Any]]]:
+    """The whole stored history, re-verified first (`integrity` on any failure).
+    The snapshot alone makes it consistent, so no lock is taken."""
+    require_snapshot(tx)
+    raw = _read(tx)
+    _load(tx, None, raw)
+    tenant, out = str(tx.tenant_id), {}
+    for name, n, cols in _WIRE:
+        rows = [{"tenant_id": tenant, **dict(zip(cols, r, strict=True))}
+                for r in raw[n]]  # fmt: skip
+        for r in rows:
+            r["recorded_at"] = format_instant(r["recorded_at"])
+        keys = aw.ORDER[name]
+        out[name] = sorted(rows, key=lambda r: [r[k] for k in keys])
+    return out
+
+
+def _load(
+    tx: TenantTx, known_as_of: datetime | None, raw: Raw | None = None
+) -> Registry:
     known = None if known_as_of is None else ensure_aware_utc(known_as_of)
     tenant = str(tx.tenant_id)
-    raw = (_rows(tx, _ACCOUNTS), _rows(tx, _SOURCES), _rows(tx, _REVISIONS),
-           _rows(tx, _LIFECYCLE))  # fmt: skip
+    raw = _read(tx) if raw is None else raw
     heads: dict[str, tuple[int, str, str]] = {}  # account: revision, hash, lifecycle
     m = SourceMap()
     accounts: dict[str, AccountRecord] = {}
@@ -433,13 +466,7 @@ def read_accounts(
                             max_age).accounts  # fmt: skip
     except ScopeError as exc:
         raise AccountStoreError(exc.code, "refused by the domain") from None
-    latest: dict[tuple[str, str], MappingRevision] = {}
-    for r in reg.revisions:  # knowledge order, so the last one wins
-        latest[(r.source_id, r.account_ref)] = r
-    named: dict[str, set[str]] = {}
-    for r in latest.values():
-        for i in r.intervals:
-            named.setdefault(i.account_id, set()).add(r.source_id)
+    named = aw.source_ids(reg.revisions)  # latest revisions, any interval dates
     out: dict[str, AccountState] = {}
     for aid, rec in sorted(reg.accounts.items()):
         view = views[aid]
@@ -452,8 +479,7 @@ def read_accounts(
             bases.pop() if view.status == "reconciled" and len(bases) == 1
             else "unknown"
         )  # fmt: skip
-        out[aid] = AccountState(rec, status, basis,
-                                tuple(sorted(named.get(aid, ()))), view)  # fmt: skip
+        out[aid] = AccountState(rec, status, basis, named.get(aid, ()), view)
     return MappingProxyType(out)
 
 
