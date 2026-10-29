@@ -667,3 +667,21 @@ below waives a test, gate or spec requirement. Numbering continues from
     accounts (CIBC), and French-language broker and plan names are common there.
     Restricting to Latin letters keeps most of the look-alike risk out."
     Implemented by: T013 (domain sources and migration 0056).
+
+104. **How deletion tombstones name records (T058).**
+    Question: "Decision 104 (T058): A deletion tombstone names the deleted record
+    only by a hash of (tenant, class, record id). The current hash is unkeyed. If
+    record ids are guessable (account numbers, sequential ids), anyone who can
+    read a tombstone or an export can recover the id in under a second and
+    confirm it was deleted. The ledger is append-only and hash-chained, so
+    switching the hash later means starting a new chain. How should tombstones
+    name records?"
+    Selected label: "Keyed hash, scheme-tagged (Recommended)".
+    Option text as presented: "Use an HMAC with a per-installation secret key,
+    kept outside the database like other operator secrets, and tag every
+    tombstone with its hash scheme so it can be rotated later. Without the key,
+    a tombstone or export reveals nothing about which record was deleted. Why:
+    deletion records outlive the data and travel in exports. The cost is a key
+    to keep: lose it and you can still prove the ledger is intact, but you can
+    no longer match a tombstone to a re-imported record."
+    Implemented by: T058 (tombstone ledger), T057 (tombstones export).
