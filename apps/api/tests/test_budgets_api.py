@@ -328,7 +328,9 @@ def test_a_tampered_row_is_integrity_never_a_page(world: Any, app_conn: Any) -> 
         world.db.execute("UPDATE app.budget_book SET book = %s WHERE tenant_id = %s",
                          (Jsonb(wire), t))  # fmt: skip
     body = assert_problem(world.client.get(URL), 409, "integrity")
-    assert "15" not in json.dumps(body) and str(t) not in json.dumps(body)
+    # the random correlation id can itself contain "15"; check everything else
+    shown = json.dumps({k: v for k, v in body.items() if k != "correlation_id"})
+    assert "15" not in shown and str(t) not in json.dumps(body)
     with world.db.transaction():  # a correct hash of another tenant: still refused
         world.db.execute("SET LOCAL session_replication_role = replica")
         world.db.execute(
