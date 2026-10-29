@@ -23,6 +23,7 @@ from jsonschema import (  # type: ignore[import-untyped]
     FormatChecker,
 )
 from qw_adapters import experiment_store as es
+from qw_adapters import tenancy as tn
 from qw_api import experiments as ex
 from qw_api.app import ApiError
 from qw_domain import improvement as im
@@ -321,3 +322,44 @@ def test_next_cycle_run_id_is_served_from_bound_lineage() -> None:
     assert errs({**core, "state": "proposed"} | promoted) == {
         "requires_human_promotion"}  # fmt: skip
     assert not EXPERIMENT.is_valid(item | promoted)
+
+
+OST = _module("qw_ostore_tests",
+              ROOT / "packages/adapters/tests/test_optimizer_store.py")  # fmt: skip
+
+
+@pytest.mark.db
+@pytest.mark.usefixtures("gate_lifted_install")
+def test_installation_optimizer_experiments_never_reach_tenant_users(
+    world: Any, runtime_urls: dict[str, str]
+) -> None:
+    """T055 API: owner decisions 87/90/91 keep the 0047 installation optimizer
+    store operator-only. With its experiment logged (SYNTHETIC, GATE-LIFTED) as
+    qw_assessor, no tenant user (owner, member or another tenant) is served it,
+    and a tenant experiment under the same id is served only as the tenant's own
+    record. Without a session both routes are 401 and name nothing."""
+    with tn.runtime_connection(runtime_urls["qw_assessor"], role="qw_assessor") as a:
+        reg = OST.logged(a)[0]
+    eid = OST.EXP
+    assert reg.protocol(eid).scope is im.Scope.INSTALLATION
+    assert world.db.execute(
+        "SELECT count(*) FROM app.optimizer_registry_entry WHERE entry_id = %s",
+        (eid,)).fetchone() == (1,)  # fmt: skip
+    for user in ("alice", "bob", "carol"):  # tenant_owner, tenant_member, tenant B
+        login(world.client, user)
+        page = world.client.get(URL).json()
+        rd.page_conforms("experiment", page)
+        assert page["items"] == [] and page["next_cursor"] is None
+        assert_problem(world.client.get(f"{URL}/{eid}"), 404, "not_found")
+    put(runtime_urls, world.tenant_a, eid, OPT)  # a tenant record, same id
+    login(world.client, "bob")
+    [item] = world.client.get(URL).json()["items"]
+    assert (valid(item)["scope"], item["scope_id"]) == ("tenant", str(world.tenant_a))
+    assert valid(world.client.get(f"{URL}/{eid}").json()) == item
+    login(world.client, "carol")
+    assert world.client.get(URL).json()["items"] == []
+    assert_problem(world.client.get(f"{URL}/{eid}"), 404, "not_found")
+    world.client.cookies.clear()
+    for path in (URL, f"{URL}/{eid}"):
+        body = assert_problem(world.client.get(path), 401, "unauthenticated")
+        assert eid not in json.dumps(body)
