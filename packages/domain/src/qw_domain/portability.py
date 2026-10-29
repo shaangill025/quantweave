@@ -10,15 +10,24 @@ the ZIP container is `qw_adapters.export_archive`.
 - Tenant sections (increment 2) are exact key sets (`unknown_field`,
   `field_missing`), scanned first (`float`), every row the manifest's scope
   (`scope_mismatch`) and re-verified (`malformed`):
-  - `financial/journal.json`: contract LedgerEvent rows (`qw_domain.ledger_wire`),
-    rebuilt, re-encoded exactly and replayed per account. No observation, claimed
-    execution, prediction or virtual record has a field there;
+  - `financial/journal.json`: `{chains, events}` (increment 3). `events` are
+    contract LedgerEvent rows (`qw_domain.ledger_wire`), rebuilt, re-encoded
+    exactly and replayed per account. No observation, claimed execution,
+    prediction or virtual record has a field there. `chains` is a closed header
+    record per account (revision, count, running head over position, id and
+    `recorded_at`) that must equal the one recomputed from `events`
+    (`journal_chain`): a backdated `recorded_at`, a dropped tail or reordered rows
+    are refused. The contract manifest has no field for it, so it is in the section;
   - `policy/policies.json`: each stored version (`policy_id`, `version`,
     `content_hash`, `label` and the draft `content`, `qw_domain.policy`), its hash
     recomputed and versions replayed. Adoption receipts, acceptance and step-up
-    material are never exported (the `approval` omission).
-  Accounts, watchlists and tombstones are `section_not_ready` until each store's
-  export function and schema.
+    material are never exported (the `approval` omission);
+  - `research/watchlists.json` (increment 3): each live list as the contract
+    Watchlist plus `tenant_id` and `description`, entries in stored form (plus
+    `needs`), each entry rebuilt and re-encoded exactly, in instrument order.
+  Accounts and tombstones are `section_not_ready`: no account, source or mapping
+  store exists (T013 persistence is deferred), so a source's kind (a mirror) could
+  not be exported; the T058 tombstone ledger is not persisted.
 - The value scan refuses high-confidence secret formats only (defence in depth).
 - Only `build_export` and `licensed_evidence` make an `ExportBundle` or a
   `LicensedDecision`; their constructors raise. A decision records each item's T021
@@ -53,6 +62,7 @@ from qw_domain import ledger_wire as lw
 from qw_domain import personal_adaptation as pa
 from qw_domain import policy as dp
 from qw_domain import rights
+from qw_domain import watchlists as wl
 from qw_domain.decimals import safe_repr
 from qw_domain.instants import InstantError, format_instant, parse_instant
 from qw_domain.sources import ID_PATTERN
@@ -62,6 +72,7 @@ READER = (1, 0)
 MANIFEST_PATH = "manifest.json"
 EVIDENCE_PATH = "research/evidence.json"
 JOURNAL_PATH, POLICIES_PATH = "financial/journal.json", "policy/policies.json"
+WATCHLISTS_PATH = "research/watchlists.json"
 MAX_PATH, MAX_DEPTH = 255, 32
 DECISION_MAX_AGE = timedelta(minutes=10)
 CLASSES = frozenset({"financial", "policy", "research", "private_learning", "audit",
@@ -70,7 +81,7 @@ SECTIONS: Mapping[str, str] = MappingProxyType({  # path -> ManifestFile content
     JOURNAL_PATH: "financial",
     "financial/accounts.json": "financial",
     POLICIES_PATH: "policy",
-    "research/watchlists.json": "research",
+    WATCHLISTS_PATH: "research",
     EVIDENCE_PATH: "research",
     "audit/tombstones.json": "audit",
     **ls.PATHS,  # the T052 learned-state files
@@ -132,8 +143,16 @@ _DRAFT: Shape = {  # qw_domain.policy.draft_to_json
                     "amount": _leaves("amount", "currency")}}  # fmt: skip
 _VERSION_ROW: Shape = {**_leaves("policy_id", "version", "content_hash", "label"),
                        "content": _DRAFT}  # fmt: skip
-TENANT_SECTIONS: Mapping[str, Shape] = {JOURNAL_PATH: _LEDGER,
-                                        POLICIES_PATH: _VERSION_ROW}  # fmt: skip
+_JOURNAL: Shape = {"chains": _leaves(*lw.CHAIN_KEYS), "events": _LEDGER}
+_WATCHLIST: Shape = {  # contract Watchlist + tenant_id, description; entry + needs
+    **_leaves("id", "tenant_id", "revision", "name", "description"),
+    "entries": {**_leaves("instrument_id", "thesis", "tags", "review_at",
+                          "monitoring_priority", "invalidation_text", "needs"),
+                "conditions": _leaves("metric", "operator", "values",
+                                      "data_spec_id", "description")}}  # fmt: skip
+TENANT_SECTIONS: Mapping[str, Shape] = {JOURNAL_PATH: _JOURNAL,
+                                        POLICIES_PATH: _VERSION_ROW,
+                                        WATCHLISTS_PATH: _WATCHLIST}  # fmt: skip
 OPEN_SECTIONS = frozenset({*ls.PATHS, EVIDENCE_PATH, *TENANT_SECTIONS})
 # "-----BEGIN" and "-----begin" in base64 at each of the 3 byte offsets
 _B64_PEM = ("LS0tLS1CRUdJT", "tLS0tQkVHSU", "LS0tLUJFR0lO", "LS0tLS1iZWdpb",
@@ -197,6 +216,7 @@ class Refusal(StrEnum):
     UNKNOWN_FIELD = "unknown_field"
     FIELD_MISSING = "field_missing"
     SCOPE_MISMATCH = "scope_mismatch"
+    JOURNAL_CHAIN = "journal_chain"
     SECRET_VALUE = "secret_value"
     OMISSION = "omission"
     DECISION = "decision"
@@ -375,13 +395,46 @@ def evidence_ids(body: object) -> list[str]:
     return ids_
 
 
-def _journal(rows: list[dict[str, Any]], scope_id: str | None) -> None:
+def _journal(body: object, scope_id: str | None) -> None:
+    """Exact keys; the events replay; then the header equals the one they give."""
+    if not isinstance(body, dict):
+        raise _refuse(Refusal.MALFORMED, f"{JOURNAL_PATH}: an object")
+    _conform(body, _JOURNAL, JOURNAL_PATH, exact=True)
+    rows = _rows(body["events"], JOURNAL_PATH)
+    head = _rows(body["chains"], JOURNAL_PATH)
     if any(r["tenant_id"] != scope_id for r in rows):
         raise _refuse(Refusal.SCOPE_MISMATCH, JOURNAL_PATH)
     try:
         lw.parse_section(rows)
     except lw.WireError as e:
         raise _refuse(Refusal.MALFORMED, f"{JOURNAL_PATH}: {e}") from None
+    if canonical(head) != canonical(lw.chains(str(scope_id), rows)):  # True is not 1
+        raise _refuse(Refusal.JOURNAL_CHAIN, JOURNAL_PATH)
+
+
+def _watchlists(rows: list[dict[str, Any]], scope_id: str | None) -> None:
+    """Unique ids in order; each entry rebuilds (`qw_domain.watchlists`) and
+    re-encodes exactly, entries in strict instrument order."""
+    for n, r in enumerate(rows):
+        if r["tenant_id"] != scope_id:
+            raise _refuse(Refusal.SCOPE_MISMATCH, f"{WATCHLISTS_PATH}: row {n}")
+        try:
+            entries = [wl.entry_from_json(e) for e in r["entries"]]
+            order = [e.instrument_id for e in entries]
+            ok = (isinstance(r["id"], str) and ID_PATTERN.fullmatch(r["id"])
+                  and type(r["revision"]) is int and r["revision"] >= 1
+                  and isinstance(r["name"], str) and r["name"] != ""
+                  and isinstance(r["description"], str)
+                  and order == sorted(set(order))
+                  and canonical([wl.entry_json(e) for e in entries])
+                  == canonical(r["entries"]))  # fmt: skip
+        except (KeyError, TypeError, ValueError, ArithmeticError, AttributeError):
+            ok = False
+        if not ok:
+            raise _refuse(Refusal.MALFORMED, f"{WATCHLISTS_PATH}: row {n}")
+    ids = [str(r["id"]) for r in rows]
+    if ids != sorted(set(ids)):
+        raise PortabilityError(Refusal.MALFORMED, "watchlist ids repeat or unsorted")
 
 
 def _policies(rows: list[dict[str, Any]], scope_id: str | None) -> None:
@@ -414,12 +467,16 @@ def check_section(path: str, body: object, scope_id: str | None = None) -> list[
     values."""
     if path not in OPEN_SECTIONS:
         raise _refuse(Refusal.SECTION_NOT_READY, path)
+    if path == JOURNAL_PATH:
+        values = scan(body)
+        _journal(body, scope_id)
+        return values
     if path in TENANT_SECTIONS:
         values = scan(body)
         rows = _rows(body, path)
         for r in rows:
             _conform(r, TENANT_SECTIONS[path], path, exact=True)
-        (_journal if path == JOURNAL_PATH else _policies)(rows, scope_id)
+        (_policies if path == POLICIES_PATH else _watchlists)(rows, scope_id)
         return values
     if path == EVIDENCE_PATH:
         evidence_ids(body)  # exact keys and types

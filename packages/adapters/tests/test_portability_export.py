@@ -1,8 +1,9 @@
-"""The journal and policy export functions (T057 increment 2) on PostgreSQL 16: a
-SYNTHETIC tenant is exported as the non-superuser qw_app login (conftest), under
-RLS in a snapshot transaction, then built, archived, read back and verified. The
-superuser `conn` only plays a tampering owner where a test says so. The oracle for
-each row is the stored history the stores already verify (`load_journal`, `load`).
+"""The journal, policy and watchlist export functions (T057 increments 2 and 3) on
+PostgreSQL 16: a SYNTHETIC tenant is exported as the non-superuser qw_app login
+(conftest), under RLS in a snapshot transaction, then built, archived, read back and
+verified. The superuser `conn` only plays a tampering owner where a test says so.
+The oracle for each row is the stored history the stores already verify
+(`load_journal`, `revision`, `load`, `page`).
 """
 
 from __future__ import annotations
@@ -19,13 +20,16 @@ from qw_adapters import journal_store as js
 from qw_adapters import policy_store as ps
 from qw_adapters import simulation_store as ss
 from qw_adapters import tenancy as tn
+from qw_adapters import watchlist_store as ws
 from qw_adapters.export_archive import read_archive, write_archive
 from qw_domain import ledger_wire as lw
 from qw_domain import portability as pt
+from qw_domain import watchlists as wl
 from qw_domain.corporate_actions import PositiveRatio, SourceRef, Split
 from qw_domain.decimals import Money, PositiveQuantity, Price
 from qw_domain.identity import InstrumentId
 from qw_domain.instants import format_instant, parse_instant
+from qw_domain.monitoring import Condition
 from qw_domain.postings import (
     Header,
     JournalError,
@@ -40,9 +44,10 @@ from qw_domain.simulation import VirtualPortfolio
 from test_portability_tenant_sections import draft  # SYNTHETIC answers
 
 Conn = psycopg.Connection[TupleRow]
-J, P = pt.JOURNAL_PATH, pt.POLICIES_PATH
+J, P, W = pt.JOURNAL_PATH, pt.POLICIES_PATH, pt.WATCHLISTS_PATH
 SYN = InstrumentId(uuid.UUID("00000000-0000-4000-8000-00000000005a"))
 ACK = "SYNTHETIC: I adopt this"
+COND = Condition("price_cross", "gt", ("100.25",), "feed-synth-iex", "SYNTHETIC")
 
 
 @dataclass(frozen=True)
@@ -52,15 +57,18 @@ class Tenant:
     session: uuid.UUID
     policy: uuid.UUID
     events: tuple[str, ...]
+    token: str = ""
+    lists: tuple[str, str] = ("", "")  # live, deleted
 
 
 def seed(app_conn: Conn, record: str) -> Tenant:
     """Two journal accounts (a deposit, a buy and its reversal; a deposit), one
-    adopted then revised policy, and a virtual portfolio, all SYNTHETIC."""
+    adopted then revised policy, a virtual portfolio, a live watchlist with two
+    entries and a deleted one, all SYNTHETIC."""
     with tn.provision_tenant(app_conn) as tx:
         owner = tn.create_user(tx, "SYNTHETIC owner")
         tn.add_membership(tx, owner, tn.MembershipRole.TENANT_OWNER)
-        session, _ = tn.create_session(tx, owner, timedelta(hours=1))
+        session, token = tn.create_session(tx, owner, timedelta(hours=1))
         tn.mark_step_up(tx, session)
         now = tx.conn.execute("SELECT now()").fetchone()
     assert now is not None
@@ -84,12 +92,25 @@ def seed(app_conn: Conn, record: str) -> Tenant:
         ps.propose(tx, policy, draft("income", str(tenant)), owner)
         sim = VirtualPortfolio.open("SIM-SYN", Money.of("500", "USD"), now[0])
         ss.save(tx, ss.Simulation("SYNTHETIC", "exec-synth-1", "bench-synth-1", sim))
-    return Tenant(tenant, owner, session, policy, tuple(e.event_id for e in events))
+        key = f"synthetic-key-{record}-"
+        live = ws.create(tx, owner, session, f"{key}1", "SYNTHETIC growth",
+                         "SYNTHETIC notes")[0].watchlist.watchlist_id  # fmt: skip
+        for n in (2, 1):  # stored in instrument order
+            iid = InstrumentId(uuid.UUID(f"00000000-0000-4000-8000-00000000006{n}"))
+            e = wl.Entry(iid, f"SYNTHETIC thesis {n}", ("syn",), now[0], 10 * n,
+                         (COND,), "SYNTHETIC invalidation")  # fmt: skip
+            ws.add_entry(tx, live, owner, session, f"{key}e{n}", None, e)
+        gone = ws.create(tx, owner, session, f"{key}2", "SYNTHETIC gone",
+                         "SYNTHETIC deleted text")[0]  # fmt: skip
+        ws.delete(tx, gone.watchlist.watchlist_id, owner, session, f"{key}3", 1)
+    return Tenant(tenant, owner, session, policy, tuple(e.event_id for e in events),
+                  token, (live, gone.watchlist.watchlist_id))  # fmt: skip
 
 
 def export(app_conn: Conn, t: Tenant, page: int = 500) -> dict[str, Any]:
     with tn.tenant_transaction(app_conn, t.id, snapshot=True) as tx:
-        return {J: js.export_journal(tx, page), P: ps.export_policies(tx, page)}
+        return {J: js.export_journal(tx, page), P: ps.export_policies(tx, page),
+                W: ws.export_watchlists(tx)}  # fmt: skip
 
 
 @pytest.mark.db
@@ -97,7 +118,7 @@ def test_round_trip_through_the_archive(app_conn: Conn) -> None:
     a = seed(app_conn, "a")
     sections = export(app_conn, a)
     assert sections == export(app_conn, a, page=1)  # keyset pages agree
-    journal, policies = sections[J], sections[P]
+    journal, policies = sections[J]["events"], sections[P]
     assert [r["id"] for r in journal] == list(a.events)  # account, then revision
     assert [(r["kind"], r["status"]) for r in journal] == [
         ("deposit", "accepted"), ("buy", "reversed"), ("correction", "accepted"),
@@ -105,6 +126,17 @@ def test_round_trip_through_the_archive(app_conn: Conn) -> None:
     with tn.tenant_transaction(app_conn, a.id) as tx:
         history = ps.load(tx, a.policy)
         stored = [e.recorded_at for e in js.load_journal(tx, "SYN-ACCT").entries()]
+        revs = {acct: js.revision(tx, acct) for acct in ("SYN-ACCT", "SYN-ACCT-2")}
+        lists = ws.page(tx, 10, None)
+    assert [
+        (c["account_id"], c["revision"], c["event_count"])
+        for c in sections[J]["chains"]
+    ] == [("SYN-ACCT", revs["SYN-ACCT"], 3), ("SYN-ACCT-2", revs["SYN-ACCT-2"], 1)]
+    assert [w["id"] for w in sections[W]] == [a.lists[0]]  # the deleted one is not
+    assert [(w["revision"], w["name"], w["description"],
+             [wl.entry_from_json(e) for e in w["entries"]]) for w in sections[W]] == [
+        (r.revision, r.watchlist.name, r.watchlist.description,
+         list(r.watchlist.entries)) for r in lists]  # fmt: skip
     assert history is not None
     assert [(r["version"], r["content_hash"]) for r in policies] == [
         (v.version, v.content_hash) for v in history.versions
@@ -114,29 +146,43 @@ def test_round_trip_through_the_archive(app_conn: Conn) -> None:
     ]  # knowledge times as stored
     bundle = pt.build_export("export-synth-1", str(a.id), parse_instant(
         journal[-1]["recorded_at"]) + timedelta(seconds=1), sections)  # fmt: skip
-    report = read_archive(write_archive(bundle))
+    archive = write_archive(bundle)
+    report = read_archive(archive)
     assert report.data == sections and report.omissions == pt.ALWAYS_OMITTED
+    assert report.pending_reconnections == ()  # no broker connection is stored
     raw = b"".join(bundle.files.values()).decode()
     receipt = history.receipts[0]
+    assert a.token and a.token not in raw  # the session bearer secret
+    with tn.tenant_transaction(app_conn, a.id) as tx:
+        keys = [r[0] for r in tx.conn.execute(
+            "SELECT idempotency_key FROM app.watchlist_revision")]  # fmt: skip
     for secret in (str(a.owner), str(a.session), receipt.step_up_receipt_id, ACK,
-                   receipt.receipt_hash, "SIM-SYN"):  # fmt: skip
-        assert secret not in raw  # approval, identity and virtual material
+                   receipt.receipt_hash, "SIM-SYN", a.lists[1],
+                   "SYNTHETIC deleted text", *keys):  # fmt: skip
+        assert secret not in raw  # approval, identity, deleted and virtual material
+        assert secret.encode() not in archive  # nor anywhere in the archive bytes
+    pt.scan([pt.parse_json(b, p) for p, b in bundle.files.items()])  # no secret
 
 
 @pytest.mark.db
 def test_another_tenants_rows_never_appear(app_conn: Conn) -> None:
     a, b = seed(app_conn, "a"), seed(app_conn, "b")  # same account names in both
     sa, sb = export(app_conn, a), export(app_conn, b)
-    assert {r["tenant_id"] for r in sa[J]} == {str(a.id)}
+    assert {r["tenant_id"] for r in sa[J]["events"]} == {str(a.id)}
     assert {r["content"]["tenant_id"] for r in sa[P]} == {str(a.id)}
-    assert {r["id"] for r in sb[J]} == set(b.events)
+    assert {r["tenant_id"] for r in sa[W]} == {str(a.id)}
+    assert {r["id"] for r in sb[J]["events"]} == set(b.events)
+    assert [r["id"] for r in sb[W]] == [b.lists[0]]
     text = pt.canonical(sa).decode()
-    for foreign in (str(b.id), str(b.policy), *b.events):
+    for foreign in (str(b.id), str(b.policy), *b.events, *b.lists):
         assert foreign not in text
-    with pytest.raises(pt.PortabilityError) as e:  # b's rows under a's scope
-        pt.build_export("export-synth-1", str(a.id), parse_instant(
-            sa[J][-1]["recorded_at"]) + timedelta(days=1), {J: sb[J]})  # fmt: skip
-    assert e.value.code is pt.Refusal.SCOPE_MISMATCH
+    # the same account names, but each chain starts from its own tenant
+    assert [c["head"] for c in sa[J]["chains"]] != [c["head"] for c in sb[J]["chains"]]
+    later = parse_instant(sa[J]["events"][-1]["recorded_at"]) + timedelta(days=1)
+    for path in (J, W):  # b's sections under a's scope
+        with pytest.raises(pt.PortabilityError) as e:
+            pt.build_export("export-synth-1", str(a.id), later, {path: sb[path]})
+        assert e.value.code is pt.Refusal.SCOPE_MISMATCH
 
 
 @pytest.mark.db
@@ -161,12 +207,43 @@ def test_tampered_rows_are_never_exported(app_conn: Conn, conn: Conn) -> None:
     )
     with pytest.raises(js.JournalIntegrityError):
         export(app_conn, a)
+    conn.execute(
+        "UPDATE app.ledger_event SET effective_at = effective_at - interval "
+        "'1 second' WHERE event_id = %s",
+        (a.events[0],),
+    )
+    assert export(app_conn, a)[J]  # restored
+    conn.execute("UPDATE app.watchlist_revision SET name = 'SYNTHETIC renamed' "
+                 "WHERE watchlist_id = %s AND revision = 1", (a.lists[0],))  # fmt: skip
+    with pytest.raises(ws.WatchlistStoreError, match="integrity"):
+        export(app_conn, a)
+
+
+@pytest.mark.db
+def test_a_revision_gap_is_never_exported(app_conn: Conn, conn: Conn) -> None:
+    """The chain binds row n to `account_rev` n, so the export refuses an account
+    whose revisions are not 1..n, even when what is left still replays."""
+    a = seed(app_conn, "a")
+    t0 = parse_instant(export(app_conn, a)[J]["events"][0]["effective_at"])
+    with tn.tenant_transaction(app_conn, a.id) as tx:
+        for n in range(2):
+            src = SourceRef("SYN-BROKER", f"gap-{n}")
+            js.post(tx, deposit(Header("SYN-GAP", t0, src), Money.of("5", "USD")))
+        first = js.load_journal(tx, "SYN-GAP").entries()[0].event.event_id
+    assert len(export(app_conn, a)[J]["chains"]) == 3
+    conn.execute("SET session_replication_role = replica")  # a tampering owner
+    for table in ("posting", "ledger_event"):
+        conn.execute(f"DELETE FROM app.{table} WHERE event_id = %s", (first,))
+    with tn.tenant_transaction(app_conn, a.id) as tx:
+        assert len(js.load_journal(tx, "SYN-GAP").entries()) == 1  # still replays
+    with pytest.raises(js.JournalIntegrityError, match="gaps"):
+        export(app_conn, a)
 
 
 @pytest.mark.db
 def test_exports_need_a_read_only_snapshot(app_conn: Conn) -> None:
     a = seed(app_conn, "a")
-    for fn in (js.export_journal, ps.export_policies):
+    for fn in (js.export_journal, ps.export_policies, ws.export_watchlists):
         with tn.tenant_transaction(app_conn, a.id) as tx, pytest.raises(
             tn.SnapshotRequired):  # fmt: skip
             fn(tx)
@@ -183,18 +260,19 @@ def test_exports_need_a_read_only_snapshot(app_conn: Conn) -> None:
 
 @pytest.mark.db
 def test_recorded_at_is_trusted_from_the_store(app_conn: Conn, conn: Conn) -> None:
-    """The event id covers source content, not knowledge time: a tampered but
-    still ordered `recorded_at` is exported as stored; only an order break fails
-    the replay. Recorded in the receipt as a limitation."""
+    """In the store, the event id covers source content, not knowledge time: a
+    tampered but still ordered `recorded_at` is exported as stored (the chain is
+    then computed over it); only an order break fails the replay. Recorded in the
+    receipt as a limitation of the store, not of the archive."""
     a = seed(app_conn, "a")
-    before = export(app_conn, a)[J]
+    before = export(app_conn, a)[J]["events"]
     conn.execute("SET session_replication_role = replica")  # a tampering owner
     conn.execute(
         "UPDATE app.ledger_event SET recorded_at = recorded_at - interval '1 day' "
         "WHERE event_id = %s",
         (a.events[0],),
     )
-    after = export(app_conn, a)[J]
+    after = export(app_conn, a)[J]["events"]
     assert after[0]["recorded_at"] != before[0]["recorded_at"]  # not detected
     assert after[1:] == before[1:]
     conn.execute(
@@ -204,6 +282,65 @@ def test_recorded_at_is_trusted_from_the_store(app_conn: Conn, conn: Conn) -> No
     )
     with pytest.raises(JournalError, match="recorded_at_order"):  # replay refuses
         export(app_conn, a)
+
+
+def _reimport(bundle: pt.ExportBundle, body: dict[str, Any]) -> pt.Refusal | None:
+    """An archive edit: `body` as the journal file, under a manifest whose file
+    hash and size are recomputed (no signature exists to stop that). None when the
+    edited archive verifies."""
+    raw = pt.canonical(body)
+    files = {**bundle.files, J: raw}
+    m = bundle.manifest
+    entries = tuple(pt.FileEntry(f.path, pt.sha256(files[f.path]),
+                                 len(files[f.path]), f.content_class)
+                    for f in m.files)  # fmt: skip
+    edited = pt.ExportManifest(m.id, m.format_version, m.created_at, m.scope_id,
+                               entries, m.omissions, m.required_reconnections,
+                               m.compatibility_version)  # fmt: skip
+    try:
+        pt.verify_import(pt.canonical(edited.to_wire()), files)
+    except pt.PortabilityError as e:
+        return e.code
+    return None
+
+
+@pytest.mark.db
+def test_archive_edits_of_knowledge_time_order_and_tail_are_refused(
+    app_conn: Conn,
+) -> None:
+    """Increment 2's gap: each edit below replays, so only the chain header
+    catches it (`journal_chain`). A rewriter who also recomputes the header is not
+    caught: that needs a signature."""
+    a, tid = seed(app_conn, "a"), ""
+    t0 = parse_instant(export(app_conn, a)[J]["events"][0]["effective_at"])
+    with tn.tenant_transaction(app_conn, a.id) as tx:
+        tid = str(tx.tenant_id)
+        heads = [Header("SYN-ACCT-2", t0, SourceRef("SYN-BROKER", f"z{n}"))
+                 for n in range(2)]  # fmt: skip
+        js.post_many(tx, [deposit(h, Money.of("7", "CAD")) for h in heads])
+    sections = export(app_conn, a)
+    events, chains = sections[J]["events"], sections[J]["chains"]
+    assert [r["account_id"] for r in events] == ["SYN-ACCT"] * 3 + ["SYN-ACCT-2"] * 3
+    later = parse_instant(events[-1]["recorded_at"]) + timedelta(seconds=1)
+    bundle = pt.build_export("export-synth-1", tid, later, sections)
+    assert read_archive(write_archive(bundle)).data == sections
+    assert _reimport(bundle, sections[J]) is None  # the unedited body verifies
+    backdated = [dict(r) for r in events]
+    t1, t2 = (parse_instant(backdated[n]["recorded_at"]) for n in (0, 1))
+    backdated[1]["recorded_at"] = format_instant(t1 + (t2 - t1) / 2)  # order holds
+    for rows in (backdated, events[:-1], events[:3]):  # backdate, tail, account
+        assert lw.parse_section(rows)  # the rows alone replay
+        body = {"chains": chains, "events": rows}
+        assert _reimport(bundle, body) is pt.Refusal.JOURNAL_CHAIN
+    tied = [dict(r) for r in events]  # equal knowledge times in the store's form
+    tied[5]["recorded_at"] = tied[4]["recorded_at"]
+    tie = pt.build_export("export-synth-2", tid, later, {J: lw.section(tid, tied)})
+    swapped = [*tied[:4], tied[5], tied[4]]
+    assert lw.parse_section(swapped)
+    body = {"chains": lw.chains(tid, tied), "events": swapped}
+    assert _reimport(tie, body) is pt.Refusal.JOURNAL_CHAIN
+    rewritten = lw.section(tid, events[:-1])  # rows and header rewritten together
+    assert _reimport(bundle, rewritten) is None  # not detectable without a signature
 
 
 @pytest.mark.db
@@ -243,7 +380,7 @@ def test_rich_journal_round_trips_exactly(app_conn: Conn) -> None:
                            old.fee, None, old.event_id)  # supersedes `old`  # fmt: skip
         js.correct(tx, new)
         stored = js.load_journal(tx, acct).entries()
-    rows = [r for r in export(app_conn, a)[J] if r["account_id"] == acct]
+    rows = [r for r in export(app_conn, a)[J]["events"] if r["account_id"] == acct]
     assert [r["kind"] for r in rows] == [
         "deposit",
         "deposit",

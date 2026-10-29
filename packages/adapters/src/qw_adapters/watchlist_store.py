@@ -27,6 +27,9 @@ addWatchlistEntry, updateWatchlistEntry, deleteWatchlistEntry).
   `expected` is not the latest revision.
 - `page` verifies every chain of the tenant (linear in its revisions) and pages the
   live lists by id.
+- `export_watchlists` is the T057 `research/watchlists.json` section: every live
+  list's latest verified state, in a read-only snapshot. Deleted lists, the revision
+  history, principals, sessions and idempotency keys are not exported.
 Times are the DB clock. Lock `watchlist:<tenant>` (shared to read) comes after every
 other lock. Research state only: nothing here reads or writes accounts or holdings.
 """
@@ -46,14 +49,13 @@ from psycopg.types.json import Jsonb
 from qw_domain import watchlists as W
 from qw_domain.identity import InstrumentId
 from qw_domain.instants import ensure_aware_utc, format_instant
-from qw_domain.monitoring import Condition
-from qw_domain.streams import FeedLatency
 
-from qw_adapters.tenancy import TenantTx
+from qw_adapters.tenancy import TenantTx, require_snapshot
 
 __all__ = ["MAX_ENTRIES", "Revision", "WatchlistStoreError", "add_entry", "create",
-           "delete", "entry_json", "load", "page", "remove_entry", "revision_hash",
-           "tombstone", "update", "update_entry"]  # fmt: skip
+           "delete", "entry_json", "export_watchlists", "load", "page",
+           "remove_entry", "revision_hash", "tombstone", "update",
+           "update_entry"]  # fmt: skip
 
 MAX_ENTRIES = 500  # per list; 0023 refuses a larger snapshot
 _ENTRY_ACTIONS = ("add_entry", "update_entry", "remove_entry")
@@ -99,30 +101,7 @@ def revision_hash(
     return hashlib.sha256(text.encode()).hexdigest()
 
 
-def entry_json(e: W.Entry) -> dict[str, Any]:
-    """The stored form: the contract response entry plus `needs`."""
-    return {"instrument_id": e.instrument_id.to_wire(), "thesis": e.thesis,
-            "tags": list(e.tags),
-            "review_at": None if e.review_at is None else format_instant(e.review_at),
-            "monitoring_priority": e.priority,
-            "conditions": [{"metric": c.metric, "operator": c.operator,
-                            "values": list(c.values), "data_spec_id": c.data_spec_id,
-                            "description": c.description} for c in e.conditions],
-            "invalidation_text": e.invalidation_text,
-            "needs": e.needs.value}  # fmt: skip
-
-
-def _entry(d: dict[str, Any]) -> W.Entry:
-    """Decode a stored entry; the caller re-encodes it, so lax shapes still fail."""
-    at = d["review_at"]
-    return W.Entry(
-        InstrumentId.from_wire(d["instrument_id"]), d["thesis"], tuple(d["tags"]),
-        None if at is None else datetime.fromisoformat(at), d["monitoring_priority"],
-        tuple(Condition(c["metric"], c["operator"], tuple(c["values"]),
-                        c["data_spec_id"], c["description"])
-              for c in d["conditions"]),
-        d["invalidation_text"], FeedLatency(d["needs"]),
-    )  # fmt: skip
+entry_json, _entry = W.entry_json, W.entry_from_json  # moved to the domain (T057)
 
 
 def _editable(e: W.Entry | None) -> tuple[Any, ...] | None:
@@ -256,6 +235,22 @@ def page(tx: TenantTx, limit: int, after: str | None) -> list[Revision]:
     chains = sorted(_chains(tx, None)[0].items())
     return [c[-1] for w, c in chains
             if not c[-1].deleted and (after is None or w > after)][:limit]  # fmt: skip
+
+
+def export_watchlists(tx: TenantTx) -> list[dict[str, Any]]:
+    """Each live list (by id) as the contract Watchlist (`id`, `revision`, `name`,
+    `entries`) plus `tenant_id` and `description`, its entries in stored form (the
+    contract entry plus `needs`). Every chain is verified first (`integrity`). Needs
+    `tenant_transaction(..., snapshot=True)`, else `tenancy.SnapshotRequired`."""
+    require_snapshot(tx)
+    _lock(tx, shared=True)
+    tenant = str(tx.tenant_id)
+    return [{"id": w, "tenant_id": tenant, "revision": c[-1].watchlist.revision,
+             "name": c[-1].watchlist.name,
+             "description": c[-1].watchlist.description,
+             "entries": [entry_json(e) for e in c[-1].watchlist.entries]}
+            for w, c in sorted(_chains(tx, None)[0].items())
+            if not c[-1].deleted]  # fmt: skip
 
 
 def create(

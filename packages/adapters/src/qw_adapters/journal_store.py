@@ -295,21 +295,25 @@ def list_accounts(
     return [(a, int(n), tuple(sorted(s))) for a, n, s in rows]
 
 
-def export_journal(tx: TenantTx, page: int = 500) -> list[dict[str, Any]]:
-    """The T057 `financial/journal.json` section: every journal account of the tenant
-    (RLS and `tx.tenant_id`) in byte order of id, each event in `account_rev` order
-    as its contract LedgerEvent (`qw_domain.ledger_wire.item`). Each account is read
-    through `load_journal`, so every event id is recomputed and the account replayed;
-    a tampered row raises `JournalIntegrityError`. Read-only; source records are
-    observations, not journal entries, and are not exported. It runs only in a
-    snapshot transaction (`tenant_transaction(..., snapshot=True)`), so the section
-    is one consistent view; otherwise `tenancy.SnapshotRequired`."""
+def export_journal(tx: TenantTx, page: int = 500) -> dict[str, Any]:
+    """The T057 `financial/journal.json` section (`qw_domain.ledger_wire.section`):
+    every journal account of the tenant (RLS and `tx.tenant_id`) in byte order of
+    id, each event in `account_rev` order as its contract LedgerEvent, under the
+    `chains` header. Each account is read through `load_journal`, so every event id
+    is recomputed and the account replayed, and its store revision must be its event
+    count + 1 (gapless `account_rev` 1..n, which the chain binds as row positions);
+    otherwise `JournalIntegrityError`. Read-only; source records are observations,
+    not journal entries, and are not exported. It runs only in a snapshot
+    transaction (`tenant_transaction(..., snapshot=True)`), so the section is one
+    consistent view; otherwise `tenancy.SnapshotRequired`."""
     require_snapshot(tx)
     tenant, rows, after = str(tx.tenant_id), [], None
     while accounts := list_accounts(tx, page, after):
-        for account_id, _, _ in accounts:
+        for account_id, rev, _ in accounts:
             entries = load_journal(tx, account_id).entries()
+            if rev != len(entries) + 1:  # so the header's revision is the store's
+                raise JournalIntegrityError(f"account {account_id} revisions have gaps")
             gone = {e.event.reverses for e in entries if e.event.reverses}
             rows += [lw.item(tenant, e, gone)[0] for e in entries]
         after = accounts[-1][0]
-    return rows
+    return lw.section(tenant, rows)
