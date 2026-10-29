@@ -3,7 +3,9 @@ T008 F-18; decisions 94 and 98 reserve the optimizer verdict's cost here). One
 `BudgetBook` per tenant and UTC month, its scope the session tenant id (the
 gateway's `req.tenant_id == book.scope_id`), written only by compare-and-set:
 - `load(tx, period)`: the book or None; every read re-hashes the row and
-  re-parses the strict domain wire, else `integrity`.
+  re-parses the strict domain wire, else `integrity`. `books(tx, through,
+  limit)`: the books newest month first, as `load` verifies them, and
+  `recorded_refs(tx)`: the tenant's recorded authorization refs (listBudgets).
 - `open_book(tx, at, caps)`: the book of `at`'s month, opened from `caps` if
   absent (0052: configured caps, current month, a null or owner-recorded ref,
   else `invalid`). A book differing only by a null ref is authorized to
@@ -59,6 +61,7 @@ PILOT = MappingProxyType({"pilot_monthly_usd": "100.00",
                           "improvement_monthly_usd_max": "20.00"})  # fmt: skip
 _CAS_TRIES = 3
 OVERDUE_PAGE = 500  # 0054's LIMIT
+BOOK_PAGE = 100  # `books`: months per call (listBudgets asks for at most 42)
 
 
 class BudgetStoreError(Exception):
@@ -130,6 +133,38 @@ def load(tx: TenantTx, period: str) -> StoredBook | None:
     except psycopg.Error as exc:
         raise _database(exc) from None
     return None if row is None else _parse(tx, scope, period, row)
+
+
+def books(tx: TenantTx, through: str | None, limit: int) -> list[StoredBook]:
+    """The session tenant's books, newest month first, at most `limit` (1 to
+    `BOOK_PAGE`), only months up to `through` if given; each re-verified."""
+    scope = _tenant(tx)
+    if type(limit) is not int or not 0 < limit <= BOOK_PAGE:
+        raise BudgetStoreError("invalid", "limit")
+    try:
+        rows = tx.conn.execute(
+            f"SELECT {', '.join(_COLS)} FROM app.budget_book WHERE tenant_id = %s "
+            "AND (%s::text IS NULL OR period <= %s) ORDER BY period DESC LIMIT %s",
+            (tx.tenant_id, through, through, limit),
+        ).fetchall()
+    except psycopg.Error as exc:
+        raise _database(exc) from None
+    return [_parse(tx, scope, str(row[1]), row) for row in rows]
+
+
+def recorded_refs(tx: TenantTx) -> frozenset[str]:
+    """The session tenant's authorization refs the owner has recorded and not
+    revoked (0052's `tenant_read`: qw_app and qw_worker read their own)."""
+    _tenant(tx)
+    try:
+        rows = tx.conn.execute(
+            "SELECT authorization_ref FROM app.budget_authorization WHERE "
+            "tenant_id = %s",
+            (tx.tenant_id,),
+        ).fetchall()
+    except psycopg.Error as exc:
+        raise _database(exc) from None
+    return frozenset(str(r[0]) for r in rows)
 
 
 def holding(tx: TenantTx, reservation_id: str) -> StoredBook | None:
