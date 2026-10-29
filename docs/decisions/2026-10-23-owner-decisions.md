@@ -652,3 +652,18 @@ below waives a test, gate or spec requirement. Numbering continues from
     will actually type, while still blocking the injection and confusable
     characters that strict IDs guard against."
     Implemented by: T013 (domain sources and migration).
+
+103. **Accented letters in broker and account-type text (T013).**
+    Question: "Decision 103 (T013, follow-up to 102): Broker and account-type
+    names are now ASCII-only. That blocks look-alike letters (for example a
+    Cyrillic 'І' standing in for 'I'), but it also refuses real names like
+    \"Crédit Agricole\" or \"Société Générale\". Widening this later needs another
+    migration, so it should be settled before real data is stored. Keep
+    ASCII-only?"
+    Selected label: "Allow Latin accents (Recommended)".
+    Option text as presented: "Also allow accented Latin letters, with text
+    normalized to one canonical form (NFC) before checking, and keep refusing
+    other scripts, invisible characters and look-alikes. Why: you hold Canadian
+    accounts (CIBC), and French-language broker and plan names are common there.
+    Restricting to Latin letters keeps most of the look-alike risk out."
+    Implemented by: T013 (domain sources and migration 0056).
