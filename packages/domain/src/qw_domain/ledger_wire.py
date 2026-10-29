@@ -17,8 +17,12 @@ project contract 0.4.0: `lot_policy_id` nullable). listLedger serves it
 exactly (so `id`, the idempotency key, movements, annotations, decimals and `Z`
 instants are canonical), replays each account in order like the store's
 `load_journal`, and checks `status` against the reversals in the section.
+`section` wraps the rows with `chains`, one header record per account binding its
+revision, count, order and knowledge times (T057 increment 3).
 """
 
+import hashlib
+import json
 from collections.abc import Mapping, Sequence, Set
 from typing import Any
 
@@ -45,6 +49,8 @@ KEYS = frozenset({"id", "account_id", "tenant_id", "kind", "effective_at",
                   "lot_policy_id", "economic_annotations"})  # fmt: skip
 POSTING_KEYS = frozenset({"book_account", "commodity", "amount"})
 MOVEMENT_KEYS = frozenset({"instrument_id", "quantity"})
+CHAIN_KEYS = frozenset({"account_id", "revision", "event_count", "head"})
+CHAIN_TAG = "qw-journal-chain/1"
 _UNIT = frozenset(a.value for a in UnitAccount)
 _KIND = {v: EventKind(k) for k, v in (KINDS | MAPPED).items()}
 
@@ -148,3 +154,30 @@ def parse_section(rows: Sequence[Mapping[str, Any]]) -> list[Entry]:
         if (r["status"] == "reversed") != (e.event.event_id in gone):
             raise WireError(f"row {n}: status")
     return entries
+
+
+def _digest(*parts: object) -> str:
+    text = json.dumps(parts, separators=(",", ":"), ensure_ascii=False)
+    return hashlib.sha256(text.encode()).hexdigest()
+
+
+def chains(tenant: str, rows: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
+    """The section header: per account (by id), its store `revision` (1 + the
+    latest gapless `account_rev`), `event_count` and `head`, a running hash over the
+    account's rows in row order. Row n (from 1) is the event at `account_rev` n, so
+    each step binds the position, the event `id` (the content fingerprint) and
+    `recorded_at`: h0 = H(tag, tenant, account), hn = H(tag, h(n-1), n, id,
+    recorded_at). Integrity against row edits only: whoever rewrites the rows can
+    rewrite this header too, until the archive is signed."""
+    heads: dict[str, tuple[int, str]] = {}
+    for r in rows:
+        a = r["account_id"]
+        n, h = heads.get(a, (0, _digest(CHAIN_TAG, tenant, a)))
+        heads[a] = (n + 1, _digest(CHAIN_TAG, h, n + 1, r["id"], r["recorded_at"]))
+    return [{"account_id": a, "revision": n + 1, "event_count": n, "head": h}
+            for a, (n, h) in sorted(heads.items())]  # fmt: skip
+
+
+def section(tenant: str, rows: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+    """The `financial/journal.json` body: the `chains` header, then the `events`."""
+    return {"chains": chains(tenant, rows), "events": list(rows)}

@@ -1,9 +1,11 @@
-"""The journal and policy export sections (T057 increment 2): closed, exact shapes,
-re-verified rows, refusals on export and on import. Every tenant, account, source,
+"""The journal, policy and watchlist export sections (T057 increments 2 and 3):
+closed, exact shapes, re-verified rows, the journal chain header, refusals on export
+and on import. Every tenant, account, source,
 instrument, amount and answer is SYNTHETIC. Expected codes come from the
 `qw_domain.portability` and `qw_domain.ledger_wire` docstring rules; the oracle for
 each row is the domain itself (the journal and the policy history)."""
 
+import hashlib
 import json
 import sys
 import uuid
@@ -19,11 +21,14 @@ from qw_domain import portability as pt
 from qw_domain.corporate_actions import SourceRef
 from qw_domain.decimals import Money, PositiveQuantity, Price
 from qw_domain.identity import InstrumentId
+from qw_domain.instants import format_instant, parse_instant
 from qw_domain.journal import Journal
 from qw_domain.onboarding import load_catalogue
 from qw_domain.postings import Header, buy, deposit
+from referencing import Registry, Resource
 
 ROOT = Path(__file__).resolve().parents[3]
+SCHEMAS = ROOT / "docs/spec/contracts/schemas"
 sys.path.insert(0, str(ROOT / "tools"))
 import project_contract  # noqa: E402  # type: ignore[import-not-found]
 
@@ -32,7 +37,7 @@ TENANT = "tenant-synth-a"
 AT = datetime(2026, 10, 29, 12, 0, tzinfo=UTC)
 T0 = datetime(2026, 1, 2, 15, tzinfo=UTC)
 SYN = InstrumentId(uuid.UUID("00000000-0000-4000-8000-00000000005a"))
-J, P = pt.JOURNAL_PATH, pt.POLICIES_PATH
+J, P, W = pt.JOURNAL_PATH, pt.POLICIES_PATH, pt.WATCHLISTS_PATH
 CATALOGUE = load_catalogue(
     json.loads((ROOT / "docs/spec/config/onboarding_questions.json").read_text())
 )
@@ -43,18 +48,50 @@ CONTRACT = {  # other records' required keys, which must never pass as journal r
 
 
 def journal_rows(tenant: str = TENANT) -> list[dict[str, Any]]:
-    """Deposit, buy, and a reversal of the buy (SYNTHETIC), as the store exports."""
+    """Deposit, buy, and a reversal of the buy; then two deposits into a second
+    account with the same `recorded_at` (SYNTHETIC), as the store exports."""
     h = [Header("SYN-ACCT", T0 + timedelta(days=d), SourceRef("SYN-BROKER", f"r{d}"))
          for d in range(3)]  # fmt: skip
-    j = Journal()
+    j, j2 = Journal(), Journal()
     bought = buy(
         h[1], SYN, PositiveQuantity("2"), Price("100.25"), Money.of("1", "USD")
     )
     for n, e in enumerate((deposit(h[0], Money.of("1000", "USD")), bought,
                            bought.reversal(h[2].source))):  # fmt: skip
         j.post(e, T0 + timedelta(days=n, hours=1))
+    for n, cash in enumerate(("50", "70")):
+        src = SourceRef("SYN-BROKER", f"t{n}")
+        j2.post(deposit(Header("SYN-ACCT-2", T0, src), Money.of(cash, "CAD")),
+                T0 + timedelta(days=5))  # fmt: skip
     gone = {e.event.reverses for e in j.entries() if e.event.reverses}
-    return [lw.item(tenant, e, gone)[0] for e in j.entries()]
+    return [lw.item(tenant, e, gone)[0] for e in (*j.entries(), *j2.entries())]
+
+
+def journal(rows: list[dict[str, Any]], tenant: str = TENANT) -> dict[str, Any]:
+    return lw.section(tenant, rows)
+
+
+COND = {"metric": "price_cross", "operator": "gt", "data_spec_id": "feed-synth-iex",
+        "description": "SYNTHETIC breakout"}  # fmt: skip
+
+
+def watchlist_rows(tenant: str = TENANT) -> list[dict[str, Any]]:
+    """Two live lists (SYNTHETIC), as `export_watchlists` gives them."""
+
+    def entry(n: int, review: str | None) -> dict[str, Any]:
+        return {"instrument_id": f"00000000-0000-4000-8000-00000000005{n}",
+                "thesis": f"SYNTHETIC thesis {n}", "tags": ["syn"],
+                "review_at": review, "monitoring_priority": 10 * n,
+                "conditions": [{**COND, "values": ["100"]}],  # a fresh copy
+                "invalidation_text": "SYNTHETIC: below 80",
+                "needs": "realtime_exchange_limited"}  # fmt: skip
+
+    return [{"id": "00000000-0000-4000-8000-0000000000a1", "tenant_id": tenant,
+             "revision": 3, "name": "Growth", "description": "SYNTHETIC list",
+             "entries": [entry(1, "2026-11-08T12:00:00Z"), entry(2, None)]},
+            {"id": "00000000-0000-4000-8000-0000000000a2", "tenant_id": tenant,
+             "revision": 1, "name": "Empty", "description": "", "entries": []}
+            ]  # fmt: skip
 
 
 def draft(objective: str = "growth", tenant: str = TENANT) -> dp.DraftPolicy:
@@ -100,7 +137,8 @@ def on_import(path: str, raw: bytes) -> pt.Refusal:
 
 
 def test_round_trip_is_exact_and_follows_the_contract() -> None:
-    sections: dict[str, object] = {J: journal_rows(), P: policy_rows()}
+    sections: dict[str, object] = {J: journal(journal_rows()), P: policy_rows(),
+                                   W: watchlist_rows()}  # fmt: skip
     b = build(sections)
     rep = pt.verify_import(pt.canonical(b.manifest.to_wire()), b.files)
     assert rep.data == sections and rep.unsupported == ()
@@ -110,12 +148,27 @@ def test_round_trip_is_exact_and_follows_the_contract() -> None:
         ledger.validate(row)
     statuses = [(r["kind"], r["status"]) for r in journal_rows()]
     assert statuses == [("deposit", "accepted"), ("buy", "reversed"),
-                        ("correction", "accepted")]  # fmt: skip
+                        ("correction", "accepted"), ("deposit", "accepted"),
+                        ("deposit", "accepted")]  # fmt: skip
+    chains = journal(journal_rows())["chains"]
+    assert [(c["account_id"], c["revision"], c["event_count"]) for c in chains] == [
+        ("SYN-ACCT", 4, 3), ("SYN-ACCT-2", 3, 2)]  # fmt: skip
+    common = json.loads((SCHEMAS / "common.schema.json").read_text())
+    watch = Draft202012Validator(project_contract.schema("watchlist"),
+                                 registry=Registry().with_resource(
+                                     "common.schema.json",
+                                     Resource.from_contents(common)))  # fmt: skip
+    for w in watchlist_rows():  # the contract Watchlist, plus the declared extras
+        watch.validate({k: v for k, v in w.items()
+                        if k not in ("tenant_id", "description")}
+                       | {"entries": [{k: v for k, v in e.items() if k != "needs"}
+                                      for e in w["entries"]]})  # fmt: skip
     assert sorted(set(pt.SECTIONS) - pt.OPEN_SECTIONS) == [
-        "audit/tombstones.json",
-        "financial/accounts.json",
-        "research/watchlists.json",
+        "audit/tombstones.json",  # no tombstone store yet (T058)
+        "financial/accounts.json",  # no account, source or mapping store (T013)
     ]
+    for closed in ("audit/tombstones.json", "financial/accounts.json"):
+        assert refused(build, {closed: []}) is R.SECTION_NOT_READY
 
 
 def _edit(rows: list[dict[str, Any]], n: int, path: str, value: object) -> None:
@@ -155,11 +208,15 @@ JOURNAL_CASES = [  # row, dotted path, new value (KeyError deletes), refusal
 def test_journal_rows_are_refused_on_export_and_import(
     n: int, path: str, value: object, code: pt.Refusal
 ) -> None:
-    rows = journal_rows()
-    _edit(rows, n, path, value)
-    assert refused(build, {J: rows}) is code
-    raw = json.dumps(rows).encode()
-    assert on_import(J, raw) is code
+    body = journal(journal_rows())  # the header of the unedited rows
+    _edit(body["events"], n, path, value)
+    assert refused(build, {J: body}) is code
+    assert on_import(J, json.dumps(body).encode()) is code
+
+
+def edited(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    """An archive edit: other rows under the honest header."""
+    return {"chains": journal(journal_rows())["chains"], "events": rows}
 
 
 @pytest.mark.parametrize("record", sorted(CONTRACT))
@@ -167,17 +224,127 @@ def test_no_other_record_passes_as_a_journal_event(record: str) -> None:
     """Observations, claimed executions and simulated (virtual) fills stay
     separate: their fields are not journal fields."""
     row = dict.fromkeys(CONTRACT[record], "x")
-    assert refused(build, {J: [row]}) is R.UNKNOWN_FIELD
+    assert refused(build, {J: edited([row])}) is R.UNKNOWN_FIELD
     mixed = [*journal_rows(), {**journal_rows()[0], **row}]
-    assert refused(build, {J: mixed}) is R.UNKNOWN_FIELD
+    assert refused(build, {J: edited(mixed)}) is R.UNKNOWN_FIELD
 
 
 def test_journal_order_and_repeats_are_refused() -> None:
     rows = journal_rows()
-    assert refused(build, {J: [rows[0], rows[0]]}) is R.MALFORMED  # not a new event
-    assert refused(build, {J: [rows[0], rows[2], rows[1]]}) is R.MALFORMED  # link
-    assert refused(build, {J: rows[:2]}) is R.MALFORMED  # reversed with no reversal
-    assert refused(build, {J: {"rows": rows}}) is R.MALFORMED
+    for bad in ([rows[0], rows[0]],  # not a new event
+                [rows[0], rows[2], rows[1]],  # broken link
+                rows[:2]):  # reversed with no reversal  # fmt: skip
+        assert refused(build, {J: journal(bad)}) is R.MALFORMED
+    assert refused(build, {J: rows}) is R.MALFORMED  # increment 2's bare list
+    assert refused(build, {J: {"rows": rows}}) is R.UNKNOWN_FIELD
+    assert refused(build, {J: {"events": rows}}) is R.FIELD_MISSING
+
+
+def _shift(row: dict[str, Any], **delta: int) -> None:
+    at = parse_instant(row["recorded_at"]) + timedelta(**delta)
+    row["recorded_at"] = format_instant(at)
+
+
+def test_knowledge_time_order_and_tail_are_bound_by_the_chain() -> None:
+    """Increment 2's undetected archive edits are now `journal_chain`: each one
+    replays, so only the header catches it. It shows integrity against edits of
+    the rows alone; a rewriter of rows and header is caught only by a signature."""
+    rows = journal_rows()
+    backdated = journal_rows()
+    _shift(backdated[1], hours=-1)  # still after row 0: the order holds
+    swapped = [*rows[:3], rows[4], rows[3]]  # same recorded_at in SYN-ACCT-2
+    assert rows[3]["recorded_at"] == rows[4]["recorded_at"]
+    for bad in (backdated, swapped, rows[:4], rows[:3]):  # tail; a whole account
+        assert lw.parse_section(bad)  # the rows alone replay
+        assert refused(build, {J: edited(bad)}) is R.JOURNAL_CHAIN
+        assert on_import(J, pt.canonical(edited(bad))) is R.JOURNAL_CHAIN
+    honest = journal(rows)
+
+    def header(n: int, key: str, value: object) -> pt.Refusal:
+        body = journal(journal_rows())
+        _edit(body["chains"], n, key, value)
+        return refused(build, {J: body})
+
+    assert header(0, "revision", 3) is R.JOURNAL_CHAIN
+    assert header(1, "event_count", 3) is R.JOURNAL_CHAIN
+    assert header(0, "head", "0" * 64) is R.JOURNAL_CHAIN
+    assert header(0, "signature", "x") is R.UNKNOWN_FIELD
+    assert header(0, "head", KeyError) is R.FIELD_MISSING
+    assert header(0, "revision", 4.0) is R.FLOAT
+    wrong: list[list[dict[str, Any]]] = [
+        honest["chains"][:1], honest["chains"][::-1], [],
+        journal(rows, "tenant-synth-b")["chains"]]  # fmt: skip
+    for chains in wrong:
+        assert refused(build, {J: {"chains": chains, "events": rows}}) is (
+            R.JOURNAL_CHAIN)  # fmt: skip
+    one = journal_rows()[:1]  # True == 1 in Python; the canonical bytes differ
+    body = journal(one)
+    body["chains"][0]["event_count"] = True
+    assert refused(build, {J: body}) is R.JOURNAL_CHAIN
+    assert build({J: journal([])}).files[J] == b'{"chains":[],"events":[]}'
+
+
+def test_the_chain_formula_is_pinned() -> None:
+    """A hand-computed vector (independent of `lw.chains`), and the header is
+    sorted by account even when the section lists accounts in another order."""
+
+    def h(*parts: object) -> str:
+        text = json.dumps(parts, separators=(",", ":"), ensure_ascii=False)
+        return hashlib.sha256(text.encode()).hexdigest()
+
+    rows = journal_rows()
+    tag, want = "qw-journal-chain/1", h("qw-journal-chain/1", TENANT, "SYN-ACCT-2")
+    for n, r in enumerate(rows[3:], start=1):
+        want = h(tag, want, n, r["id"], r["recorded_at"])
+    later_first = [*rows[3:], *rows[:3]]
+    chains = journal(later_first)["chains"]
+    assert [c["account_id"] for c in chains] == ["SYN-ACCT", "SYN-ACCT-2"]
+    assert chains[1] == {"account_id": "SYN-ACCT-2", "revision": 3,
+                         "event_count": 2, "head": want}  # fmt: skip
+    assert build({J: journal(later_first)})  # accounts in any order verify
+
+
+SECOND = "00000000-0000-4000-8000-000000000052"  # the second entry's instrument
+WATCHLIST_CASES = [  # row, dotted path, new value (KeyError deletes), refusal
+    (0, "principal_id", "user-synth-1", R.UNKNOWN_FIELD),
+    (0, "idempotency_key", "k-1", R.UNKNOWN_FIELD),
+    (0, "entries.0.price", "100", R.UNKNOWN_FIELD),
+    (0, "entries.0.conditions.0.secret", "x", R.UNKNOWN_FIELD),
+    (0, "entries.0.monitoring_priority", 10.5, R.FLOAT),
+    (0, "description", KeyError, R.FIELD_MISSING),
+    (0, "entries.0.needs", KeyError, R.FIELD_MISSING),
+    (0, "tenant_id", "tenant-synth-b", R.SCOPE_MISMATCH),
+    (0, "revision", 0, R.MALFORMED),
+    (0, "revision", True, R.MALFORMED),
+    (0, "name", "", R.MALFORMED),
+    (0, "id", "not an id", R.MALFORMED),
+    (0, "entries.0.instrument_id", "SYN", R.MALFORMED),
+    (0, "entries.0.instrument_id", SECOND, R.MALFORMED),  # a repeated instrument
+    (0, "entries.0.review_at", "2026-11-08T13:00:00+01:00", R.MALFORMED),
+    (0, "entries.0.monitoring_priority", 101, R.MALFORMED),
+    (0, "entries.0.needs", "instant", R.MALFORMED),
+    (0, "entries.0.conditions.0.operator", "between", R.MALFORMED),
+    (0, "entries.0.tags", "syn", R.MALFORMED),
+]
+
+
+@pytest.mark.parametrize(("n", "path", "value", "code"), WATCHLIST_CASES)
+def test_watchlist_rows_are_refused_on_export_and_import(
+    n: int, path: str, value: object, code: pt.Refusal
+) -> None:
+    rows = watchlist_rows()
+    _edit(rows, n, path, value)
+    assert refused(build, {W: rows}) is code
+    assert on_import(W, json.dumps(rows).encode()) is code
+
+
+def test_watchlist_order_and_repeats_are_refused() -> None:
+    a, b = watchlist_rows()
+    assert refused(build, {W: [b, a]}) is R.MALFORMED
+    assert refused(build, {W: [a, a]}) is R.MALFORMED
+    swapped = {**a, "entries": a["entries"][::-1]}
+    assert refused(build, {W: [swapped, b]}) is R.MALFORMED
+    assert refused(build, {W: {"lists": [a]}}) is R.MALFORMED
 
 
 POLICY_CASES = [

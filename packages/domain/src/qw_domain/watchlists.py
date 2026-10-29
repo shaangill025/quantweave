@@ -10,16 +10,20 @@ spec §2 Journey C, §4, §13 "Watchlists and research").
 - `watch_demands` turns active entries into T022 stream demands: priority 1..100 is
   `user_prioritized` (rank 100 - priority, so higher first), 0 is `candidate`; an
   instrument on several lists keeps its highest priority per latency need.
+- `entry_json` / `entry_from_json`: the stored entry (the contract response entry
+  plus `needs`), moved unchanged from `qw_adapters.watchlist_store` so the T057
+  export section re-verifies entries with the same code.
 In-memory; persistence is remaining work. Stdlib only.
 """
 
 from collections.abc import Callable
 from dataclasses import dataclass, replace
 from datetime import datetime
+from typing import Any
 
 from qw_domain.decimals import safe_repr
 from qw_domain.identity import InstrumentId
-from qw_domain.instants import ensure_aware_utc
+from qw_domain.instants import ensure_aware_utc, format_instant
 from qw_domain.monitoring import Condition
 from qw_domain.sources import ID_PATTERN
 from qw_domain.streams import DemandClass, FeedLatency, WatchDemand
@@ -71,6 +75,32 @@ class Entry:
             raise WatchlistError("malformed", "needs must be a FeedLatency")
         if self.review_at is not None:
             object.__setattr__(self, "review_at", ensure_aware_utc(self.review_at))
+
+
+def entry_json(e: Entry) -> dict[str, Any]:
+    """The stored form: the contract response entry plus `needs`."""
+    return {"instrument_id": e.instrument_id.to_wire(), "thesis": e.thesis,
+            "tags": list(e.tags),
+            "review_at": None if e.review_at is None else format_instant(e.review_at),
+            "monitoring_priority": e.priority,
+            "conditions": [{"metric": c.metric, "operator": c.operator,
+                            "values": list(c.values), "data_spec_id": c.data_spec_id,
+                            "description": c.description} for c in e.conditions],
+            "invalidation_text": e.invalidation_text,
+            "needs": e.needs.value}  # fmt: skip
+
+
+def entry_from_json(d: dict[str, Any]) -> Entry:
+    """Decode a stored entry; the caller re-encodes it, so lax shapes still fail."""
+    at = d["review_at"]
+    return Entry(
+        InstrumentId.from_wire(d["instrument_id"]), d["thesis"], tuple(d["tags"]),
+        None if at is None else datetime.fromisoformat(at), d["monitoring_priority"],
+        tuple(Condition(c["metric"], c["operator"], tuple(c["values"]),
+                        c["data_spec_id"], c["description"])
+              for c in d["conditions"]),
+        d["invalidation_text"], FeedLatency(d["needs"]),
+    )  # fmt: skip
 
 
 @dataclass(frozen=True, slots=True)
