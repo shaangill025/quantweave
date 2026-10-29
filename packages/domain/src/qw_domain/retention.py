@@ -43,10 +43,23 @@ R052, R075, R077, R086, R087, R088). Domain, stdlib only, in memory.
 - A delete intent under a legal hold is planned as `held`, not dropped. `execute`
   re-checks holds and the current policy (the stricter of plan and current wins) at
   its own time; a suspended intent stays pending until a later run deletes it. An
-  item already tombstoned keeps its first tombstone. Tombstones carry a pseudonym (an
-  unkeyed hash of tenant, class and record id; ids are case-sensitive, as in the
-  stores; guessable ids make it a pseudonym, not confidentiality), the residual
-  backups that may still hold a copy and their expiry.
+  item already tombstoned keeps its first tombstone. Tombstones carry a pseudonym,
+  the residual backups that may still hold a copy (distinct ids) and their expiry.
+- Owner decision 104 (keyed hash, scheme-tagged): the pseudonym is an HMAC-SHA256
+  under the installation's `RecordKey` (an operator-held secret kept outside the
+  database, never in a repr, log or export) over tenant, class, record id (case-
+  sensitive) and the record's `created_at`, its incarnation: a record re-created
+  under the same id is another key. Every tombstone names its `hash_scheme`;
+  `verify` accepts only `HASH_SCHEMES`, and new entries use `HASH_SCHEME`. Without
+  the key nothing can be planned or matched (`key_unavailable`), but the chain
+  still verifies: `entry_hash` covers only stored fields. Each tombstone also
+  names its key by `key_id`, a one-way MAC of a fixed label (not the key): a
+  ledger holds one key, so appending or restoring under another key is
+  `key_mismatch`, never a silent miss. Rotation starts a new ledger chain (not
+  built). `Item.created_at` must be the record's immutable, microsecond-exact
+  creation instant: a truncated or restamped time is another incarnation and
+  would not be suppressed. Callers that name records by hash (`reproducibility`)
+  compute them with `Item.pseudonym(key)`.
 - The ledger is a hash chain, append-only in time. The chain detects accidental
   edits; authenticity depends on the `LedgerCheckpoint` (length and head) kept
   outside the backup failure domain. `restore` requires that anchor, refuses a
@@ -54,12 +67,13 @@ R052, R075, R077, R086, R087, R088). Domain, stdlib only, in memory.
   and drops every tombstoned item before anything is served.
 - `reproducibility` marks derived items whose inputs were deleted (transitively) as
   not reproducible, and unknown inputs as `lineage_missing` (T052 approach, not code).
-LIMITATIONS: no persistence, routes, real backups or store-specific deletion; the
-caller deletes rows from each store; the anchor is unkeyed (a keyed or signed anchor
+LIMITATIONS: no routes, real backups or store-specific deletion; the caller
+deletes rows from each store; the anchor is unkeyed (a keyed or signed anchor
 waits for a reviewed key scheme: an owner decision).
 """
 
 import hashlib
+import hmac
 import json
 import re
 from collections.abc import Iterable, Mapping, Sequence
@@ -76,11 +90,12 @@ from qw_domain.sources import ID_PATTERN
 _CODE = re.compile(r"[a-z][a-z0-9_]{0,63}", re.ASCII)
 GENESIS = "0" * 64
 
-OWNER_DECISIONS = (  # still open after decisions 9 (2026-10-15), 20-22, 30, 31, 34
+OWNER_DECISIONS = (  # still open after decisions 9 (2026-10-15), 20-22, 30, 31, 34,
+    # 104
     "the financial journal's own retention period (decision 21: retained, "
     "append-only; only a period the owner sets later may expire it)",
     "mapping of spec §12 class names onto the data dictionary classes",
-    "a keyed HMAC for record hashes and a keyed or signed ledger anchor",
+    "a keyed or signed ledger anchor",
 )
 
 
@@ -246,8 +261,71 @@ def owner_defaults() -> Policy:
     return Policy(DEFAULT_POLICY_ID, 1, rules)
 
 
-def record_hash(tenant_id: str, cls: RetentionClass, record_id: str) -> str:
-    return _sha(["qw-record-1", tenant_id, cls.value, record_id])
+HASH_SCHEME = "qw-record-hmac-1"  # owner decision 104; the scheme for new entries
+HASH_SCHEMES = frozenset({HASH_SCHEME})  # schemes `verify` accepts
+MIN_KEY_BYTES = 32  # as the API secret_key and the notification keys
+
+
+class RecordKey:
+    """The installation's record-hash key (decision 104): operator-held, supplied
+    by the caller like the API `secret_key`, never stored, logged or exported.
+    The bytes live only in a keyed HMAC object, not in an attribute: no dataclass
+    field, `vars`, pickle or copy reaches them, and equality compares `key_id`."""
+
+    __slots__ = ("_mac", "key_id", "scheme")
+    _mac: "hmac.HMAC"
+    key_id: str  # non-secret: HMAC(key, KEY_ID_LABEL), 32 hex
+    scheme: str
+
+    def __init__(self, key: bytes, scheme: str = HASH_SCHEME) -> None:
+        if type(key) is not bytes or len(key) < MIN_KEY_BYTES:
+            raise RetentionError("record_key", f"at least {MIN_KEY_BYTES} bytes")
+        if scheme != HASH_SCHEME:
+            raise RetentionError("hash_scheme", "not the active scheme")
+        mac = hmac.new(key, digestmod=hashlib.sha256)
+        kid = mac.copy()
+        kid.update(KEY_ID_LABEL)
+        for name, value in (("_mac", mac), ("key_id", kid.hexdigest()[:32]),
+                            ("scheme", scheme)):  # fmt: skip
+            object.__setattr__(self, name, value)
+
+    def __setattr__(self, name: str, value: object) -> None:
+        raise AttributeError("RecordKey is immutable")
+
+    def __reduce__(self) -> str | tuple[object, ...]:
+        raise TypeError("a RecordKey cannot be pickled or copied")
+
+    def __eq__(self, other: object) -> bool:
+        return type(other) is RecordKey and (other.scheme, other.key_id) == (
+            self.scheme, self.key_id)  # fmt: skip
+
+    def __hash__(self) -> int:
+        return hash((self.scheme, self.key_id))
+
+    def __repr__(self) -> str:
+        return f"RecordKey(scheme={self.scheme!r}, key_id={self.key_id!r})"
+
+    def mac(self, data: bytes) -> str:
+        m = self._mac.copy()
+        m.update(data)
+        return m.hexdigest()
+
+
+KEY_ID_LABEL = b"qw-record-key-id-1"
+
+
+def _key(key: object) -> "RecordKey":
+    if type(key) is not RecordKey:
+        raise RetentionError("key_unavailable", "the record key is required")
+    return key
+
+
+def record_hash(key: RecordKey | None, tenant_id: str, cls: RetentionClass,
+                record_id: str, created_at: datetime) -> str:  # fmt: skip
+    k = _key(key)
+    text = json.dumps([k.scheme, tenant_id, cls.value, record_id,
+                       format_instant(created_at)], separators=(",", ":"))  # fmt: skip
+    return k.mac(text.encode())
 
 
 @dataclass(frozen=True, slots=True)
@@ -264,9 +342,9 @@ class Item:
             raise TypeError("cls must be RetentionClass")
         object.__setattr__(self, "created_at", _utc(self.created_at))
 
-    @property
-    def record_hash(self) -> str:
-        return record_hash(self.tenant_id, self.cls, self.record_id)
+    def pseudonym(self, key: RecordKey | None) -> str:
+        return record_hash(key, self.tenant_id, self.cls, self.record_id,
+                           self.created_at)  # fmt: skip
 
 
 class HoldRole(StrEnum):  # owner decision 22: who may place and release holds
@@ -536,6 +614,8 @@ class Plan:
     decisions: tuple[Decision, ...]  # sorted by record hash
     not_found: tuple[str, ...]
     digest: str
+    hash_scheme: str = HASH_SCHEME
+    key_id: str = ""  # the RecordKey that named the decisions
 
 
 def _decide(it: Item, trig: Trigger, rule: Rule, holds: Holds,
@@ -571,31 +651,35 @@ def _allows(trig: Trigger, rule: Rule, d: "Decision", at: datetime) -> bool:
     return rule.expire_after is not None and d.created_at + rule.expire_after <= at
 
 
-def plan(trig: Trigger, items: Iterable[Item], policy: Policy, holds: Holds) -> Plan:
+def plan(trig: Trigger, items: Iterable[Item], policy: Policy, holds: Holds,
+         key: RecordKey | None = None) -> Plan:  # fmt: skip
     job_id, at = _job(trig)
+    k = _key(key)
     decisions, seen, keys = [], set(), set()
     for it in items:
         if type(it) is not Item:
             raise TypeError("items must be Item")
         if it.tenant_id != trig.tenant_id:
             raise RetentionError("other_tenant", safe_repr(it.record_id))
-        if it.record_hash in keys:
+        if (it.cls, it.record_id) in keys:  # one incarnation per record
             raise RetentionError("duplicate_item", safe_repr(it.record_id))
-        keys.add(it.record_hash)
+        keys.add((it.cls, it.record_id))
         seen.add(it.record_id)
         reason = _decide(it, trig, policy.rule(it.cls), holds, at)
         if reason is not None:
             act = (Action.DELETE if reason in _INTENT else Action.HELD
                    if reason.startswith("legal_hold:") else Action.RETAIN)  # fmt: skip
-            decisions.append(Decision(it.record_id, it.record_hash, it.cls,
+            decisions.append(Decision(it.record_id, it.pseudonym(k), it.cls,
                                       it.created_at, act, reason))  # fmt: skip
     decisions.sort(key=lambda d: d.record_hash)
     asked = trig.record_ids if isinstance(trig, DeletionRequest) else frozenset()
     missing = tuple(sorted(asked - seen))
     body = [job_id, trig.tenant_id, format_instant(at), policy.policy_id,
-            policy.version, [asdict(d) for d in decisions], missing]  # fmt: skip
+            policy.version, [asdict(d) for d in decisions], missing,
+            k.scheme, k.key_id]  # fmt: skip
     return Plan(job_id, trig.tenant_id, at, policy.policy_id, policy.version,
-                tuple(decisions), missing, _sha(body))  # fmt: skip
+                tuple(decisions), missing, _sha(body), k.scheme,
+                k.key_id)  # fmt: skip
 
 
 @dataclass(frozen=True, slots=True)
@@ -635,13 +719,22 @@ class Tombstone:
     deleted_at: datetime  # first execution that deleted it
     residual_backups: tuple[str, ...]  # unexpired backups that may hold a copy
     backup_expiry_at: datetime | None  # None: no residual copy, or unknown expiry
+    hash_scheme: str  # decision 104: how record_hash was keyed
+    key_id: str  # which key: one per ledger chain
     prev_hash: str
     entry_hash: str
 
 
-def _entry_hash(t: Tombstone) -> str:
-    body = {k: v for k, v in asdict(t).items() if k != "entry_hash"}
-    return _sha(["qw-tombstone-1", body])
+def entry_hash(t: Tombstone) -> str:
+    """sha256 over compact JSON of the stored fields in a fixed order; 0057's guard
+    computes the same bytes. Ids, hashes and instants need no JSON escaping."""
+    exp = t.backup_expiry_at
+    body = ["qw-tombstone-2", t.seq, t.tenant_id, t.record_hash, str(t.cls),
+            t.job_id, format_instant(t.requested_at), format_instant(t.deleted_at),
+            list(t.residual_backups), None if exp is None else format_instant(exp),
+            t.hash_scheme, t.key_id, t.prev_hash]  # fmt: skip
+    text = json.dumps(body, separators=(",", ":"))
+    return hashlib.sha256(text.encode()).hexdigest()
 
 
 @dataclass(frozen=True, slots=True)
@@ -654,7 +747,8 @@ def verify(entries: Sequence[Tombstone]) -> None:
     prev = GENESIS
     for n, t in enumerate(entries):
         if type(t) is not Tombstone or t.seq != n or t.prev_hash != prev or (
-                t.entry_hash != _entry_hash(t)):  # fmt: skip
+                t.hash_scheme not in HASH_SCHEMES
+                or t.entry_hash != entry_hash(t)):  # fmt: skip
             raise RetentionError("ledger_tampered", f"entry {n}")
         prev = t.entry_hash
 
@@ -680,6 +774,12 @@ class TombstoneLedger:
                backups: Sequence[Backup]) -> Tombstone:  # fmt: skip
         if self._entries and at < self._entries[-1].deleted_at:
             raise RetentionError("time_order", "before the latest tombstone")
+        if p.hash_scheme != HASH_SCHEME:
+            raise RetentionError("hash_scheme", "not the active scheme")
+        if self._entries and self._entries[-1].key_id != p.key_id:
+            raise RetentionError("key_mismatch", "the ledger holds another key")
+        if len({b.backup_id for b in backups}) != len(backups):
+            raise RetentionError("duplicate_backup", "backup ids must be distinct")
         residual = sorted(
             (b for b in backups if d.created_at <= b.cutoff_at < at
              and (b.expires_at is None or b.expires_at > at)),
@@ -690,8 +790,9 @@ class TombstoneLedger:
         kept = tuple(b.backup_id for b in residual)
         n = len(self._entries)
         draft = Tombstone(n, p.tenant_id, d.record_hash, d.cls, p.job_id,
-                          p.trigger_at, at, kept, expiry, prev, "")  # fmt: skip
-        t = replace(draft, entry_hash=_entry_hash(draft))
+                          p.trigger_at, at, kept, expiry, p.hash_scheme,
+                          p.key_id, prev, "")  # fmt: skip
+        t = replace(draft, entry_hash=entry_hash(draft))
         self._entries.append(t)
         return t
 
@@ -713,6 +814,7 @@ class Retention:
     holds: Holds = field(default_factory=Holds)
     ledger: TombstoneLedger = field(default_factory=TombstoneLedger)
     policy: Policy = field(default_factory=owner_defaults)
+    key: RecordKey | None = field(default=None, repr=False)  # decision 104
     _jobs: dict[str, tuple[Trigger, Plan]] = field(default_factory=dict)
 
     def submit(self, trig: Trigger, items: Iterable[Item],
@@ -726,7 +828,7 @@ class Retention:
             if old[0] == trig and same:
                 return old[1]  # retry: the stored plan and trigger time stand
             raise RetentionError("conflicting_duplicate", safe_repr(job_id))
-        p = plan(trig, items, policy, self.holds)
+        p = plan(trig, items, policy, self.holds, self.key)
         self._jobs[job_id] = (trig, p)
         return p
 
@@ -790,8 +892,9 @@ class Restored:
 
 
 def restore(snap: Snapshot, current: Sequence[Tombstone], anchor: LedgerCheckpoint,
-            restored_at: datetime,
-            incident_at: datetime | None = None) -> Restored:  # fmt: skip
+            restored_at: datetime, incident_at: datetime | None = None,
+            key: RecordKey | None = None) -> Restored:  # fmt: skip
+    """Suppresses exactly the deleted incarnations: matching needs the key."""
     at = _utc(restored_at)
     if at < snap.backup.completed_at:
         raise RetentionError("time_order", "restore before backup completion")
@@ -806,10 +909,15 @@ def restore(snap: Snapshot, current: Sequence[Tombstone], anchor: LedgerCheckpoi
         raise RetentionError("ledger_mismatch", "head differs from the anchor")
     if tuple(current[: len(snap.ledger)]) != tuple(snap.ledger):
         raise RetentionError("ledger_diverged", "current ledger must extend the copy")
+    k = _key(key)
+    if any(t.hash_scheme != k.scheme for t in current):
+        raise RetentionError("hash_scheme", "a tombstone under another scheme")
+    if any(t.key_id != k.key_id for t in current):
+        raise RetentionError("key_mismatch", "the ledger holds another key")
     dead = {(t.tenant_id, t.record_hash) for t in current}
-    kept = tuple(i for i in snap.items if (i.tenant_id, i.record_hash) not in dead)
-    gone = tuple(i.record_hash for i in snap.items
-                 if (i.tenant_id, i.record_hash) in dead)  # fmt: skip
+    hashed = [(i, i.pseudonym(k)) for i in snap.items]
+    kept = tuple(i for i, h in hashed if (i.tenant_id, h) not in dead)
+    gone = tuple(h for i, h in hashed if (i.tenant_id, h) in dead)
     loss = None
     if incident_at is not None:
         loss = _utc(incident_at) - snap.backup.cutoff_at
