@@ -165,10 +165,8 @@ def test_round_trip_is_exact_and_follows_the_contract() -> None:
                                       for e in w["entries"]]})  # fmt: skip
     assert sorted(set(pt.SECTIONS) - pt.OPEN_SECTIONS) == [
         "audit/tombstones.json",  # no tombstone store yet (T058)
-        "financial/accounts.json",  # no account, source or mapping store (T013)
     ]
-    for closed in ("audit/tombstones.json", "financial/accounts.json"):
-        assert refused(build, {closed: []}) is R.SECTION_NOT_READY
+    assert refused(build, {"audit/tombstones.json": []}) is R.SECTION_NOT_READY
 
 
 def _edit(rows: list[dict[str, Any]], n: int, path: str, value: object) -> None:

@@ -1,32 +1,36 @@
-"""The journal, policy and watchlist export functions (T057 increments 2 and 3) on
-PostgreSQL 16: a SYNTHETIC tenant is exported as the non-superuser qw_app login
+"""The journal, policy, watchlist and account export functions (T057 increments 2
+to 4) on PostgreSQL 16: a SYNTHETIC tenant is exported as the non-superuser qw_app login
 (conftest), under RLS in a snapshot transaction, then built, archived, read back and
 verified. The superuser `conn` only plays a tampering owner where a test says so.
 The oracle for each row is the stored history the stores already verify
-(`load_journal`, `revision`, `load`, `page`).
+(`load_journal`, `revision`, `load`, `page`, `account_store.load`).
 """
 
 from __future__ import annotations
 
+import copy
+import unicodedata
 import uuid
 from dataclasses import dataclass
-from datetime import timedelta
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import psycopg
 import pytest
 from psycopg.rows import TupleRow
+from qw_adapters import account_store as st
 from qw_adapters import journal_store as js
 from qw_adapters import policy_store as ps
 from qw_adapters import simulation_store as ss
 from qw_adapters import tenancy as tn
 from qw_adapters import watchlist_store as ws
 from qw_adapters.export_archive import read_archive, write_archive
+from qw_domain import account_wire as aw
 from qw_domain import ledger_wire as lw
 from qw_domain import portability as pt
 from qw_domain import watchlists as wl
 from qw_domain.corporate_actions import PositiveRatio, SourceRef, Split
-from qw_domain.decimals import Money, PositiveQuantity, Price
+from qw_domain.decimals import Money, PositiveQuantity, Price, Quantity
 from qw_domain.identity import InstrumentId
 from qw_domain.instants import format_instant, parse_instant
 from qw_domain.monitoring import Condition
@@ -40,14 +44,28 @@ from qw_domain.postings import (
     sell,
     split,
 )
+from qw_domain.research_data import digest
 from qw_domain.simulation import VirtualPortfolio
+from qw_domain.sources import (
+    HoldingLine,
+    MappedInterval,
+    Source,
+    SourceKind,
+    SourceSnapshot,
+    consolidate,
+)
 from test_portability_tenant_sections import draft  # SYNTHETIC answers
 
 Conn = psycopg.Connection[TupleRow]
-J, P, W = pt.JOURNAL_PATH, pt.POLICIES_PATH, pt.WATCHLISTS_PATH
+J, P, W, A = pt.JOURNAL_PATH, pt.POLICIES_PATH, pt.WATCHLISTS_PATH, pt.ACCOUNTS_PATH
 SYN = InstrumentId(uuid.UUID("00000000-0000-4000-8000-00000000005a"))
 ACK = "SYNTHETIC: I adopt this"
 COND = Condition("price_cross", "gt", ("100.25",), "feed-synth-iex", "SYNTHETIC")
+V0 = datetime(2026, 1, 1, tzinfo=UTC)  # valid times; knowledge times are the server's
+V1 = datetime(2026, 6, 1, tzinfo=UTC)
+AT = datetime(2026, 10, 1, 15, tzinfo=UTC)
+NFD = unicodedata.normalize("NFD", "Crédit Agricole")
+DAY = timedelta(days=1)
 
 
 @dataclass(frozen=True)
@@ -103,6 +121,24 @@ def seed(app_conn: Conn, record: str) -> Tenant:
         gone = ws.create(tx, owner, session, f"{key}2", "SYNTHETIC gone",
                          "SYNTHETIC deleted text")[0]  # fmt: skip
         ws.delete(tx, gone.watchlist.watchlist_id, owner, session, f"{key}3", 1)
+    with tn.tenant_transaction(app_conn, tenant) as tx:  # accounts (T013)
+        for aid, broker, kind, ccy in (
+            ("SYN-A", NFD, "TFSA - Self-directed", "CAD"),
+            ("SYN-B", "Interactive Brokers", "margin", "USD"),
+            ("SYN-OLD", "Société Générale", "cash", "USD"),
+        ):
+            a = st.account_from_text(tx, aid, broker, kind, ccy)  # NFC from here
+            st.register_account(tx, a, f"SYNTHETIC {aid}", "complete_declared")
+        st.add_source(tx, Source("SYN-BRK", str(tenant), SourceKind.BROKER_EXPORT),
+                      "syn-broker")  # fmt: skip
+        st.add_source(tx, Source("SYN-YAHOO", str(tenant), SourceKind.MIRROR), "yahoo")
+        for src, ref, aid in (("SYN-BRK", "1001", "SYN-A"),
+                              ("SYN-YAHOO", "pf-1", "SYN-A"),
+                              ("SYN-BRK", "1002", "SYN-OLD")):  # fmt: skip
+            st.remap(tx, src, ref, (MappedInterval(aid, V0),), 0)
+        st.remap(tx, "SYN-BRK", "1002", (MappedInterval("SYN-OLD", V0, V1),
+                                         MappedInterval("SYN-B", V1)), 1)  # fmt: skip
+        st.archive_account(tx, "SYN-OLD", 1)
     return Tenant(tenant, owner, session, policy, tuple(e.event_id for e in events),
                   token, (live, gone.watchlist.watchlist_id))  # fmt: skip
 
@@ -110,7 +146,7 @@ def seed(app_conn: Conn, record: str) -> Tenant:
 def export(app_conn: Conn, t: Tenant, page: int = 500) -> dict[str, Any]:
     with tn.tenant_transaction(app_conn, t.id, snapshot=True) as tx:
         return {J: js.export_journal(tx, page), P: ps.export_policies(tx, page),
-                W: ws.export_watchlists(tx)}  # fmt: skip
+                W: ws.export_watchlists(tx), A: st.export_accounts(tx)}  # fmt: skip
 
 
 @pytest.mark.db
@@ -179,7 +215,9 @@ def test_another_tenants_rows_never_appear(app_conn: Conn) -> None:
     # the same account names, but each chain starts from its own tenant
     assert [c["head"] for c in sa[J]["chains"]] != [c["head"] for c in sb[J]["chains"]]
     later = parse_instant(sa[J]["events"][-1]["recorded_at"]) + timedelta(days=1)
-    for path in (J, W):  # b's sections under a's scope
+    assert {r["tenant_id"] for rows in sa[A].values() for r in rows} == {str(a.id)}
+    assert sa[A]["accounts"] != sb[A]["accounts"]  # the same ids, other hashes
+    for path in (J, W, A):  # b's sections under a's scope
         with pytest.raises(pt.PortabilityError) as e:
             pt.build_export("export-synth-1", str(a.id), later, {path: sb[path]})
         assert e.value.code is pt.Refusal.SCOPE_MISMATCH
@@ -243,7 +281,8 @@ def test_a_revision_gap_is_never_exported(app_conn: Conn, conn: Conn) -> None:
 @pytest.mark.db
 def test_exports_need_a_read_only_snapshot(app_conn: Conn) -> None:
     a = seed(app_conn, "a")
-    for fn in (js.export_journal, ps.export_policies, ws.export_watchlists):
+    for fn in (js.export_journal, ps.export_policies, ws.export_watchlists,
+               st.export_accounts):  # fmt: skip
         with tn.tenant_transaction(app_conn, a.id) as tx, pytest.raises(
             tn.SnapshotRequired):  # fmt: skip
             fn(tx)
@@ -284,12 +323,14 @@ def test_recorded_at_is_trusted_from_the_store(app_conn: Conn, conn: Conn) -> No
         export(app_conn, a)
 
 
-def _reimport(bundle: pt.ExportBundle, body: dict[str, Any]) -> pt.Refusal | None:
-    """An archive edit: `body` as the journal file, under a manifest whose file
+def _reimport(
+    bundle: pt.ExportBundle, body: dict[str, Any], path: str = J
+) -> pt.Refusal | None:
+    """An archive edit: `body` as the `path` file, under a manifest whose file
     hash and size are recomputed (no signature exists to stop that). None when the
     edited archive verifies."""
     raw = pt.canonical(body)
-    files = {**bundle.files, J: raw}
+    files = {**bundle.files, path: raw}
     m = bundle.manifest
     entries = tuple(pt.FileEntry(f.path, pt.sha256(files[f.path]),
                                  len(files[f.path]), f.content_class)
@@ -397,3 +438,274 @@ def test_rich_journal_round_trips_exactly(app_conn: Conn) -> None:
     bundle = pt.build_export("export-synth-1", str(a.id), now[0] + timedelta(1),
                              sections)  # fmt: skip
     assert read_archive(write_archive(bundle)).data == sections
+
+
+def _snap(src: str, ref: str, qty: str) -> SourceSnapshot:  # SYNTHETIC holdings
+    return SourceSnapshot(src, ref, AT, (HoldingLine(SYN, "USD", Quantity(qty)),),
+                          (), True)  # fmt: skip
+
+
+@pytest.mark.db
+def test_accounts_round_trip_and_the_mirror_still_counts_once(app_conn: Conn) -> None:
+    """Accounts, archive, sources, kinds and mapping chains come back exactly
+    through the archive, and consolidating the imported map gives what the store's
+    map gives: the broker and its Yahoo mirror of SYN-A count once, SYN-B stays
+    distinct."""
+    a = seed(app_conn, "a")
+    sections = export(app_conn, a)
+    later = parse_instant(sections[J]["events"][-1]["recorded_at"]) + timedelta(1)
+    report = read_archive(write_archive(pt.build_export("export-synth-1", str(a.id),
+                                                        later, sections)))  # fmt: skip
+    assert report.data == sections and report.pending_reconnections == ()
+    got = aw.parse_section(str(a.id), report.data[A])  # type: ignore[arg-type]
+    snaps = [_snap("SYN-BRK", "1001", "50"), _snap("SYN-YAHOO", "pf-1", "50"),
+             _snap("SYN-BRK", "1002", "50")]  # fmt: skip
+    with tn.tenant_transaction(app_conn, a.id) as tx:
+        reg = st.load(tx)
+        states = st.read_accounts(tx, snaps, AT, timedelta(days=1))
+    assert {k: (r.account, r.name, r.analysis_scope, r.recorded_at, r.revision,
+                r.lifecycle) for k, r in got.accounts.items()} == {
+        k: (r.account, r.name, r.analysis_scope, r.recorded_at, r.revision,
+            r.lifecycle) for k, r in reg.accounts.items()}  # fmt: skip
+    assert got.accounts["SYN-OLD"].lifecycle == "archived"
+    assert got.accounts["SYN-A"].account.institution == "Crédit Agricole" != NFD
+    assert {k: (s.source, s.provider) for k, s in reg.sources.items()} == dict(
+        got.sources)  # fmt: skip
+    assert got.sources["SYN-YAHOO"][0].kind is SourceKind.MIRROR  # never upgraded
+    assert got.revisions == reg.revisions and len(got.revisions) == 4
+    views = consolidate(got.source_map, str(a.id), snaps, AT, timedelta(1)).accounts
+    for aid, state in states.items():
+        v = views[aid]
+        assert (v.status, dict(v.units), dict(v.cash), v.sources) == (
+            state.view.status, dict(state.view.units), dict(state.view.cash),
+            state.view.sources)  # fmt: skip
+    units = [v.units.get((SYN, "USD")) for v in views.values()]
+    assert units.count(Quantity("50")) == 2 and units.count(None) == 1  # 100, once
+    assert views["SYN-A"].sources == ("SYN-BRK", "SYN-YAHOO")
+    # source_ids: the latest revision per (source, reference), any interval dates,
+    # text ids as stored (SYN-OLD's interval has ended, and it still counts)
+    named = aw.source_ids(got.revisions)
+    assert named == {k: s.source_ids for k, s in states.items() if s.source_ids}
+    assert named["SYN-OLD"] == ("SYN-BRK",)
+
+
+DERIVED = {"status", "cash_basis", "sizing_blocked", "data_state", "source_ids",
+           "view", "health", "conflicts"}  # fmt: skip
+
+
+def _keys(x: object) -> set[str]:
+    if isinstance(x, dict):
+        return set(x).union(*(_keys(v) for v in x.values()))
+    return set().union(*(_keys(v) for v in x)) if isinstance(x, list) else set()
+
+
+@pytest.mark.db
+def test_no_account_is_presented_as_healthy(app_conn: Conn) -> None:
+    """Gate (a) of T013: the store's `status` reads `active` for an account with no
+    snapshot. The section carries no derived field at all, refuses one, and the
+    imported map consolidates to `no_data` and sizing-blocked for every account."""
+    a = seed(app_conn, "a")
+    body = export(app_conn, a)[A]
+    with tn.tenant_transaction(app_conn, a.id) as tx:
+        states = st.read_accounts(tx, (), AT, timedelta(days=1))
+    assert states["SYN-A"].status == "active" and states["SYN-A"].sizing_blocked
+    assert not _keys(body) & DERIVED
+    secretish = ("secret", "token", "credential", "password", "connection", "key")
+    assert not [k for k in _keys(body) if any(w in k for w in secretish)]
+    got = aw.parse_section(str(a.id), body)
+    views = consolidate(got.source_map, str(a.id), (), AT, timedelta(1)).accounts
+    assert {(v.status, v.sizing_blocked) for v in views.values()} == {
+        ("no_data", True)}  # fmt: skip
+    for k, v in (("status", "active"), ("cash_basis", "broker_available"),
+                 ("sizing_blocked", False)):  # fmt: skip
+        bad = copy.deepcopy(body)
+        bad["accounts"][0][k] = v
+        with pytest.raises(pt.PortabilityError) as e:
+            pt.build_export("export-synth-1", str(a.id), AT, {A: bad})
+        assert e.value.code is pt.Refusal.UNKNOWN_FIELD
+
+
+def _reseal(row: dict[str, Any], content: str) -> None:
+    row["content_hash"] = content
+    row["row_hash"] = aw.seal(content, parse_instant(row["recorded_at"]))
+
+
+def _account_digest(t: str, r: dict[str, Any]) -> str:  # without the domain check
+    return digest(["account", t, r["account_id"], r["name"], r["broker"],
+                   r["account_type"], r["reporting_currency"],
+                   r["analysis_scope"]])  # fmt: skip
+
+
+def _mapping_digest(t: str, r: dict[str, Any]) -> str:  # as revision_content
+    return digest(["source_mapping_revision", t, r["source_id"], r["account_ref"],
+                   r["revision"], r["intervals"], r["previous_hash"]])  # fmt: skip
+
+
+@pytest.mark.db
+def test_account_tampering_is_refused_on_export_and_import(
+    app_conn: Conn, conn: Conn
+) -> None:
+    a, b = seed(app_conn, "a"), seed(app_conn, "b")
+    t, R = str(a.id), pt.Refusal
+    good, foreign = export(app_conn, a)[A], export(app_conn, b)[A]
+    bundle = pt.build_export("export-synth-1", t, AT, {A: good})
+    assert _reimport(bundle, good, A) is None
+    acc = {r["account_id"]: n for n, r in enumerate(good["accounts"])}
+    maps = {(r["source_id"], r["account_ref"], r["revision"]): n
+            for n, r in enumerate(good["mappings"])}  # fmt: skip
+    yahoo = [r["source_id"] for r in good["sources"]].index("SYN-YAHOO")
+
+    def case(edit: Any, want: pt.Refusal | None) -> None:
+        body = copy.deepcopy(good)
+        edit(body)
+        assert _reimport(bundle, body, A) is want  # import
+        try:
+            pt.build_export("export-synth-2", t, AT, {A: body})
+            got = None
+        except pt.PortabilityError as e:
+            got = e.code
+        assert got is want  # export
+
+    def flip(body: dict[str, Any], reseal: bool) -> None:
+        r = body["sources"][yahoo]
+        r["kind"] = "broker_export"
+        if reseal:
+            s = Source(r["source_id"], t, SourceKind.BROKER_EXPORT)
+            _reseal(r, aw.source_content(t, s, r["provider"]))
+
+    case(lambda x: flip(x, False), R.ACCOUNT_SEAL)  # kind flip
+    case(lambda x: flip(x, True), None)  # a full rewrite needs a signature (T060)
+
+    def interval(body: dict[str, Any], key: tuple[str, str, int], ivs: Any,
+                 reseal: bool) -> None:  # fmt: skip
+        r = body["mappings"][maps[key]]
+        r["intervals"] = ivs
+        if reseal:
+            _reseal(r, _mapping_digest(t, r))
+
+    old = good["mappings"][maps[("SYN-BRK", "1002", 1)]]["intervals"]
+    moved = [{**old[0], "valid_from": format_instant(V1)}]
+    one = ("SYN-YAHOO", "pf-1", 1)
+    v0, v1 = format_instant(V0), format_instant(V1)
+    plus = v0.replace("Z", "+00:00")
+    for key, ivs, reseal, want in (
+        (("SYN-BRK", "1002", 1), moved, False, R.ACCOUNT_SEAL),  # interval edit
+        (("SYN-BRK", "1002", 1), moved, True, R.ACCOUNT_CHAIN),  # revision 2 names it
+        (one, [{"account_id": "SYN-A", "valid_from": v1, "valid_to": v0}], True,
+         R.MAPPING_REPLAY),  # empty interval
+        (one, [{"account_id": "SYN-A", "valid_from": v0, "valid_to": None},
+               {"account_id": "SYN-B", "valid_from": v1, "valid_to": None}], True,
+         R.MAPPING_REPLAY),  # overlap
+        (one, [{"account_id": "SYN-NOPE", "valid_from": v0, "valid_to": None}],
+         True, R.MAPPING_REPLAY),  # an account the section does not hold
+        (one, [{"account_id": "SYN-A", "valid_from": plus, "valid_to": None}], True,
+         R.MALFORMED),  # not canonical
+        (one, [{**old[0], "note": "x"}], False, R.UNKNOWN_FIELD),
+        (("SYN-BRK", "1002", 2), good["mappings"][maps[("SYN-BRK", "1002", 2)]][
+            "intervals"][::-1], True, R.MAPPING_REPLAY),  # not in valid-time order
+    ):  # fmt: skip
+        case(lambda x, k=key, i=ivs, s=reseal: interval(x, k, i, s), want)
+
+    def chain(body: dict[str, Any]) -> None:
+        r = body["mappings"][maps[("SYN-BRK", "1002", 2)]]
+        r["previous_hash"] = "0" * 64
+        _reseal(r, _mapping_digest(t, r))
+
+    case(chain, R.ACCOUNT_CHAIN)  # broken chain
+
+    def bounds(body: dict[str, Any], revision: int, many: int) -> None:
+        r = body["mappings"][maps[one]]  # the database's bounds, validly sealed
+        r["revision"] = revision
+        r["intervals"] = [
+            {
+                "account_id": "SYN-A",
+                "valid_from": format_instant(V0 + n * DAY),
+                "valid_to": format_instant(V0 + (n + 1) * DAY),
+            }
+            for n in range(many)
+        ]
+        _reseal(r, _mapping_digest(t, r))
+
+    case(lambda x: bounds(x, 1, aw.MAX_INTERVALS + 1), R.MALFORMED)
+    case(lambda x: bounds(x, aw.MAX_REVISION + 1, 1), R.MALFORMED)
+    assert st.MAX_INTERVALS is aw.MAX_INTERVALS  # one definition
+    with pytest.raises(pt.PortabilityError) as e:
+        pt.check_section(A, good, None)
+    assert e.value.code is R.SCOPE_MISMATCH
+    case(lambda x: x["mappings"].pop(maps[("SYN-BRK", "1002", 1)]), R.ACCOUNT_CHAIN)
+
+    def forged(body: dict[str, Any]) -> None:
+        r = body["accounts"][acc["SYN-B"]]
+        later = parse_instant(r["recorded_at"]) + timedelta(microseconds=1)
+        r["row_hash"] = aw.seal(r["content_hash"], later)
+
+    case(forged, R.ACCOUNT_SEAL)  # forged seal
+    case(lambda x: x["accounts"][acc["SYN-B"]].update(content_hash="0" * 64),
+         R.ACCOUNT_SEAL)  # the stored digest alone  # fmt: skip
+    plus_at = good["sources"][yahoo]["recorded_at"].replace("Z", "+00:00")
+    # the same instant, so the seal (over the canonical form) still matches
+    case(lambda x: x["sources"][yahoo].update(recorded_at=plus_at), R.MALFORMED)
+
+    def relinked(body: dict[str, Any]) -> None:
+        r = body["account_revisions"][0]
+        r["previous_hash"] = body["accounts"][acc["SYN-A"]]["row_hash"]
+        _reseal(r, aw.lifecycle_content(t, "SYN-OLD", 2, "archived",
+                                        r["previous_hash"]))  # fmt: skip
+
+    case(relinked, R.ACCOUNT_CHAIN)  # an archive naming another account's row
+    case(lambda x: x["accounts"][acc["SYN-B"]].update(
+        recorded_at=format_instant(V0)), R.ACCOUNT_SEAL)  # backdated  # fmt: skip
+
+    def decomposed(body: dict[str, Any]) -> None:
+        r = body["accounts"][acc["SYN-A"]]
+        r["broker"] = NFD
+        _reseal(r, _account_digest(t, r))
+
+    case(decomposed, R.ACCOUNT_TEXT)  # NFC-decomposed text, validly sealed
+
+    def renamed(body: dict[str, Any], name: str) -> None:
+        r = body["accounts"][acc["SYN-B"]]
+        r["name"] = name
+        _reseal(r, _account_digest(t, r))
+
+    case(lambda x: renamed(x, ""), R.MALFORMED)  # validly sealed, 1 to 100
+    case(lambda x: renamed(x, "x" * 101), R.MALFORMED)
+
+    def before(body: dict[str, Any], name: str, n: int) -> None:
+        r = body[name][n]  # known before the rows it depends on, validly sealed
+        r["recorded_at"] = format_instant(V0)
+        _reseal(r, r["content_hash"])
+
+    case(lambda x: before(x, "mappings", maps[one]), R.MAPPING_REPLAY)
+    case(lambda x: before(x, "account_revisions", 0), R.ACCOUNT_CHAIN)
+
+    def lifecycle(body: dict[str, Any], life: str, rev: int) -> None:
+        archive = body["account_revisions"][0]
+        assert (archive["account_id"], archive["revision"]) == ("SYN-OLD", 2)
+        r = archive
+        if rev == 3:  # after the archive, chained to it
+            r = {**archive, "revision": 3, "previous_hash": archive["row_hash"]}
+            body["account_revisions"].append(r)
+        r["lifecycle"] = life
+        _reseal(r, aw.lifecycle_content(t, "SYN-OLD", rev, life,
+                                        r["previous_hash"]))  # fmt: skip
+
+    for life, rev in (("active", 3), ("archived", 3), ("active", 2)):
+        case(lambda x, y=life, n=rev: lifecycle(x, y, n), R.ACCOUNT_LIFECYCLE)
+    retagged = [{**r, "tenant_id": t} for r in foreign["sources"]]  # b's, as a's
+    for edit, want in (
+        (lambda x: x["accounts"][0].update(status="active"), R.UNKNOWN_FIELD),
+        (lambda x: x.update(connections=[]), R.UNKNOWN_FIELD),
+        (lambda x: x["sources"][0].pop("row_hash"), R.FIELD_MISSING),
+        (lambda x: x["accounts"].reverse(), R.MALFORMED),  # not in key order
+        (lambda x: x["mappings"][0].update(revision=True), R.MALFORMED),
+        (lambda x: x.update(sources=foreign["sources"]), R.SCOPE_MISMATCH),
+        (lambda x: x.update(sources=retagged), R.ACCOUNT_SEAL),
+    ):
+        case(edit, want)
+    # the store refuses to export a tampered row (`load` re-verifies every seal)
+    conn.execute("SET session_replication_role = replica")  # a tampering owner
+    conn.execute("UPDATE app.data_source SET kind = 'broker_api' WHERE tenant_id = %s "
+                 "AND source_id = 'SYN-YAHOO'", (a.id,))  # fmt: skip
+    with pytest.raises(st.AccountStoreError, match="integrity"):
+        export(app_conn, a)

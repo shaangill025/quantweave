@@ -25,9 +25,13 @@ the ZIP container is `qw_adapters.export_archive`.
   - `research/watchlists.json` (increment 3): each live list as the contract
     Watchlist plus `tenant_id` and `description`, entries in stored form (plus
     `needs`), each entry rebuilt and re-encoded exactly, in instrument order.
-  Accounts and tombstones are `section_not_ready`: no account, source or mapping
-  store exists (T013 persistence is deferred), so a source's kind (a mirror) could
-  not be exported; the T058 tombstone ledger is not persisted.
+  - `financial/accounts.json` (increment 4): the stored accounts, account
+    revisions, sources and mapping revisions (`qw_domain.account_wire`), each
+    re-sealed and rebuilt through the domain, both chains checked and the map
+    replayed (`account_seal`, `account_chain`, `account_lifecycle`,
+    `account_text`, `mapping_replay`). Stored facts only: no derived status,
+    cash basis, data state or sizing field, and no credential.
+  Tombstones are `section_not_ready`: the T058 tombstone ledger is not persisted.
 - The value scan refuses high-confidence secret formats only (defence in depth).
 - Only `build_export` and `licensed_evidence` make an `ExportBundle` or a
   `LicensedDecision`; their constructors raise. A decision records each item's T021
@@ -56,6 +60,7 @@ from numbers import Real
 from types import MappingProxyType
 from typing import Any, NoReturn, cast
 
+from qw_domain import account_wire as aw
 from qw_domain import feedback as fb
 from qw_domain import learned_state as ls
 from qw_domain import ledger_wire as lw
@@ -73,13 +78,14 @@ MANIFEST_PATH = "manifest.json"
 EVIDENCE_PATH = "research/evidence.json"
 JOURNAL_PATH, POLICIES_PATH = "financial/journal.json", "policy/policies.json"
 WATCHLISTS_PATH = "research/watchlists.json"
+ACCOUNTS_PATH = "financial/accounts.json"
 MAX_PATH, MAX_DEPTH = 255, 32
 DECISION_MAX_AGE = timedelta(minutes=10)
 CLASSES = frozenset({"financial", "policy", "research", "private_learning", "audit",
                      "metadata"})  # fmt: skip
 SECTIONS: Mapping[str, str] = MappingProxyType({  # path -> ManifestFile content_class
     JOURNAL_PATH: "financial",
-    "financial/accounts.json": "financial",
+    ACCOUNTS_PATH: "financial",
     POLICIES_PATH: "policy",
     WATCHLISTS_PATH: "research",
     EVIDENCE_PATH: "research",
@@ -150,10 +156,20 @@ _WATCHLIST: Shape = {  # contract Watchlist + tenant_id, description; entry + ne
                           "monitoring_priority", "invalidation_text", "needs"),
                 "conditions": _leaves("metric", "operator", "values",
                                       "data_spec_id", "description")}}  # fmt: skip
+_ACCOUNTS: Shape = {
+    "accounts": _leaves(*aw.ACCOUNT_KEYS),
+    "account_revisions": _leaves(*aw.REVISION_KEYS),
+    "sources": _leaves(*aw.SOURCE_KEYS),
+    "mappings": {**_leaves(*aw.MAPPING_KEYS), "intervals": _leaves(*aw.INTERVAL_KEYS)},
+}  # fmt: skip
+_ACCOUNT_CODES = {"seal": "account_seal", "chain": "account_chain",
+                  "lifecycle": "account_lifecycle", "text": "account_text",
+                  "replay": "mapping_replay", "malformed": "malformed"}  # fmt: skip
 TENANT_SECTIONS: Mapping[str, Shape] = {JOURNAL_PATH: _JOURNAL,
                                         POLICIES_PATH: _VERSION_ROW,
                                         WATCHLISTS_PATH: _WATCHLIST}  # fmt: skip
-OPEN_SECTIONS = frozenset({*ls.PATHS, EVIDENCE_PATH, *TENANT_SECTIONS})
+OPEN_SECTIONS = frozenset({*ls.PATHS, EVIDENCE_PATH, *TENANT_SECTIONS,
+                           ACCOUNTS_PATH})  # fmt: skip
 # "-----BEGIN" and "-----begin" in base64 at each of the 3 byte offsets
 _B64_PEM = ("LS0tLS1CRUdJT", "tLS0tQkVHSU", "LS0tLUJFR0lO", "LS0tLS1iZWdpb",
             "tLS0tYmVnaW", "LS0tLWJlZ2lu")  # fmt: skip
@@ -217,6 +233,11 @@ class Refusal(StrEnum):
     FIELD_MISSING = "field_missing"
     SCOPE_MISMATCH = "scope_mismatch"
     JOURNAL_CHAIN = "journal_chain"
+    ACCOUNT_SEAL = "account_seal"
+    ACCOUNT_CHAIN = "account_chain"
+    ACCOUNT_LIFECYCLE = "account_lifecycle"
+    ACCOUNT_TEXT = "account_text"
+    MAPPING_REPLAY = "mapping_replay"
     SECRET_VALUE = "secret_value"
     OMISSION = "omission"
     DECISION = "decision"
@@ -412,6 +433,23 @@ def _journal(body: object, scope_id: str | None) -> None:
         raise _refuse(Refusal.JOURNAL_CHAIN, JOURNAL_PATH)
 
 
+def _accounts(body: object, scope_id: str | None) -> None:
+    """Exact keys; every row the scope's; then rebuilt through the domain."""
+    if scope_id is None:  # the content hashes need the tenant
+        raise _refuse(Refusal.SCOPE_MISMATCH, f"{ACCOUNTS_PATH}: no scope")
+    if not isinstance(body, dict):
+        raise _refuse(Refusal.MALFORMED, f"{ACCOUNTS_PATH}: an object")
+    _conform(body, _ACCOUNTS, ACCOUNTS_PATH, exact=True)
+    for name in _ACCOUNTS:
+        if any(r["tenant_id"] != scope_id for r in _rows(body[name], ACCOUNTS_PATH)):
+            raise _refuse(Refusal.SCOPE_MISMATCH, f"{ACCOUNTS_PATH}: {name}")
+    try:
+        aw.parse_section(str(scope_id), body)
+    except aw.WireError as e:
+        code = Refusal(_ACCOUNT_CODES[e.code])
+        raise _refuse(code, f"{ACCOUNTS_PATH}: {e}") from None
+
+
 def _watchlists(rows: list[dict[str, Any]], scope_id: str | None) -> None:
     """Unique ids in order; each entry rebuilds (`qw_domain.watchlists`) and
     re-encodes exactly, entries in strict instrument order."""
@@ -467,9 +505,9 @@ def check_section(path: str, body: object, scope_id: str | None = None) -> list[
     values."""
     if path not in OPEN_SECTIONS:
         raise _refuse(Refusal.SECTION_NOT_READY, path)
-    if path == JOURNAL_PATH:
+    if path in (JOURNAL_PATH, ACCOUNTS_PATH):
         values = scan(body)
-        _journal(body, scope_id)
+        (_journal if path == JOURNAL_PATH else _accounts)(body, scope_id)
         return values
     if path in TENANT_SECTIONS:
         values = scan(body)
