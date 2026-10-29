@@ -1,4 +1,4 @@
-"""0055 and qw_adapters.account_store on PostgreSQL 16 as non-owner qw_app,
+"""0055, 0056 and qw_adapters.account_store on PostgreSQL 16 as non-owner qw_app,
 qw_worker, qw_assessor and qw_release logins; the superuser `conn` only observes or
 tampers. SYNTHETIC tenants, accounts, sources and holdings; recorded times are the
 database clock, valid times and snapshot times are fixed."""
@@ -16,11 +16,12 @@ from psycopg import errors
 from psycopg.types.json import Jsonb
 from qw_adapters import account_store as st
 from qw_adapters import tenancy as tn
-from qw_domain.decimals import Quantity
+from qw_domain.decimals import Money, Quantity
 from qw_domain.identity import InstrumentId
 from qw_domain.sources import (
     HoldingLine,
     MappedInterval,
+    ScopeError,
     Source,
     SourceKind,
     SourceSnapshot,
@@ -33,6 +34,7 @@ Conn = psycopg.Connection[Any]
 SYNTH = InstrumentId(uuid.UUID("00000000-0000-4000-8000-0000000000a1"))
 V0 = datetime(2026, 1, 1, tzinfo=UTC)  # valid (effective) time, not knowledge time
 AT = datetime(2026, 10, 1, 15, tzinfo=UTC)
+DAY = timedelta(days=1)
 
 
 @pytest.fixture
@@ -273,6 +275,13 @@ def tamper(conn: Conn, sql: str) -> None:
     "AND revision = 1",
     "UPDATE app.source_mapping_revision SET revision = 3 "
     "WHERE account_ref = '1001' AND revision = 2",
+    "UPDATE app.account SET broker = 'Interactive Brokers' WHERE account_id = 'SYN-A'",
+    "UPDATE app.account_revision SET recorded_at = recorded_at - interval '1 second'",
+    "UPDATE app.account_revision SET previous_hash = repeat('0', 64)",
+    "UPDATE app.account_revision SET revision = 3",
+    "UPDATE app.account_revision SET account_id = 'SYN-A'",
+    "INSERT INTO app.account_revision SELECT tenant_id, account_id, 3, lifecycle, "
+    "recorded_at, row_hash, content_hash, row_hash FROM app.account_revision",
 ])  # fmt: skip
 def test_tamper_is_integrity(app_conn: Conn, conn: Conn, tenant: Any,
                              sql: str) -> None:  # fmt: skip
@@ -280,9 +289,13 @@ def test_tamper_is_integrity(app_conn: Conn, conn: Conn, tenant: Any,
     seed(app_conn, t)
     new = (MappedInterval("SYN-A", V0, AT), MappedInterval("SYN-B", AT))
     call(app_conn, t, "remap", "SYN-BRK", "1001", new, 1)
+    call(app_conn, t, "archive_account", "SYN-B", 1)
     call(app_conn, t, "load")
     tamper(conn, sql)
     assert code(lambda: call(app_conn, t, "load")) == "integrity"
+    assert code(lambda: call(app_conn, t, "read_accounts", (), AT, DAY)) == (
+        "integrity"
+    )
     later = (MappedInterval("SYN-B", V0),)
     assert code(lambda: call(app_conn, t, "remap", "SYN-BRK", "1002", later, 1)) == (
         "integrity"
@@ -434,3 +447,291 @@ def test_a_rewritten_revision_with_a_valid_hash_breaks_the_chain(
         "WHERE account_ref = '1001' AND revision = 1",
     )
     assert code(lambda: call(app_conn, t, "load")) == "integrity"
+
+
+E_ACUTE = "\N{LATIN SMALL LETTER E WITH ACUTE}"
+# the parity table: value, accepted (decisions 102 and 103)
+DISPLAY = [
+    ("Interactive Brokers", True), ("TFSA - Self-directed", True), ("A", True),
+    ("x" * 80, True), ("RRSP (spousal) #2", True),
+    (f"Cr{E_ACUTE}dit Agricole", True),
+    (f"Soci{E_ACUTE}t{E_ACUTE} G{E_ACUTE}n{E_ACUTE}rale", True),
+    ("Caisse Desjardins \N{LATIN CAPITAL LETTER E WITH ACUTE}pargne", True),
+    (E_ACUTE * 80, True), ("\N{LATIN CAPITAL LETTER A WITH GRAVE}", True),
+    ("\N{LATIN SMALL LETTER Y WITH DIAERESIS}", True),
+    ("\N{LATIN CAPITAL LETTER A WITH MACRON}\N{LATIN SMALL LETTER LONG S}", True),
+    ("", False), (" ", False), (" IB", False), ("IB ", False),
+    ("Interactive  Brokers", False), ("a" * 81, False), ("a" * 128, False),
+    (E_ACUTE * 81, False), ("IB\tX", False), ("IB\n", False), ("IB\x7f", False),
+    ("IB\x1bX", False), ("Cre\N{COMBINING ACUTE ACCENT}dit", False),
+    ("\N{ANGSTROM SIGN}", False), ("x\N{COMBINING ACUTE ACCENT}", False),
+    ("\N{CYRILLIC CAPITAL LETTER BYELORUSSIAN-UKRAINIAN I}nteractive", False),
+    ("\N{GREEK CAPITAL LETTER ALPHA}B", False),
+    ("Interactive\N{NO-BREAK SPACE}Brokers", False), ("IB\N{THIN SPACE}X", False),
+    ("2\N{MULTIPLICATION SIGN}3", False), ("2\N{DIVISION SIGN}3", False),
+    ("\N{FULLWIDTH LATIN CAPITAL LETTER I}B", False),
+    ("IB\N{ZERO WIDTH SPACE}", False), ("I\N{SOFT HYPHEN}B", False),
+    ("\N{LATIN SMALL LETTER B WITH STROKE}", False),
+    ("\N{LATIN CAPITAL LETTER A WITH DOT BELOW}", False),
+    ("\N{MATHEMATICAL BOLD CAPITAL A}", False),
+]  # fmt: skip
+
+
+def _domain_ok(value: str) -> bool:
+    try:
+        UnderlyingAccount("SYN-D", "t", value, value, "USD")
+    except ScopeError:
+        return False
+    return True
+
+
+def test_display_rule_parity_over_every_code_point(app_conn: Conn) -> None:
+    """Decision 103: app.account_display_text agrees with the domain for every
+    code point but NUL and surrogates, alone and between letters, on this
+    database (encoding and collation recorded)."""
+    row = app_conn.execute("SELECT current_setting('server_encoding'), "
+                           "datcollate, datctype FROM pg_database "
+                           "WHERE datname = current_database()").fetchone()  # fmt: skip
+    assert row is not None and row[0] == "UTF8"
+    values = [v for c in range(1, 0x110000) if not 0xD800 <= c <= 0xDFFF
+              for v in (chr(c), f"a{chr(c)}b")]  # fmt: skip
+    got = app_conn.execute("SELECT array_agg(app.account_display_text(v) ORDER BY n) "
+                           "FROM unnest(%s::text[]) WITH ORDINALITY u (v, n)",
+                           (values,)).fetchone()  # fmt: skip
+    assert got is not None
+    diff = [v for v, ok in zip(values, got[0], strict=True) if ok != _domain_ok(v)]
+    assert diff == []
+    accepted = {ord(v) for v, ok in zip(values, got[0], strict=True)
+                if ok and len(v) == 1 and ord(v) > 0x7E}  # fmt: skip
+    assert accepted == set(range(0xC0, 0x180)) - {0xD7, 0xF7}
+
+
+def test_broker_and_account_type_are_one_display_rule_in_domain_and_sql(
+    app_conn: Conn, tenant: Any
+) -> None:
+    """Decisions 102 and 103: the domain and 0056's raw-insert CHECKs accept and
+    refuse exactly the parity table; account ids keep their stricter rule."""
+    t, n = tenant(), iter(range(10**6))
+
+    def domain_ok(broker: str, atype: str) -> bool:
+        try:
+            UnderlyingAccount("SYN-D", str(t), broker, atype, "USD")
+        except ScopeError:
+            return False
+        return True
+
+    def sql_ok(broker: str, atype: str) -> bool:
+        try:
+            with tn.tenant_transaction(app_conn, t) as tx:
+                tx.conn.execute(
+                    "INSERT INTO app.account (tenant_id, account_id, name, broker, "
+                    "account_type, reporting_currency, analysis_scope, content_hash) "
+                    "VALUES (%s, %s, 'SYNTHETIC', %s, %s, 'USD', 'hypothetical', %s)",
+                    (t, f"SYN-RAW-{next(n)}", broker, atype, "0" * 64))  # fmt: skip
+        except errors.CheckViolation:
+            return False
+        return True
+
+    for value, want in DISPLAY:
+        for pair in ((value, "margin"), ("IB", value)):
+            assert (domain_ok(*pair), sql_ok(*pair)) == (want, want), pair
+    with pytest.raises(ScopeError, match="account_id"):
+        UnderlyingAccount("SYN D", str(t), "IB", "cash", "USD")
+    u = tenant()
+    for aid, broker, atype in (
+        ("SYN-IB", "Interactive Brokers", "TFSA - Self-directed"),
+        ("SYN-FR", DISPLAY[6][0], DISPLAY[7][0]),  # Societe Generale, Caisse ...
+    ):  # fmt: skip
+        a = UnderlyingAccount(aid, str(u), broker, atype, "CAD")
+        call(app_conn, u, "register_account", a, "SYNTHETIC", "partial_declared")
+        assert call(app_conn, u, "load").accounts[aid].account == a
+    with pytest.raises(ScopeError) as err:
+        UnderlyingAccount("SYN-X", str(u), "Cre\N{COMBINING ACUTE ACCENT}dit", "cash",
+                          "CAD")  # fmt: skip
+    assert err.value.code == "not_nfc"
+
+
+def test_store_normalizes_caller_text_to_nfc(
+    app_conn: Conn, conn: Conn, tenant: Any
+) -> None:
+    """Decision 103 as written: the store normalizes broker and account type to
+    NFC before the domain value and the hashes; anything that bypasses the store
+    (a raw insert) is still refused."""
+    t = tenant()
+    nfc = f"Cr{E_ACUTE}dit Agricole"
+    decomposed = "Cre\N{COMBINING ACUTE ACCENT}dit Agricole"
+    assert nfc != decomposed and len(decomposed) == len(nfc) + 1
+    with tn.tenant_transaction(app_conn, t) as tx:
+        built = st.account_from_text(tx, "SYN-CA", decomposed, decomposed, "CAD")
+        direct = UnderlyingAccount("SYN-CA", str(t), nfc, nfc, "CAD")
+        assert built == direct and built.institution == nfc
+        assert code(lambda: st.account_from_text(tx, "SYN-CA", " x", "cash",
+                                                 "CAD")) == "institution"  # fmt: skip
+    rec, wrote = call(app_conn, t, "register_account", built, "SYNTHETIC",
+                      "partial_declared")  # fmt: skip
+    assert wrote and rec.account.institution == nfc
+    row = conn.execute("SELECT broker, account_type, content_hash FROM app.account "
+                       "WHERE tenant_id = %s AND account_id = 'SYN-CA'",
+                       (t,)).fetchone()  # fmt: skip
+    assert row is not None and row[:2] == (nfc, nfc)  # stored precomposed
+    want = st._account_content(tn.TenantTx(conn, t), direct, "SYNTHETIC",
+                               "partial_declared")  # fmt: skip
+    assert row[2] == want  # the hash of registering the NFC form directly
+    assert call(app_conn, t, "register_account", direct, "SYNTHETIC",
+                "partial_declared") == (rec, False)  # fmt: skip
+    for broker, atype in ((decomposed, "cash"), ("IB", decomposed)):
+        with pytest.raises(errors.CheckViolation), \
+                tn.tenant_transaction(app_conn, t) as tx:  # fmt: skip
+            tx.conn.execute(
+                "INSERT INTO app.account (tenant_id, account_id, name, broker, "
+                "account_type, reporting_currency, analysis_scope, content_hash) "
+                "VALUES (%s, 'SYN-RAW', 'x', %s, %s, 'CAD', 'hypothetical', %s)",
+                (t, broker, atype, "0" * 64))  # fmt: skip
+
+
+def test_archive_is_compare_and_set_final_and_as_of(
+    app_conn: Conn, worker_conn: Conn, conn: Conn, tenant: Any
+) -> None:
+    t = tenant()
+    seed(app_conn, t)
+    before = clock(app_conn)
+    for bad in (0, -1, "1", True, None, 1.0):
+        assert code(lambda b=bad: call(app_conn, t, "archive_account", "SYN-A",  # type: ignore[misc]
+                                       b)) == "expected"  # fmt: skip
+    assert code(lambda: call(app_conn, t, "archive_account", "SYN-NONE", 1)) == (
+        "unknown_account"
+    )
+    assert code(lambda: call(app_conn, t, "archive_account", "SYN-A", 2)) == "stale"
+    assert code(lambda: call(worker_conn, t, "archive_account", "SYN-A", 1)) == (
+        "forbidden"
+    )
+    rec, wrote = call(app_conn, t, "archive_account", "SYN-A", 1)
+    assert (rec.revision, rec.lifecycle, wrote) == (2, "archived", True)
+    assert call(app_conn, t, "archive_account", "SYN-A", 1) == (rec, False)  # retry
+    assert code(lambda: call(app_conn, t, "archive_account", "SYN-A", 2)) == (
+        "archived"
+    )  # final: no unarchive, no second archive
+    then, now = call(worker_conn, t, "load", before), call(worker_conn, t, "load")
+    assert (then.accounts["SYN-A"].revision, then.accounts["SYN-A"].lifecycle) == (
+        1, "active")  # fmt: skip
+    assert now.accounts["SYN-A"] == rec
+    assert now.accounts["SYN-B"].lifecycle == "active"
+    again = call(app_conn, t, "register_account", acct(t, "SYN-A"), "SYNTHETIC SYN-A",
+                 "complete_declared")  # fmt: skip
+    assert again == (rec, False)
+    with tn.tenant_transaction(app_conn, t) as tx:
+        head = st._account_head(tx, "SYN-A")
+        b1 = st._account_head(tx, "SYN-B")
+    cases = [("SYN-A", 3, "archived", head, "archived"),
+             ("SYN-B", 3, "archived", b1, "next revision"),
+             ("SYN-B", 2, "archived", head, "next revision"),
+             ("SYN-NONE", 2, "archived", b1, "next revision"),
+             ("SYN-B", 2, "active", b1, "lifecycle_check")]  # fmt: skip
+    for aid, rev, life, prev, match in cases:
+        with pytest.raises(errors.CheckViolation, match=match), \
+                tn.tenant_transaction(app_conn, t) as tx:  # fmt: skip
+            tx.conn.execute(
+                "INSERT INTO app.account_revision (tenant_id, account_id, revision, "
+                "lifecycle, previous_hash, content_hash) VALUES (%s, %s, %s, %s, %s, "
+                "%s)", (t, aid, rev, life, prev, "0" * 64))  # fmt: skip
+    for stmt in ("UPDATE app.account_revision SET lifecycle = 'archived'",
+                 "DELETE FROM app.account_revision"):  # fmt: skip
+        with pytest.raises(errors.InsufficientPrivilege), \
+                tn.tenant_transaction(app_conn, t):  # fmt: skip
+            app_conn.execute(stmt)
+    with pytest.raises(errors.RaiseException):  # even the owner's session
+        conn.execute("DELETE FROM app.account_revision")
+    assert call(app_conn, t, "load").accounts["SYN-A"] == rec
+    # 0056's guard counts account revisions in the tenant's latest-row floor
+    ahead = clock(app_conn) + timedelta(hours=1)
+    c = st._lifecycle_content(tn.TenantTx(conn, t), "SYN-B", 2, "archived", b1)
+    tamper(conn, "INSERT INTO app.account_revision (tenant_id, account_id, revision, "
+                 "lifecycle, previous_hash, content_hash, recorded_at, row_hash) "
+                 f"VALUES ('{t}', 'SYN-B', 2, 'archived', '{b1}', '{c}', "
+                 f"'{ahead.isoformat()}', '{st.seal(c, ahead)}')")  # fmt: skip
+    assert call(app_conn, t, "load").accounts["SYN-B"].lifecycle == "archived"
+    src, _ = call(app_conn, t, "add_source",
+                  Source("SYN-NEXT", str(t), SourceKind.MANUAL), "x")  # fmt: skip
+    assert src.recorded_at >= ahead
+
+
+def cash_snap(src: str, ref: str, *cash: Money, qty: str = "50",
+              complete: bool = True) -> SourceSnapshot:  # fmt: skip
+    return SourceSnapshot(src, ref, AT, (HoldingLine(SYNTH, "USD", Quantity(qty)),),
+                          cash, complete)  # fmt: skip
+
+
+def test_read_accounts_derives_status_and_cash_basis(
+    app_conn: Conn, worker_conn: Conn, tenant: Any
+) -> None:
+    """Decision 101: derived on every read from a consolidation, never stored."""
+    t = tenant()
+    seed(app_conn, t)
+    call(app_conn, t, "add_source", Source("SYN-ME", str(t), SourceKind.MANUAL), "me")
+    call(app_conn, t, "remap", "SYN-ME", "b", (MappedInterval("SYN-B", V0),), 0)
+
+    def read(*snaps: SourceSnapshot, known: datetime | None = None) -> Any:
+        got = call(worker_conn, t, "read_accounts", snaps, AT, DAY, known)
+        return {a: (s.status, s.cash_basis) for a, s in got.items()}, got
+
+    # no snapshot: nothing to consolidate, so the basis is unknown (fail closed)
+    states, got = read()
+    assert states == {"SYN-A": ("active", "unknown"), "SYN-B": ("active", "unknown")}
+    assert got["SYN-A"].view.status == "no_data" and got["SYN-A"].view.sizing_blocked
+    assert got["SYN-A"].source_ids == ("SYN-BRK", "SYN-YAHOO")
+    assert got["SYN-B"].source_ids == ("SYN-BRK", "SYN-ME")
+    usd, cad = Money.of("10", "USD"), Money.of("5", "CAD")
+    # one shared basis: broker_available; a mirror lag is a conflict, basis unknown
+    ok = cash_snap("SYN-BRK", "1001", usd, cad)
+    assert read(ok)[0]["SYN-A"] == ("active", "broker_available")
+    lag = cash_snap("SYN-YAHOO", "pf-1", usd, cad, qty="40", complete=False)
+    assert read(ok, lag)[0]["SYN-A"] == ("conflicted", "unknown")
+    # SYN-B: broker cash in USD, the user's report alone in CAD: mixed, so unknown
+    mixed = (cash_snap("SYN-BRK", "1002", usd, complete=False),
+             cash_snap("SYN-ME", "b", usd, cad))  # fmt: skip
+    states, got = read(*mixed)
+    assert got["SYN-B"].view.status == "reconciled"
+    assert dict(got["SYN-B"].view.cash_basis) == {
+        "USD": "broker_available", "CAD": "user_reported"}  # fmt: skip
+    assert states["SYN-B"] == ("active", "unknown")
+    assert read(cash_snap("SYN-ME", "b", cad))[0]["SYN-B"] == (
+        "active", "user_reported")  # fmt: skip
+    # archived wins over conflicted; as of before the archive the account is active
+    before = clock(app_conn)
+    call(app_conn, t, "archive_account", "SYN-A", 1)
+    assert read(ok, lag)[0]["SYN-A"] == ("archived", "unknown")
+    assert read(ok)[0]["SYN-A"] == ("archived", "broker_available")
+    # review finding: the view of an archived account may be unblocked; the
+    # state's sizing permission never is
+    arch, live = read(ok)[1]["SYN-A"], read(ok, known=before)[1]["SYN-A"]
+    assert not arch.view.sizing_blocked and arch.sizing_blocked
+    assert not live.view.sizing_blocked and not live.sizing_blocked
+    assert read()[1]["SYN-B"].sizing_blocked  # no_data, active: still blocked
+    assert read(ok, lag, known=before)[0]["SYN-A"] == ("conflicted", "unknown")
+    assert read(ok, known=before)[1]["SYN-A"].record.revision == 1
+    assert read(ok, known=before - timedelta(days=3650))[0] == {}
+    # source_ids follow each reference's latest revision only
+    call(app_conn, t, "remap", "SYN-ME", "b", (MappedInterval("SYN-A", V0),), 1)
+    got = read()[1]
+    assert got["SYN-A"].source_ids == ("SYN-BRK", "SYN-ME", "SYN-YAHOO")
+    assert got["SYN-B"].source_ids == ("SYN-BRK",)
+
+
+def test_a_forged_account_revision_with_valid_hashes_is_integrity(
+    app_conn: Conn, conn: Conn, tenant: Any
+) -> None:
+    """Hash-only: a forger can seal any row, but not a second archive or a row
+    whose previous hash breaks the chain."""
+    for aid, rev, forged_previous in (("SYN-A", 3, False), ("SYN-B", 2, True)):
+        t = tenant()
+        seed(app_conn, t)
+        rec, _ = call(app_conn, t, "archive_account", "SYN-A", 1)
+        with tn.tenant_transaction(app_conn, t) as tx:
+            prev = "0" * 64 if forged_previous else st._account_head(tx, aid)
+        at = rec.recorded_at + timedelta(seconds=1)
+        c = st._lifecycle_content(tn.TenantTx(conn, t), aid, rev, "archived", prev)
+        tamper(conn, "INSERT INTO app.account_revision (tenant_id, account_id, "
+                     "revision, lifecycle, previous_hash, content_hash, recorded_at, "
+                     f"row_hash) VALUES ('{t}', '{aid}', {rev}, 'archived', '{prev}', "
+                     f"'{c}', '{at.isoformat()}', '{st.seal(c, at)}')")  # fmt: skip
+        assert code(lambda t=t: call(app_conn, t, "load")) == "integrity"  # type: ignore[misc]

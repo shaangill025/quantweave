@@ -15,6 +15,10 @@ Journey A ("map sources to real accounts"); T008 review F-04.
   that marks the account `conflicted` and blocks its sizing; nothing is averaged or
   summed. An account backed by no fresh complete snapshot is `incomplete` and blocked.
   Other accounts continue. Cash stays per account and currency.
+- `institution` and `account_type` are bounded display text (owner decisions 102
+  and 103): NFC words of printable ASCII and accented Latin letters separated by
+  single spaces, 1 to 80 characters (`DISPLAY_TEXT`), e.g. "Interactive Brokers".
+  Every other identifier keeps its stricter pattern.
 - LIMITATIONS: precedence is one ranking per source kind for every item; spec §4's
   field-specific precedence is not implemented. Aggregator cash counts as
   broker-available; that needs per-provider qualification (T005).
@@ -22,6 +26,7 @@ Stdlib only.
 """
 
 import re
+import unicodedata
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -36,6 +41,15 @@ from qw_domain.instants import ensure_aware_utc
 
 AUTHORITY_POLICY = "source_authority/1"
 ID_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}", re.ASCII)
+# Decisions 102 and 103: printable ASCII plus the accented Latin letters of Latin-1
+# Supplement and Latin Extended-A, without the multiplication and division signs
+# U+00D7 and U+00F7. Words are separated by one U+0020 ("A  B" would look like "A B");
+# NBSP, other spaces, zero-width and format characters, combining marks, fullwidth
+# forms and other scripts (Cyrillic, Greek, ...) are refused as look-alikes. The
+# value must already be NFC (`not_nfc`), so stored bytes are what the caller sent.
+DISPLAY_LETTERS = ((0xC0, 0xD6), (0xD8, 0xF6), (0xF8, 0x17F))  # 0056 holds the same
+_WORD = "[!-~" + "".join(f"{chr(a)}-{chr(b)}" for a, b in DISPLAY_LETTERS) + "]"
+DISPLAY_TEXT = re.compile(rf"(?=[\s\S]{{1,80}}\Z){_WORD}+(?: {_WORD}+)*")
 _REF = re.compile(r"[\x21-\x7e]{1,128}", re.ASCII)
 _CURRENCY = re.compile(r"[A-Z]{3}", re.ASCII)
 
@@ -51,6 +65,14 @@ class ScopeError(ValueError):
 def check_text(pattern: re.Pattern[str], value: object, what: str) -> None:
     if not isinstance(value, str) or pattern.fullmatch(value) is None:
         raise ScopeError(what, f"{safe_repr(value)} is malformed")
+
+
+def check_display_text(value: object, what: str) -> None:
+    """Decisions 102 and 103: NFC first (`not_nfc`, never normalized here), then
+    `DISPLAY_TEXT` (`what`)."""
+    if isinstance(value, str) and not unicodedata.is_normalized("NFC", value):
+        raise ScopeError("not_nfc", f"{what} is not in NFC")
+    check_text(DISPLAY_TEXT, value, what)
 
 
 class SourceKind(StrEnum):
@@ -91,8 +113,8 @@ class UnderlyingAccount:
     def __post_init__(self) -> None:
         check_text(ID_PATTERN, self.account_id, "account_id")
         check_text(ID_PATTERN, self.tenant_id, "tenant_id")
-        check_text(_REF, self.institution, "institution")
-        check_text(_REF, self.account_type, "account_type")
+        check_display_text(self.institution, "institution")
+        check_display_text(self.account_type, "account_type")
         check_text(_CURRENCY, self.base_currency, "currency")
 
 

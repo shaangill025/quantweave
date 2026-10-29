@@ -99,7 +99,12 @@ OPTIMIZER_TABLES = (
     "optimizer_promotion_fixture",
 )
 BUDGET_TABLES = ("budget_book", "budget_authorization")  # 0052, test_budget_store
-ACCOUNT_TABLES = ("account", "data_source", "source_mapping_revision")  # 0055
+ACCOUNT_TABLES = (
+    "account",
+    "data_source",
+    "source_mapping_revision",
+    "account_revision",
+)  # 0055, 0056
 
 
 def make_tenant(conn: Conn, name: str) -> tuple[uuid.UUID, uuid.UUID]:

@@ -1,7 +1,11 @@
-"""Accounts, sources and source-mapping revisions (T013 increment 2;
-`0055_accounts_sources.sql`; spec §4; data dictionary account, source_connection,
-account_source_binding; contract Account).
+"""Accounts, sources and source-mapping revisions (T013 increments 2 and 3;
+`0055_accounts_sources.sql`, `0056_account_lifecycle.sql`; spec §4; data
+dictionary account, source_connection, account_source_binding; contract Account;
+owner decisions 101, 102 and 103).
 
+- `account_from_text` is the boundary for caller text: it NFC-normalizes `broker`
+  and `account_type` (decision 103) and builds the domain value; codes are the
+  domain's (`not_nfc` can then only come from a value built elsewhere).
 - `register_account` stores a domain `UnderlyingAccount` (broker = `institution`,
   reporting currency = `base_currency`) with the contract's `name` and
   `analysis_scope`. `add_source` stores a domain `Source` (its `SourceKind`;
@@ -29,6 +33,17 @@ account_source_binding; contract Account).
   lock shared, so load(T) for a T before the read does not change later, except
   in a snapshot transaction whose snapshot predates a write in flight at T.
   Hash-only, as watchlist_store: removing a chain's latest rows is not detected.
+- Lifecycle (owner decision 101): `archive_account` appends the account's next
+  revision (0056) with compare-and-set on `expected_revision` (`stale`; the same
+  archive at `expected_revision + 1` is a retry, `wrote` False). Archive is the
+  only change and is final (`archived`). `load` gives each account's revision and
+  lifecycle as of `known_as_of`.
+- `read_accounts` derives the contract Account's `status` and `cash_basis` from a
+  fresh domain `consolidate` on every read; neither is stored. `status`: archived,
+  else conflicted when the consolidation shows a conflict, else active.
+  `cash_basis`: the one basis every currency shares, only for a `reconciled`
+  account, else `unknown`. No snapshot store exists yet (T014/T017), so callers
+  pass the snapshots they hold; with none, cash_basis is `unknown`.
 - Errors: `forbidden` (no grant: only qw_app writes, qw_app and qw_worker read),
   `tenant` (a domain value of another tenant), `database`, `integrity`, and the
   domain `ScopeError` codes.
@@ -37,9 +52,10 @@ account_source_binding; contract Account).
 from __future__ import annotations
 
 import hashlib
-from collections.abc import Sequence
+import unicodedata
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, replace
-from datetime import datetime
+from datetime import datetime, timedelta
 from types import MappingProxyType
 from typing import Any, Literal, get_args
 
@@ -48,22 +64,31 @@ from psycopg.types.json import Jsonb
 from qw_domain.instants import ensure_aware_utc, format_instant
 from qw_domain.research_data import digest
 from qw_domain.sources import (
+    AccountView,
     MappedInterval,
     MappingRevision,
     ScopeError,
     Source,
     SourceKind,
     SourceMap,
+    SourceSnapshot,
     UnderlyingAccount,
+    consolidate,
 )
 
 from qw_adapters.tenancy import TenantTx
 
-__all__ = ["MAX_INTERVALS", "AccountRecord", "AccountStoreError", "AnalysisScope",
-           "Registry", "SourceRecord", "add_source", "load", "register_account",
-           "remap", "seal"]  # fmt: skip
+__all__ = ["MAX_INTERVALS", "AccountRecord", "AccountState", "AccountStoreError",
+           "AnalysisScope", "Registry", "SourceRecord", "account_from_text",
+           "add_source", "archive_account", "load", "read_accounts",
+           "register_account", "remap", "seal"]  # fmt: skip
 
 type AnalysisScope = Literal["complete_declared", "partial_declared", "hypothetical"]
+type Lifecycle = Literal["active", "archived"]
+type ContractStatus = Literal["active", "archived", "conflicted"]
+type ContractCashBasis = Literal[
+    "broker_available", "reconciled_ledger", "user_reported", "unknown"
+]
 MAX_INTERVALS = 1000  # per revision; 0055's CHECK holds the same
 
 
@@ -78,7 +103,9 @@ class AccountRecord:
     account: UnderlyingAccount
     name: str
     analysis_scope: AnalysisScope
-    recorded_at: datetime
+    recorded_at: datetime  # registration (revision 1)
+    revision: int = 1  # as of the Registry's known_as_of
+    lifecycle: Lifecycle = "active"
 
 
 @dataclass(frozen=True, slots=True)
@@ -97,6 +124,24 @@ class Registry:
     accounts: MappingProxyType[str, AccountRecord]
     sources: MappingProxyType[str, SourceRecord]
     revisions: tuple[MappingRevision, ...]  # knowledge order
+
+
+@dataclass(frozen=True, slots=True)
+class AccountState:
+    """The contract Account's derived fields for one account (decision 101)."""
+
+    record: AccountRecord
+    status: ContractStatus
+    cash_basis: ContractCashBasis
+    source_ids: tuple[str, ...]  # sources whose latest revision names the account
+    view: AccountView  # the raw consolidation; it knows nothing of the lifecycle
+
+    @property
+    def sizing_blocked(self) -> bool:
+        """The sizing permission: blocked when the consolidation blocks it or the
+        account is archived. Read this, never `view.sizing_blocked` alone (an
+        archived account with a fresh complete snapshot has an unblocked view)."""
+        return self.view.sizing_blocked or self.record.lifecycle == "archived"
 
 
 def _intervals_json(ivs: Sequence[MappedInterval]) -> list[dict[str, Any]]:
@@ -129,6 +174,11 @@ def _revision_content(
                    _intervals_json(ivs), previous])  # fmt: skip
 
 
+def _lifecycle_content(tx: TenantTx, aid: str, rev: int, life: str,
+                       previous: str) -> str:  # fmt: skip
+    return digest(["account_revision", str(tx.tenant_id), aid, rev, life, previous])
+
+
 def _lock(tx: TenantTx, shared: bool) -> None:
     fn = "pg_advisory_xact_lock_shared" if shared else "pg_advisory_xact_lock"
     tx.conn.execute(f"SELECT {fn}(hashtextextended(%s, 0))",
@@ -158,6 +208,9 @@ _REVISIONS = ("SELECT source_id, account_ref, revision, intervals, recorded_at, 
               "previous_hash, content_hash, row_hash FROM "
               "app.source_mapping_revision WHERE tenant_id = %s "
               "ORDER BY source_id, account_ref, revision")  # fmt: skip
+_LIFECYCLE = ("SELECT account_id, revision, lifecycle, recorded_at, previous_hash, "
+              "content_hash, row_hash FROM app.account_revision WHERE tenant_id = %s "
+              "ORDER BY account_id, revision")  # fmt: skip
 
 
 def _sealed(content: str, want: str, at: datetime, stored: str) -> bool:
@@ -172,7 +225,9 @@ def load(tx: TenantTx, known_as_of: datetime | None = None) -> Registry:
 def _load(tx: TenantTx, known_as_of: datetime | None) -> Registry:
     known = None if known_as_of is None else ensure_aware_utc(known_as_of)
     tenant = str(tx.tenant_id)
-    raw = (_rows(tx, _ACCOUNTS), _rows(tx, _SOURCES), _rows(tx, _REVISIONS))
+    raw = (_rows(tx, _ACCOUNTS), _rows(tx, _SOURCES), _rows(tx, _REVISIONS),
+           _rows(tx, _LIFECYCLE))  # fmt: skip
+    heads: dict[str, tuple[int, str, str]] = {}  # account: revision, hash, lifecycle
     m = SourceMap()
     accounts: dict[str, AccountRecord] = {}
     sources: dict[str, SourceRecord] = {}
@@ -186,8 +241,20 @@ def _load(tx: TenantTx, known_as_of: datetime | None) -> Registry:
             content = _account_content(tx, a.account, name, scope)
             if not _sealed(c, content, a.recorded_at, h) or not 1 <= len(name) <= 100:
                 raise ValueError(f"account {aid}")
+            heads[aid] = (1, h, "active")
             if known is None or a.recorded_at <= known:
                 accounts[aid] = a
+        for aid, rev, life, at, prev, c, h in raw[3]:
+            head = heads.get(aid)
+            stamp = ensure_aware_utc(at)
+            if (head is None or head[2] != "active" or life != "archived"
+                    or (rev, prev) != (head[0] + 1, head[1])
+                    or not _sealed(c, _lifecycle_content(tx, aid, rev, life, prev),
+                                   stamp, h)):  # fmt: skip
+                raise ValueError(f"account {aid} revision {rev}")
+            heads[aid] = (rev, h, life)
+            if aid in accounts and (known is None or stamp <= known):
+                accounts[aid] = replace(accounts[aid], revision=rev, lifecycle=life)
         for sid, kind, provider, at, c, h in raw[1]:
             s = SourceRecord(Source(sid, tenant, SourceKind(kind)), provider,
                              ensure_aware_utc(at))  # fmt: skip
@@ -250,6 +317,25 @@ def _own(tx: TenantTx, tenant_id: str) -> None:
         raise AccountStoreError("tenant", "a value of another tenant")
 
 
+def _nfc(value: str) -> str:  # a non-str is left for the domain to refuse
+    return unicodedata.normalize("NFC", value) if isinstance(value, str) else value
+
+
+def account_from_text(
+    tx: TenantTx, account_id: str, broker: str, account_type: str,
+    reporting_currency: str,
+) -> UnderlyingAccount:  # fmt: skip
+    """The store boundary for caller text (decision 103): `broker` and
+    `account_type` are normalized to NFC before the domain value is built, so the
+    stored bytes and hashes are the NFC form. The domain then applies its rule
+    (`not_nfc` stays for values built directly; 0056 refuses raw non-NFC rows)."""
+    try:
+        return UnderlyingAccount(account_id, str(tx.tenant_id), _nfc(broker),
+                                 _nfc(account_type), reporting_currency)  # fmt: skip
+    except ScopeError as exc:
+        raise AccountStoreError(exc.code, "refused by the domain") from None
+
+
 def register_account(
     tx: TenantTx, account: UnderlyingAccount, name: str, analysis_scope: AnalysisScope
 ) -> tuple[AccountRecord, bool]:
@@ -295,6 +381,80 @@ def add_source(
         "kind": source.kind.value, "provider": provider,
         "content_hash": _source_content(tx, source, provider)})  # fmt: skip
     return _load(tx, None).sources[source.source_id], True
+
+
+def archive_account(
+    tx: TenantTx, account_id: str, expected_revision: int
+) -> tuple[AccountRecord, bool]:
+    """Archive (decision 101's only lifecycle change, final): the next revision."""
+    if type(expected_revision) is not int or expected_revision < 1:
+        raise AccountStoreError("expected", "an int >= 1")
+    _lock(tx, shared=False)
+    old = _load(tx, None).accounts.get(account_id)
+    if old is None:
+        raise AccountStoreError("unknown_account", "no such account")
+    if old.revision == expected_revision + 1 and old.lifecycle == "archived":
+        return old, False  # a retry of this archive
+    if old.revision != expected_revision:
+        raise AccountStoreError("stale", "not the latest revision")
+    if old.lifecycle == "archived":
+        raise AccountStoreError("archived", "archive is final")
+    previous = _account_head(tx, account_id)
+    rev = expected_revision + 1
+    _insert(tx, "account_revision", {
+        "tenant_id": tx.tenant_id, "account_id": account_id, "revision": rev,
+        "lifecycle": "archived", "previous_hash": previous,
+        "content_hash": _lifecycle_content(tx, account_id, rev, "archived",
+                                           previous)})  # fmt: skip
+    return _load(tx, None).accounts[account_id], True
+
+
+def _account_head(tx: TenantTx, account_id: str) -> str:
+    row = tx.conn.execute(
+        "SELECT row_hash FROM (SELECT row_hash, 1 AS revision FROM app.account "
+        "WHERE tenant_id = %(t)s AND account_id = %(a)s UNION ALL SELECT row_hash, "
+        "revision FROM app.account_revision WHERE tenant_id = %(t)s AND "
+        "account_id = %(a)s) x ORDER BY revision DESC LIMIT 1",
+        {"t": tx.tenant_id, "a": account_id},
+    ).fetchone()
+    assert row is not None  # _load just verified the account
+    return str(row[0])
+
+
+def read_accounts(
+    tx: TenantTx, snapshots: Iterable[SourceSnapshot], as_of: datetime,
+    max_age: timedelta, known_as_of: datetime | None = None,
+) -> MappingProxyType[str, AccountState]:  # fmt: skip
+    """Each account recorded by `known_as_of` with its contract `status` and
+    `cash_basis` derived from `consolidate` on the stored map (decision 101)."""
+    reg = load(tx, known_as_of)
+    try:
+        views = consolidate(reg.source_map, str(tx.tenant_id), snapshots, as_of,
+                            max_age).accounts  # fmt: skip
+    except ScopeError as exc:
+        raise AccountStoreError(exc.code, "refused by the domain") from None
+    latest: dict[tuple[str, str], MappingRevision] = {}
+    for r in reg.revisions:  # knowledge order, so the last one wins
+        latest[(r.source_id, r.account_ref)] = r
+    named: dict[str, set[str]] = {}
+    for r in latest.values():
+        for i in r.intervals:
+            named.setdefault(i.account_id, set()).add(r.source_id)
+    out: dict[str, AccountState] = {}
+    for aid, rec in sorted(reg.accounts.items()):
+        view = views[aid]
+        status: ContractStatus = (
+            "archived" if rec.lifecycle == "archived"
+            else "conflicted" if view.status == "conflicted" else "active"
+        )  # fmt: skip
+        bases = set(view.cash_basis.values())
+        basis: ContractCashBasis = (
+            bases.pop() if view.status == "reconciled" and len(bases) == 1
+            else "unknown"
+        )  # fmt: skip
+        out[aid] = AccountState(rec, status, basis,
+                                tuple(sorted(named.get(aid, ()))), view)  # fmt: skip
+    return MappingProxyType(out)
 
 
 def remap(
