@@ -623,3 +623,32 @@ below waives a test, gate or spec requirement. Numbering continues from
     overdue money is freed within the hour for every tenant, and the worker
     learns only which tenants have something to sweep."
     Implemented by: T037 (budget expiry sweep), T025 (durable jobs).
+
+101. **Where an account's status and cash basis come from (T013, T057).**
+    Question: "Decision 101 (T013/T057): The contract's Account has one `status`
+    and one `cash_basis` per account. The stored account has neither. The domain
+    tracks cash basis per currency, and 'conflicted' only appears when sources are
+    consolidated. Where should these two fields come from?"
+    Selected label: "Store lifecycle, derive the rest (Recommended)".
+    Option text as presented: "Store only the lifecycle (active or archived).
+    Derive 'conflicted' and cash_basis from a fresh consolidation each time the
+    account is read. cash_basis shows a value only when every currency agrees;
+    otherwise, or with no snapshot, it reads 'unknown'. Why: the values always
+    come from current data, never a stale copy, and an unknown or mixed state
+    fails closed."
+    Implemented by: T013 (account store and routes), T057 (accounts export).
+
+102. **Broker and account-type text (T013).**
+    Question: "Decision 102 (T013): The domain only allows broker and
+    account-type values without spaces, so \"Interactive Brokers\" is refused
+    today. The contract's `broker` is free text. Changing this later needs a new
+    migration, so it should be settled before real data is stored. What should be
+    allowed?"
+    Selected label: "Bounded display text (Recommended)".
+    Option text as presented: "Allow printable text with single spaces, 1 to 80
+    characters, for broker and account type (e.g. \"Interactive Brokers\",
+    \"TFSA - Self-directed\"), with control characters and leading or trailing
+    spaces refused. Why: this matches the contract's free-text field and what you
+    will actually type, while still blocking the injection and confusable
+    characters that strict IDs guard against."
+    Implemented by: T013 (domain sources and migration).
