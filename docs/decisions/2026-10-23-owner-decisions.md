@@ -685,3 +685,24 @@ below waives a test, gate or spec requirement. Numbering continues from
     to keep: lose it and you can still prove the ledger is intact, but you can
     no longer match a tombstone to a re-imported record."
     Implemented by: T058 (tombstone ledger), T057 (tombstones export).
+
+105. **Evaluating Kronos as a strategy input (post-first-release).**
+    Question: "Decision 105: Should quantweave evaluate Kronos (shiyu-coder, MIT,
+    a pre-trained price-forecasting model) as a candidate input to its
+    strategies? Kronos is not part of the spec's mandatory first-release scope.
+    It would add a large ML dependency (PyTorch plus model weights) that the
+    self-hosted edition would also have to carry."
+    Selected label: "Gated eval, inference only, later (Recommended)".
+    Option text as presented: "Plan one increment after the mandatory
+    first-release work. Run the smallest Kronos model for forecasts only, with
+    no fine-tuning and no paid compute. Weights are pinned by hash and loaded
+    only from safetensors. It goes through a T009 dependency review first. Its
+    forecasts are scored after fees and slippage on held-back data, and they
+    serve only as evidence for an existing strategy family, never as a
+    decision. It stays only if it beats the current families; otherwise it is
+    dropped, and the records show why. Why: it tests whether Kronos adds real
+    value without spending money, diverting effort from scope that can't be
+    dropped, or weakening any gate."
+    Implemented by: a post-first-release increment on the strategy/model
+    improvement path (T047), after a T009 dependency review. Not first-release
+    scope.
