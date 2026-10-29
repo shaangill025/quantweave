@@ -797,3 +797,45 @@ def test_reserve_once_never_reuses_a_lapsed_reservation(
         None)  # the store loads it  # fmt: skip
     assert code(partial(reserve_once, worker_conn, u)) == "reservation_expired"
     assert load(worker_conn, u, now_) is None  # no book opened this month
+
+
+def test_books_lists_the_tenants_months_newest_first_and_bounded(
+    tenant: Callable[..., uuid.UUID], app_conn: Conn, conn: Conn
+) -> None:
+    t, other, at = tenant(), tenant(), clock(app_conn)
+    if period_of(at + timedelta(seconds=60)) != period_of(at):
+        pytest.skip("explicit time skip: a UTC month boundary within 60 s")
+    book_v1(app_conn, t, at)
+    start = at.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    older = [start - timedelta(days=d) for d in (1, 40)]  # two earlier months
+    for when in older:  # 0052 opens only the current month: as the owner
+        wire = BudgetBook.open(str(t), when, CAPS).to_wire()
+        with conn.transaction():
+            conn.execute("SET LOCAL session_replication_role = replica")
+            conn.execute("INSERT INTO app.budget_book (tenant_id, scope_id, period,"
+                         " version, book, book_hash) VALUES (%s, %s, %s, 0, %s, %s)",
+                         (t, str(t), wire["period"], Jsonb(wire),
+                          bs.book_hash(tn.TenantTx(conn, t), wire)))  # fmt: skip
+    months = [period_of(at), *(period_of(w) for w in older)]
+
+    def periods(through: str | None, n: int) -> list[str]:
+        got = call(app_conn, t, lambda tx: bs.books(tx, through, n))
+        assert all(s.book.scope_id == str(t) for s in got)
+        return [s.book.period for s in got]
+
+    assert periods(None, bs.BOOK_PAGE) == months
+    assert periods(None, 1) == months[:1]
+    assert periods(months[1], 5) == months[1:]
+    assert periods("0000-00", 5) == []
+    for bad in (0, bs.BOOK_PAGE + 1, True):
+        assert code(partial(periods, None, bad)) == "invalid"
+    assert call(app_conn, other, lambda tx: bs.books(tx, None, 10)) == []
+    with app_conn.transaction():  # outside its tenant transaction
+        assert code(lambda: bs.books(tn.TenantTx(app_conn, t), None, 1)) == (
+            "tenant_transaction")  # fmt: skip
+    with conn.transaction():  # a tampered older month fails the whole read
+        conn.execute("SET LOCAL session_replication_role = replica")
+        conn.execute("UPDATE app.budget_book SET book_hash = %s WHERE tenant_id = %s"
+                     " AND period = %s", ("0" * 64, t, months[2]))  # fmt: skip
+    assert code(lambda: periods(None, 10)) == "integrity"
+    assert periods(None, 2) == months[:2]

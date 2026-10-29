@@ -283,6 +283,7 @@ def create_app(
     """`release_test_verifiers` is the in-process test hook of
     `release_store.stored_keys`: test-only release keys store no material, so they
     verify only with a verifier the process supplies (none in production)."""
+    from qw_api.budgets import router as budgets
     from qw_api.capabilities import router as capabilities
     from qw_api.experiments import router as experiments
     from qw_api.feedback import router as feedback
@@ -310,6 +311,7 @@ def create_app(
     app.state.rights = rights
     app.state.release_test_verifiers = dict(release_test_verifiers or {})
     app.include_router(router)
+    app.include_router(budgets)
     app.include_router(capabilities)
     app.include_router(experiments)
     app.include_router(feedback)
