@@ -777,7 +777,7 @@
       "requirements": "R006,R013,R036,R054,R076,R077,R088,R092,R096,R097",
       "deliverable": "Package supported local/hosted profiles with health, secrets, backups, resource quotas and upgrade docs.",
       "verification": "No vendor call required for self-hosting; full sandbox profile actually qualified.",
-      "status": "Not started",
+      "status": "In progress",
       "size": "M",
       "release_required": "Yes"
     },

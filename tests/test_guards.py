@@ -44,7 +44,8 @@ ALLOWED_THIRD_PARTY: dict[str, frozenset[str]] = {
 # through qw_adapters, so psycopg stays adapter-only. apps/web has no Python.
 APP_ALLOWED_THIRD_PARTY: dict[str, frozenset[str]] = {
     "api": frozenset(
-        {"fastapi", "starlette", "pydantic", "argon2", "qw_adapters", "qw_domain"}
+        {"fastapi", "starlette", "pydantic", "argon2", "uvicorn"}
+        | {"qw_adapters", "qw_domain"}
     ),
     "web": frozenset(),
     "worker": frozenset({"qw_adapters", "qw_domain"}),

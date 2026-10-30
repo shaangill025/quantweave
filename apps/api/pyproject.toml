@@ -10,9 +10,11 @@ dependencies = [
     "pydantic==2.13.5",
     "starlette==1.6.0",
     "qw-adapters",
+    "uvicorn==0.54.0",
 ]
 
 [project.scripts]
+qw-api = "qw_api.serve:main"
 qw-bootstrap = "qw_api.bootstrap:main"
 qw-seed-strategies = "qw_api.bootstrap:seed_main"
 
