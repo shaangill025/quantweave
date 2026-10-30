@@ -23,6 +23,7 @@ T0 = datetime(2026, 10, 1, 12, tzinfo=UTC)
 H = timedelta(hours=1)
 D = timedelta(days=1)
 TENANT = "tenant-synth-a"
+KEY = rt.RecordKey(b"SYNTHETIC-test-record-key-0123456789")  # test only
 SEVEN_YEARS = 2557 * D  # 7 x 365 days + at most 2 leap days in any 7 years
 
 # (on request, age expiry, authority) per class, written from the receipt table and
@@ -85,7 +86,7 @@ def test_each_default_value() -> None:
 
 
 def test_defaults_resolve_every_class_to_a_concrete_policy() -> None:
-    store = rt.Retention()  # no policy passed: the configured defaults apply
+    store = rt.Retention(key=KEY)  # no policy passed: the configured defaults apply
     items = [item(f"r-{c.value}", c) for c in C]
     req = rt.DeletionRequest("del-1", TENANT, "scope-1", frozenset(C), T0 + H,
                              "reauth-1", "I understand")  # fmt: skip
@@ -111,7 +112,7 @@ def test_expiry_sweep_under_the_defaults() -> None:
 
     def sweep(at: datetime) -> dict[str, tuple[rt.Action, str]]:
         trig = rt.ExpirySweep(f"sw-{int((at - T0) / H)}", TENANT, at)
-        return acts(rt.plan(trig, items, pol, rt.Holds()))
+        return acts(rt.plan(trig, items, pol, rt.Holds(), KEY))
 
     early = sweep(T0 + 48 * H - timedelta(seconds=1))
     assert "p-1" not in early and "l-1" not in early and "a-1" not in early
@@ -126,7 +127,7 @@ def test_expiry_sweep_under_the_defaults() -> None:
 
 
 def test_legal_hold_beats_expiry_and_request_under_the_defaults() -> None:
-    store = rt.Retention()
+    store = rt.Retention(key=KEY)
     scope = frozenset({C.AUDIT, C.RESEARCH})
     store.holds.place(rt.LegalHold("hold-1", TENANT, scope, frozenset(),
                                    "litigation", "counsel-1", T0,
@@ -167,13 +168,13 @@ def test_unknown_or_unconfigured_classes_still_report_unconfigured() -> None:
     empty = rt.Policy("synthetic-empty", 1, {})  # a policy that names no class
     req = rt.DeletionRequest("del-1", TENANT, "scope-1", frozenset({C.LOG}),
                              T0 + H, "reauth-1", "I understand")  # fmt: skip
-    p = rt.plan(req, [item("l-1", C.LOG)], empty, rt.Holds())
+    p = rt.plan(req, [item("l-1", C.LOG)], empty, rt.Holds(), KEY)
     assert acts(p) == {"l-1": (rt.Action.RETAIN, "retention_unconfigured")}
     cfg = rc.parse(doc(classes={"log": {"on_request": "unconfigured"}}))
-    p = rt.plan(req, [item("l-1", C.LOG)], cfg.policy, rt.Holds())
+    p = rt.plan(req, [item("l-1", C.LOG)], cfg.policy, rt.Holds(), KEY)
     assert acts(p) == {"l-1": (rt.Action.RETAIN, "retention_unconfigured")}
     sweep = rt.ExpirySweep("sw-1", TENANT, T0 + 400 * D)
-    p = rt.plan(sweep, [item("l-1", C.LOG)], cfg.policy, rt.Holds())
+    p = rt.plan(sweep, [item("l-1", C.LOG)], cfg.policy, rt.Holds(), KEY)
     assert acts(p) == {"l-1": (rt.Action.RETAIN, "retention_period_unconfigured")}
 
 
@@ -340,7 +341,7 @@ def test_solo_hold_release_flag() -> None:  # owner decision 31
         rc.RetentionConfig(base.policy, base.windows,
                            solo_hold_release=1)  # type: ignore[arg-type]  # fmt: skip
     assert err.value.code == "solo_hold_release"
-    store = rt.Retention(holds=rt.Holds(solo=solo))
+    store = rt.Retention(holds=rt.Holds(solo=solo), key=KEY)
     store.holds.place(rt.LegalHold("hold-1", TENANT, frozenset({C.RESEARCH}),
                                    frozenset(), "litigation", "counsel-1", T0,
                                    rt.HoldRole.OPERATOR, "pilot-synth-1"))  # fmt: skip
