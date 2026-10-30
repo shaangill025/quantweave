@@ -31,7 +31,8 @@ the ZIP container is `qw_adapters.export_archive`.
     replayed (`account_seal`, `account_chain`, `account_lifecycle`,
     `account_text`, `mapping_replay`). Stored facts only: no derived status,
     cash basis, data state or sizing field, and no credential.
-  Tombstones are `section_not_ready`: the T058 tombstone ledger is not persisted.
+  Tombstones are `section_not_ready`: the T058 ledger is persisted (0057,
+  `qw_adapters.tombstone_store.export_tombstones`), but no section reads it yet.
 - The value scan refuses high-confidence secret formats only (defence in depth).
 - Only `build_export` and `licensed_evidence` make an `ExportBundle` or a
   `LicensedDecision`; their constructors raise. A decision records each item's T021
