@@ -9,6 +9,9 @@ dependencies = [
     "qw-domain",
 ]
 
+[project.scripts]
+qw-migrate = "qw_adapters.migrate_cli:main"
+
 [tool.uv.sources]
 qw-domain = { workspace = true }
 

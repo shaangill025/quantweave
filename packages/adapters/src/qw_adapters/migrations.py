@@ -14,6 +14,16 @@ The scanner skips comments and quoted or dollar-quoted text and refuses files it
 cannot scan; `BEGIN ATOMIC` bodies are refused (use quoted bodies).
 
 Versions after 0001 (which creates the roles) run under `SET LOCAL ROLE qw_migrate`.
+0001 runs as the session user (a superuser: owner decision 108's db-init); in its
+transaction the runner installs the ledger guard (T060): SELECT and INSERT on the
+ledger for qw_migrate, so later runs can be the non-superuser `qw-migrate` login,
+and a deferred trigger keeping the versions 1..n at every commit. The ledger is
+created only when absent (that login has no CREATE on `public`). A superuser run on
+an unguarded ledger (an older runner's 0001) installs the guard first and logs it.
+Accepted trade-off: the qw_migrate credential can insert the next pending row so
+that migration is skipped, which adds nothing: owning every app object, it can
+already undo any migration with DDL. A row leaving a gap is refused; there is no
+UPDATE or DELETE grant.
 Inside the transaction a migration is rolled back if it ended the transaction,
 finished under another role or session user, left a user object not owned by
 `qw_migrate` (except the ledger), left a column failing `schema_guard`, or changed
@@ -36,6 +46,7 @@ environment is read.
 from __future__ import annotations
 
 import hashlib
+import logging
 import re
 from dataclasses import dataclass
 from pathlib import Path
@@ -47,6 +58,7 @@ from psycopg.rows import TupleRow
 
 from qw_adapters.schema_guard import column_type_violations
 
+log = logging.getLogger("qw_adapters.migrations")
 MIGRATIONS_DIR = Path(__file__).resolve().parent.joinpath("sql")
 FILE_PATTERN = re.compile(r"([0-9]{4})_([a-z0-9]+(?:_[a-z0-9]+)*)\.sql")
 LOCK_KEY = 0x71776D6967726174  # b"qwmigrat"; advisory locks are per database
@@ -60,6 +72,40 @@ CREATE TABLE IF NOT EXISTS public.schema_migrations (
     checksum text NOT NULL CHECK (checksum ~ '^[0-9a-f]{64}$'),
     applied_at timestamptz NOT NULL DEFAULT now()
 )
+"""
+
+# The ledger guard (T060): the runner's own writes for a non-superuser qw_migrate
+# login, and a deferred check that the versions stay 1..n. Deferred, so a migration
+# that writes the ledger is still rolled back by the in-transaction "ledger changed"
+# check first. Owned by the superuser that runs 0001; qw_migrate cannot drop or
+# disable it (it owns neither the table nor the function). Idempotent.
+_GUARD_SQL = b"""
+CREATE OR REPLACE FUNCTION public.schema_migrations_contiguous() RETURNS trigger
+LANGUAGE plpgsql SET search_path = pg_catalog AS $guard$ BEGIN
+    IF (SELECT count(*) <> max(version) FROM public.schema_migrations) THEN
+        RAISE EXCEPTION 'schema_migrations must stay contiguous from 1'
+            USING ERRCODE = 'integrity_constraint_violation';
+    END IF;
+    RETURN NULL;
+END $guard$;
+REVOKE ALL ON FUNCTION public.schema_migrations_contiguous() FROM PUBLIC;
+GRANT SELECT, INSERT ON public.schema_migrations TO qw_migrate;
+DROP TRIGGER IF EXISTS schema_migrations_contiguous ON public.schema_migrations;
+CREATE CONSTRAINT TRIGGER schema_migrations_contiguous
+AFTER INSERT ON public.schema_migrations DEFERRABLE INITIALLY DEFERRED
+FOR EACH ROW EXECUTE FUNCTION public.schema_migrations_contiguous();
+"""
+_SUPERUSER: LiteralString = (
+    "SELECT rolsuper FROM pg_catalog.pg_roles WHERE rolname = session_user"
+)
+_GUARDED_SQL: LiteralString = """
+SELECT to_regclass('public.schema_migrations') IS NOT NULL
+    AND to_regrole('qw_migrate') IS NOT NULL
+    AND has_table_privilege('qw_migrate', 'public.schema_migrations', 'SELECT')
+    AND has_table_privilege('qw_migrate', 'public.schema_migrations', 'INSERT')
+    AND EXISTS (SELECT 1 FROM pg_catalog.pg_trigger WHERE tgenabled <> 'D' AND
+        tgrelid = to_regclass('public.schema_migrations')
+        AND tgname = 'schema_migrations_contiguous')
 """
 
 
@@ -221,8 +267,15 @@ def migrate(
     conn.execute("SELECT pg_advisory_lock(%s)", (LOCK_KEY,))
     done: list[int] = []
     try:
-        conn.execute(_CREATE_TABLE)
-        for migration in pending_migrations(migrations, applied_migrations(conn)):
+        if _scalar(conn, "SELECT to_regclass('public.schema_migrations')") is None:
+            conn.execute(_CREATE_TABLE)
+        applied = applied_migrations(conn)
+        guarded = BOOTSTRAP_VERSION not in applied or ledger_guarded(conn)
+        if not guarded and _scalar(conn, _SUPERUSER) is True:  # an older runner's
+            with conn.transaction():
+                conn.execute(_GUARD_SQL)
+            log.warning("ledger guard installed on a ledger that predates it")
+        for migration in pending_migrations(migrations, applied):
             _apply(conn, migration, run_as)
             done.append(migration.version)
     except BaseException as exc:
@@ -269,6 +322,7 @@ _LEDGER = {
     ("pg_class", "public.schema_migrations_name_key"),
     ("pg_type", "public.schema_migrations"),
     ("pg_type", "public._schema_migrations"),
+    ("pg_proc", "public.schema_migrations_contiguous"),
 }
 
 
@@ -398,6 +452,8 @@ def _apply(
             if role is not None and current != role:
                 raise MigrationError("it changed the current role")
             conn.execute("RESET ROLE; RESET ALL")  # RESET ALL skips the role
+            if migration.version == BOOTSTRAP_VERSION:
+                conn.execute(_GUARD_SQL)
             owned = foreign_owned_objects(conn, run_as) if run_as else []
             problems = [f"ownership: {p}" for p in owned]
             problems += privilege_violations(
@@ -418,6 +474,12 @@ def _apply(
             )
     except (MigrationError, psycopg.Error) as exc:
         raise MigrationError(f"{migration.name} rolled back: {exc}") from exc
+
+
+def ledger_guarded(conn: psycopg.Connection[TupleRow]) -> bool:
+    """Whether the ledger has the qw_migrate grant and the enabled contiguity
+    trigger (readable by any login)."""
+    return _scalar(conn, _GUARDED_SQL) is True
 
 
 def _scalar(conn: psycopg.Connection[TupleRow], query: LiteralString) -> object:
