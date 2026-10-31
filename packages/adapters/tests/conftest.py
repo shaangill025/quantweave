@@ -123,15 +123,20 @@ def conn(database_url: str) -> Iterator[psycopg.Connection[TupleRow]]:
 
 @pytest.fixture
 def runtime_urls(
-    database_url: str, conn: psycopg.Connection[TupleRow]
+    database_url: str, conn: psycopg.Connection[TupleRow], tmp_path: Path
 ) -> Iterator[dict[str, str]]:
     """Migrate the test database as the superuser, then create throwaway LOGIN roles
     that are members of `qw_app`, `qw_worker`, `qw_assessor` and `qw_release` (the
     release operator; non-superuser, non-owner, NOBYPASSRLS, no password: both
     harness modes use trust auth). Yields {group: url}; the roles are dropped
-    afterwards."""
+    afterwards. Each url names a private SYNTHETIC passfile, so entry points that
+    require one (`file_secrets.passfile_conninfo`) accept it; trust auth never
+    reads it."""
     from qw_adapters.migrations import migrate
 
+    passfile = tmp_path / "runtime.pgpass"
+    passfile.write_text("*:*:*:*:SYNTHETIC-unused-under-trust-auth\n")
+    passfile.chmod(0o600)
     migrate(conn)
     suffix = uuid.uuid4().hex[:12]
     logins = {
@@ -146,7 +151,10 @@ def runtime_urls(
                     "NOREPLICATION NOBYPASSRLS INHERIT IN ROLE {}"
                 ).format(sql.Identifier(login), sql.Identifier(group))
             )
-        yield {g: make_conninfo(database_url, user=u) for g, u in logins.items()}
+        yield {
+            g: make_conninfo(database_url, user=u, passfile=str(passfile))
+            for g, u in logins.items()
+        }
     finally:
         for login in logins.values():
             conn.execute(

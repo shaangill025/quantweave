@@ -157,3 +157,31 @@ def test_refuses_inline_secrets_a_non_superuser_and_a_foreign_role(
     login = conn.execute("SELECT 1 FROM pg_roles WHERE rolname = %s",
                          (names["qw_migrate"],)).fetchone()  # fmt: skip
     assert login is None  # the logins are created in one transaction
+
+
+def test_check_config_checks_db_init_and_qw_migrate_without_connecting(
+    tmp_path: Path, capsys: Cap
+) -> None:
+    """`--check-config` (T060): the configuration checks of each command, exit 0 or
+    2, and no connection (no server is at this host)."""
+    host = f"host={tmp_path / 'no-socket'} dbname=qw"
+    su = secret(tmp_path, "su.pgpass", "*:*:*:postgres:SYNTHETIC-unused\n")
+    line = f"*:*:*:qwtest_migrate_cc:SYNTHETIC-{uuid.uuid4().hex}\n"
+    mig = secret(tmp_path, "qw_migrate.pgpass", line)
+    init = {db_init_cli.URL_VARIABLE: f"{host} user=postgres passfile={su}",
+            db_init_cli.PASSFILE_PREFIX + "QW_MIGRATE": mig}  # fmt: skip
+    later = {migrate_cli.URL_VARIABLE: f"{host} user=qwtest_migrate_cc passfile={mig}"}
+    for main, env, name in ((db_init_cli.main, init, "qw-db-init"),
+                            (migrate_cli.main, later, "qw-migrate")):  # fmt: skip
+        assert main(["--check-config"], env) == 0
+        assert capsys.readouterr().out == f"config ok: {name}\n"
+        assert main(["--check-config"], {**env, "PGPASSWORD": "SYNTHETIC-x"}) == 2
+        out = capsys.readouterr()
+        assert out.err.startswith("refused: PGPASSWORD") and "SYNTHETIC" not in out.err
+    Path(mig).chmod(0o640)
+    for main, env in ((db_init_cli.main, init), (migrate_cli.main, later)):
+        assert main(["--check-config"], env) == 2
+        assert "group or world" in capsys.readouterr().err
+    Path(mig).chmod(0o600)
+    missing = {k: v for k, v in init.items() if k != db_init_cli.URL_VARIABLE}
+    assert db_init_cli.main(["--check-config"], missing) == 2
