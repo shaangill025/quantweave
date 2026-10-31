@@ -48,9 +48,11 @@ the ZIP container is `qw_adapters.export_archive`.
   is not its decided feed, and a denied id in any string value (`_mentions`).
 - GATE for the export route/job: `at` and `created_at` come from the server clock.
 - Import results are inert: nothing is adopted, activated or reauthorized.
-LIMITATIONS: other stores are not exported and nothing is re-imported; no account
-mapping, migration or reconnection; hashes are integrity, not authenticity; import
-does not bind the source scope to the destination tenant; free-text fields can carry
+- Destination apply (increment 6): `qw_domain.portability_apply.plan` and
+  `qw_adapters.destination_import`; `verify_import` itself stays inert.
+LIMITATIONS: other stores are not exported; only policy versions are applied (the
+other sections only while empty); no account mapping, format migration or
+reconnection; hashes are integrity, not authenticity; free-text fields can carry
 what the scan misses; T052 field values are checked by the T052 importer; source
 observations (`source_record`) are not a section, so they are not exported.
 """
@@ -265,6 +267,15 @@ class Refusal(StrEnum):
     EVIDENCE_UNDECIDED = "evidence_undecided"
     EVIDENCE_OMITTED = "evidence_omitted"
     EVIDENCE_FEED_MISMATCH = "evidence_feed_mismatch"
+    # destination apply (qw_domain.portability_apply, qw_adapters.destination_import)
+    APPLY_FORMAT = "apply_format"
+    DESTINATION_SCOPE = "destination_scope"
+    DESTINATION_NOT_EMPTY = "destination_not_empty"
+    SECTION_NOT_APPLICABLE = "section_not_applicable"
+    KEY_UNAVAILABLE = "key_unavailable"
+    KEY_MISMATCH = "key_mismatch"
+    APPLY_PRINCIPAL = "apply_principal"
+    APPLY_VERIFY = "apply_verify"
     # archive container (qw_adapters.export_archive)
     ARCHIVE_MALFORMED = "archive_malformed"
     ARCHIVE_LAYOUT = "archive_layout"
