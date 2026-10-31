@@ -20,6 +20,7 @@ from psycopg import errors
 from qw_adapters import tenancy as tn
 from qw_adapters import tombstone_store as st
 from qw_domain import retention as rt
+from qw_domain import tombstone_wire as tw
 
 pytestmark = pytest.mark.db
 Conn = psycopg.Connection[Any]
@@ -145,7 +146,8 @@ def test_no_deleted_content_is_stored(worker_conn: Conn, conn: Conn,
                                 "backup_expiry_at", "hash_scheme", "key_id",
                                 "prev_hash",
                                 "entry_hash",
-                                "recorded_at", "row_hash"]),
+                                "recorded_at", "row_hash",
+                                "residual_backups_unknown"]),  # 0059
         ("deletion_tombstone_checkpoint", ["tenant_id", "length", "head",
                                            "recorded_at", "row_hash"]),
     ]  # fmt: skip
@@ -165,6 +167,7 @@ def test_no_deleted_content_is_stored(worker_conn: Conn, conn: Conn,
     "UPDATE app.deletion_tombstone SET cls = 'market' WHERE seq = 1",
     "UPDATE app.deletion_tombstone SET job_id = 'del-9'",
     "UPDATE app.deletion_tombstone SET residual_backups = '{bk-9}'",
+    "UPDATE app.deletion_tombstone SET residual_backups_unknown = true WHERE seq = 1",
     "UPDATE app.deletion_tombstone SET recorded_at = recorded_at + interval '1 s' "
     "WHERE seq = 1",
     "UPDATE app.deletion_tombstone SET row_hash = entry_hash WHERE seq = 0",
@@ -383,6 +386,43 @@ def test_export_is_snapshot_only_and_lossless(
         assert r["row_hash"] == st.seal(
             r["entry_hash"], datetime.fromisoformat(r["recorded_at"])
         )
+
+
+def test_unknown_backups_are_stored_exported_and_imported(
+    worker_conn: Conn, conn: Conn, tenant: Any
+) -> None:  # owner decision 114: no catalog yet, never an empty list alone
+    t = tenant()
+    p = plan_for(t, clock(conn))
+    one, wrote = call(worker_conn, t, "append", KEY, deletes(p)[0], p, None)
+    assert wrote and one.backups_unknown and one.residual_backups == ()
+    two, _ = call(worker_conn, t, "append", KEY, deletes(p)[1], p, ())
+    assert not two.backups_unknown
+    assert call(worker_conn, t, "load").entries == (one, two)
+    with tn.tenant_transaction(worker_conn, t, snapshot=True) as tx:
+        body = st.export_tombstones(tx)
+    marks = [r["residual_backups_unknown"] for r in body["tombstones"]]
+    assert marks == [True, False]
+    assert tw.parse_section(str(t), body).entries == (one, two)
+    for bad, why in ((False, "entry"), (1, "malformed"), (None, "malformed")):
+        forged = json.loads(json.dumps(body))
+        forged["tombstones"][0]["residual_backups_unknown"] = bad
+        with pytest.raises(tw.WireError) as err:
+            tw.parse_section(str(t), forged)
+        assert err.value.code == why
+    forged = json.loads(json.dumps(body))
+    forged["tombstones"][0]["residual_backups"] = ["bk-1"]  # contradicts the marker
+    with pytest.raises(tw.WireError, match="malformed"):
+        tw.parse_section(str(t), forged)
+    last = call(worker_conn, t, "load").entries[-1]
+    with pytest.raises(errors.CheckViolation), \
+            tn.tenant_transaction(worker_conn, t) as tx:  # fmt: skip
+        raw(
+            tx,
+            2,
+            last.entry_hash,
+            max(clock(conn), last.deleted_at),
+            {"residual_backups_unknown": True},
+        )  # and a listed backup: refused
 
 
 def test_matching_needs_the_key_and_integrity_does_not(

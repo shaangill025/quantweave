@@ -11,6 +11,7 @@ import copy
 import dataclasses
 import hashlib
 import hmac
+import json
 import pickle
 import random
 from collections.abc import Callable
@@ -21,6 +22,7 @@ import pytest
 from hypothesis import given, settings
 from hypothesis import strategies as st
 from qw_domain import retention as rt
+from qw_domain.instants import format_instant
 from qw_domain.release import Edition
 
 C = rt.RetentionClass
@@ -851,3 +853,47 @@ def test_created_at_must_be_the_exact_creation_instant() -> None:  # round 2
                        (exact, drift), ())  # fmt: skip
     out = rt.restore(snap, led.entries, led.checkpoint(), T0 + 3 * H, key=KEY)
     assert out.items == (drift,)  # pinned: only the exact instant is suppressed
+
+
+def test_unknown_residual_backups_are_an_explicit_marker() -> None:  # decision 114
+    led = rt.TombstoneLedger()
+    p = rplan(request(ids=frozenset({"r-a", "r-b"})), [item("r-a"), item("r-b")],
+              CONFIGURED, rt.Holds())  # fmt: skip
+    known = led.append(p.decisions[0], p, T0 + 2 * H, ())  # a catalog: none hold it
+    unknown = led.append(p.decisions[1], p, T0 + 2 * H, None)  # no catalog yet
+    assert (known.residual_backups, known.backups_unknown) == ((), False)
+    assert (unknown.residual_backups, unknown.backup_expiry_at) == ((), None)
+    assert unknown.backups_unknown is True
+    rt.verify(led.entries)
+    # the known form keeps the qw-tombstone-2 bytes, so stored ledgers still verify
+    body = ["qw-tombstone-2", 0, TENANT, known.record_hash, "research", "del-1",
+            format_instant(known.requested_at), format_instant(known.deleted_at),
+            [], None, rt.HASH_SCHEME, KEY.key_id, rt.GENESIS]  # fmt: skip
+    text = json.dumps(body, separators=(",", ":")).encode()
+    assert known.entry_hash == hashlib.sha256(text).hexdigest()
+    flipped = replace(unknown, backups_unknown=False)  # the marker is covered
+    with pytest.raises(rt.RetentionError, match="ledger_tampered"):
+        rt.verify([known, flipped])
+    listed = replace(unknown, residual_backups=("bk-1",), entry_hash="")
+    listed = replace(listed, entry_hash=rt.entry_hash(listed))  # recomputed
+    with pytest.raises(rt.RetentionError, match="ledger_tampered"):
+        rt.verify([known, listed])  # unknown and a listed backup contradict
+    odd = replace(unknown, backups_unknown=1)  # type: ignore[arg-type]
+    with pytest.raises(rt.RetentionError, match="ledger_tampered"):
+        rt.verify([known, odd])
+
+
+def test_pending_says_why_an_intent_waits() -> None:  # T058 PR B
+    holds = rt.Holds()
+    holds.place(hold(ids=frozenset({"r-a"})))
+    req = request(ids=frozenset({"r-a", "r-b"}))
+    p = rplan(req, [item("r-a"), item("r-b")], CONFIGURED, rt.Holds())
+    why = {d.record_id: rt.pending(req, CONFIGURED, holds, d, T0 + 2 * H)
+           for d in p.decisions}  # fmt: skip
+    assert why == {"r-a": "legal_hold:hold-1", "r-b": None}
+    kept = policy(rule(C.RESEARCH, rt.OnRequest.RETAIN))
+    d = next(d for d in p.decisions if d.record_id == "r-b")
+    assert rt.pending(req, kept, holds, d, T0 + 2 * H) == "policy_changed"
+    fin = request(classes=frozenset({C.FINANCIAL}))
+    fp = rplan(fin, [item("r-f", C.FINANCIAL)], CONFIGURED, rt.Holds())
+    assert rt.pending(fin, CONFIGURED, holds, fp.decisions[0], T0 + 2 * H) == "retain"

@@ -14,7 +14,9 @@ LedgerCheckpoint; R052, R087, R088).
   key (`key_id`, a one-way MAC); another key is `key_mismatch` on `append` and
   `find`, never a silent miss. Rotation starts a new chain (not built).
 - `append(tx, key, decision, plan, backups)` records one deletion through the domain
-  `TombstoneLedger.append` (residual backups, expiry, seq, prev and entry hash)
+  `TombstoneLedger.append` (residual backups, expiry, seq, prev and entry hash;
+  `backups` None: no catalog, so the row is marked `residual_backups_unknown`,
+  0059 and owner decision 114)
   on the verified stored ledger, at the database clock (never before the latest
   tombstone), and writes the new checkpoint in the same transaction. The
   decision must be one of the plan's delete intents (`not_in_plan`,
@@ -95,7 +97,8 @@ class StoredLedger:
 _TOMBSTONES = ("SELECT seq, record_hash, cls, job_id, requested_at, deleted_at, "
                "residual_backups, backup_expiry_at, hash_scheme, key_id, "
                "prev_hash, entry_hash, "
-               "recorded_at, row_hash FROM app.deletion_tombstone "
+               "recorded_at, row_hash, residual_backups_unknown "
+               "FROM app.deletion_tombstone "
                "WHERE tenant_id = %s ORDER BY seq")  # fmt: skip
 _CHECKPOINTS = ("SELECT length, head, recorded_at, row_hash FROM "
                 "app.deletion_tombstone_checkpoint WHERE tenant_id = %s "
@@ -104,7 +107,7 @@ _T_COLS = ("seq", "record_hash", "cls", "job_id", "requested_at", "deleted_at",
            "residual_backups", "backup_expiry_at", "hash_scheme", "key_id",
            "prev_hash",
            "entry_hash",
-           "recorded_at", "row_hash")  # fmt: skip
+           "recorded_at", "row_hash", "residual_backups_unknown")  # fmt: skip
 _C_COLS = ("length", "head", "recorded_at", "row_hash")
 _INSTANTS = ("requested_at", "deleted_at", "backup_expiry_at", "recorded_at")
 
@@ -169,6 +172,7 @@ def _load(tx: TenantTx, anchor: LedgerCheckpoint | None,
             eh,
             rec,
             row,
+            unknown,
         ) in rows:
             at = _utc(rec)
             if row != seal(eh, at) or (stamps and at < stamps[-1]):
@@ -176,7 +180,7 @@ def _load(tx: TenantTx, anchor: LedgerCheckpoint | None,
             entries.append(Tombstone(
                 seq, tenant, rh, RetentionClass(cls), job, _utc(req), _utc(dele),
                 tuple(kept), None if exp is None else _utc(exp), hs, kid, prev,
-                eh))  # fmt: skip
+                eh, unknown))  # fmt: skip
             stamps.append(at)
         verify(entries)
         length, head, last = 0, GENESIS, None
@@ -211,7 +215,9 @@ def _hash(key: RecordKey | None, tenant: str, cls: RetentionClass, rid: str,
 
 
 def _check(tx: TenantTx, key: RecordKey | None, d: Decision, p: Plan,
-           backups: Sequence[Backup]) -> None:  # fmt: skip
+           backups: Sequence[Backup] | None) -> None:  # fmt: skip
+    if backups is None:  # decision 114: no catalog, the tombstone says unknown
+        backups = ()
     if type(d) is not Decision or type(p) is not Plan or isinstance(
             backups, (str, bytes)) or not all(
             type(b) is Backup for b in backups):  # fmt: skip
@@ -247,7 +253,8 @@ def find(tx: TenantTx, key: RecordKey | None, item: Item) -> Tombstone | None:
 
 
 def append(tx: TenantTx, key: RecordKey | None, decision: Decision, plan: Plan,
-           backups: Sequence[Backup] = ()) -> tuple[Tombstone, bool]:  # fmt: skip
+           backups: Sequence[Backup] | None = (),
+           ) -> tuple[Tombstone, bool]:  # fmt: skip
     _check(tx, key, decision, plan, backups)
     _lock(tx, shared=False)
     stored = _load(tx, None)
@@ -259,7 +266,9 @@ def append(tx: TenantTx, key: RecordKey | None, decision: Decision, plan: Plan,
     if at < plan.trigger_at:
         raise TombstoneStoreError("time_order", "before the job's trigger time")
     try:
-        t = ledger.append(decision, plan, at, tuple(backups))
+        t = ledger.append(
+            decision, plan, at, None if backups is None else tuple(backups)
+        )
     except RetentionError as exc:
         raise TombstoneStoreError(exc.code, "refused by the domain") from None
     values = {"tenant_id": tx.tenant_id, "seq": t.seq, "record_hash": t.record_hash,
@@ -268,8 +277,8 @@ def append(tx: TenantTx, key: RecordKey | None, decision: Decision, plan: Plan,
               "residual_backups": list(t.residual_backups),
               "backup_expiry_at": t.backup_expiry_at,
               "hash_scheme": t.hash_scheme, "key_id": t.key_id,
-              "prev_hash": t.prev_hash,
-              "entry_hash": t.entry_hash}  # fmt: skip
+              "prev_hash": t.prev_hash, "entry_hash": t.entry_hash,
+              "residual_backups_unknown": t.backups_unknown}  # fmt: skip
     try:
         with tx.conn.transaction():
             tx.conn.execute(
