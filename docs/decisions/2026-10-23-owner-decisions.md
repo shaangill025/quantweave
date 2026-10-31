@@ -781,3 +781,30 @@ below waives a test, gate or spec requirement. Numbering continues from
     superuser client). Other parts of 108 are as originally decided.
     Implemented by: T060 (`qw-db-init`, compose `db-init` and `migrate`
     services).
+
+111. **Destination tenant id on import (T057).**
+    Question: "Decision 111 (T057): Importing an export archive into a new
+    install requires the destination tenant to have the SAME tenant id as the
+    source, because policy content hashes, journal chains and deletion-record
+    pseudonyms all bind the tenant id. Today tenants can only be created with a
+    random id. How should the destination tenant get its id?"
+    Selected label: "Provision with archive's id (Recommended)".
+    Option text as presented: "Add an import-provisioning path that creates an
+    empty tenant with the archive's scope id (refused if that id already
+    exists), owned by the importing owner. Hashes, chains and deletion records
+    carry over unchanged and stay verifiable."
+    Implemented by: T057 (destination import).
+
+112. **Import-only insert path for stamped records (T057).**
+    Question: "Decision 112 (T057): Today the insert paths for the journal,
+    accounts, watchlists and deletion records re-stamp `recorded_at` (and
+    journal account revisions) with the destination's clock, which would
+    rewrite source facts on import. Importing them faithfully needs an
+    import-only insert path that accepts the archive's original stamps and
+    seals. Which shape?"
+    Selected label: "SECURITY DEFINER import functions (Recommended)".
+    Option text as presented: "One migration adds per-table import functions
+    granted to qw_app. Each refuses unless the tenant is empty and the import
+    lock is held, and re-verifies chains and seals in SQL before inserting
+    with the original stamps. No new login or secret."
+    Implemented by: T057 (destination import migration).
