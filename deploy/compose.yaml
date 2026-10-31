@@ -1,0 +1,147 @@
+# Local self-hosted profile (T060; owner decisions 106-109). Setup, secrets and
+# the order of first start: docs/operator/self-hosted.md. Run from the repository
+# root:  docker compose -f deploy/compose.yaml ...
+# Every secret is a file under QW_SECRETS_DIR (outside the repository), owned by
+# the uid:gid of the one service that mounts it, mode 0400. Compose bind-mounts
+# file secrets with the host file's owner and mode (its secret uid/gid/mode keys
+# apply only in Swarm mode and are ignored here), so the host files carry them;
+# qw-api, qw-migrate and qw-db-init refuse a file not owned by their uid or not
+# private.
+name: quantweave
+
+x-hardening: &hardening
+  read_only: true
+  cap_drop: [ALL]
+  security_opt: ["no-new-privileges:true"]
+  tmpfs: ["/tmp:rw,noexec,nosuid,nodev,size=64m"]
+  networks: [backend]
+
+services:
+  db:
+    image: ${QW_POSTGRES_IMAGE:?set QW_POSTGRES_IMAGE to a digest-pinned postgres:16 image}
+    # The official image supports an arbitrary --user; as 999 (postgres) its
+    # entrypoint needs no root step (no chown, no gosu), so every capability drops.
+    user: "999:999"
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    environment:
+      POSTGRES_DB: quantweave
+      POSTGRES_PASSWORD_FILE: /run/secrets/db_superuser_password
+      POSTGRES_HOST_AUTH_METHOD: scram-sha-256
+      POSTGRES_INITDB_ARGS: --encoding=UTF8 --auth-host=scram-sha-256
+    secrets:
+      - db_superuser_password
+    volumes: [pgdata:/var/lib/postgresql/data]
+    healthcheck:
+      test: ["CMD", "pg_isready", "-h", "127.0.0.1", "-U", "postgres", "-d", "quantweave"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+    networks: [backend]
+    restart: unless-stopped
+
+  # One-time, as the PostgreSQL superuser (decision 108): applies 0001 and the
+  # ledger guard, creates the login of each runtime role. Only on request:
+  #   docker compose -f deploy/compose.yaml --profile init run --rm db-init
+  db-init:
+    <<: *hardening
+    image: ${QW_IMAGE:-quantweave/self-hosted:local}
+    pull_policy: never
+    profiles: [init]
+    user: "10003:10003"
+    command: ["qw-db-init"]
+    environment:
+      QW_DBINIT_DATABASE_URL: host=db port=5432 dbname=quantweave user=postgres passfile=/run/secrets/dbinit_superuser
+      QW_DBINIT_PASSFILE_QW_MIGRATE: /run/secrets/dbinit_qw_migrate
+      QW_DBINIT_PASSFILE_QW_APP: /run/secrets/dbinit_qw_app
+      QW_DBINIT_PASSFILE_QW_WORKER: /run/secrets/dbinit_qw_worker
+    secrets:
+      - dbinit_superuser
+      - dbinit_qw_migrate
+      - dbinit_qw_app
+      - dbinit_qw_worker
+    depends_on:
+      db: {condition: service_healthy}
+    restart: "no"
+
+  # Later migrations as the non-superuser qw_migrate login, on every start; it
+  # refuses a database that db-init has not set up.
+  migrate:
+    <<: *hardening
+    image: ${QW_IMAGE:-quantweave/self-hosted:local}
+    pull_policy: never
+    user: "10004:10004"
+    command: ["qw-migrate"]
+    environment:
+      QW_MIGRATE_DATABASE_URL: host=db port=5432 dbname=quantweave user=qw_migrate_login passfile=/run/secrets/migrate_pgpass
+    secrets:
+      - migrate_pgpass
+    depends_on:
+      db: {condition: service_healthy}
+    restart: "no"
+
+  api:
+    <<: *hardening
+    image: ${QW_IMAGE:-quantweave/self-hosted:local}
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+      args:
+        NODE_IMAGE: ${QW_NODE_IMAGE:?set QW_NODE_IMAGE to a digest-pinned node:22.22.0 image}
+    user: "10001:10001"
+    command: ["qw-api"]
+    environment:
+      QW_DATABASE_URL: host=db port=5432 dbname=quantweave user=qw_app_login passfile=/run/secrets/api_pgpass
+      QW_SECRET_KEY_FILE: /run/secrets/api_secret_key
+      QW_EDITION: self_hosted
+      QW_API_HOST: 0.0.0.0
+      QW_API_PORT: "8000"
+      QW_ALLOWED_ORIGINS: ${QW_ALLOWED_ORIGINS:-http://127.0.0.1:8000}
+    secrets:
+      - api_pgpass
+      - api_secret_key
+    ports: ["127.0.0.1:8000:8000"]
+    networks: [backend, frontend]
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request as u; u.urlopen('http://127.0.0.1:8000/health/live', timeout=3)"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+    depends_on:
+      migrate: {condition: service_completed_successfully}
+    restart: unless-stopped
+
+  worker:
+    <<: *hardening
+    image: ${QW_IMAGE:-quantweave/self-hosted:local}
+    pull_policy: never
+    user: "10002:10002"
+    command: ["qw-worker"]
+    environment:
+      QW_DATABASE_URL: host=db port=5432 dbname=quantweave user=qw_worker_login passfile=/run/secrets/worker_pgpass
+      QW_WORKER_NAME: worker-1
+    secrets:
+      - worker_pgpass
+    depends_on:
+      migrate: {condition: service_completed_successfully}
+    restart: unless-stopped
+
+# backend has no route out: db, db-init, migrate and worker reach only each other.
+# api also joins frontend, the network its published port is reached through.
+networks:
+  backend: {internal: true}
+  frontend: {}
+
+volumes:
+  pgdata: {}
+
+secrets:
+  db_superuser_password: {file: "${QW_SECRETS_DIR:?set QW_SECRETS_DIR}/db/superuser_password"}
+  dbinit_superuser: {file: "${QW_SECRETS_DIR:?set QW_SECRETS_DIR}/dbinit/superuser.pgpass"}
+  dbinit_qw_migrate: {file: "${QW_SECRETS_DIR:?set QW_SECRETS_DIR}/dbinit/qw_migrate.pgpass"}
+  dbinit_qw_app: {file: "${QW_SECRETS_DIR:?set QW_SECRETS_DIR}/dbinit/qw_app.pgpass"}
+  dbinit_qw_worker: {file: "${QW_SECRETS_DIR:?set QW_SECRETS_DIR}/dbinit/qw_worker.pgpass"}
+  migrate_pgpass: {file: "${QW_SECRETS_DIR:?set QW_SECRETS_DIR}/migrate/qw_migrate.pgpass"}
+  api_pgpass: {file: "${QW_SECRETS_DIR:?set QW_SECRETS_DIR}/api/qw_app.pgpass"}
+  api_secret_key: {file: "${QW_SECRETS_DIR:?set QW_SECRETS_DIR}/api/secret_key"}
+  worker_pgpass: {file: "${QW_SECRETS_DIR:?set QW_SECRETS_DIR}/worker/qw_worker.pgpass"}

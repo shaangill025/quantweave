@@ -1,0 +1,17 @@
+# Build context for deploy/Dockerfile: only what the image needs.
+**
+!package.json
+!pnpm-lock.yaml
+!pnpm-workspace.yaml
+!apps/web/
+!pyproject.toml
+!uv.lock
+!packages/
+!apps/api/
+!apps/worker/
+**/node_modules/
+**/dist/
+**/.venv/
+**/__pycache__/
+**/*.py[cod]
+**/tests/

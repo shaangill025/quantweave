@@ -156,6 +156,26 @@ def test_an_old_runner_ledger_is_repaired_by_a_superuser_run(
     assert migrations.ledger_guarded(conn)
 
 
+def test_a_replica_only_trigger_is_no_guard(
+    conn: Conn, initialised: str, tmp_path: Path, capsys: Cap
+) -> None:
+    """tgenabled 'R' fires only under session_replication_role = replica, so in an
+    ordinary session the ledger is unguarded; 'A' (always) still guards."""
+    url, table = initialised, "ALTER TABLE public.schema_migrations "
+    conn.execute(table + "ENABLE REPLICA TRIGGER schema_migrations_contiguous")
+    assert not migrations.ledger_guarded(conn)
+    code, out = run(url, capsys)
+    assert code == 1 and "predates the qw_migrate grant" in out
+    assert sorted(migrations.applied_migrations(conn)) == [1]
+    migrations.migrate(conn, tmp_path / "bootstrap")  # the superuser repair
+    tgenabled = "SELECT tgenabled FROM pg_trigger WHERE tgname = %s"
+    row = conn.execute(tgenabled, ("schema_migrations_contiguous",)).fetchone()
+    assert row == ("O",) and migrations.ledger_guarded(conn)
+    conn.execute(table + "ENABLE ALWAYS TRIGGER schema_migrations_contiguous")
+    assert migrations.ledger_guarded(conn)
+    assert run(url, capsys)[0] == 0
+
+
 def test_qw_migrate_can_forge_only_the_next_ledger_row(
     conn: Conn, initialised: str, capsys: Cap
 ) -> None:

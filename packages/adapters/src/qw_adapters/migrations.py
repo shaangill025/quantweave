@@ -103,8 +103,8 @@ SELECT to_regclass('public.schema_migrations') IS NOT NULL
     AND to_regrole('qw_migrate') IS NOT NULL
     AND has_table_privilege('qw_migrate', 'public.schema_migrations', 'SELECT')
     AND has_table_privilege('qw_migrate', 'public.schema_migrations', 'INSERT')
-    AND EXISTS (SELECT 1 FROM pg_catalog.pg_trigger WHERE tgenabled <> 'D' AND
-        tgrelid = to_regclass('public.schema_migrations')
+    AND EXISTS (SELECT 1 FROM pg_catalog.pg_trigger WHERE tgenabled IN ('O', 'A')
+        AND tgrelid = to_regclass('public.schema_migrations')
         AND tgname = 'schema_migrations_contiguous')
 """
 
@@ -256,8 +256,11 @@ def migrate(
     directory: Path = MIGRATIONS_DIR,
     *,
     run_as: str | None = MIGRATE_ROLE,
+    through: int | None = None,
 ) -> list[int]:
-    """Apply pending migrations in order and return the versions applied."""
+    """Apply pending migrations in order and return the versions applied; with
+    `through`, only those up to that version (the db-init job passes 1). The whole
+    history is still checked against every file in `directory`."""
     if not conn.autocommit:
         raise MigrationError("migrate() needs an autocommit connection")
     encoding = _scalar(conn, "SELECT current_setting('server_encoding')")
@@ -276,6 +279,8 @@ def migrate(
                 conn.execute(_GUARD_SQL)
             log.warning("ledger guard installed on a ledger that predates it")
         for migration in pending_migrations(migrations, applied):
+            if through is not None and migration.version > through:
+                break
             _apply(conn, migration, run_as)
             done.append(migration.version)
     except BaseException as exc:
@@ -477,8 +482,10 @@ def _apply(
 
 
 def ledger_guarded(conn: psycopg.Connection[TupleRow]) -> bool:
-    """Whether the ledger has the qw_migrate grant and the enabled contiguity
-    trigger (readable by any login)."""
+    """Whether the ledger has the qw_migrate grant and the contiguity trigger,
+    enabled so that it fires in an ordinary session (tgenabled 'O' or 'A'; a
+    trigger set to fire on replicas only, 'R', or disabled, 'D', is no guard).
+    Readable by any login."""
     return _scalar(conn, _GUARDED_SQL) is True
 
 
