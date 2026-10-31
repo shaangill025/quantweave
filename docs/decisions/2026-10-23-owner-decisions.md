@@ -808,3 +808,42 @@ below waives a test, gate or spec requirement. Numbering continues from
     lock is held, and re-verifies chains and seals in SQL before inserting
     with the original stamps. No new login or secret."
     Implemented by: T057 (destination import migration).
+
+113. **Resuming a deletion after its legal hold is released (T058).**
+    Question: "Decision 113 (T058): When a deletion request is blocked by a
+    legal hold, the job stops as 'deletion_suspended'. After the hold is
+    released, how should the suspended deletion resume?"
+    Selected label: "Automatic re-run (Recommended)".
+    Option text as presented: "On release, a fresh retention.delete job is
+    enqueued for each suspended request of that tenant, keeping the original
+    request time; the hourly sweep is a backstop, and an operator is alerted
+    if a request stays suspended past a stated period. Erasure obligations
+    don't lapse because a hold existed."
+    Implemented by: T058 (deletion jobs).
+
+114. **Deletion before a backup catalog exists (T058, T063).**
+    Question: "Decision 114 (T058): No backup catalog exists yet (planned for
+    T063). Deleting a record removes the live copy and writes a deletion
+    record that also suppresses it if a backup is ever restored, but the
+    system cannot yet list which backups still hold a copy or when they
+    expire. What should deletion jobs do until the catalog exists?"
+    Selected label: "Delete, mark backups unknown (Recommended)".
+    Option text as presented: "Delete live data now; each deletion record
+    carries an explicit 'residual backups unknown' marker (not an empty list,
+    which would falsely read as 'no backup holds this'). Restore still
+    re-deletes via the record. The marker is a release gate until T063 adds
+    the catalog."
+    Implemented by: T058 (deletion jobs and tombstones), T063 (backup catalog).
+
+115. **Recovering from a corrupt legal-hold record (T058).**
+    Question: "Decision 115 (T058): Legal-hold records are append-only and
+    integrity-checked; if one hold row is corrupt (bug or tampering), the
+    system fails closed and blocks ALL deletions for that tenant, with no
+    repair path. How should that be recoverable?"
+    Selected label: "Owner-approved quarantine (Recommended)".
+    Option text as presented: "Add a superuser-only, audited repair step (run
+    like db-init, never by a running service) that marks a corrupt hold row
+    quarantined after owner approval; quarantined holds still block deletion
+    of their scope until a valid replacement place/release is recorded.
+    Deletion elsewhere in the tenant can then resume."
+    Implemented by: T058 (legal holds).
