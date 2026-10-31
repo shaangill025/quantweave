@@ -763,3 +763,21 @@ below waives a test, gate or spec requirement. Numbering continues from
     image to secure, and the page and API share one origin, which keeps the
     security rules (CSRF, allowed origins) simple."
     Implemented by: T060 (container profiles).
+
+110. **Amendment to decision 108: where the db-init job runs (T060).**
+    Question: "Decision 108 (self-hosted DB init): it chose 'runs as the
+    Postgres superuser through the official image's init mechanism, then a
+    migrate-once job'. The implementation instead runs a one-shot `qw-db-init`
+    job from the app image as a superuser *client*, because migration 0001
+    must go through the Python migrator to install the ledger guard and its
+    checksum row (the init hook can only run raw SQL). The superuser password
+    still comes from a file, and the job is opt-in (compose profile). Ratify
+    this deviation?"
+    Selected label: "Ratify app-image db-init (Recommended)".
+    Option text as presented: "Record an amendment to 108: one-shot qw-db-init
+    from the app image as superuser client, then qw-migrate on every start.
+    Keeps the ledger guard installed through the checked migrator."
+    Amends: 108, only in where the db-init job runs (the app image, as a
+    superuser client). Other parts of 108 are as originally decided.
+    Implemented by: T060 (`qw-db-init`, compose `db-init` and `migrate`
+    services).
