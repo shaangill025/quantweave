@@ -13,6 +13,7 @@ import hashlib
 import re
 import uuid
 from datetime import timedelta
+from typing import LiteralString
 
 import psycopg
 import pytest
@@ -649,3 +650,36 @@ def test_check_runtime_role_requires_runtime_group(
     finally:
         conn.execute(sql.SQL("DROP OWNED BY {}").format(ident))
         conn.execute(sql.SQL("DROP ROLE {}").format(ident))
+
+
+@pytest.mark.db
+@pytest.mark.parametrize(
+    ("attribute", "option"),
+    [("SUPERUSER", "INHERIT TRUE, SET FALSE"), ("SUPERUSER", "INHERIT FALSE, SET TRUE"),
+     ("NOSUPERUSER BYPASSRLS", "INHERIT TRUE, SET TRUE")],
+)  # fmt: skip
+def test_check_runtime_role_refuses_a_member_of_a_privileged_role(
+    runtime_urls: dict[str, str], database_url: str, conn: Conn,
+    attribute: LiteralString, option: LiteralString,
+) -> None:  # fmt: skip
+    """T060: SUPERUSER and BYPASSRLS are not inherited, but a member can SET ROLE
+    to them (or a grant could later be widened), so membership by any grant of
+    such a role refuses the login, even when it is exactly a qw_app member."""
+    suffix = uuid.uuid4().hex[:12]
+    login, holder = f"qwtest_app_{suffix}", f"qwtest_priv_{suffix}"
+    ident, priv = sql.Identifier(login), sql.Identifier(holder)
+    create = sql.SQL("CREATE ROLE {} LOGIN NOBYPASSRLS IN ROLE qw_app")
+    conn.execute(create.format(ident))
+    conn.execute(sql.SQL("CREATE ROLE {} NOLOGIN " + attribute).format(priv))
+    try:
+        with psycopg.connect(make_conninfo(database_url, user=login)) as other:
+            check_runtime_role(other, "qw_app")  # passes before the grant
+        conn.execute(sql.SQL("GRANT {} TO {} WITH " + option).format(priv, ident))
+        with (
+            psycopg.connect(make_conninfo(database_url, user=login)) as other,
+            pytest.raises(TenancyError, match="member of a superuser or BYPASSRLS"),
+        ):
+            check_runtime_role(other, "qw_app")
+    finally:
+        conn.execute(sql.SQL("DROP ROLE {}").format(ident))
+        conn.execute(sql.SQL("DROP ROLE {}").format(priv))

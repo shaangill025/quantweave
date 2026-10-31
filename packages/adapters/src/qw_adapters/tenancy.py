@@ -481,14 +481,18 @@ def check_runtime_role(conn: Conn, role: RuntimeRole | None = None) -> None:
     assessor, the operator or the ingest login and anything else. The checks are of
     the login itself (session_user), and a connection whose role was changed (say
     `options=-c role=...` at connect) is refused, so a mixed login cannot pass as
-    one of its groups and RESET ROLE back."""
+    one of its groups and RESET ROLE back. A login that is a member of a superuser
+    or BYPASSRLS role (by any grant: those attributes are not inherited, but SET
+    ROLE reaches them) is refused too (T060)."""
     if role is not None and role not in _RUNTIME:
         raise TenancyError(f"unknown runtime role {role!r}")
     row = conn.execute(
         "SELECT r.rolsuper, r.rolbypassrls, pg_has_role(r.oid, 'qw_migrate', 'MEMBER'),"
         " ARRAY(SELECT g FROM unnest(%s::text[]) g WHERE pg_has_role(r.oid, g,"
-        " 'MEMBER')), current_user = session_user FROM pg_catalog.pg_roles r"
-        " WHERE r.rolname = session_user",
+        " 'MEMBER')), current_user = session_user, EXISTS (SELECT 1 FROM"
+        " pg_catalog.pg_roles s WHERE (s.rolsuper OR s.rolbypassrls) AND"
+        " s.oid <> r.oid AND pg_has_role(r.oid, s.oid, 'MEMBER'))"
+        " FROM pg_catalog.pg_roles r WHERE r.rolname = session_user",
         (list(_GROUPS),),
     ).fetchone()
     if row is not None and not row[4]:
@@ -497,6 +501,9 @@ def check_runtime_role(conn: Conn, role: RuntimeRole | None = None) -> None:
         raise TenancyError("runtime connection is a superuser")
     if row[1] or row[2]:
         raise TenancyError("runtime connection can bypass RLS or owns the schema")
+    if row[5]:  # MEMBER: SET ROLE to it is possible, inherited or not
+        raise TenancyError("runtime connection is a member of a superuser or "
+                           "BYPASSRLS role")  # fmt: skip
     groups = set(row[3])
     if not groups & set(_RUNTIME):
         raise TenancyError("runtime connection is not a member of a runtime role")

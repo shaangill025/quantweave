@@ -10,6 +10,7 @@ dependencies = [
 ]
 
 [project.scripts]
+qw-db-init = "qw_adapters.db_init_cli:main"
 qw-migrate = "qw_adapters.migrate_cli:main"
 
 [tool.uv.sources]
