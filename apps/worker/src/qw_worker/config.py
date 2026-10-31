@@ -7,7 +7,17 @@ minimums. Their defaults are the configured retention defaults
 (`qw_domain.retention_config`, owner decision 9): idempotency records 48 h (A-05: at
 least 24 h), outbox 7 days, inbox 30 days. QW_RETENTION_CONFIG names an operator
 JSON file (`retention_config.parse`) that sets the windows and purge holds; a held
-window is not purged.
+window is not purged. Its retention policy (`retention_policy`, default
+`owner_defaults`) drives the deletion job.
+
+`record_key_from_env` (T058 PR B; owner decisions 104 and 107): the installation's
+`RecordKey` from the file QW_RECORD_KEY_FILE names (`qw_adapters.file_secrets`
+checks: absolute path, mode 0600, one line of visible ASCII, at least 32 bytes);
+QW_RECORD_KEY set inline refuses the start. A refusal names the variable, never
+the value. Unset: None. Decision 31's solo opt-in is not plumbed here: the
+edition and operator set are deployment facts the worker has no record of yet,
+so the deletion job loads holds with `solo=None` (a solo release, which no route
+can record yet, would make the hold state unknown: fail closed).
 """
 
 from __future__ import annotations
@@ -16,8 +26,15 @@ import os
 import re
 from collections.abc import Mapping
 from dataclasses import dataclass
+from dataclasses import field as _field
 from datetime import timedelta
 
+from qw_adapters.file_secrets import (
+    ConfigError,
+    read_secret_file,
+    refuse_inline,
+    secret_text,
+)
 from qw_adapters.jobs import (
     DEFAULT_BACKOFF,
     IDEMPOTENCY_RETENTION,
@@ -28,6 +45,7 @@ from qw_adapters.jobs import (
     RELAY_MAX_ATTEMPTS,
 )
 from qw_domain.jobs import Backoff, Pool
+from qw_domain.retention import Policy, RecordKey, RetentionError, owner_defaults
 from qw_domain.retention_config import DEFAULT_WINDOWS, Window, parse
 
 _NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
@@ -58,6 +76,7 @@ class WorkerSettings:
     inbox_retention: timedelta = DEFAULT_WINDOWS[Window.INBOX]
     idempotency_retention: timedelta = DEFAULT_WINDOWS[Window.IDEMPOTENCY]
     purge_held: frozenset[Window] = frozenset()  # under a purge hold: not purged
+    retention_policy: Policy = _field(default_factory=owner_defaults)
 
     def __post_init__(self) -> None:
         if not isinstance(self.pool, Pool):
@@ -90,6 +109,8 @@ class WorkerSettings:
         if type(self.purge_held) is not frozenset or not all(
                 type(w) is Window for w in self.purge_held):  # fmt: skip
             raise ValueError("purge_held must be a frozenset of Window")
+        if type(self.retention_policy) is not Policy:
+            raise ValueError("retention_policy must be a Policy")
 
 
 # Optional integer overrides from the environment; anything else keeps its default.
@@ -135,7 +156,25 @@ def settings_from_env(environ: Mapping[str, str] = os.environ) -> WorkerSettings
         values.update(outbox_retention=cfg.windows[Window.OUTBOX],
                       inbox_retention=cfg.windows[Window.INBOX],
                       idempotency_retention=cfg.windows[Window.IDEMPOTENCY],
-                      purge_held=cfg.held())  # fmt: skip
+                      purge_held=cfg.held(),
+                      retention_policy=cfg.policy)  # fmt: skip
     pool = Pool(environ.get("QW_WORKER_POOL", Pool.STANDARD.value))
     name = environ.get("QW_WORKER_NAME", f"worker-{os.getpid()}")
     return WorkerSettings(name, pool, **values)  # type: ignore[arg-type]
+
+
+RECORD_KEY_FILE = "QW_RECORD_KEY_FILE"
+
+
+def record_key_from_env(environ: Mapping[str, str] = os.environ) -> RecordKey | None:
+    """The record key from its file, or None when QW_RECORD_KEY_FILE is unset;
+    ConfigError (naming the variable, never a value) when unsafe or short."""
+    refuse_inline(environ, ("QW_RECORD_KEY",))
+    raw = read_secret_file(environ, RECORD_KEY_FILE, required=False)
+    if raw is None:
+        return None
+    try:
+        return RecordKey(secret_text(RECORD_KEY_FILE, raw))
+    except RetentionError:
+        why = "the key must be at least 32 bytes"
+        raise ConfigError(RECORD_KEY_FILE, why) from None

@@ -44,7 +44,9 @@ R052, R075, R077, R086, R087, R088). Domain, stdlib only, in memory.
   re-checks holds and the current policy (the stricter of plan and current wins) at
   its own time; a suspended intent stays pending until a later run deletes it. An
   item already tombstoned keeps its first tombstone. Tombstones carry a pseudonym,
-  the residual backups that may still hold a copy (distinct ids) and their expiry.
+  the residual backups that may still hold a copy (distinct ids) and their expiry,
+  or (owner decision 114) the `backups_unknown` marker when no backup catalog
+  lists them: an empty list then never reads as "no backup holds this".
 - Owner decision 104 (keyed hash, scheme-tagged): the pseudonym is an HMAC-SHA256
   under the installation's `RecordKey` (an operator-held secret kept outside the
   database, never in a repr, log or export) over tenant, class, record id (case-
@@ -651,6 +653,19 @@ def _allows(trig: Trigger, rule: Rule, d: "Decision", at: datetime) -> bool:
     return rule.expire_after is not None and d.created_at + rule.expire_after <= at
 
 
+def pending(trig: Trigger, policy: Policy, holds: Holds, d: Decision,
+            at: datetime) -> str | None:  # fmt: skip
+    """Why the planned decision `d` may not be deleted at `at`: `retain` (not an
+    intent), `legal_hold:<id>` or `policy_changed`; None when it may. Holds are
+    checked first; the current policy can only veto the plan, never widen it."""
+    if d.action is Action.RETAIN:
+        return "retain"
+    held = holds.active(Item(trig.tenant_id, d.record_id, d.cls, d.created_at), at)
+    if held is not None:
+        return f"legal_hold:{held.hold_id}"
+    return None if _allows(trig, policy.rule(d.cls), d, at) else "policy_changed"
+
+
 def plan(trig: Trigger, items: Iterable[Item], policy: Policy, holds: Holds,
          key: RecordKey | None = None) -> Plan:  # fmt: skip
     job_id, at = _job(trig)
@@ -723,16 +738,23 @@ class Tombstone:
     key_id: str  # which key: one per ledger chain
     prev_hash: str
     entry_hash: str
+    # decision 114: no backup catalog, so which backups hold a copy is unknown
+    # (residual_backups is then empty and says nothing); never "none hold it"
+    backups_unknown: bool = False
 
 
 def entry_hash(t: Tombstone) -> str:
     """sha256 over compact JSON of the stored fields in a fixed order; 0057's guard
-    computes the same bytes. Ids, hashes and instants need no JSON escaping."""
+    (0059's since the marker) computes the same bytes. Ids, hashes and instants
+    need no JSON escaping. Without the marker the bytes are qw-tombstone-2's, so
+    earlier entries verify unchanged; with it, qw-tombstone-3 adds `true`."""
     exp = t.backup_expiry_at
-    body = ["qw-tombstone-2", t.seq, t.tenant_id, t.record_hash, str(t.cls),
+    body = ["qw-tombstone-3" if t.backups_unknown else "qw-tombstone-2", t.seq,
+            t.tenant_id, t.record_hash, str(t.cls),
             t.job_id, format_instant(t.requested_at), format_instant(t.deleted_at),
             list(t.residual_backups), None if exp is None else format_instant(exp),
-            t.hash_scheme, t.key_id, t.prev_hash]  # fmt: skip
+            t.hash_scheme, t.key_id, t.prev_hash,
+            *([True] if t.backups_unknown else [])]  # fmt: skip
     text = json.dumps(body, separators=(",", ":"))
     return hashlib.sha256(text.encode()).hexdigest()
 
@@ -748,6 +770,9 @@ def verify(entries: Sequence[Tombstone]) -> None:
     for n, t in enumerate(entries):
         if type(t) is not Tombstone or t.seq != n or t.prev_hash != prev or (
                 t.hash_scheme not in HASH_SCHEMES
+                or type(t.backups_unknown) is not bool
+                or (t.backups_unknown and (t.residual_backups
+                                           or t.backup_expiry_at is not None))
                 or t.entry_hash != entry_hash(t)):  # fmt: skip
             raise RetentionError("ledger_tampered", f"entry {n}")
         prev = t.entry_hash
@@ -771,7 +796,10 @@ class TombstoneLedger:
                      if (t.tenant_id, t.record_hash) == key), None)  # fmt: skip
 
     def append(self, d: Decision, p: Plan, at: datetime,
-               backups: Sequence[Backup]) -> Tombstone:  # fmt: skip
+               backups: Sequence[Backup] | None) -> Tombstone:  # fmt: skip
+        """`backups` None: no catalog lists them (decision 114), so the tombstone
+        is marked `backups_unknown`; a sequence, even empty, is the catalog."""
+        unknown, backups = backups is None, () if backups is None else backups
         if self._entries and at < self._entries[-1].deleted_at:
             raise RetentionError("time_order", "before the latest tombstone")
         if p.hash_scheme != HASH_SCHEME:
@@ -791,7 +819,7 @@ class TombstoneLedger:
         n = len(self._entries)
         draft = Tombstone(n, p.tenant_id, d.record_hash, d.cls, p.job_id,
                           p.trigger_at, at, kept, expiry, p.hash_scheme,
-                          p.key_id, prev, "")  # fmt: skip
+                          p.key_id, prev, "", unknown)  # fmt: skip
         t = replace(draft, entry_hash=entry_hash(draft))
         self._entries.append(t)
         return t
@@ -848,14 +876,11 @@ class Retention:
             if d.action is Action.RETAIN:
                 continue
             old = self.ledger.find(p.tenant_id, d.record_hash)
-            held = self.holds.active(Item(p.tenant_id, d.record_id, d.cls,
-                                          d.created_at), at)  # fmt: skip
+            why = pending(trig, policy, self.holds, d, at)
             if old is not None:
                 done.append(old)
-            elif held is not None:
-                suspended.append((d.record_hash, f"legal_hold:{held.hold_id}"))
-            elif not _allows(trig, policy.rule(d.cls), d, at):
-                suspended.append((d.record_hash, "policy_changed"))
+            elif why is not None:
+                suspended.append((d.record_hash, why))
             else:
                 todo.append(d)
         last = self.ledger.entries[-1:]

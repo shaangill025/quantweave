@@ -12,7 +12,12 @@ claimed only by an experiment-pool worker, QW_WORKER_POOL=experiment) and
 `budget_sweep.HANDLERS` (kind `budget.expire_due`, standard pool). A
 standard-pool worker also runs the budget-sweep timer (owner decision 100) every
 `budget_sweep_every` (QW_WORKER_BUDGET_SWEEP_EVERY_MINUTES, default 5); an
-experiment-pool worker runs no timer. No publish
+experiment-pool worker runs no timer. The record key comes from QW_RECORD_KEY_FILE
+(`config.record_key_from_env`, decision 107; inline QW_RECORD_KEY or a short key
+refuses the start, exit 2, also under --check-config). A standard-pool worker with
+the key handles `retention.delete` (`deletion_job`) once a store `Target` exists;
+none does yet, so no deletion handler is registered and those jobs stay queued
+rather than failing. No publish
 target is passed, so the outbox relay is off and events stay pending: a real
 transport needs explicit owner authorisation.
 
@@ -29,8 +34,8 @@ from qw_adapters import tenancy
 from qw_adapters.file_secrets import ConfigError, passfile_conninfo
 from qw_domain.jobs import Pool
 
-from qw_worker import budget_sweep, optimizer_cycle
-from qw_worker.config import settings_from_env
+from qw_worker import budget_sweep, deletion_job, optimizer_cycle
+from qw_worker.config import record_key_from_env, settings_from_env
 from qw_worker.loop import Worker, install_signal_handlers
 
 
@@ -47,6 +52,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 1
     try:
         conninfo = passfile_conninfo(os.environ, "QW_DATABASE_URL")
+        record_key = record_key_from_env()
     except ConfigError as exc:  # names the variable and reason, never a value
         print(f"refused: {exc}", file=sys.stderr)
         return 2
@@ -61,6 +67,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         with tenancy.runtime_connection(conninfo, role="qw_worker") as conn:
             handlers = {**optimizer_cycle.HANDLERS, **budget_sweep.HANDLERS}
+            targets = deletion_job.TARGETS  # empty until a store handler exists
+            if record_key is not None and settings.pool is Pool.STANDARD and targets:
+                handlers |= deletion_job.handlers(
+                    record_key, settings.retention_policy, targets)  # fmt: skip
             timers = ((budget_sweep.timer(settings.budget_sweep_every),)
                       if settings.pool is Pool.STANDARD else ())  # fmt: skip
             worker = Worker(conn, settings, handlers=handlers, timers=timers,

@@ -20,6 +20,13 @@
   qw_app supplies every hashed input and can append a well-sealed release with
   fabricated step-up receipts; the store checks only the domain's combination
   rules. Verifying step-up receipts is the hold route's job (the trust boundary).
+- Owner decision 113: `release` also calls `resume_suspended` in its transaction,
+  which enqueues a fresh `retention.delete` job for each request of the tenant
+  whose latest job stopped `deletion_suspended` before the latest release:
+  revision `request:<id>:r<release seq>`, the same payload, so the original
+  request time stands. The deletion job's sweep calls it too (the backstop).
+  The operator alert for a request suspended past a stated period is not built
+  (no alert channel exists).
 - Errors: `forbidden` (only qw_app writes; qw_app and qw_worker read),
   `database`, `integrity`, `isolation` (`load` outside READ COMMITTED: a
   snapshot taken before the lock could miss a committed place), and the domain's
@@ -39,10 +46,27 @@ import psycopg
 from qw_domain import retention as rt
 from qw_domain.account_wire import seal
 from qw_domain.instants import ensure_aware_utc, format_instant
+from qw_domain.jobs import Priority
+from qw_domain.sources import ID_PATTERN
 
+from qw_adapters import jobs as qj
 from qw_adapters.tenancy import TenantTx
 
-__all__ = ["HoldStoreError", "load", "place", "release"]
+__all__ = ["DELETION_KIND", "HoldStoreError", "load", "place", "release",
+           "resume_suspended"]  # fmt: skip
+DELETION_KIND = "retention.delete"
+_SUSPENDED = (
+    "WITH rel AS (SELECT seq, recorded_at FROM app.legal_hold_event WHERE "
+    "tenant_id = %(t)s AND kind = 'release' ORDER BY seq DESC LIMIT 1), "
+    "last AS (SELECT DISTINCT ON (payload ->> 'request_id') payload, state, "
+    "last_error, updated_at FROM app.job WHERE tenant_id = %(t)s AND kind = %(k)s "
+    "AND payload ->> 'trigger' = 'request' "
+    "ORDER BY payload ->> 'request_id', created_at DESC, id) "
+    "SELECT rel.seq, last.payload FROM rel, last WHERE last.state = 'failed' "
+    "AND last.last_error IN ('deletion_suspended', 'deletion_refused') AND "
+    "last.updated_at <= "
+    "rel.recorded_at ORDER BY last.payload ->> 'request_id'"
+)
 
 _COLS = ("seq", "kind", "hold_id", "reason", "authority_id", "classes",
          "record_ids", "placed_by", "principal_id", "approval_roles",
@@ -224,4 +248,31 @@ def release(tx: TenantTx, hold_id: str, authority_id: str, reason: str,
                  "approval_step_ups": [a.stepped_up_at for a in r.approvals],
                  "solo": r.solo, "prev_hash": prev}, solo)  # fmt: skip
     assert isinstance(stored, rt.HoldRelease)
+    resume_suspended(tx)
     return stored
+
+
+def resume_suspended(tx: TenantTx) -> list[Any]:
+    """Owner decision 113: re-queue every suspended deletion request of `tx`'s
+    tenant after its latest release; the ids of newly queued jobs. A request that
+    ended `deletion_refused` is re-queued too: a refused record outranks a held one
+    in the job's outcome, so the held record would otherwise never be erased. The
+    re-run re-checks holds and retries refused records. Idempotent per (request,
+    release). Takes no lock beyond the job rows it inserts."""
+    out = []
+    try:
+        rows = tx.conn.execute(_SUSPENDED, {"t": tx.tenant_id,
+                                            "k": DELETION_KIND}).fetchall()  # fmt: skip
+        for seq, body in rows:
+            rid = body.get("request_id") if isinstance(body, dict) else None
+            if not isinstance(rid, str) or ID_PATTERN.fullmatch(rid) is None:
+                continue  # a forged payload: its own job fails payload_invalid
+            jid, created = qj.enqueue(tx, DELETION_KIND, f"request:{rid}:r{seq}",
+                                      Priority.SAFETY, body)  # fmt: skip
+            if created:
+                out.append(jid)
+    except psycopg.Error as exc:
+        raise _database(exc) from None
+    except qj.IdempotencyConflict:
+        raise HoldStoreError("conflicting_duplicate", "a resumed job") from None
+    return out

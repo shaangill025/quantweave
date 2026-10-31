@@ -4,7 +4,9 @@ re-verification, which never needs or carries the record key (owner decision 104
 
 The body is `{ledger, tombstones, checkpoints}`, exact keys at every level:
 - `tombstones`: one record per stored row in `seq` order, exactly the domain
-  `Tombstone` plus `recorded_at` (the database's stamp) and `row_hash` (its seal,
+  `Tombstone` (its `backups_unknown` as 0059's `residual_backups_unknown`, owner
+  decision 114: a JSON boolean; true lists no backup and no expiry) plus
+  `recorded_at` (the database's stamp) and `row_hash` (its seal,
   `account_wire.seal` over `entry_hash`). The record is named only by its keyed
   pseudonym, never its id.
 - `checkpoints`: the stored `LedgerCheckpoint` rows (length, head, stamp, seal).
@@ -52,7 +54,7 @@ TOMBSTONE_KEYS = frozenset({"tenant_id", "seq", "record_hash", "cls", "job_id",
                             "requested_at", "deleted_at", "residual_backups",
                             "backup_expiry_at", "hash_scheme", "key_id",
                             "prev_hash", "entry_hash", "recorded_at",
-                            "row_hash"})  # fmt: skip
+                            "row_hash", "residual_backups_unknown"})  # fmt: skip
 CHECKPOINT_KEYS = frozenset({"tenant_id", "length", "head", "recorded_at",
                              "row_hash"})  # fmt: skip
 HEADER_KEYS = frozenset({"tenant_id", "length", "head", "hash_scheme", "key_id"})
@@ -137,12 +139,14 @@ def _tombstone(r: Mapping[str, Any], tenant: str) -> Tombstone:
         raise WireError("malformed", f"tombstone {seq}: class") from None
     req, dele = _at(r["requested_at"]), _at(r["deleted_at"])
     exp = _instant(r["backup_expiry_at"], nullable=True)
-    if cls is RetentionClass.PRIVACY or req > dele or (exp is not None and not kept):
+    unknown = r["residual_backups_unknown"]  # owner decision 114, 0059
+    if cls is RetentionClass.PRIVACY or req > dele or (exp is not None and not kept) \
+            or type(unknown) is not bool or (unknown and (kept or exp)):  # fmt: skip
         raise WireError("malformed", f"tombstone {seq}")
     return Tombstone(seq, tenant, _hex(r["record_hash"]), cls, _id(r["job_id"]),
                      req, dele, tuple(kept), exp, str(r["hash_scheme"]),
                      _hex(r["key_id"], _HEX32), _hex(r["prev_hash"]),
-                     _hex(r["entry_hash"]))  # fmt: skip
+                     _hex(r["entry_hash"]), unknown)  # fmt: skip
 
 
 def parse_section(tenant: str, body: Mapping[str, Any]) -> Parsed:
