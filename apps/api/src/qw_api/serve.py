@@ -9,9 +9,15 @@ once before serving (unreachable: `refused: database unavailable (<class or
 SQLSTATE>)`, exit 2). Plain settings: QW_ALLOWED_ORIGINS and QW_TRUSTED_PROXIES
 (comma-separated), QW_EDITION (hosted | self_hosted, default hosted),
 QW_JURISDICTION, QW_RELEASE_DEPLOYMENT_ID, QW_API_HOST (an IP address, default
-127.0.0.1) and QW_API_PORT (default 8000; 0 picks a free port). uvicorn runs with
+127.0.0.1), QW_API_PORT (default 8000; 0 picks a free port) and QW_WEB_DIR (owner
+decision 109: the built web app, an absolute directory with an index.html,
+served on the API's origin; unset, nothing static is served). uvicorn runs with
 no reload, no proxy-header rewriting (the app applies trusted_proxies itself), no
 access log (it would hold query strings) and no server header.
+
+`qw-api --check-config` reads and checks the same configuration (the file
+owner and mode rules apply to the user it runs as) without connecting anywhere:
+exit 0 and `config ok: qw-api`, or exit 2 and `refused: <variable>: <reason>`.
 """
 
 from __future__ import annotations
@@ -79,6 +85,22 @@ def _keyring(data: bytes) -> Keyring:
         raise ConfigError(name, str(exc)) from None
 
 
+def _web_dir(environ: Mapping[str, str]) -> str | None:
+    name, path = "QW_WEB_DIR", environ.get("QW_WEB_DIR")
+    if path is None:
+        return None
+    if not os.path.isabs(path):
+        raise ConfigError(name, "must be an absolute path")
+    if not os.path.isdir(path):
+        raise ConfigError(name, "not a directory")
+    index = os.path.realpath(os.path.join(path, "index.html"))
+    if os.path.commonpath([index, os.path.realpath(path)]) != os.path.realpath(path):
+        raise ConfigError(name, "index.html resolves outside the directory")
+    if not os.path.isfile(index):
+        raise ConfigError(name, "has no index.html file (build the web app)")
+    return path
+
+
 def config_from_env(environ: Mapping[str, str] = os.environ) -> ServeConfig:
     refuse_inline(environ, INLINE_SECRETS + LIBPQ_INLINE)
     raw_key = read_secret_file(environ, "QW_SECRET_KEY_FILE") or b""
@@ -90,6 +112,7 @@ def config_from_env(environ: Mapping[str, str] = os.environ) -> ServeConfig:
         ipaddress.ip_address(host)
     except ValueError:
         raise ConfigError("QW_API_HOST", "must be an IP address") from None
+    web_dir = _web_dir(environ)
     port_text = environ.get("QW_API_PORT", str(DEFAULT_PORT))
     if not (port_text.isascii() and port_text.isdigit() and int(port_text) < 65536):
         raise ConfigError("QW_API_PORT", "must be a port number")
@@ -106,6 +129,7 @@ def config_from_env(environ: Mapping[str, str] = os.environ) -> ServeConfig:
             jurisdiction=environ.get("QW_JURISDICTION") or None,
             notification_keys=None if keys is None else _keyring(keys),
             release_deployment_id=environ.get("QW_RELEASE_DEPLOYMENT_ID") or None,
+            web_dir=web_dir,
         )
     except ValueError as exc:  # Settings' messages name no secret
         raise ConfigError("settings", str(exc)) from None
@@ -113,9 +137,14 @@ def config_from_env(environ: Mapping[str, str] = os.environ) -> ServeConfig:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    argparse.ArgumentParser(prog="qw-api", description=__doc__).parse_args(argv)
+    parser = argparse.ArgumentParser(prog="qw-api", description=__doc__)
+    parser.add_argument("--check-config", action="store_true")
+    args = parser.parse_args(argv)
     try:
         config = config_from_env()
+        if args.check_config:
+            print("config ok: qw-api")
+            return 0
         # fail fast: exactly a qw_app login, never a superuser, and reachable
         check_runtime_login(config.database_url, "qw_app")
     except (ConfigError, DatabaseUnavailable, tenancy.TenancyError) as exc:

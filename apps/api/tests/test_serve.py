@@ -40,6 +40,7 @@ pg_admin_url, database_url, conn = (
 CANARY = "SYNTHETIC-canary-api-7c2e4a6b8d0f1e3a5c7b9d1f3e5a7c9b"
 KEY = "SYNTHETIC-qw-api-secret-key-000000000000"
 SCRIPT = Path(sys.executable).parent / "qw-api"
+INDEX = "<!doctype html><title>SYNTHETIC built page</title>"
 
 
 def private(path: Path, text: str, mode: int = 0o600) -> str:
@@ -182,7 +183,10 @@ def test_qw_api_serves_liveness_on_an_ephemeral_loopback_port(
     passfile = private(tmp_path / "app.pgpass", f"*:*:*:{app_login}\n")
     base = {k: v for k, v in conninfo_to_dict(database_url).items() if k != "password"}
     url = make_conninfo("", **{**base, "user": login, "passfile": passfile})
-    proc = run_script(env | {"QW_DATABASE_URL": url, "QW_API_PORT": "0"})
+    web = str(web_dir(tmp_path))
+    proc = run_script(
+        env | {"QW_DATABASE_URL": url, "QW_API_PORT": "0", "QW_WEB_DIR": web}
+    )
     lines: queue.Queue[str] = queue.Queue()
     assert proc.stdout is not None
     stdout = proc.stdout
@@ -205,6 +209,9 @@ def test_qw_api_serves_liveness_on_an_ephemeral_loopback_port(
         )
         assert httpx.head(f"{api}/health/live", timeout=10).status_code == 200
         assert httpx.get(f"{api}/nope", timeout=10).status_code == 404
+        page = httpx.get(api.removesuffix("/api/v1") + "/", timeout=10)
+        assert (page.status_code, page.text) == (200, INDEX)  # same origin
+        assert page.headers["x-frame-options"] == "DENY"
     finally:
         proc.send_signal(signal.SIGTERM)
         proc.wait(timeout=30)
@@ -230,3 +237,49 @@ def test_qw_api_refuses_a_superuser_database_login(
     proc = run_script(env | {"QW_DATABASE_URL": url})
     out, _ = proc.communicate(timeout=60)
     assert proc.returncode == 2 and "refused:" in out and "superuser" in out
+
+
+def web_dir(tmp_path: Path) -> Path:
+    web = tmp_path / "web"
+    web.mkdir()
+    (web / "index.html").write_text(INDEX)
+    return web
+
+
+def test_the_web_dir_is_checked(env: dict[str, str], tmp_path: Path) -> None:
+    assert serve.config_from_env(env).settings.web_dir is None
+    empty = tmp_path / "empty"
+    empty.mkdir()
+    (empty / "index.html").mkdir()  # a directory, not a page
+    (tmp_path / "outside.html").write_text(INDEX)
+    escaping = tmp_path / "escaping"
+    escaping.mkdir()
+    (escaping / "index.html").symlink_to(tmp_path / "outside.html")
+    for bad in ("web", str(tmp_path / "missing"), str(tmp_path / "outside.html"),
+                str(empty), str(escaping), ""):  # fmt: skip
+        assert refused(env | {"QW_WEB_DIR": bad}).startswith("QW_WEB_DIR"), bad
+    web = web_dir(tmp_path)
+    config = serve.config_from_env(env | {"QW_WEB_DIR": str(web)})
+    assert config.settings.web_dir == str(web)
+
+
+def check_config(env: dict[str, str]) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        [str(SCRIPT), "--check-config"], env={"PATH": os.environ["PATH"]} | env,
+        capture_output=True, text=True, timeout=60, check=False,
+    )  # fmt: skip
+
+
+def test_check_config_validates_without_connecting(
+    env: dict[str, str], tmp_path: Path
+) -> None:
+    passfile = conninfo_to_dict(env["QW_DATABASE_URL"])["passfile"]
+    # No server listens on this socket: a connection attempt would fail.
+    url = f"host={tmp_path / 'no-socket'} dbname=qw user=qw passfile={passfile}"
+    good = env | {"QW_DATABASE_URL": url, "QW_WEB_DIR": str(web_dir(tmp_path))}
+    proc = check_config(good)
+    assert (proc.returncode, proc.stdout, proc.stderr) == (0, "config ok: qw-api\n", "")
+    for bad in ({"QW_SECRET_KEY": CANARY}, {"QW_WEB_DIR": str(tmp_path)}):
+        proc = check_config(good | bad)
+        assert proc.returncode == 2 and proc.stderr.startswith("refused: ")
+        assert CANARY not in proc.stdout + proc.stderr and proc.stdout == ""

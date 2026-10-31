@@ -4,6 +4,8 @@ libpq connection string whose password is in a passfile (`file_secrets`). It nev
 runs 0001: a database without it (and the ledger grant the runner makes there) has
 not been through the superuser `db-init` job and is refused, as is a superuser, a
 login that is not a member of qw_migrate, or one connected under another role.
+`--check-config` checks QW_MIGRATE_DATABASE_URL and its passfile as the user it
+runs as, without connecting: exit 0 and `config ok: qw-migrate`, or exit 2.
 """
 
 from __future__ import annotations
@@ -91,13 +93,18 @@ def run(conninfo: str) -> list[int]:
 def main(
     argv: Sequence[str] | None = None, environ: Mapping[str, str] | None = None
 ) -> int:
-    argparse.ArgumentParser(prog="qw-migrate", description=__doc__).parse_args(argv)
+    parser = argparse.ArgumentParser(prog="qw-migrate", description=__doc__)
+    parser.add_argument("--check-config", action="store_true")
+    args = parser.parse_args(argv)
     env = os.environ if environ is None else environ
     try:
         conninfo = file_secrets.passfile_conninfo(env, URL_VARIABLE)
     except file_secrets.ConfigError as exc:
         print(f"refused: {exc}", file=sys.stderr)
         return 2
+    if args.check_config:
+        print("config ok: qw-migrate")
+        return 0
     try:
         done = run(conninfo)
     except MigrateRefused as exc:

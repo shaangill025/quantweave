@@ -118,6 +118,22 @@ def test_db_is_hardened_and_checked_over_tcp() -> None:
     assert db["security_opt"] == ["no-new-privileges:true"]
 
 
+def test_api_serves_the_built_web_app_and_checks_a_real_route() -> None:
+    """Decision 109: the web build is copied to the directory the api serves; the
+    health check names the real liveness route (all API routes are under
+    /api/v1, and anything else is a static path)."""
+    api = SERVICES["api"]
+    copied = re.search(r"^COPY --from=web /src/apps/web/dist (\S+)$", DOCKERFILE, re.M)
+    assert copied is not None
+    assert copied[1] == api["environment"]["QW_WEB_DIR"] == "/opt/qw/web"
+    assert "Not served" not in DOCKERFILE
+    probe = api["healthcheck"]["test"][-1]
+    assert "'http://127.0.0.1:8000/api/v1/health/live'" in probe
+    for name in APP:
+        if name != "api":
+            assert "QW_WEB_DIR" not in SERVICES[name]["environment"]
+
+
 def test_tmpfs_and_networks() -> None:
     for name in APP:
         (tmp,) = SERVICES[name]["tmpfs"]

@@ -64,8 +64,8 @@ RUN apt-get update \
  && rm -rf /usr/local/bin/pip* /usr/local/lib/python3.13/site-packages/pip \
       /usr/local/lib/python3.13/site-packages/pip-*.dist-info
 COPY --from=build /opt/qw/venv /opt/qw/venv
-# The built web app. Not served yet: the API's static file serving (decision 109)
-# is a later T060 increment.
+# The built web app; qw-api serves it on its own origin when QW_WEB_DIR names
+# this directory (compose sets it; decision 109).
 COPY --from=web /src/apps/web/dist /opt/qw/web
 ENV PATH=/opt/qw/venv/bin:$PATH PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
 USER 65534:65534

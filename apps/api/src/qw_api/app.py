@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import ipaddress
 import logging
+import os
 import re
 import secrets
 from collections.abc import Callable, Iterable, Mapping
@@ -25,6 +26,7 @@ from qw_adapters.tenancy import MAX_SESSION_TTL, Conn, TenantTx, ThrottlePolicy
 from qw_domain.release import Edition, Verifier
 from qw_domain.rights import Registry
 from starlette.exceptions import HTTPException as StarletteHTTPException
+from starlette.staticfiles import StaticFiles
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 if TYPE_CHECKING:
@@ -67,7 +69,10 @@ class Settings:
     `secret_key` leaves stored notifications valid. Unset, the feed is 503.
     `release_deployment_id` (owner decision 45): the release deployment this server
     runs as, the id the operator recorded with `qw-release-admin`; an id, never a
-    secret. Unset, the server belongs to no recorded deployment."""
+    secret. Unset, the server belongs to no recorded deployment.
+    `web_dir` (owner decision 109): an absolute directory of the built web app,
+    served on the API's origin for GET/HEAD paths outside /api; unset, nothing
+    static is served."""
 
     allowed_origins: frozenset[str]
     secret_key: bytes = field(repr=False)  # never in repr/str or logs
@@ -82,8 +87,11 @@ class Settings:
     jurisdiction: str | None = None
     notification_keys: Keyring | None = None
     release_deployment_id: str | None = None
+    web_dir: str | None = None
 
     def __post_init__(self) -> None:
+        if self.web_dir is not None and not os.path.isabs(self.web_dir):
+            raise ValueError("web_dir must be an absolute path")
         if self.release_deployment_id is not None and not _DEPLOYMENT_ID.fullmatch(
             self.release_deployment_id
         ):  # fmt: skip
@@ -273,6 +281,51 @@ class Envelope:
             log.info("%s %s %s cid=%s", scope["method"], route, status[0], cid)
 
 
+# On static responses only: the page may not be framed (clickjacking) and its
+# content types are not sniffed. Script/style CSP needs the real build (deferred).
+_STATIC_HEADERS = [(b"x-content-type-options", b"nosniff"),
+                   (b"x-frame-options", b"DENY"),
+                   (b"content-security-policy", b"frame-ancestors 'none'")]  # fmt: skip
+
+
+class WebAssets:
+    """The router's fallback (it runs only when no API route matched, after a
+    known path's 405): Starlette's StaticFiles over `directory` for GET/HEAD
+    outside /api, with `html=True` for `/` -> index.html. StaticFiles never lists
+    a directory, and with `follow_symlink=False` it resolves each path (and
+    symlink) and serves nothing outside the directory. Everything else is the
+    usual 404. The web app routes by URL hash, so no index.html fallback.
+    Nothing under `<directory>/api` is served, however the path is spelled
+    (`//api`, `/./api`, `/assets/../api`, or a symlink to it): the check uses the
+    normalised relative path StaticFiles itself serves, and its resolved target."""
+
+    def __init__(self, directory: str) -> None:
+        self.files = StaticFiles(directory=directory, html=True, follow_symlink=False)
+        self.api_dir = os.path.join(os.path.realpath(directory), "api")
+
+    def _reserved(self, scope: Scope) -> bool:
+        rel = self.files.get_path(scope)  # `//`, `.` and `..` resolved, as served
+        if rel.split(os.sep, 1)[0] == "api":
+            return True
+        try:
+            target = os.path.realpath(os.path.join(os.path.dirname(self.api_dir), rel))
+        except (ValueError, OSError):  # a NUL byte, an unresolvable path: 404
+            return True
+        return os.path.commonpath([target, self.api_dir]) == self.api_dir
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["method"] not in SAFE_METHODS or self._reserved(scope):
+            raise HTTPException(404)
+
+        async def headed(message: Message) -> None:
+            if message["type"] == "http.response.start":
+                headers = [*message.get("headers", []), *_STATIC_HEADERS]
+                message = {**message, "headers": headers}
+            await send(message)
+
+        await self.files(scope, receive, headed)
+
+
 def create_app(
     settings: Settings,
     connections: ConnectionProvider,
@@ -324,6 +377,8 @@ def create_app(
     app.include_router(simulations)
     app.include_router(strategies)
     app.include_router(watchlists)
+    if settings.web_dir is not None:
+        app.router.default = WebAssets(settings.web_dir)
     app.add_exception_handler(ApiError, problem)
     app.add_exception_handler(RequestValidationError, _on_validation)
     app.add_exception_handler(StarletteHTTPException, _on_http)

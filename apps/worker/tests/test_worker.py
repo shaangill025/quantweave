@@ -560,7 +560,7 @@ def test_entry_point_refuses_a_login_that_is_not_exactly_qw_worker(
                          ).format(sql.Identifier(mixed)))  # fmt: skip
     try:
         wrong = [runtime_urls["qw_app"], runtime_urls["qw_assessor"],
-                 make_conninfo(database_url, user=mixed)]  # fmt: skip
+                 make_conninfo(runtime_urls["qw_app"], user=mixed)]  # fmt: skip
         for url in wrong:
             monkeypatch.setenv("QW_DATABASE_URL", url)
             assert entry.main() == 1
@@ -573,6 +573,48 @@ def test_entry_point_refuses_a_login_that_is_not_exactly_qw_worker(
         terminate = "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE "
         conn.execute(sql.SQL(terminate + "usename = {}").format(sql.Literal(mixed)))
         conn.execute(sql.SQL("DROP ROLE {}").format(sql.Identifier(mixed)))
+
+
+CANARY = "SYNTHETIC-canary-worker-5d1f8b2a"
+
+
+def test_entry_point_reads_a_passfile_only_url_and_checks_config(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """T060: QW_DATABASE_URL goes through the same file_secrets passfile rules as
+    qw-api and qw-migrate, refused (exit 2) before any connection; `--check-config`
+    checks the configuration and never connects (no server is at this host)."""
+    for name in ("PGPASSWORD", "PGSERVICE", "PGSERVICEFILE",
+                 "QW_ASSESSOR_DATABASE_URL"):  # fmt: skip
+        monkeypatch.delenv(name, raising=False)
+    passfile = tmp_path / "worker.pgpass"
+    passfile.write_text(f"*:*:*:qw_worker_login:{CANARY}\n")
+    passfile.chmod(0o600)
+    url = f"host={tmp_path / 'no-socket'} dbname=qw user=qw_worker_login"
+    good = f"{url} passfile={passfile}"
+    monkeypatch.setenv("QW_DATABASE_URL", good)
+    assert entry.main(["--check-config"]) == 0
+    assert capsys.readouterr().out == "config ok: qw-worker\n"
+    assert entry.main(["--check-config", "extra"]) == 2
+    monkeypatch.setenv("QW_WORKER_POOL", "gpu")
+    assert entry.main(["--check-config"]) == 2
+    assert "invalid worker settings" in capsys.readouterr().err
+    monkeypatch.delenv("QW_WORKER_POOL")
+    for bad in (url, f"{good} password={CANARY}",
+                f"postgresql://w:{CANARY}@db/qw?passfile={passfile}"):  # fmt: skip
+        monkeypatch.setenv("QW_DATABASE_URL", bad)
+        for argv in ([], ["--check-config"]):
+            assert entry.main(argv) == 2
+            err = capsys.readouterr().err
+            assert err.startswith("refused: QW_DATABASE_URL") and CANARY not in err
+    monkeypatch.setenv("QW_DATABASE_URL", good)
+    monkeypatch.setenv("PGPASSWORD", CANARY)
+    assert entry.main([]) == 2
+    assert capsys.readouterr().err.startswith("refused: PGPASSWORD")
+    monkeypatch.delenv("PGPASSWORD")
+    passfile.chmod(0o644)
+    assert entry.main(["--check-config"]) == 2
+    assert "group or world" in capsys.readouterr().err
 
 
 def test_settings_validate_and_env_overrides() -> None:

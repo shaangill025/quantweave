@@ -1,6 +1,9 @@
 """`qw-worker` / `python -m qw_worker`: run the worker loop in the foreground (no
 daemonisation; a process supervisor owns restarts). The runtime database URL comes
-from QW_DATABASE_URL and must be exactly a qw_worker member (owner decision 17:
+from QW_DATABASE_URL, a libpq string whose password is in a checked passfile
+(`qw_adapters.file_secrets.passfile_conninfo`, as qw-api and qw-migrate; T060,
+owner decision 107: an inline password or PGPASSWORD is refused, exit 2), and must
+be exactly a qw_worker member (owner decision 17:
 `runtime_connection(..., role="qw_worker")` refuses a qw_app, qw_assessor or mixed
 login at startup); it refuses to start at all when QW_ASSESSOR_DATABASE_URL is set
 (owner decision 40: only `qw-assessor` holds the assessor login); settings from
@@ -12,13 +15,18 @@ standard-pool worker also runs the budget-sweep timer (owner decision 100) every
 experiment-pool worker runs no timer. No publish
 target is passed, so the outbox relay is off and events stay pending: a real
 transport needs explicit owner authorisation.
+
+`qw-worker --check-config` checks the same configuration as the user it runs as
+and never connects: exit 0 and `config ok: qw-worker`, or exit 2 and the reason.
 """
 
 import logging
 import os
 import sys
+from collections.abc import Sequence
 
 from qw_adapters import tenancy
+from qw_adapters.file_secrets import ConfigError, passfile_conninfo
 from qw_domain.jobs import Pool
 
 from qw_worker import budget_sweep, optimizer_cycle
@@ -26,21 +34,30 @@ from qw_worker.config import settings_from_env
 from qw_worker.loop import Worker, install_signal_handlers
 
 
-def main() -> int:
+def main(argv: Sequence[str] | None = None) -> int:
+    args = list(sys.argv[1:] if argv is None else argv)
+    check = "--check-config" in args
+    if check and args != ["--check-config"]:
+        print("usage: qw-worker [--check-config]", file=sys.stderr)
+        return 2
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(message)s")
     if os.environ.get("QW_ASSESSOR_DATABASE_URL"):  # owner decision 40
         print("refused: QW_ASSESSOR_DATABASE_URL is set; the assessor login is for "
               "qw-assessor only", file=sys.stderr)  # fmt: skip
         return 1
-    conninfo = os.environ.get("QW_DATABASE_URL")
-    if not conninfo:
-        print("need QW_DATABASE_URL", file=sys.stderr)
+    try:
+        conninfo = passfile_conninfo(os.environ, "QW_DATABASE_URL")
+    except ConfigError as exc:  # names the variable and reason, never a value
+        print(f"refused: {exc}", file=sys.stderr)
         return 2
     try:
         settings = settings_from_env()
     except ValueError as exc:
         print(f"invalid worker settings: {exc}", file=sys.stderr)
         return 2
+    if check:
+        print("config ok: qw-worker")
+        return 0
     try:
         with tenancy.runtime_connection(conninfo, role="qw_worker") as conn:
             handlers = {**optimizer_cycle.HANDLERS, **budget_sweep.HANDLERS}

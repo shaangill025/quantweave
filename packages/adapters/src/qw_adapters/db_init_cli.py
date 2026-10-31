@@ -16,6 +16,8 @@ a member of its group alone; an existing login of that group gets the new
 verifier (rotation); an existing role that is not exactly that is refused.
 
 Exit 0 on success, 2 for configuration, 1 for a refusal or a database failure.
+`--check-config` runs the configuration checks only, as the user it runs as, and
+never connects: exit 0 and `config ok: qw-db-init`, or exit 2.
 """
 
 from __future__ import annotations
@@ -150,7 +152,9 @@ def run(conn: Conn, logins: Mapping[str, tuple[str, str]]) -> list[str]:
 def main(
     argv: Sequence[str] | None = None, environ: Mapping[str, str] | None = None
 ) -> int:
-    argparse.ArgumentParser(prog="qw-db-init", description=__doc__).parse_args(argv)
+    parser = argparse.ArgumentParser(prog="qw-db-init", description=__doc__)
+    parser.add_argument("--check-config", action="store_true")
+    args = parser.parse_args(argv)
     env = os.environ if environ is None else environ
     try:
         refuse_inline(env, LIBPQ_INLINE)
@@ -161,6 +165,9 @@ def main(
     except ConfigError as exc:
         print(f"refused: {exc}", file=sys.stderr)
         return 2
+    if args.check_config:
+        print("config ok: qw-db-init")
+        return 0
     try:
         with psycopg.connect(conninfo, autocommit=True) as conn:
             report = run(conn, logins)
