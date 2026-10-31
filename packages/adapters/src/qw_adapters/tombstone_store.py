@@ -35,9 +35,10 @@ LedgerCheckpoint; R052, R087, R088).
   failure domain must be a prefix of the stored ledger. Any failure is
   `integrity`. The stored checkpoint shares the database's failure domain: it
   cannot detect a rollback of the whole database; only the caller's anchor can.
-- `export_tombstones(tx)` returns every stored row of both tables, re-verified
-  first; read-only, only in a snapshot transaction (`tenancy.require_snapshot`).
-  The T057 `audit/tombstones.json` section is not wired to it yet.
+- `export_tombstones(tx)` is the T057 `audit/tombstones.json` body
+  (`qw_domain.tombstone_wire`): every stored row of both tables, re-verified
+  first, and the closed `ledger` header (length, head, scheme and `key_id`);
+  read-only, only in a snapshot transaction (`tenancy.require_snapshot`).
 - Errors: `forbidden` (no grant: only qw_worker writes; qw_app and qw_worker
   read), `argument`, `database`, `integrity` and the codes above.
 """
@@ -68,6 +69,7 @@ from qw_domain.retention import (
     record_hash,
     verify,
 )
+from qw_domain.tombstone_wire import header
 
 from qw_adapters.tenancy import TenantTx, require_snapshot
 
@@ -286,14 +288,14 @@ def append(tx: TenantTx, key: RecordKey | None, decision: Decision, plan: Plan,
     return t, True
 
 
-def export_tombstones(tx: TenantTx) -> dict[str, list[dict[str, Any]]]:
+def export_tombstones(tx: TenantTx) -> dict[str, Any]:
     """Every stored row, re-verified first (`integrity` on any failure). The
     snapshot alone makes it consistent, so no lock is taken."""
     require_snapshot(tx)
     raw = _read(tx)
     _load(tx, None, raw)
     tenant = str(tx.tenant_id)
-    out: dict[str, list[dict[str, Any]]] = {}
+    out: dict[str, Any] = {}
     for name, rows, cols in (("tombstones", raw[0], _T_COLS),
                              ("checkpoints", raw[1], _C_COLS)):  # fmt: skip
         out[name] = []
@@ -305,4 +307,4 @@ def export_tombstones(tx: TenantTx) -> dict[str, list[dict[str, Any]]]:
             if "residual_backups" in d:
                 d["residual_backups"] = list(d["residual_backups"])
             out[name].append(d)
-    return out
+    return {"ledger": header(tenant, out["tombstones"]), **out}

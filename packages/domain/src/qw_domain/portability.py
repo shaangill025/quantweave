@@ -31,8 +31,14 @@ the ZIP container is `qw_adapters.export_archive`.
     replayed (`account_seal`, `account_chain`, `account_lifecycle`,
     `account_text`, `mapping_replay`). Stored facts only: no derived status,
     cash basis, data state or sizing field, and no credential.
-  Tombstones are `section_not_ready`: the T058 ledger is persisted (0057,
-  `qw_adapters.tombstone_store.export_tombstones`), but no section reads it yet.
+  - `audit/tombstones.json` (increment 5): the T058 ledger (0057,
+    `qw_adapters.tombstone_store.export_tombstones`) as `{ledger, tombstones,
+    checkpoints}` (`qw_domain.tombstone_wire`). Without the key, each entry hash
+    is recomputed, the chain, seals and checkpoints are checked, one known
+    `hash_scheme` and one `key_id` per chain (`tombstone_*` codes), and the
+    closed `ledger` header (where the contract manifest has no field) declares
+    the key a destination needs to match tombstones to re-imported records.
+  Every section is open.
 - The value scan refuses high-confidence secret formats only (defence in depth).
 - Only `build_export` and `licensed_evidence` make an `ExportBundle` or a
   `LicensedDecision`; their constructors raise. A decision records each item's T021
@@ -68,6 +74,7 @@ from qw_domain import ledger_wire as lw
 from qw_domain import personal_adaptation as pa
 from qw_domain import policy as dp
 from qw_domain import rights
+from qw_domain import tombstone_wire as tw
 from qw_domain import watchlists as wl
 from qw_domain.decimals import safe_repr
 from qw_domain.instants import InstantError, format_instant, parse_instant
@@ -80,6 +87,7 @@ EVIDENCE_PATH = "research/evidence.json"
 JOURNAL_PATH, POLICIES_PATH = "financial/journal.json", "policy/policies.json"
 WATCHLISTS_PATH = "research/watchlists.json"
 ACCOUNTS_PATH = "financial/accounts.json"
+TOMBSTONES_PATH = "audit/tombstones.json"
 MAX_PATH, MAX_DEPTH = 255, 32
 DECISION_MAX_AGE = timedelta(minutes=10)
 CLASSES = frozenset({"financial", "policy", "research", "private_learning", "audit",
@@ -90,7 +98,7 @@ SECTIONS: Mapping[str, str] = MappingProxyType({  # path -> ManifestFile content
     POLICIES_PATH: "policy",
     WATCHLISTS_PATH: "research",
     EVIDENCE_PATH: "research",
-    "audit/tombstones.json": "audit",
+    TOMBSTONES_PATH: "audit",
     **ls.PATHS,  # the T052 learned-state files
 })  # fmt: skip
 OMISSION_CLASSES = frozenset({"licensed_evidence", "credential", "approval",
@@ -166,11 +174,14 @@ _ACCOUNTS: Shape = {
 _ACCOUNT_CODES = {"seal": "account_seal", "chain": "account_chain",
                   "lifecycle": "account_lifecycle", "text": "account_text",
                   "replay": "mapping_replay", "malformed": "malformed"}  # fmt: skip
+_TOMBSTONES: Shape = {"ledger": _leaves(*tw.HEADER_KEYS),
+                      "tombstones": _leaves(*tw.TOMBSTONE_KEYS),
+                      "checkpoints": _leaves(*tw.CHECKPOINT_KEYS)}  # fmt: skip
 TENANT_SECTIONS: Mapping[str, Shape] = {JOURNAL_PATH: _JOURNAL,
                                         POLICIES_PATH: _VERSION_ROW,
                                         WATCHLISTS_PATH: _WATCHLIST}  # fmt: skip
 OPEN_SECTIONS = frozenset({*ls.PATHS, EVIDENCE_PATH, *TENANT_SECTIONS,
-                           ACCOUNTS_PATH})  # fmt: skip
+                           ACCOUNTS_PATH, TOMBSTONES_PATH})  # fmt: skip
 # "-----BEGIN" and "-----begin" in base64 at each of the 3 byte offsets
 _B64_PEM = ("LS0tLS1CRUdJT", "tLS0tQkVHSU", "LS0tLUJFR0lO", "LS0tLS1iZWdpb",
             "tLS0tYmVnaW", "LS0tLWJlZ2lu")  # fmt: skip
@@ -239,6 +250,15 @@ class Refusal(StrEnum):
     ACCOUNT_LIFECYCLE = "account_lifecycle"
     ACCOUNT_TEXT = "account_text"
     MAPPING_REPLAY = "mapping_replay"
+    TOMBSTONE_SCHEME = "tombstone_scheme"
+    TOMBSTONE_KEY = "tombstone_key"
+    TOMBSTONE_ENTRY = "tombstone_entry"
+    TOMBSTONE_CHAIN = "tombstone_chain"
+    TOMBSTONE_DUPLICATE = "tombstone_duplicate"
+    TOMBSTONE_TIME = "tombstone_time"
+    TOMBSTONE_SEAL = "tombstone_seal"
+    TOMBSTONE_CHECKPOINT = "tombstone_checkpoint"
+    TOMBSTONE_HEADER = "tombstone_header"
     SECRET_VALUE = "secret_value"
     OMISSION = "omission"
     DECISION = "decision"
@@ -451,6 +471,26 @@ def _accounts(body: object, scope_id: str | None) -> None:
         raise _refuse(code, f"{ACCOUNTS_PATH}: {e}") from None
 
 
+def _tombstones(body: object, scope_id: str | None) -> None:
+    """Exact keys; every row and the header the scope's; then re-verified without
+    the key (`qw_domain.tombstone_wire`)."""
+    if scope_id is None:  # the entry hashes cover the tenant
+        raise _refuse(Refusal.SCOPE_MISMATCH, f"{TOMBSTONES_PATH}: no scope")
+    if not isinstance(body, dict) or not isinstance(body.get("ledger"), dict):
+        raise _refuse(Refusal.MALFORMED, f"{TOMBSTONES_PATH}: an object")
+    _conform(body, _TOMBSTONES, TOMBSTONES_PATH, exact=True)
+    rows = _rows(body["tombstones"], TOMBSTONES_PATH)
+    rows = [body["ledger"], *rows, *_rows(body["checkpoints"], TOMBSTONES_PATH)]
+    if any(r["tenant_id"] != scope_id for r in rows):
+        raise _refuse(Refusal.SCOPE_MISMATCH, TOMBSTONES_PATH)
+    try:
+        tw.parse_section(scope_id, body)
+    except tw.WireError as e:
+        plain = {"malformed": Refusal.MALFORMED, "scope": Refusal.SCOPE_MISMATCH}
+        code = plain.get(e.code) or Refusal(f"tombstone_{e.code}")
+        raise _refuse(code, f"{TOMBSTONES_PATH}: {e}") from None
+
+
 def _watchlists(rows: list[dict[str, Any]], scope_id: str | None) -> None:
     """Unique ids in order; each entry rebuilds (`qw_domain.watchlists`) and
     re-encodes exactly, entries in strict instrument order."""
@@ -506,9 +546,11 @@ def check_section(path: str, body: object, scope_id: str | None = None) -> list[
     values."""
     if path not in OPEN_SECTIONS:
         raise _refuse(Refusal.SECTION_NOT_READY, path)
-    if path in (JOURNAL_PATH, ACCOUNTS_PATH):
+    whole = {JOURNAL_PATH: _journal, ACCOUNTS_PATH: _accounts,
+             TOMBSTONES_PATH: _tombstones}  # fmt: skip
+    if path in whole:
         values = scan(body)
-        (_journal if path == JOURNAL_PATH else _accounts)(body, scope_id)
+        whole[path](body, scope_id)
         return values
     if path in TENANT_SECTIONS:
         values = scan(body)
