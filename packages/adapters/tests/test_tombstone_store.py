@@ -368,7 +368,7 @@ def test_export_is_snapshot_only_and_lossless(
         st.export_tombstones(tx)
     with tn.tenant_transaction(app_conn, t, snapshot=True) as tx:
         out = st.export_tombstones(tx)
-    assert sorted(out) == ["checkpoints", "tombstones"]
+    assert sorted(out) == ["checkpoints", "ledger", "tombstones"]
     assert [r["entry_hash"] for r in out["tombstones"]] == [
         e.entry_hash for e in stored.entries
     ]

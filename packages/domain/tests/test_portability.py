@@ -117,12 +117,8 @@ def test_round_trip_of_open_sections_is_inert() -> None:
     Draft202012Validator(project_contract.schema("evidence")).validate(ev())
 
 
-@pytest.mark.parametrize("path", sorted(set(pt.SECTIONS) - pt.OPEN_SECTIONS))
-def test_sections_without_a_structure_are_closed(path: str) -> None:
-    assert refused(build, {path: []}) is R.SECTION_NOT_READY
-    cls = pt.SECTIONS[path]
-    assert refused(pt.verify_import, one_file(path, b"[]", cls=cls), {path: b"[]"}) is (
-        R.SECTION_NOT_READY)  # fmt: skip
+def test_every_section_has_a_structure() -> None:
+    assert set(pt.SECTIONS) == pt.OPEN_SECTIONS  # T057 increment 5: tombstones
     assert refused(build, {"secrets/vault.json": []}) is R.SECTION_UNKNOWN
 
 

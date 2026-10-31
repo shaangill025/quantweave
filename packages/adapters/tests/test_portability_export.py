@@ -1,19 +1,25 @@
-"""The journal, policy, watchlist and account export functions (T057 increments 2
-to 4) on PostgreSQL 16: a SYNTHETIC tenant is exported as the non-superuser qw_app login
-(conftest), under RLS in a snapshot transaction, then built, archived, read back and
-verified. The superuser `conn` only plays a tampering owner where a test says so.
-The oracle for each row is the stored history the stores already verify
-(`load_journal`, `revision`, `load`, `page`, `account_store.load`).
+"""The journal, policy, watchlist, account and tombstone export functions (T057
+increments 2 to 5; tombstones are appended as the qw_worker login) on PostgreSQL
+16: a SYNTHETIC tenant is exported as the non-superuser qw_app login (conftest),
+under RLS in a snapshot transaction, then built, archived, read back and verified.
+The superuser `conn` only plays a tampering owner where a test says so. The oracle
+for each row is the stored history the stores already verify (`load_journal`,
+`revision`, `load`, `page`, `account_store.load`).
 """
 
 from __future__ import annotations
 
+import base64
 import copy
+import hashlib
+import hmac
+import json
 import unicodedata
 import uuid
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
-from typing import Any
+from typing import Any, cast
 
 import psycopg
 import pytest
@@ -23,11 +29,14 @@ from qw_adapters import journal_store as js
 from qw_adapters import policy_store as ps
 from qw_adapters import simulation_store as ss
 from qw_adapters import tenancy as tn
+from qw_adapters import tombstone_store as tb
 from qw_adapters import watchlist_store as ws
 from qw_adapters.export_archive import read_archive, write_archive
 from qw_domain import account_wire as aw
 from qw_domain import ledger_wire as lw
 from qw_domain import portability as pt
+from qw_domain import retention as rt
+from qw_domain import tombstone_wire as tw
 from qw_domain import watchlists as wl
 from qw_domain.corporate_actions import PositiveRatio, SourceRef, Split
 from qw_domain.decimals import Money, PositiveQuantity, Price, Quantity
@@ -58,6 +67,7 @@ from test_portability_tenant_sections import draft  # SYNTHETIC answers
 
 Conn = psycopg.Connection[TupleRow]
 J, P, W, A = pt.JOURNAL_PATH, pt.POLICIES_PATH, pt.WATCHLISTS_PATH, pt.ACCOUNTS_PATH
+T = pt.TOMBSTONES_PATH
 SYN = InstrumentId(uuid.UUID("00000000-0000-4000-8000-00000000005a"))
 ACK = "SYNTHETIC: I adopt this"
 COND = Condition("price_cross", "gt", ("100.25",), "feed-synth-iex", "SYNTHETIC")
@@ -146,7 +156,8 @@ def seed(app_conn: Conn, record: str) -> Tenant:
 def export(app_conn: Conn, t: Tenant, page: int = 500) -> dict[str, Any]:
     with tn.tenant_transaction(app_conn, t.id, snapshot=True) as tx:
         return {J: js.export_journal(tx, page), P: ps.export_policies(tx, page),
-                W: ws.export_watchlists(tx), A: st.export_accounts(tx)}  # fmt: skip
+                W: ws.export_watchlists(tx), A: st.export_accounts(tx),
+                T: tb.export_tombstones(tx)}  # fmt: skip
 
 
 @pytest.mark.db
@@ -217,7 +228,7 @@ def test_another_tenants_rows_never_appear(app_conn: Conn) -> None:
     later = parse_instant(sa[J]["events"][-1]["recorded_at"]) + timedelta(days=1)
     assert {r["tenant_id"] for rows in sa[A].values() for r in rows} == {str(a.id)}
     assert sa[A]["accounts"] != sb[A]["accounts"]  # the same ids, other hashes
-    for path in (J, W, A):  # b's sections under a's scope
+    for path in (J, W, A, T):  # b's sections under a's scope
         with pytest.raises(pt.PortabilityError) as e:
             pt.build_export("export-synth-1", str(a.id), later, {path: sb[path]})
         assert e.value.code is pt.Refusal.SCOPE_MISMATCH
@@ -282,7 +293,7 @@ def test_a_revision_gap_is_never_exported(app_conn: Conn, conn: Conn) -> None:
 def test_exports_need_a_read_only_snapshot(app_conn: Conn) -> None:
     a = seed(app_conn, "a")
     for fn in (js.export_journal, ps.export_policies, ws.export_watchlists,
-               st.export_accounts):  # fmt: skip
+               st.export_accounts, tb.export_tombstones):  # fmt: skip
         with tn.tenant_transaction(app_conn, a.id) as tx, pytest.raises(
             tn.SnapshotRequired):  # fmt: skip
             fn(tx)
@@ -709,3 +720,341 @@ def test_account_tampering_is_refused_on_export_and_import(
                  "AND source_id = 'SYN-YAHOO'", (a.id,))  # fmt: skip
     with pytest.raises(st.AccountStoreError, match="integrity"):
         export(app_conn, a)
+
+
+# --- the `audit/tombstones.json` section (T057 increment 5): deletions appended
+# as qw_worker with a SYNTHETIC key (decision 104), exported as qw_app, then
+# re-verified without the key.
+RAW = b"SYNTHETIC-test-record-key-0123456789"  # test only
+KEY = rt.RecordKey(RAW)
+SECRET = "SYNTHETIC-private-note-content"  # the deletion acknowledgement
+
+R = pt.Refusal
+IDS = ("acct-004217", "acct-000815")  # guessable, as decision 104 assumes
+OTHER = rt.RecordKey(b"SYNTHETIC-another-installation-key-0123")
+Body = dict[str, Any]
+
+
+def clock(conn: Conn) -> datetime:
+    row = conn.execute("SELECT clock_timestamp()").fetchone()
+    assert row is not None
+    return cast(datetime, row[0])
+
+
+def deleted(worker_conn: Conn, t: uuid.UUID) -> tuple[rt.Plan, rt.Backup]:
+    """A SYNTHETIC deletion of the two research records IDS (and a retained
+    financial one), with one residual backup."""
+    now = clock(worker_conn)
+    bk = rt.backup("bk-synth-1", now - DAY * 2, now - DAY * 2)
+    research, fin = rt.RetentionClass.RESEARCH, rt.RetentionClass.FINANCIAL
+    items = [rt.Item(str(t), r, research, now - DAY * 9) for r in IDS]
+    items.append(rt.Item(str(t), "rec-fin", fin, now - DAY * 9))
+    req = rt.DeletionRequest("del-synth-1", str(t), "scope-1", frozenset(
+        {research, fin}), now - timedelta(seconds=1), "reauth-1", SECRET)  # fmt: skip
+    p = rt.plan(req, items, rt.owner_defaults(), rt.Holds(), KEY)
+    for d in p.decisions:
+        if d.action is rt.Action.DELETE:
+            with tn.tenant_transaction(worker_conn, t) as tx:
+                assert tb.append(tx, KEY, d, p, (bk,))[1]
+    return p, bk
+
+
+def load(app_conn: Conn, t: uuid.UUID) -> tb.StoredLedger:
+    with tn.tenant_transaction(app_conn, t) as tx:
+        return tb.load(tx)
+
+
+def bundle_of(t: Tenant, sections: dict[str, Any]) -> pt.ExportBundle:
+    stamps = [parse_instant(r["recorded_at"]) for r in sections[T]["tombstones"]]
+    at = max([*stamps, *(parse_instant(r["recorded_at"])
+                         for r in sections[pt.JOURNAL_PATH]["events"])])  # fmt: skip
+    return pt.build_export("export-synth-1", str(t.id), at + timedelta(seconds=1),
+                           sections)  # fmt: skip
+
+
+def _tomb(r: Body) -> rt.Tombstone:  # unvalidated, to recompute a tampered hash
+    exp = r["backup_expiry_at"]
+    return rt.Tombstone(r["seq"], r["tenant_id"], r["record_hash"],
+                        cast(Any, r["cls"]), r["job_id"],
+                        parse_instant(r["requested_at"]),
+                        parse_instant(r["deleted_at"]),
+                        tuple(r["residual_backups"]),
+                        None if exp is None else parse_instant(exp),
+                        r["hash_scheme"], r["key_id"], r["prev_hash"],
+                        "")  # fmt: skip
+
+
+def fix(b: Body, rehash: bool = True, rechain: bool = False,
+        heads: bool = True) -> Body:  # fmt: skip
+    """Recomputes what a forger could: entry hashes (`rehash`), links (`rechain`),
+    seals, checkpoint heads (`heads`) and the header."""
+    rows, prev = b["tombstones"], rt.GENESIS
+    for r in rows:
+        r["prev_hash"] = prev if rechain else r["prev_hash"]
+        r["entry_hash"] = rt.entry_hash(_tomb(r)) if rehash else r["entry_hash"]
+        r["row_hash"] = tb.seal(r["entry_hash"], parse_instant(r["recorded_at"]))
+        prev = r["entry_hash"]
+    for c in b["checkpoints"]:
+        if heads and 0 < c["length"] <= len(rows):
+            c["head"] = rows[c["length"] - 1]["entry_hash"]
+        c["row_hash"] = tb.seal(c["head"], parse_instant(c["recorded_at"]))
+    b["ledger"] = tw.header(b["ledger"]["tenant_id"], rows)
+    return b
+
+
+def _set(path: str, value: object, **how: bool) -> Callable[[Body], Body]:
+    def edit(b: Body) -> Body:
+        *parents, leaf = path.split(".")
+        obj: Any = b
+        for p in parents:
+            obj = obj[int(p)] if p.lstrip("-").isdigit() else obj[p]
+        if value is KeyError:
+            del obj[leaf]
+        else:
+            obj[leaf] = value(b) if callable(value) else value
+        return fix(b, **how) if how else b
+
+    return edit
+
+
+def _drop(name: str, n: int, **how: bool) -> Callable[[Body], Body]:
+    def edit(b: Body) -> Body:
+        del b[name][n]
+        return fix(b, **how)
+
+    return edit
+
+
+def _earlier(b: Body) -> str:
+    at = parse_instant(b["tombstones"][0]["deleted_at"]) - timedelta(microseconds=1)
+    return format_instant(at)
+
+
+def _after(b: Body) -> str:
+    at = parse_instant(b["tombstones"][1]["recorded_at"]) + timedelta(microseconds=1)
+    return format_instant(at)
+
+
+def _scheme(b: Body) -> Body:
+    for r in b["tombstones"]:
+        r["hash_scheme"] = "qw-record-hmac-9"
+    return fix(b, rechain=True)
+
+
+def _beyond(b: Body) -> Body:
+    last = b["checkpoints"][-1]
+    b["checkpoints"].append({**last, "length": last["length"] + 1})
+    return fix(b, heads=False)
+
+
+NO = {"rehash": False}
+CASES: list[tuple[str, Callable[[Body], Body], R]] = [
+    ("forged entry hash", lambda b: _set("tombstones.1.prev_hash", "ab" * 32, **NO)(
+        _set("tombstones.0.entry_hash", "ab" * 32)(b)), R.TOMBSTONE_ENTRY),
+    ("record hash, entry not rehashed", _set("tombstones.0.record_hash", "cd" * 32,
+                                             **NO), R.TOMBSTONE_ENTRY),
+    ("job id, entry not rehashed", _set("tombstones.0.job_id", "del-other", **NO),
+     R.TOMBSTONE_ENTRY),
+    ("broken link", _set("tombstones.1.prev_hash", "cd" * 32, rehash=True),
+     R.TOMBSTONE_CHAIN),
+    ("record hash rehashed, not relinked", _set("tombstones.0.record_hash",
+                                                "cd" * 32, rehash=True),
+     R.TOMBSTONE_CHAIN),
+    ("renumbered", _set("tombstones.1.seq", 2, rehash=True), R.TOMBSTONE_CHAIN),
+    ("first dropped", _drop("tombstones", 0), R.TOMBSTONE_CHAIN),
+    ("deletion time backwards", _set("tombstones.1.deleted_at", _earlier,
+                                     rechain=True), R.TOMBSTONE_CHAIN),
+    ("checkpoint not the head", _set("checkpoints.0.head",
+                                     lambda b: b["tombstones"][1]["entry_hash"],
+                                     heads=False), R.TOMBSTONE_CHECKPOINT),
+    ("latest checkpoint dropped", _drop("checkpoints", -1), R.TOMBSTONE_CHECKPOINT),
+    ("checkpoint past the end", _beyond, R.TOMBSTONE_CHECKPOINT),
+    ("checkpoint before its entry", _set("checkpoints.0.recorded_at",
+                                         "2020-01-01T00:00:00Z", rechain=True),
+     R.TOMBSTONE_CHECKPOINT),
+    ("mixed key id", _set("tombstones.1.key_id", OTHER.key_id, rechain=True),
+     R.TOMBSTONE_KEY),
+    ("unknown scheme", _scheme, R.TOMBSTONE_SCHEME),
+    ("seal", _set("tombstones.0.row_hash", "ef" * 32), R.TOMBSTONE_SEAL),
+    ("stamp order", _set("tombstones.0.recorded_at", lambda b: format_instant(
+        parse_instant(b["tombstones"][1]["recorded_at"]) + DAY), rechain=True),
+     R.TOMBSTONE_SEAL),
+    ("header head", _set("ledger.head", rt.GENESIS), R.TOMBSTONE_HEADER),
+    ("header key", _set("ledger.key_id", OTHER.key_id), R.TOMBSTONE_HEADER),
+    ("header length true for 1", lambda b: _set("ledger.length", True)(_drop(
+        "checkpoints", -1)(_drop("tombstones", -1)(b))), R.TOMBSTONE_HEADER),
+    ("extra tombstone key", _set("tombstones.0.record_id", IDS[0]), R.UNKNOWN_FIELD),
+    ("extra header key", _set("ledger.key", RAW.hex()), R.UNKNOWN_FIELD),
+    ("extra checkpoint key", _set("checkpoints.0.key_id", KEY.key_id),
+     R.UNKNOWN_FIELD),
+    ("extra section key", _set("key", RAW.hex()), R.UNKNOWN_FIELD),
+    ("missing key", _set("tombstones.0.row_hash", KeyError), R.FIELD_MISSING),
+    ("foreign row", _set("tombstones.0.tenant_id", str(uuid.uuid4())),
+     R.SCOPE_MISMATCH),
+    ("seq true", _set("tombstones.0.seq", True), R.MALFORMED),
+    ("seq true for 1, recomputed", _set("tombstones.1.seq", True, rechain=True),
+     R.MALFORMED),
+    ("checkpoint length true for 1", _set("checkpoints.0.length", True),
+     R.MALFORMED),
+    ("record hash repeated", _set("tombstones.1.record_hash", lambda b: b[
+        "tombstones"][0]["record_hash"], rechain=True), R.TOMBSTONE_DUPLICATE),
+    ("deleted after recorded", _set("tombstones.1.deleted_at", _after,
+                                    rechain=True), R.TOMBSTONE_TIME),
+    ("privacy class", _set("tombstones.0.cls", "privacy", rechain=True),
+     R.MALFORMED),
+    ("backups unsorted", _set("tombstones.0.residual_backups", ["bk-z", "bk-a"],
+                              rechain=True), R.MALFORMED),
+    ("backups repeated", _set("tombstones.0.residual_backups", ["bk-a", "bk-a"],
+                              rechain=True), R.MALFORMED),
+    ("instant not canonical", _set("tombstones.0.deleted_at", lambda b: b[
+        "tombstones"][0]["deleted_at"].replace("Z", "+00:00")), R.MALFORMED),
+    ("key id not hex", _set("tombstones.0.key_id", "K" * 32), R.MALFORMED),
+]  # fmt: skip
+
+
+@pytest.mark.db
+def test_round_trip_of_every_store_section(worker_conn: Conn, app_conn: Conn) -> None:
+    a = seed(app_conn, "a")
+    deleted(worker_conn, a.id)
+    sections = export(app_conn, a)
+    assert set(sections) == {pt.JOURNAL_PATH, pt.POLICIES_PATH, pt.WATCHLISTS_PATH,
+                             pt.ACCOUNTS_PATH, T}  # fmt: skip
+    bundle = bundle_of(a, sections)
+    report = read_archive(write_archive(bundle))
+    assert report.data == sections and report.pending_reconnections == ()
+    got = tw.parse_section(str(a.id), cast(Body, report.data[T]))  # no key
+    stored = load(app_conn, a.id)
+    assert (got.entries, got.checkpoint) == (stored.entries, stored.checkpoint)
+    assert (got.hash_scheme, got.key_id) == (rt.HASH_SCHEME, KEY.key_id)
+    assert sections[T]["ledger"] == {
+        "tenant_id": str(a.id), "length": 2, "head": stored.checkpoint.head,
+        "hash_scheme": rt.HASH_SCHEME, "key_id": KEY.key_id}  # fmt: skip
+    assert {e.residual_backups for e in got.entries} == {("bk-synth-1",)}
+
+
+@pytest.mark.db
+def test_the_destination_needs_the_same_key(worker_conn: Conn,
+                                            app_conn: Conn) -> None:  # fmt: skip
+    a = seed(app_conn, "a")
+    p, bk = deleted(worker_conn, a.id)
+    body = read_archive(write_archive(bundle_of(a, export(app_conn, a)))).data[T]
+    got = tw.parse_section(str(a.id), cast(Body, body))
+    tw.check_key(got, KEY)
+    for ledger, key, why in ((got, OTHER, "key_mismatch"),
+                             (got, None, "key_unavailable"),
+                             (cast(Body, body)["ledger"], KEY, "argument"),
+                             ({}, KEY, "argument")):  # fmt: skip
+        with pytest.raises(tw.WireError) as e:
+            tw.check_key(cast(tw.Parsed, ledger), key)
+        assert e.value.code == why  # detected up front, from the header
+    created = p.decisions[0].created_at
+    items = tuple(rt.Item(str(a.id), r, rt.RetentionClass.RESEARCH, created)
+                  for r in (*IDS, "acct-live"))  # fmt: skip
+    snap = rt.Snapshot(bk, items, ())
+    at = clock(worker_conn)
+    back = rt.restore(snap, got.entries, got.checkpoint, at, key=KEY)
+    assert [i.record_id for i in back.items] == ["acct-live"]  # carried key
+    with pytest.raises(rt.RetentionError) as err:  # never a silent miss
+        rt.restore(snap, got.entries, got.checkpoint, at, key=OTHER)
+    assert err.value.code == "key_mismatch"
+
+
+@pytest.mark.db
+def test_archive_tampering_is_refused(worker_conn: Conn, app_conn: Conn) -> None:
+    a = seed(app_conn, "a")
+    deleted(worker_conn, a.id)
+    sections = export(app_conn, a)
+    bundle = bundle_of(a, sections)
+    at = bundle.manifest.created_at
+    for name, edit, want in CASES:
+        body = edit(copy.deepcopy(sections[T]))
+        with pytest.raises(pt.PortabilityError) as e:
+            pt.build_export("export-synth-1", str(a.id), at, {T: body})
+        assert (name, e.value.code) == (name, want)
+        assert (name, _reimport(bundle, body, T)) == (name, want)
+    # integrity, not authenticity (T060): a full rewrite, or a dropped tail with
+    # its checkpoint, verifies
+    for edit in (
+        _set("tombstones.0.record_hash", "cd" * 32, rechain=True),
+        lambda b: _drop("checkpoints", -1)(_drop("tombstones", -1)(b)),
+    ):
+        assert _reimport(bundle, edit(copy.deepcopy(sections[T])), T) is None
+
+
+@pytest.mark.db
+def test_the_archive_holds_no_key_and_no_record_id(worker_conn: Conn,
+                                                   app_conn: Conn) -> None:  # fmt: skip
+    a = seed(app_conn, "a")
+    p, _ = deleted(worker_conn, a.id)
+    archive = write_archive(bundle_of(a, export(app_conn, a)))
+    for secret in (RAW, RAW.hex().encode(), base64.b64encode(RAW), SECRET.encode(),
+                   *(i.encode() for i in IDS), b"scope-1", b"reauth-1"):  # fmt: skip
+        assert secret not in archive
+    body = cast(Body, read_archive(archive).data[T])
+    names = {r["record_hash"] for r in body["tombstones"]}
+    created, tenant = format_instant(p.decisions[0].created_at), str(a.id)
+
+    def guesses(rid: str) -> list[str]:  # what a reader without the key can try
+        forms = ([tenant, "research", rid], [rt.HASH_SCHEME, tenant, "research", rid,
+                                             created])  # fmt: skip
+        texts = [json.dumps(f, separators=(",", ":")).encode() for f in forms]
+        return [*(hashlib.sha256(x).hexdigest() for x in texts),
+                *(OTHER.mac(x) for x in texts),
+                *(hmac.new(b"", x, "sha256").hexdigest() for x in texts)]  # fmt: skip
+
+    candidates = [f"acct-{n:06d}" for n in range(20000)]
+    assert IDS[0] in candidates and IDS[1] in candidates
+    assert not [c for c in candidates if names & set(guesses(c))]  # nothing
+    with_key = {rt.record_hash(KEY, tenant, rt.RetentionClass.RESEARCH, c,
+                               p.decisions[0].created_at): c
+                for c in candidates}  # fmt: skip
+    assert sorted(with_key[n] for n in names) == sorted(IDS)  # the key recovers
+
+
+@pytest.mark.db
+def test_tenants_are_isolated(worker_conn: Conn, app_conn: Conn) -> None:
+    a, b, c = seed(app_conn, "a"), seed(app_conn, "b"), seed(app_conn, "c")
+    deleted(worker_conn, a.id)
+    deleted(worker_conn, b.id)  # the same record ids in both tenants
+    sa, sb, sc = (export(app_conn, t)[T] for t in (a, b, c))
+    assert sc == {"ledger": tw.header(str(c.id), []), "tombstones": [],
+                  "checkpoints": []}  # fmt: skip
+    tw.check_key(tw.parse_section(str(c.id), sc), None)  # nothing to match
+    assert not {r["record_hash"] for r in sa["tombstones"]} & {
+        r["record_hash"] for r in sb["tombstones"]}  # fmt: skip
+    text = pt.canonical(sb).decode()
+    for r in sa["tombstones"]:
+        assert r["record_hash"] not in text and r["entry_hash"] not in text
+    assert str(a.id) not in text
+    at = clock(worker_conn) + timedelta(seconds=1)
+    for body, scope, want in (
+        (sa, str(b.id), R.SCOPE_MISMATCH),  # a's section under b's scope
+        (sc, str(b.id), R.SCOPE_MISMATCH),  # c's empty one
+        (_retag(sa, b.id, False), str(b.id), R.TOMBSTONE_ENTRY),  # entries bind a
+        (sb, None, R.SCOPE_MISMATCH),  # the entry hashes need the tenant
+    ):  # fmt: skip
+        with pytest.raises(pt.PortabilityError) as e:
+            pt.check_section(T, body, scope)
+        assert e.value.code is want
+    # integrity, not authenticity: a full retag verifies, but its pseudonyms are
+    # keyed by a's tenant, so they match none of b's records
+    # parse_section checks the scope itself, even when every hash is recomputed
+    retagged = _retag(sa, b.id, True)
+    only_cp = copy.deepcopy(sa)
+    only_cp["checkpoints"][0]["tenant_id"] = str(b.id)
+    for body in (retagged, only_cp, {"tombstones": None}):
+        with pytest.raises(tw.WireError) as w:
+            tw.parse_section(str(a.id), cast(Body, body))
+        assert w.value.code == ("malformed" if body.get("tombstones") is None
+                                else "scope")  # fmt: skip
+    forged = _retag(sa, b.id, True)
+    pt.build_export("export-synth-1", str(b.id), at, {T: forged})
+    assert not {r["record_hash"] for r in forged["tombstones"]} & {
+        r["record_hash"] for r in sb["tombstones"]}  # fmt: skip
+
+
+def _retag(body: Body, tenant: uuid.UUID, rehash: bool) -> Body:
+    b = copy.deepcopy(body)
+    for r in (b["ledger"], *b["tombstones"], *b["checkpoints"]):
+        r["tenant_id"] = str(tenant)
+    return fix(b, rehash=rehash, rechain=rehash)

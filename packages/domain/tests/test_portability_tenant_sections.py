@@ -163,10 +163,8 @@ def test_round_trip_is_exact_and_follows_the_contract() -> None:
                         if k not in ("tenant_id", "description")}
                        | {"entries": [{k: v for k, v in e.items() if k != "needs"}
                                       for e in w["entries"]]})  # fmt: skip
-    assert sorted(set(pt.SECTIONS) - pt.OPEN_SECTIONS) == [
-        "audit/tombstones.json",  # no tombstone store yet (T058)
-    ]
-    assert refused(build, {"audit/tombstones.json": []}) is R.SECTION_NOT_READY
+    assert sorted(set(pt.SECTIONS) - pt.OPEN_SECTIONS) == []  # tombstones: T058 5b
+    assert refused(build, {pt.TOMBSTONES_PATH: []}) is R.MALFORMED
 
 
 def _edit(rows: list[dict[str, Any]], n: int, path: str, value: object) -> None:
