@@ -53,13 +53,15 @@ AUDIT_ACTION = "portability.imported"
 # Every tenant table an import must find empty: each store a section is exported
 # from, and every record bound to the journal, a policy or holdings (source
 # observations and import previews, proposals, risk pauses, strategy adoptions,
-# calculations, evidence and claims, feedback, virtual portfolios).
+# calculations, deletion records and legal holds, evidence and claims, feedback,
+# virtual portfolios).
 EMPTY_TABLES = ("ledger_event", "source_record", "import_preview", "policy_version",
                 "policy_adoption", "risk_pause", "proposal_version", "proposal_event",
                 "proposal_commitment", "strategy_adoption", "calculation_record",
                 "watchlist_revision", "account", "account_revision", "data_source",
                 "source_mapping_revision", "deletion_tombstone",
-                "deletion_tombstone_checkpoint", "evidence_source", "evidence_record",
+                "deletion_tombstone_checkpoint", "legal_hold_event",
+                "evidence_source", "evidence_record",
                 "evidence_event", "claim", "claim_evidence", "claim_resolution",
                 "feedback", "feedback_consent", "simulation")  # fmt: skip
 # Covered through a foreign key to their parent (empty parent, empty child); the
