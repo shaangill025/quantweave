@@ -618,7 +618,8 @@ def test_security_definer_functions_are_hardened(conn: Conn) -> None:
             and r not in guard + history + budget]  # fmt: skip
     assert [r[0] for r in jobs] == [
         "idempotency_purge", "inbox_purge", "job_expired_leases", "job_overdue",
-        "job_pick", "outbox_pick", "outbox_purge"]  # fmt: skip
+        "job_pick", "outbox_pick", "outbox_purge",
+        "retention_sweep_tenants"]  # 0061, decision 113  # fmt: skip
     pick = conn.execute(
         "SELECT array_agg(p.oid::regprocedure::text) FROM pg_proc p "
         "WHERE p.proname = 'job_pick'"

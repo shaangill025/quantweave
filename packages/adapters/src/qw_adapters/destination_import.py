@@ -61,6 +61,7 @@ EMPTY_TABLES = ("ledger_event", "source_record", "import_preview", "policy_versi
                 "watchlist_revision", "account", "account_revision", "data_source",
                 "source_mapping_revision", "deletion_tombstone",
                 "deletion_tombstone_checkpoint", "legal_hold_event",
+                "legal_hold_quarantine",
                 "evidence_source", "evidence_record",
                 "evidence_event", "claim", "claim_evidence", "claim_resolution",
                 "feedback", "feedback_consent", "simulation")  # fmt: skip
