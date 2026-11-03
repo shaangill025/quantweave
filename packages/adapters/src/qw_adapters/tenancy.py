@@ -110,11 +110,21 @@ def require_snapshot(tx: TenantTx) -> None:
 
 
 @contextmanager
-def provision_tenant(conn: Conn) -> Iterator[TenantTx]:
-    """Create a tenant with a fresh server-generated id; the caller adds its first
+def provision_tenant(
+    conn: Conn, tenant_id: uuid.UUID | None = None
+) -> Iterator[TenantTx]:
+    """Create a tenant with a fresh server-generated id, or with `tenant_id` (owner
+    decision 111: only the T057 import provisioning, from a verified archive's
+    scope); an id that exists is refused (TenancyError). The caller adds its first
     user and owner membership in the same transaction."""
-    with tenant_transaction(conn, uuid.uuid4()) as tx:
-        conn.execute("INSERT INTO app.tenant (id) VALUES (%s)", (tx.tenant_id,))
+    with tenant_transaction(conn, tenant_id or uuid.uuid4()) as tx:
+        made = conn.execute(
+            "INSERT INTO app.tenant (id) VALUES (%s) ON CONFLICT DO NOTHING "
+            "RETURNING id",
+            (tx.tenant_id,),
+        ).fetchone()
+        if made is None:
+            raise TenancyError("tenant id already exists")
         yield tx
 
 

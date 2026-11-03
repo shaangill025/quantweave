@@ -1,4 +1,4 @@
-"""The destination apply plan (T057 increment 6, `qw_domain.portability_apply`):
+"""The destination apply plan (T057 increments 6 and 7, `qw_domain.portability_apply`):
 refusals before any write, in the docstring's order, and the policy versions it
 lists. Every tenant, policy and answer is SYNTHETIC; the oracle is the archive
 itself (`verify_import`) and the domain policy history."""
@@ -92,13 +92,20 @@ def test_any_format_but_the_written_one_is_refused() -> None:
         assert refused(rep) is R.APPLY_FORMAT  # but it is not applied
 
 
-@pytest.mark.parametrize(("path", "body"), [
-    (pt.JOURNAL_PATH, journal(journal_rows(TENANT), TENANT)),
-    (pt.WATCHLISTS_PATH, watchlist_rows(TENANT)),
-])  # fmt: skip
-def test_a_section_that_would_be_re_stamped_is_refused(path: str, body: Any) -> None:
-    rep = report({pt.POLICIES_PATH: policies(), path: body})
+def test_a_section_that_would_be_re_stamped_is_refused() -> None:
+    rep = report({pt.POLICIES_PATH: policies(), pt.WATCHLISTS_PATH:
+                  watchlist_rows(TENANT)})  # fmt: skip
     assert refused(rep) is R.SECTION_NOT_APPLICABLE  # the policies are not written
+
+
+def test_the_journal_is_planned_as_verified() -> None:
+    """Increment 7: the journal is applied (decision 112's import function), so
+    the plan carries the verified section; with no section, an empty one."""
+    body = journal(journal_rows(TENANT), TENANT)
+    got = pa.plan(report({pt.POLICIES_PATH: policies(), pt.JOURNAL_PATH: body}),
+                  TENANT, None)  # fmt: skip
+    assert got.journal == body and len(got.policies) == len(policies())
+    assert pa.plan(report({}), TENANT, None).journal == journal([], TENANT)
 
 
 def test_a_policy_id_that_is_not_a_store_key_is_refused() -> None:
