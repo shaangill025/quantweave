@@ -909,3 +909,47 @@ below waives a test, gate or spec requirement. Numbering continues from
     5-minute check as a constant (each tenant is still swept at most once
     per clock hour). Fewer settings to misconfigure."
     Implemented by: T058 (sweep timer).
+
+121. **Privacy deletion of the research class (T058).**
+    Question: "T058 privacy deletion of the research class (watchlists,
+    claims, proposals). Proposals are referenced by review receipts (audit)
+    and by proposal commitments (financial). What should a deletion request
+    do?"
+    Selected label: "Tombstone in place (Recommended)".
+    Option text as presented: "Delete watchlists and claim/proposal free
+    text. Keep proposal ids and hashes as tombstoned stubs so the audit and
+    financial references stay valid. Proposals that are still current are
+    invalidated."
+    Implemented by: T058 (a later deletion-target increment).
+
+122. **Privacy deletion of the policy class (T058).**
+    Question: "T058 policy class: may a privacy deletion remove a policy
+    version that an adoption references, or the active policy or risk
+    pause?"
+    Selected label: "Keep referenced (Recommended)".
+    Option text as presented: "Delete only unreferenced, inactive policy
+    versions. Refuse the active policy, an active risk pause, and any version
+    an adoption references, recording them as retained with a reason."
+    Implemented by: T058 (a later deletion-target increment).
+
+123. **Privacy deletion of the improvement class (T058).**
+    Question: "T058 improvement class: feedback can currently only be
+    tombstoned by its own author. Should a tenant-wide deletion request also
+    remove other principals' feedback and the experiment, assessor and
+    holdout records?"
+    Selected label: "Feedback yes, eval kept (Recommended)".
+    Option text as presented: "A tenant-owner request tombstones all of the
+    tenant's feedback through a new worker-only path. Experiment, assessor
+    and holdout records are kept as evidence under the audit class (7-year
+    expiry)."
+    Implemented by: T058 (a later deletion-target increment).
+
+124. **Scope of evidence deletion (T058).**
+    Question: "T058 evidence scope: the current target removes a source's
+    text and records a deleted event, but keeps the hashes, passages and
+    citations. Is that enough?"
+    Selected label: "Also drop passages (Recommended)".
+    Option text as presented: "Also delete the extracted passage text and
+    readings. Keep only hashes, ids and citations, which become
+    replay-limited, plus minimal source metadata (type, recorded_at)."
+    Implemented by: T058 (evidence deletion target, increment 7).
