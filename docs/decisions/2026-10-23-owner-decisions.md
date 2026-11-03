@@ -847,3 +847,65 @@ below waives a test, gate or spec requirement. Numbering continues from
     of their scope until a valid replacement place/release is recorded.
     Deletion elsewhere in the tenant can then resume."
     Implemented by: T058 (legal holds).
+
+116. **Attribution of imported watchlist revisions (T057).**
+    Question: "Decision 116 (T057): When an export archive is imported into a
+    new install, watchlist revisions must be recreated in order. Each stored
+    revision records which person made it and an idempotency key, but people's
+    identities are never exported (only the new install's owner exists). How
+    should imported watchlist revisions be attributed?"
+    Selected label: "Importing owner, import key (Recommended)".
+    Option text as presented: "Each imported revision is recorded as made by
+    the importing owner, with an idempotency key derived from the archive
+    (e.g. import:<export_id>:<watchlist_id>:<revision>), so a retried import
+    cannot duplicate it. Matches how imported policy versions are already
+    attributed; the original revision numbers, content and times are kept."
+    Implemented by: T057 (destination import).
+
+117. **Import provisioning claims a self-hosted install (T057, T060).**
+    Question: "Decision 117 (T057, T060): A fresh self-hosted install can be
+    set up either with `qw-bootstrap` (new owner) or by importing an export
+    archive (owner created with the archive's tenant id). Today the import
+    path does not mark the install as bootstrapped, so `qw-bootstrap` could
+    later create a second owner tenant. Should importing claim the install?"
+    Selected label: "Import claims the install (Recommended)".
+    Option text as presented: "On a self-hosted install, import provisioning
+    claims the one-time bootstrap marker in the same transaction, so a later
+    qw-bootstrap is refused (and an import is refused if bootstrap already
+    ran). The hosted edition, which provisions many tenants, is unaffected."
+    Implemented by: T057 (import provisioning), T060 (self-hosted bootstrap).
+
+118. **Default scope of a legal-hold quarantine (T058).**
+    Question: "Decision 118 (T058): When an operator quarantines a corrupt
+    legal-hold record (decision 115), the corrupt row's own scope can't be
+    trusted, so a replacement hold is placed over a stated scope. If the
+    approver doesn't state one, what should the default be?"
+    Selected label: "Whole tenant by default (Recommended)".
+    Option text as presented: "Default to every retention class and every
+    record of the tenant; the approver may narrow it with --class /
+    --record-id. Fails safe: nothing that might have been held is deleted
+    until a valid two-person release of the replacement hold."
+    Implemented by: T058 (hold quarantine).
+
+119. **A quarantined hold's only release (T058).**
+    Question: "Decision 119 (T058): The hold table allows one release per hold
+    id. If the corrupt row being quarantined is that hold's only release, the
+    hold can never be released again. Accept that, or add a way to supersede
+    it?"
+    Selected label: "Accept; use the replacement hold (Recommended)".
+    Option text as presented: "The quarantined hold stays unreleasable, but
+    quarantine always places a new replacement hold over the stated scope,
+    and releasing that replacement (with two-person approval) unblocks
+    deletion. No new event kind; the original id is simply retired."
+    Implemented by: T058 (hold quarantine).
+
+120. **Deletion sweep cadence and suspended tenants (T058).**
+    Question: "Decision 120 (T058): The deletion sweep (backstop for decision
+    113 and age-based expiry) runs every 5 minutes as a fixed constant, and
+    lists every tenant including suspended ones (erasure obligations don't
+    lapse). Keep both?"
+    Selected label: "Keep both (Recommended)".
+    Option text as presented: "Include suspended tenants, and keep the
+    5-minute check as a constant (each tenant is still swept at most once
+    per clock hour). Fewer settings to misconfigure."
+    Implemented by: T058 (sweep timer).
