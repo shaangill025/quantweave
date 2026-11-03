@@ -614,8 +614,12 @@ def test_security_definer_functions_are_hardened(conn: Conn) -> None:
             ["qw_migrate", "qw_worker"],
         ),
     ]
+    imports = [r for r in rows if r[0].startswith("portability_import_")]
+    assert imports == [("portability_import_journal", "qw_migrate", True,  # 0060
+                        ["search_path=pg_catalog, pg_temp"],
+                        ["qw_app", "qw_migrate"])]  # fmt: skip
     jobs = [r for r in rows if not r[0].startswith("throttle_")
-            and r not in guard + history + budget]  # fmt: skip
+            and r not in guard + history + budget + imports]  # fmt: skip
     assert [r[0] for r in jobs] == [
         "idempotency_purge", "inbox_purge", "job_expired_leases", "job_overdue",
         "job_pick", "outbox_pick", "outbox_purge"]  # fmt: skip

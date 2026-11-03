@@ -64,7 +64,13 @@ class JournalIntegrityError(Exception):
 
 def lock_account(tx: TenantTx, account_id: str) -> None:
     """Serialise writers of one account until the transaction ends (same key as the
-    `app.ledger_event_stamp` trigger)."""
+    `app.ledger_event_stamp` trigger). The tenant's import lock is shared first, as
+    0060's triggers do, so every path takes import, then account, and a writer
+    never holds an account lock while it waits for an import (no deadlock)."""
+    tx.conn.execute(
+        "SELECT pg_advisory_xact_lock_shared(hashtextextended(%s, 0))",
+        (f"import:{tx.tenant_id}",),
+    )
     tx.conn.execute(
         "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
         (f"ledger:{tx.tenant_id}:{account_id}",),

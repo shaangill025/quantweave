@@ -1,4 +1,4 @@
-"""The destination apply (T057 increment 6, `qw_adapters.destination_import`) on
+"""The destination apply (T057 increments 6 and 7, `qw_adapters.destination_import`) on
 PostgreSQL 16. A SYNTHETIC tenant is exported from the test database as the qw_app
 login (conftest) and applied, as the same non-superuser login, to a second migrated
 database standing for the other installation, where the destination tenant has the
@@ -8,7 +8,10 @@ same sections. The superuser only creates and migrates the second database.
 
 from __future__ import annotations
 
+import dataclasses
 import io
+import threading
+import time
 import uuid
 import zipfile
 from collections.abc import Callable, Iterator
@@ -18,7 +21,7 @@ from typing import Any
 
 import psycopg
 import pytest
-from psycopg import sql
+from psycopg import errors, sql
 from psycopg.conninfo import make_conninfo
 from psycopg.rows import TupleRow
 from qw_adapters import account_store as st
@@ -37,9 +40,9 @@ from qw_domain import portability as pt
 from qw_domain import retention as rt
 from qw_domain import sources as src
 from qw_domain.corporate_actions import SourceRef
-from qw_domain.decimals import Money
+from qw_domain.decimals import Money, PositiveQuantity, Price
 from qw_domain.identity import InstrumentId, Listing, Mic, SecurityMaster, Ticker
-from qw_domain.postings import Header, deposit
+from qw_domain.postings import Header, buy, deposit
 from qw_domain.simulation import VirtualPortfolio
 from test_portability_tenant_sections import draft  # SYNTHETIC answers
 
@@ -106,8 +109,32 @@ def owner_of(conn: Conn, tenant: uuid.UUID,
     return user, session
 
 
+def seed_journal(tx: tn.TenantTx) -> None:
+    """SYN-J1: a deposit, a buy with a fee, then a correction (its reversal and a
+    superseding buy); SYN-J2: a deposit (SYNTHETIC). Stamped by the source's
+    clock."""
+    now = tx.conn.execute("SELECT now()").fetchone()[0]  # type: ignore[index]
+    h = [Header("SYN-J1", now - 9 * DAY + n * DAY, SourceRef("SYN-BROKER", f"j{n}"))
+         for n in range(3)]  # fmt: skip
+    js.post(tx, deposit(h[0], Money.of("1000", "USD")))
+    bought = buy(h[1], SYN, PositiveQuantity("2"), Price("100.25"),
+                 Money.of("1", "USD"))  # fmt: skip
+    js.post(tx, bought)
+    fixed = buy(
+        dataclasses.replace(h[1], source=h[2].source),
+        SYN,
+        PositiveQuantity("2"),
+        Price("100.5"),
+        Money.of("1", "USD"),
+    )
+    js.correct(tx, dataclasses.replace(fixed, supersedes=bought.event_id))
+    js.post(tx, deposit(Header("SYN-J2", now - DAY, SourceRef("SYN-BROKER", "k0")),
+                        Money.of("50", "CAD")))  # fmt: skip
+
+
 def seed(app_conn: Conn) -> tuple[uuid.UUID, uuid.UUID, uuid.UUID]:
-    """Policy a: v1 adopted, then v2; policy b: v1 (SYNTHETIC). Nothing else."""
+    """Policy a: v1 adopted, then v2; policy b: v1; the `seed_journal` events
+    (SYNTHETIC). Nothing else."""
     tenant = uuid.uuid4()
     owner, session = owner_of(app_conn, tenant)
     a, b = sorted((uuid.uuid4(), uuid.uuid4()))
@@ -126,6 +153,7 @@ def seed(app_conn: Conn) -> tuple[uuid.UUID, uuid.UUID, uuid.UUID]:
         )
         ps.propose(tx, a, draft("income", str(tenant)), owner)
         ps.propose(tx, b, draft("income", str(tenant)), owner)
+        seed_journal(tx)
     return tenant, a, b
 
 
@@ -197,7 +225,7 @@ def test_an_empty_destination_receives_the_same_state(app_conn: Conn,
                                             "app.policy_version")}  # fmt: skip
     assert history is not None and history.receipts == ()  # re-adopt at the destination
     assert by == {who}  # the importing owner, not the source's principal
-    assert state(dest, tenant) == (3, 0, 0, 1)
+    assert got.journal_events == 5 and state(dest, tenant) == (3, 0, 5, 1)
     assert refused(dest, tenant, data, who) is R.DESTINATION_NOT_EMPTY  # only once
 
 
@@ -317,10 +345,11 @@ def test_scope_principal_and_sections_are_checked_before_any_write(
     member, _ = owner_of(dest, tenant, tn.MembershipRole.TENANT_MEMBER, new=False)
     assert refused(dest, tenant, data, member) is R.APPLY_PRINCIPAL
     assert refused(dest, tenant, data, stranger) is R.APPLY_PRINCIPAL  # not here
+    user, session = owner_of(app_conn, tenant, new=False)
     with tn.tenant_transaction(app_conn, tenant) as tx:
-        _journal(tx)
-    journal = archive(app_conn, tenant)  # the policies travel with it
-    assert refused(dest, tenant, journal, who) is R.SECTION_NOT_APPLICABLE
+        _watchlist(tx, user, session)
+    listed = archive(app_conn, tenant)  # the policies and journal travel with it
+    assert refused(dest, tenant, listed, who) is R.SECTION_NOT_APPLICABLE
 
 
 def _zip(files: dict[str, bytes]) -> bytes:
@@ -438,13 +467,15 @@ def test_a_failed_write_leaves_nothing(
     monkeypatch.setattr(ps, "propose", lying)
     assert refused(dest, tenant, data, who) is R.APPLY_VERIFY
 
-    # a writer inside the window: another policy's version, or a journal event
+    # a writer inside the window: another policy's version, a journal event or an
+    # account
     def version(tx: tn.TenantTx, by: uuid.UUID) -> None:  # not via the patch
         real(tx, uuid.uuid4(), draft(tenant=str(tx.tenant_id)), by)
 
     for writer, code in (
         (version, R.APPLY_VERIFY),
-        (_journal, R.DESTINATION_NOT_EMPTY),
+        (_journal, R.DESTINATION_NOT_EMPTY),  # 0060 finds the journal occupied
+        (_account, R.DESTINATION_NOT_EMPTY),  # the post-write check
     ):
 
         def racing(*args: Any, writer: Callable[..., None] = writer) -> Any:
@@ -468,3 +499,181 @@ def test_the_record_key_is_checked_before_anything(
     assert refused(dest, tenant, data, who, OTHER) is R.KEY_MISMATCH
     # with the right key, the ledger itself still needs an insert path (0057 stamps)
     assert refused(dest, tenant, data, who, KEY) is R.SECTION_NOT_APPLICABLE
+
+
+VERIFIER = "$argon2id$v=19$SYNTHETIC"  # not a real verifier
+
+
+@pytest.mark.db
+def test_provisioning_creates_the_archive_tenant_once(
+    app_conn: Conn, dest: Conn, dest_worker: Conn
+) -> None:
+    """Decision 111: the destination tenant gets the archive's id and a new owner;
+    an existing id is refused, and so is an archive the apply would refuse."""
+    tenant, *_ = seed(app_conn)
+    data = archive(app_conn, tenant)
+    got, who = di.provision(dest, data, "SYNTHETIC owner", "synthetic-importer",
+                            VERIFIER, claim_installation=False)  # fmt: skip
+    assert got == tenant
+    with tn.tenant_transaction(dest, tenant) as tx:
+        member = tn.get_membership(tx, who)
+        acts = tx.conn.execute("SELECT action, actor_user_id FROM app.audit_event"
+                               ).fetchall()  # fmt: skip
+    assert member is not None and member.role is tn.MembershipRole.TENANT_OWNER
+    assert acts == [(di.PROVISION_ACTION, who)]
+    for conn in (dest, dest_worker):  # it exists; a worker login may not provision
+        with pytest.raises(tn.TenancyError):
+            di.provision(conn, data, "SYNTHETIC owner", "synthetic-two", VERIFIER,
+                         claim_installation=False)  # fmt: skip
+    assert apply(dest, tenant, data, who).journal_events == 5
+    assert export(dest, tenant) == export(app_conn, tenant)
+    other, *_ = seed(app_conn)
+    seeded = owner_of(app_conn, other, new=False)
+    with tn.tenant_transaction(app_conn, other) as tx:
+        _watchlist(tx, *seeded)
+    with pytest.raises(pt.PortabilityError) as e:  # not applicable: no tenant made
+        di.provision(dest, archive(app_conn, other), "SYNTHETIC owner",
+                     "synthetic-three", VERIFIER, claim_installation=False)  # fmt: skip
+    assert e.value.code is R.SECTION_NOT_APPLICABLE
+    with tn.tenant_transaction(dest, other) as tx:
+        assert tx.conn.execute("SELECT count(*) FROM app.tenant").fetchone() == (0,)
+
+
+@pytest.mark.db
+def test_journal_writers_on_other_connections_and_the_import_exclude_each_other(
+    app_conn: Conn, dest: Conn, dest_urls: dict[str, str]
+) -> None:
+    """The hard gate: every journal insert shares the tenant's import lock (0060's
+    stamp trigger), so no writer can commit between the import's emptiness check
+    and its commit, and an open writer holds the import off."""
+    tenant, *_ = seed(app_conn)
+    data = archive(app_conn, tenant)
+    who, _ = owner_of(dest, tenant)
+    with psycopg.connect(dest_urls["qw_app"], autocommit=True) as other:
+        with tn.tenant_transaction(other, tenant) as tx:  # an open writer first
+            _journal(tx)
+            with (pytest.raises(errors.LockNotAvailable),
+                  tn.tenant_transaction(dest, tenant) as dtx):  # fmt: skip
+                dest.execute("SET LOCAL lock_timeout = '300ms'")
+                di.apply_archive(dtx, data, who)
+        assert refused(dest, tenant, data, who) is R.DESTINATION_NOT_EMPTY
+    for writer in (_journal, _simulation):  # a simulation takes the account lock
+        tenant, *_ = seed(app_conn)
+        data = archive(app_conn, tenant)
+        who, _ = owner_of(dest, tenant)
+        with (psycopg.connect(dest_urls["qw_app"], autocommit=True) as other,
+              tn.tenant_transaction(dest, tenant) as dtx):  # import first  # fmt: skip
+            di.apply_archive(dtx, data, who)
+            with (pytest.raises((errors.LockNotAvailable, ss.SimulationStoreError),
+                                match=r"lock timeout|LockNotAvailable"),
+                  tn.tenant_transaction(other, tenant) as tx):  # fmt: skip
+                other.execute("SET LOCAL lock_timeout = '300ms'")
+                writer(tx)
+        assert state(dest, tenant) == (3, 0, 5, 1)
+
+
+@pytest.mark.db
+def test_a_writer_of_an_archive_account_waits_for_the_import_without_deadlock(
+    app_conn: Conn, dest: Conn, dest_urls: dict[str, str]
+) -> None:
+    """The review's deadlock (40P01): the import holds `import:<tenant>` exclusive
+    while a writer of an archive account posts. Every taker of an account lock
+    shares the import lock first (`journal_store.lock_account`, 0060's triggers), so
+    the writer waits holding nothing the import needs, the import completes, and
+    then the writer appends after it."""
+    tenant, *_ = seed(app_conn)
+    data = archive(app_conn, tenant)
+    who, _ = owner_of(dest, tenant)
+    failures: list[BaseException] = []
+
+    def write(other: Conn) -> None:
+        h = Header("SYN-J1", datetime.now(UTC) - DAY, SourceRef("SYN-BROKER", "w0"))
+        try:
+            with tn.tenant_transaction(other, tenant) as tx:
+                js.post(tx, deposit(h, Money.of("5", "USD")))
+        except BaseException as e:  # reported below, not lost in the thread
+            failures.append(e)
+
+    with psycopg.connect(dest_urls["qw_app"], autocommit=True) as other:
+        pid = other.info.backend_pid
+        with tn.tenant_transaction(dest, tenant) as dtx:
+            dest.execute("SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
+                         (f"import:{tenant}",))  # fmt: skip
+            thread = threading.Thread(target=write, args=(other,))
+            thread.start()
+            waiting = ("SELECT EXISTS (SELECT 1 FROM pg_locks WHERE pid = %s "
+                       "AND NOT granted)")  # fmt: skip
+            for _ in range(200):
+                if dest.execute(waiting, (pid,)).fetchone() == (True,):
+                    break
+                time.sleep(0.05)
+            else:
+                pytest.fail("the writer never waited")
+            applied = di.apply_archive(dtx, data, who)
+        thread.join(30)
+    assert not thread.is_alive() and failures == []
+    assert applied.journal_events == 5 and state(dest, tenant) == (3, 0, 6, 1)
+
+
+@pytest.mark.db
+def test_a_deadlock_in_the_apply_is_a_typed_refusal(
+    app_conn: Conn, dest: Conn, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A deadlock the apply did not foresee (40P01) is `destination_not_empty`: a
+    concurrent writer of the tenant; the savepoint has rolled back."""
+    tenant, *_ = seed(app_conn)
+    data = archive(app_conn, tenant)
+    who, _ = owner_of(dest, tenant)
+
+    def deadlocked(*_: Any) -> Any:
+        raise errors.DeadlockDetected("SYNTHETIC deadlock")
+
+    monkeypatch.setattr(ps, "propose", deadlocked)
+    assert refused(dest, tenant, data, who) is R.DESTINATION_NOT_EMPTY
+
+
+@pytest.mark.db
+def test_provisioning_claims_the_bootstrap_marker_only_when_asked(
+    app_conn: Conn, dest: Conn, dest_urls: dict[str, str]
+) -> None:
+    """Decision 117: on a self-hosted install, provisioning with `claim_installation`
+    takes the one-time bootstrap marker in the same transaction, so a later
+    `qw-bootstrap` is refused, and a claim after a bootstrap is refused with no
+    tenant made. Without it (the hosted edition) the marker is left alone."""
+
+    def marker(tenant: uuid.UUID) -> list[Any]:
+        with tn.tenant_transaction(dest, tenant) as tx:
+            return tx.conn.execute("SELECT tenant_id FROM app.installation_bootstrap"
+                                   ).fetchall()  # fmt: skip
+
+    hosted, *_ = seed(app_conn)
+    assert di.provision(dest, archive(app_conn, hosted), "SYNTHETIC owner",
+                        "synthetic-hosted", VERIFIER,
+                        claim_installation=False)[0] == hosted  # fmt: skip
+    assert marker(hosted) == []
+    tenant, *_ = seed(app_conn)
+    got, _ = di.provision(dest, archive(app_conn, tenant), "SYNTHETIC owner",
+                          "synthetic-importer", VERIFIER,
+                          claim_installation=True)  # fmt: skip
+    assert got == tenant and marker(tenant) == [(tenant,)]
+    with pytest.raises(tn.TenancyError, match="already bootstrapped"):
+        tn.bootstrap_installation(dest, "SYNTHETIC owner", "synthetic-boot", VERIFIER)
+    assert marker(tenant) == [(tenant,)]
+
+
+@pytest.mark.db
+def test_provisioning_after_a_bootstrap_cannot_claim(
+    app_conn: Conn, dest: Conn
+) -> None:
+    first, _ = tn.bootstrap_installation(dest, "SYNTHETIC owner", "synthetic-boot",
+                                         VERIFIER)  # fmt: skip
+    tenant, *_ = seed(app_conn)
+    data = archive(app_conn, tenant)
+    with pytest.raises(tn.TenancyError, match="already bootstrapped"):
+        di.provision(dest, data, "SYNTHETIC owner", "synthetic-importer", VERIFIER,
+                     claim_installation=True)  # fmt: skip
+    with tn.tenant_transaction(dest, tenant) as tx:  # no tenant was made
+        assert tx.conn.execute("SELECT count(*) FROM app.tenant WHERE id = %s",
+                               (tenant,)).fetchone() == (0,)  # fmt: skip
+        assert tx.conn.execute("SELECT tenant_id FROM app.installation_bootstrap"
+                               ).fetchall() == [(first,)]  # fmt: skip
