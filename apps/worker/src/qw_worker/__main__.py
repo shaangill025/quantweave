@@ -17,7 +17,8 @@ experiment-pool worker runs no timer. The record key comes from QW_RECORD_KEY_FI
 refuses the start, exit 2, also under --check-config). A standard-pool worker with
 the key handles `retention.delete` (`deletion_job`) once a store `Target` exists;
 none does yet, so no deletion handler is registered and those jobs stay queued
-rather than failing. No publish
+rather than failing. Beside that handler, and only then, it runs the hourly
+retention-sweep timer (`deletion_job.timer`, owner decision 113). No publish
 target is passed, so the outbox relay is off and events stay pending: a real
 transport needs explicit owner authorisation.
 
@@ -36,7 +37,7 @@ from qw_domain.jobs import Pool
 
 from qw_worker import budget_sweep, deletion_job, optimizer_cycle
 from qw_worker.config import record_key_from_env, settings_from_env
-from qw_worker.loop import Worker, install_signal_handlers
+from qw_worker.loop import Timer, Worker, install_signal_handlers
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -68,11 +69,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         with tenancy.runtime_connection(conninfo, role="qw_worker") as conn:
             handlers = {**optimizer_cycle.HANDLERS, **budget_sweep.HANDLERS}
             targets = deletion_job.TARGETS  # empty until a store handler exists
+            standard = settings.pool is Pool.STANDARD
+            timers: tuple[Timer, ...] = (
+                (budget_sweep.timer(settings.budget_sweep_every),) if standard else ()
+            )
             if record_key is not None and settings.pool is Pool.STANDARD and targets:
                 handlers |= deletion_job.handlers(
                     record_key, settings.retention_policy, targets)  # fmt: skip
-            timers = ((budget_sweep.timer(settings.budget_sweep_every),)
-                      if settings.pool is Pool.STANDARD else ())  # fmt: skip
+                timers += (deletion_job.timer(),)  # decision 113's hourly backstop
             worker = Worker(conn, settings, handlers=handlers, timers=timers,
                             publish=None)  # relay off (above)  # fmt: skip
             install_signal_handlers(worker)

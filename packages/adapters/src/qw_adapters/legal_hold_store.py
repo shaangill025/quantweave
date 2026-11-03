@@ -14,7 +14,24 @@
   event: entry hash, seal, time order and chain link, then the domain rules, so
   a row the domain refuses is `integrity`. Callers treat any failure as "hold
   state unknown": no deletion runs. One corrupt row blocks every hold action and
-  every deletion of its tenant until owner decision 115's quarantine step exists.
+  every deletion of its tenant until it is quarantined (below).
+- Owner decision 115: `quarantine(tx, seq, approved_by, approval_ref, reason,
+  classes, record_ids)` runs only on a superuser connection (`qw-hold-quarantine`,
+  after owner approval; 0061). It refuses unless `seq` is the first event that
+  fails replay (`not_corrupt`), records the row's digest, the approval and the
+  scope the approver states (default: every class of the tenant; the corrupt
+  row's own scope is not trusted), and appends an ordinary `place` of a
+  replacement hold with exactly that scope. Replay then skips the quarantined
+  row (never replayed, so a corrupt release releases nothing and a corrupt place
+  lends its hold id to no later release), crosses its chain link by the recorded
+  next link, and is `integrity` if the row's bytes changed since, or a
+  quarantine's replacement place is missing or has another scope. The block
+  lasts until a valid release of the replacement; the rest of the tenant
+  resumes at once, and requests whose latest job failed `hold_state_unknown` are
+  re-queued (`request:<id>:q<replacement seq>`). One row per run: a second
+  corrupt row after it fails the replay and nothing is written.
+- `sweep_tenants(conn)`: qw_worker's cross-tenant read for the hourly sweep
+  timer (0061, decision 113): every tenant id, ascending, 500 per page.
 - Trust. The entry hash is unkeyed and computed here, so it detects edits only by
   a writer that cannot compute it (the superuser editing rows, storage faults).
   qw_app supplies every hashed input and can append a well-sealed release with
@@ -37,6 +54,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
+import uuid
 from collections.abc import Iterable
 from dataclasses import replace
 from datetime import datetime
@@ -50,10 +69,10 @@ from qw_domain.jobs import Priority
 from qw_domain.sources import ID_PATTERN
 
 from qw_adapters import jobs as qj
-from qw_adapters.tenancy import TenantTx
+from qw_adapters.tenancy import Conn, TenantTx
 
-__all__ = ["DELETION_KIND", "HoldStoreError", "load", "place", "release",
-           "resume_suspended"]  # fmt: skip
+__all__ = ["DELETION_KIND", "HoldStoreError", "load", "place", "quarantine",
+           "release", "resume_suspended", "sweep_tenants"]  # fmt: skip
 DELETION_KIND = "retention.delete"
 _SUSPENDED = (
     "WITH rel AS (SELECT seq, recorded_at FROM app.legal_hold_event WHERE "
@@ -67,6 +86,17 @@ _SUSPENDED = (
     "last.updated_at <= "
     "rel.recorded_at ORDER BY last.payload ->> 'request_id'"
 )
+_UNKNOWN = (
+    "SELECT payload FROM (SELECT DISTINCT ON (payload ->> 'request_id') payload, "
+    "state, last_error FROM app.job WHERE tenant_id = %(t)s AND kind = %(k)s AND "
+    "payload ->> 'trigger' = 'request' ORDER BY payload ->> 'request_id', "
+    "created_at DESC, id) last WHERE state = 'failed' AND last_error = "
+    "'hold_state_unknown' ORDER BY payload ->> 'request_id'"
+)
+_Q_COLS = ("seq", "row_digest", "next_prev_hash", "replacement_hold_id", "classes",
+           "record_ids")  # fmt: skip
+_REASON = re.compile(r"[a-z][a-z0-9_]{0,63}", re.ASCII)
+SWEEP_PAGE = 500
 
 _COLS = ("seq", "kind", "hold_id", "reason", "authority_id", "classes",
          "record_ids", "placed_by", "principal_id", "approval_roles",
@@ -126,30 +156,84 @@ def _lock(tx: TenantTx, shared: bool) -> None:
         raise _database(exc) from None
 
 
-def _load(tx: TenantTx, solo: rt.SoloRelease | None) -> tuple[rt.Holds, str, int]:
-    """(the replayed holds, the head entry hash, the next seq)."""
-    tenant = str(tx.tenant_id)
+def _digest(tenant: str, r: dict[str, Any]) -> str:
+    """sha256 over every stored column of an event, as decision 115 binds it."""
+
+    def enc(v: object) -> object:
+        if isinstance(v, datetime):
+            return format_instant(ensure_aware_utc(v))
+        return [enc(x) for x in v] if isinstance(v, list) else v
+
+    body = [tenant, *(enc(r[c]) for c in _COLS)]
+    return hashlib.sha256(json.dumps(body, separators=(",", ":")).encode()).hexdigest()
+
+
+class _Bad(Exception):
+    def __init__(self, n: int, why: str) -> None:
+        super().__init__(f"event {n}: {why}")
+        self.n = n
+
+
+def _rows(tx: TenantTx) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """(the events in seq order, the quarantine records)."""
     try:
         rows = [dict(zip(_COLS, r, strict=True))
                 for r in tx.conn.execute(_SELECT, (tx.tenant_id,))]  # fmt: skip
+        qs = [dict(zip(_Q_COLS, r, strict=True)) for r in tx.conn.execute(
+            f"SELECT {', '.join(_Q_COLS)} FROM app.legal_hold_quarantine WHERE "
+            "tenant_id = %s", (tx.tenant_id,))]  # fmt: skip
     except psycopg.Error as exc:
         raise _database(exc) from None
+    return rows, qs
+
+
+def _replay(tenant: str, rows: list[dict[str, Any]], qs: list[dict[str, Any]],
+            solo: rt.SoloRelease | None) -> tuple[rt.Holds, str]:  # fmt: skip
+    """(the replayed holds, the head entry hash), or `_Bad` naming the first
+    event that fails. A quarantined row is skipped (decision 115, above)."""
     holds, prev, last = rt.Holds(solo=solo), rt.GENESIS, None
-    try:
-        for n, r in enumerate(rows):
+    skipped: set[object] = set()  # hold ids of quarantined places
+    waiting: dict[object, dict[str, Any]] = {}  # replacement id -> quarantine
+    for n, r in enumerate(rows):
+        try:
+            q = next((q for q in qs if q["seq"] == n == r["seq"]
+                      and q["row_digest"] == _digest(tenant, r)), None)  # fmt: skip
+            if q is not None:
+                if r["kind"] == "place":
+                    skipped.add(r["hold_id"])
+                waiting[q["replacement_hold_id"]] = q
+                prev = q["next_prev_hash"]
+                continue
             at = ensure_aware_utc(r["recorded_at"])
             if (r["seq"] != n or r["prev_hash"] != prev
                     or r["entry_hash"] != _entry(tenant, r)
                     or r["row_hash"] != seal(r["entry_hash"], at)
                     or (last is not None and at < last)):  # fmt: skip
-                raise ValueError(f"event {n}")
+                raise ValueError("hash, seal, link or time")
             e = _event(r, tenant)
             if isinstance(e, rt.LegalHold):
+                q = waiting.pop(e.hold_id, None)
+                if q is not None and (sorted(c.value for c in e.classes),
+                                      sorted(e.record_ids)) != (
+                        list(q["classes"]), list(q["record_ids"])):  # fmt: skip
+                    raise ValueError("not the quarantine's stated scope")
                 holds.place(e)
-            else:
+            elif e.hold_id not in skipped:  # a quarantined place releases nothing
                 holds.release(e)
             prev, last = r["entry_hash"], at
-    except (rt.RetentionError, ValueError, TypeError, KeyError) as exc:
+        except (rt.RetentionError, ValueError, TypeError, KeyError) as exc:
+            raise _Bad(n, str(exc)) from None
+    if waiting or any(q["seq"] >= len(rows) for q in qs):
+        raise _Bad(len(rows), "a quarantine without its replacement")
+    return holds, prev
+
+
+def _load(tx: TenantTx, solo: rt.SoloRelease | None) -> tuple[rt.Holds, str, int]:
+    """(the replayed holds, the head entry hash, the next seq)."""
+    rows, qs = _rows(tx)
+    try:
+        holds, prev = _replay(str(tx.tenant_id), rows, qs, solo)
+    except _Bad as exc:
         raise HoldStoreError("integrity", str(exc)) from None
     return holds, prev, len(rows)
 
@@ -276,3 +360,101 @@ def resume_suspended(tx: TenantTx) -> list[Any]:
     except qj.IdempotencyConflict:
         raise HoldStoreError("conflicting_duplicate", "a resumed job") from None
     return out
+
+
+def quarantine(tx: TenantTx, seq: int, approved_by: str, approval_ref: str,
+               reason: str, classes: Iterable[rt.RetentionClass] | None = None,
+               record_ids: Iterable[str] = (),
+               solo: rt.SoloRelease | None = None) -> rt.LegalHold:  # fmt: skip
+    """Owner decision 115 (above), on a superuser connection only: the stored
+    replacement hold."""
+    try:
+        su = tx.conn.execute(
+            "SELECT rolsuper AND current_user = session_user FROM "
+            "pg_roles WHERE rolname = session_user"
+        ).fetchone()
+    except psycopg.Error as exc:
+        raise _database(exc) from None
+    if su is None or su[0] is not True:
+        raise HoldStoreError("forbidden", "a superuser acting as itself only")
+    if (type(seq) is not int or not isinstance(reason, str)
+            or _REASON.fullmatch(reason) is None):  # fmt: skip
+        raise HoldStoreError("argument", "seq and reason")
+    scope = frozenset(rt.RetentionClass) if classes is None else frozenset(classes)
+    if not scope:
+        raise HoldStoreError("classes", "a stated scope names at least one class")
+    _lock(tx, shared=False)
+    rows, qs = _rows(tx)
+    tenant = str(tx.tenant_id)
+    try:
+        _replay(tenant, rows, qs, solo)
+    except _Bad as bad:
+        if bad.n != seq or seq >= len(rows):
+            why = f"the first failure is {bad.n}"
+            raise HoldStoreError("not_corrupt", why) from None
+    else:
+        raise HoldStoreError("not_corrupt", "every event replays")
+    r, digest = rows[seq], _digest(tenant, rows[seq])
+    nxt = rows[seq + 1]["prev_hash"] if seq + 1 < len(rows) else r["entry_hash"]
+    try:
+        h = rt.LegalHold(f"quarantine-{seq}-{digest[:16]}", tenant, scope,
+                         frozenset(record_ids), "quarantine_replacement",
+                         approval_ref, _now(tx), rt.HoldRole.OPERATOR,
+                         approved_by)  # fmt: skip
+        rt.Holds().place(h)  # the domain's own checks of the stated scope
+    except rt.RetentionError as exc:
+        raise _domain(exc) from None
+    except TypeError:
+        raise HoldStoreError("argument", "hold scope") from None
+    q = {"seq": seq, "row_digest": digest, "next_prev_hash": nxt,
+         "replacement_hold_id": h.hold_id,
+         "classes": sorted(c.value for c in h.classes),
+         "record_ids": sorted(h.record_ids), "approved_by": approved_by,
+         "approval_ref": approval_ref, "reason": reason}  # fmt: skip
+    try:
+        tx.conn.execute(
+            f"INSERT INTO app.legal_hold_quarantine (tenant_id, {', '.join(q)}) "
+            f"VALUES (%(t)s, {', '.join(f'%({k})s' for k in q)})",
+            {"t": tx.tenant_id, **q})  # fmt: skip
+    except psycopg.Error as exc:
+        raise _database(exc) from None
+    stored = _insert(tx, {"seq": len(rows), "kind": "place", "hold_id": h.hold_id,
+                 "reason": h.reason, "authority_id": h.authority_id,
+                 "classes": q["classes"], "record_ids": q["record_ids"],
+                 "placed_by": h.placed_by.value, "principal_id": h.principal_id,
+                 "approval_roles": [], "approval_principals": [],
+                 "approval_receipts": [], "approval_step_ups": [], "solo": False,
+                 "prev_hash": rows[-1]["entry_hash"]}, solo)  # fmt: skip
+    assert isinstance(stored, rt.LegalHold)
+    try:  # decision 115: deletion elsewhere in the tenant resumes
+        for (body,) in tx.conn.execute(
+            _UNKNOWN, {"t": tx.tenant_id, "k": DELETION_KIND}
+        ).fetchall():
+            rid = body.get("request_id") if isinstance(body, dict) else None
+            if isinstance(rid, str) and ID_PATTERN.fullmatch(rid) is not None:
+                qj.enqueue(tx, DELETION_KIND, f"request:{rid}:q{len(rows)}",
+                           Priority.SAFETY, body)  # fmt: skip
+    except psycopg.Error as exc:
+        raise _database(exc) from None
+    except qj.IdempotencyConflict:
+        raise HoldStoreError("conflicting_duplicate", "a resumed job") from None
+    return stored
+
+
+def sweep_tenants(conn: Conn) -> list[uuid.UUID]:
+    """qw_worker (0061): every tenant id, ascending, keyset-paged `SWEEP_PAGE` at
+    a time until a short page. Ids that do not strictly ascend are `integrity`."""
+    out: list[uuid.UUID] = []
+    after: uuid.UUID | None = None
+    while True:
+        try:
+            rows = conn.execute("SELECT t FROM app.retention_sweep_tenants("
+                                "%s::uuid) t", (after,)).fetchall()  # fmt: skip
+        except psycopg.Error as exc:
+            raise _database(exc) from None
+        for (t,) in rows:
+            if type(t) is not uuid.UUID or (after is not None and t <= after):
+                raise HoldStoreError("integrity", "the tenant ids do not ascend")
+            out.append(after := t)
+        if len(rows) < SWEEP_PAGE:
+            return out
