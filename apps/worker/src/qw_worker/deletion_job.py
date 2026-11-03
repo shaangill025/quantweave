@@ -4,7 +4,14 @@ deletion request or expiry sweep of one tenant, on qw_worker in its transaction.
 - `submit_request` enqueues a `DeletionRequest` once per request id; `submit_sweep`
   an `ExpirySweep` once per hour of the database clock. The payload carries the
   trigger time (a retry or a resume never resets it) and never the acknowledgement
-  text. No timer submits sweeps yet (a cross-tenant lister is needed).
+  text.
+- `schedule(conn)` / `timer()` (decision 113's hourly backstop): every
+  `SWEEP_EVERY` the worker lists every tenant through 0061's qw_worker-only
+  lister (ids only) on its own connection and calls `submit_sweep` in each
+  tenant's transaction. The hour's revision makes it idempotent across ticks and
+  restarts; one tenant's failure is logged (its exception type) and the others
+  go on. The entry point runs it only beside the deletion handler, so no sweep
+  is queued for a worker that cannot run one.
 - `handlers(key, policy, targets, solo)`: bound to the installation's `RecordKey`
   (`config.record_key_from_env`, a file, never the database) and one `Target` per
   class (a store's handler: list records with their exact `created_at`; delete
@@ -39,21 +46,22 @@ import logging
 import uuid
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from types import MappingProxyType
 
 from qw_adapters import legal_hold_store as hs
 from qw_adapters import tombstone_store as ts
 from qw_adapters.jobs import ClaimedJob, Json, enqueue
-from qw_adapters.tenancy import TenantTx
+from qw_adapters.tenancy import Conn, TenantTx, tenant_transaction
 from qw_domain import retention as rt
 from qw_domain.instants import ensure_aware_utc, format_instant
 from qw_domain.jobs import Priority, check_error_code
 
-from qw_worker.loop import Handler, HandlerFailed
+from qw_worker.loop import Handler, HandlerFailed, Timer
 
 log = logging.getLogger("qw_worker.deletion_job")
 KIND = hs.DELETION_KIND
+SWEEP_EVERY = timedelta(minutes=5)  # each hour's sweep is queued once (revision)
 ACK = "recorded-by-the-request-route"  # the planner never reads the text
 _RETRY = frozenset({"database", "stale_clock", "time_order"})
 _REQUEST = frozenset({"trigger", "request_id", "scope_id", "classes", "record_ids",
@@ -122,6 +130,30 @@ def submit_sweep(tx: TenantTx) -> tuple[uuid.UUID, bool]:
     sweep = rt.ExpirySweep(f"sweep-{hour:%Y%m%dT%H}", str(tx.tenant_id), hour)
     return enqueue(tx, KIND, f"sweep:{sweep.sweep_id}", Priority.SAFETY,
                    payload(sweep))  # fmt: skip
+
+
+def schedule(conn: Conn) -> tuple[list[uuid.UUID], list[tuple[uuid.UUID, str]]]:
+    """Queue this hour's sweep for every tenant: (the ids of newly queued jobs,
+    the (tenant, exception type) of each tenant that failed). A failure to list
+    raises (the loop logs it and tries again one interval later)."""
+    queued: list[uuid.UUID] = []
+    failed: list[tuple[uuid.UUID, str]] = []
+    for t in hs.sweep_tenants(conn):
+        try:
+            with tenant_transaction(conn, t) as tx:
+                jid, created = submit_sweep(tx)
+        except Exception as exc:  # one tenant never stops the rest
+            log.warning("retention sweep for tenant %s not queued: %s", t,
+                        type(exc).__name__)  # fmt: skip
+            failed.append((t, type(exc).__name__))
+            continue
+        if created:
+            queued.append(jid)
+    return queued, failed
+
+
+def timer() -> Timer:
+    return Timer(KIND, SWEEP_EVERY, schedule)
 
 
 class _Bad(Exception):

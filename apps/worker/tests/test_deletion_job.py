@@ -10,6 +10,7 @@ from __future__ import annotations
 import importlib.util
 import logging
 import os
+import time
 import uuid
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -21,7 +22,7 @@ from qw_adapters import legal_hold_store as hs
 from qw_adapters import tenancy as tn
 from qw_adapters import tombstone_store as ts
 from qw_adapters.file_secrets import ConfigError, InlineSecretError
-from qw_adapters.jobs import ClaimedJob, IdempotencyConflict
+from qw_adapters.jobs import ClaimedJob, IdempotencyConflict, enqueue
 from qw_domain import retention as rt
 from qw_domain.account_wire import seal
 from qw_domain.jobs import Backoff, JobState, Priority
@@ -414,3 +415,115 @@ def test_record_key_is_file_only(
     assert entry.main(["--check-config"]) == 2  # the key is checked at startup
     out = capsys.readouterr().err
     assert "QW_RECORD_KEY_FILE" in out and "SYNTHETIC-too-short" not in out
+
+
+def clear_of_hour_turn(c: Conn) -> None:
+    """The sweep is once per DB-clock hour: start at least 30 s before an hour
+    boundary (waiting out at most 30 s), never skip."""
+    now = c.execute("SELECT clock_timestamp()").fetchone()
+    assert now is not None
+    turn = now[0].replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)
+    if turn - now[0] < timedelta(seconds=30):
+        time.sleep((turn - now[0]).total_seconds() + 1)
+
+
+def sweeps(su: Conn, t: uuid.UUID) -> list[str]:
+    return [r[0] for r in jobs(su, t) if r[0].startswith("sweep:")]
+
+
+def test_the_sweep_timer_queues_each_tenant_once_an_hour_across_restarts(
+        app_conn: Conn, worker_conn: Conn, conn: Conn,
+        notes: None) -> None:  # fmt: skip
+    """Decision 113's hourly backstop: every tenant, suspended ones too (an
+    erasure obligation does not lapse), gets one sweep per hour of the database
+    clock, however often the timer runs and however often the worker restarts."""
+    clear_of_hour_turn(conn)
+    a, b = sorted((tenant(app_conn, conn, "old-a"), tenant(app_conn, conn)))
+    conn.execute("UPDATE app.tenant SET status = 'suspended' WHERE id = %s", (b,))
+    assert hs.sweep_tenants(worker_conn) == [a, b]
+    timer = dj.timer()
+    assert (timer.name, timer.every) == (dj.KIND, timedelta(minutes=5))
+    handlers = dj.handlers(KEY, POLICY, TARGETS)
+    w = Worker(worker_conn, SETTINGS, handlers=handlers, timers=[timer])
+    first = w.tick()  # claims run before the timer: nothing queued yet
+    ((name, result),) = first.timed
+    queued: list[uuid.UUID] = result[0]  # type: ignore[index]
+    assert (first.jobs, name, len(queued), result) == ([], dj.KIND, 2, (queued, []))
+    assert dj.schedule(worker_conn) == ([], [])  # the same hour: nothing new
+    second = w.tick()
+    assert sorted(second.jobs) == sorted((j, JobState.SUCCEEDED) for j in queued)
+    for _ in range(2):  # restarts: a fresh worker runs its timer at once
+        again = Worker(worker_conn, SETTINGS, handlers=handlers, timers=[timer])
+        assert again.tick().timed == [(dj.KIND, ([], []))]
+    for t in (a, b):
+        assert len(sweeps(conn, t)) == 1
+    with tn.tenant_transaction(worker_conn, a) as tx:  # the job's own revision
+        jid, created = dj.submit_sweep(tx)
+    assert not created and jid in queued
+
+
+def test_one_tenants_sweep_failure_does_not_stop_the_others(
+        app_conn: Conn, worker_conn: Conn, conn: Conn,
+        caplog: pytest.LogCaptureFixture) -> None:  # fmt: skip
+    clear_of_hour_turn(conn)
+    a, b, c = sorted(tenant(app_conn, conn) for _ in range(3))
+    with tn.tenant_transaction(app_conn, b) as tx:  # b's slot holds another job
+        rev = dj.payload(rt.ExpirySweep("x", str(b), datetime.now(UTC)))
+        hour = tx.conn.execute("SELECT to_char(clock_timestamp() AT TIME ZONE "
+                               "'UTC', 'YYYYMMDD\"T\"HH24')").fetchone()  # fmt: skip
+        assert hour is not None
+        enqueue(tx, dj.KIND, f"sweep:sweep-{hour[0]}", Priority.SAFETY, rev)
+    with caplog.at_level(logging.WARNING, "qw_worker"):
+        queued, failed = dj.schedule(worker_conn)
+    assert (len(queued), failed) == (2, [(b, "IdempotencyConflict")])
+    assert f"retention sweep for tenant {b} not queued: IdempotencyConflict" in (
+        caplog.text)  # fmt: skip
+    assert [len(sweeps(conn, t)) for t in (a, b, c)] == [1, 1, 1]
+
+
+def test_only_qw_worker_may_list_the_tenants_to_sweep(
+        app_conn: Conn, worker_conn: Conn, conn: Conn,
+        runtime_urls: dict[str, str]) -> None:  # fmt: skip
+    t = tenant(app_conn, conn)
+    for group in ("qw_app", "qw_assessor", "qw_release"):
+        with psycopg.connect(runtime_urls[group], autocommit=True) as c:
+            with pytest.raises(hs.HoldStoreError) as err:
+                hs.sweep_tenants(c)
+            assert err.value.code == "forbidden"
+            with pytest.raises(psycopg.errors.InsufficientPrivilege):
+                c.execute("SELECT app.retention_sweep_tenants(NULL)")
+            with pytest.raises(hs.HoldStoreError):  # the timer step too
+                dj.schedule(c)
+            if group == "qw_app":  # the others have no grant on app.tenant
+                assert c.execute("SELECT count(*) FROM app.tenant").fetchone() == (0,)
+    with conn.transaction():  # a qw_migrate session that is no worker login
+        conn.execute("SET LOCAL SESSION AUTHORIZATION qw_migrate")
+        got = conn.execute("SELECT * FROM app.retention_sweep_tenants(NULL)")
+        assert got.fetchall() == []
+        assert conn.execute("SELECT count(*) FROM app.tenant").fetchone() == (0,)
+    # the worker itself reads no tenant row outside the lister
+    assert worker_conn.execute("SELECT count(*) FROM app.tenant").fetchone() == (0,)
+    assert hs.sweep_tenants(worker_conn) == [t]
+
+
+def test_the_entry_point_runs_the_sweep_timer_only_with_the_deletion_handler(
+        runtime_urls: dict[str, str], tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch) -> None:  # fmt: skip
+    started: list[Worker] = []
+    monkeypatch.setattr(Worker, "run", lambda w, max_ticks=None: started.append(w))
+    monkeypatch.setattr(entry, "install_signal_handlers", lambda worker: None)
+    monkeypatch.setenv("QW_DATABASE_URL", runtime_urls["qw_worker"])
+    monkeypatch.delenv("QW_ASSESSOR_DATABASE_URL", raising=False)
+    f = tmp_path / "record.key"
+    f.write_bytes(RAW)
+    f.chmod(0o600)
+    monkeypatch.setenv("QW_RECORD_KEY_FILE", str(f))
+    assert entry.main() == 0  # no store target: no handler, no timer
+    monkeypatch.setattr(dj, "TARGETS", TARGETS)
+    assert entry.main() == 0
+    monkeypatch.setenv("QW_WORKER_POOL", "experiment")
+    assert entry.main() == 0
+    names = [sorted(t.name for t in w.timers) for w in started]
+    assert names == [["budget.expire_due"],
+                     ["budget.expire_due", dj.KIND], []]  # fmt: skip
+    assert dj.KIND in started[1].handlers and dj.KIND not in started[0].handlers

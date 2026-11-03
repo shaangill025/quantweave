@@ -107,7 +107,7 @@ ACCOUNT_TABLES = (
     "account_revision",
 )  # 0055, 0056
 TOMBSTONE_TABLES = ("deletion_tombstone", "deletion_tombstone_checkpoint")  # 0057
-HOLD_TABLES = ("legal_hold_event",)  # 0058
+HOLD_TABLES = ("legal_hold_event", "legal_hold_quarantine")  # 0058, 0061
 
 
 def make_tenant(conn: Conn, name: str) -> tuple[uuid.UUID, uuid.UUID]:
