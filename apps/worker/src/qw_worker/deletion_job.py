@@ -16,7 +16,11 @@ deletion request or expiry sweep of one tenant, on qw_worker in its transaction.
   (`config.record_key_from_env`, a file, never the database) and one `Target` per
   class (a store's handler: list records with their exact `created_at`; delete
   one). A request for a class the policy deletes but no target handles is
-  `no_target`, before anything runs.
+  `no_target`, before anything runs. `TARGETS` holds the installation's:
+  simulation only (`qw_adapters.deletion_targets`). Evidence stays unregistered
+  until owner decision 124's passage-reading redaction lands, so a request
+  naming it is `no_target`. A listing takes its store's lock, so every store
+  lock precedes the first tombstone lock.
 - Lock order (PR A review M2): the first lock is `legal_hold` shared, through
   `legal_hold_store.load` (READ COMMITTED only); every tombstone lock comes after
   it, inside `tombstone_store.append`. The job never places or releases a hold.
@@ -49,6 +53,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from types import MappingProxyType
 
+from qw_adapters import deletion_targets as dt
 from qw_adapters import legal_hold_store as hs
 from qw_adapters import tombstone_store as ts
 from qw_adapters.jobs import ClaimedJob, Json, enqueue
@@ -90,9 +95,42 @@ class Target:
     delete: Callable[[TenantTx, rt.Item], bool]
 
 
-# The installation's store handlers. None exists yet (each needs its own task and
-# its exact-`created_at` acceptance test), so the entry point registers no handler.
-TARGETS: Mapping[rt.RetentionClass, Target] = MappingProxyType({})
+def _store_target(cls: rt.RetentionClass,
+                  items: Callable[[TenantTx, frozenset[str]], Sequence[rt.Item]],
+                  delete: Callable[[TenantTx, rt.Item], bool]) -> Target:  # fmt: skip
+    """`qw_adapters.deletion_targets`' functions as a Target: a store refusal
+    becomes a `TargetError` with its code and retryability."""
+
+    def listed(tx: TenantTx, ids: frozenset[str]) -> Sequence[rt.Item]:
+        try:
+            return items(tx, ids)
+        except dt.TargetStoreError as exc:
+            raise TargetError(exc.code, retryable=exc.retryable) from None
+
+    def deleted(tx: TenantTx, item: rt.Item) -> bool:
+        try:
+            return delete(tx, item)
+        except dt.TargetStoreError as exc:
+            raise TargetError(exc.code, retryable=exc.retryable) from None
+
+    return Target(cls, listed, deleted)
+
+
+# The installation's store handlers (`qw_adapters.deletion_targets`), one per class
+# whose stores they delete completely to the owner's required scope; the entry
+# point registers the handler and the sweep timer because one exists. Evidence is
+# not registered: its target removes the source text but not the passage
+# readings owner decision 124 also requires, and a class is never reported deleted
+# when it is not fully deleted. A request naming a class the policy deletes but no
+# target covers (evidence, research, security, policy, ...) is `no_target` before
+# anything runs.
+TARGETS: Mapping[rt.RetentionClass, Target] = MappingProxyType(
+    {
+        rt.RetentionClass.SIMULATION: _store_target(
+            rt.RetentionClass.SIMULATION, dt.simulation_items, dt.simulation_delete
+        ),
+    }
+)
 
 
 def _now(tx: TenantTx) -> datetime:
