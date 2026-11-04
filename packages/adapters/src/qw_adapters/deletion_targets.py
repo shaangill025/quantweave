@@ -1,7 +1,7 @@
 """Store deletion targets for the `retention.delete` job (T058; spec §4, §12, §15;
 R052, R086-R088): for each retention class the job deletes, list the tenant's
 records with their exact `created_at` and delete one record by (id, created_at).
-The worker wraps the registered ones as `deletion_job.Target`s (simulation only);
+The worker wraps them as `deletion_job.Target`s (both registered);
 everything runs as qw_worker in the job's tenant transaction, under forced RLS,
 and every statement also names the tenant.
 
@@ -13,27 +13,25 @@ and every statement also names the tenant.
   any deletion that leaves the definition behind. A record with the id but
   another `created_at` is another incarnation and is not touched (absent).
   Calculation records of the simulation (audit class) are kept.
-- `evidence` (0012; data dictionary evidence_record): NOT REGISTERED in
-  `deletion_job.TARGETS` until owner decision 124's passage-reading redaction
-  lands (receipt T058 increment 7). These functions delete less than decision
-  124 requires, so the job must not report the class deleted through them; they
-  are kept, with their direct tests, as the base for that redesign. A record is
-  one evidence source whose text is still held, its `created_at` the source row's
+- `evidence` (0012, 0065; data dictionary evidence_record): a record is one
+  evidence source not yet deleted (its text held, or already purged after
+  retention, with its readings still stored), its `created_at` the source row's
   `recorded_at`. Deleting it is the evidence store's own deletion
-  (`EvidenceStore.delete` then `evidence_store.save`): a `deleted` event, and the
-  text removed; hashes, passages and history remain by that design, and
-  citations of the source become replay-limited when the store is read. No new
-  grant: 0012 already lets qw_worker do this. Owner decision 124 also requires
-  the passages' readings (`evidence_record.reading`) to go; that is not built.
+  (`EvidenceStore.delete` then `evidence_store.save`), to owner decision 124's
+  scope: a `deleted` event, the text removed (if still held) and its passages'
+  readings set to
+  NULL (0065's qw_worker-only UPDATE; a tombstone cannot commit while a reading
+  remains). Ids, offsets, hashes, citations (replay-limited) and the source
+  row's metadata remain. Claims' stated values are research class (decision
+  121) and stay.
 - Locks: a listing first checks, without a lock, whether the tenant has any
   candidate; with none it returns [] and takes no lock. Otherwise it takes the
   store's tenant lock exclusively and keeps it to the end of the transaction, so
   the job holds every store lock before the first tombstone lock, and two jobs
-  of one tenant cannot deadlock. The registered path takes only `simulation`;
-  the evidence listing keeps its `evidence` lock, which in class order comes
-  first (as the simulation store requires) once evidence is registered. A
-  sweep with candidates therefore blocks the store's writers for its duration
-  (an accepted residual).
+  of one tenant cannot deadlock. In class order the job takes `evidence`, then
+  `simulation` (the simulation store's documented order). A sweep with
+  candidates therefore blocks the store's writers for its duration (an
+  accepted residual).
 - Failures are `TargetStoreError(code, retryable)`: `database`, retryable only
   for a transient error (`TRANSIENT`), or the evidence store's `integrity` / its
   domain refusal (not retryable).
@@ -145,19 +143,20 @@ def simulation_delete(tx: TenantTx, item: rt.Item) -> bool:
     return _guarded(go)
 
 
+# Not yet deleted: no `deleted` event (a purged source's readings remain).
+_LIVE = ("NOT EXISTS (SELECT 1 FROM app.evidence_event e WHERE e.tenant_id = "
+         "s.tenant_id AND e.kind = 'deleted' AND e.subject = s.id)")  # fmt: skip
 _SOURCES = ("SELECT s.id, s.recorded_at FROM app.evidence_source s WHERE "
             "s.tenant_id = %s AND (cardinality(%s::text[]) = 0 OR s.id = ANY(%s)) "
-            "AND EXISTS (SELECT 1 FROM app.evidence_content c WHERE c.tenant_id = "
-            "s.tenant_id AND c.source_id = s.id) ORDER BY s.id")  # fmt: skip
+            f"AND {_LIVE} ORDER BY s.id")  # fmt: skip
 
 
-_HELD = ("SELECT 1 FROM app.evidence_source s JOIN app.evidence_content c ON "
-         "c.tenant_id = s.tenant_id AND c.source_id = s.id WHERE s.tenant_id = %s "
-         "AND s.id = %s AND s.recorded_at = %s")  # fmt: skip
+_PRESENT = ("SELECT 1 FROM app.evidence_source s WHERE s.tenant_id = %s "
+         f"AND s.id = %s AND s.recorded_at = %s AND {_LIVE}")  # fmt: skip
 
 
 def evidence_items(tx: TenantTx, ids: frozenset[str]) -> list[rt.Item]:
-    """The tenant's evidence sources whose text is held (all when `ids` is empty),
+    """The tenant's evidence sources not yet deleted (all when `ids` is empty),
     the store exclusively locked. The store is verified per deletion, not here,
     so a corrupt evidence row fails its own deletions, never a sweep."""
 
@@ -171,19 +170,19 @@ def evidence_items(tx: TenantTx, ids: frozenset[str]) -> list[rt.Item]:
 
 
 def evidence_delete(tx: TenantTx, item: rt.Item) -> bool:
-    """Tombstone the source `item` names and drop its text; False when absent
-    (no such source or incarnation, or its text is already gone)."""
+    """Tombstone the source `item` names, drop any text and redact its readings;
+    False when absent (no such source or incarnation, or already deleted)."""
 
-    def held() -> bool:
-        row = tx.conn.execute(_HELD, (tx.tenant_id, item.record_id,
+    def present() -> bool:
+        row = tx.conn.execute(_PRESENT, (tx.tenant_id, item.record_id,
                                       item.created_at)).fetchone()  # fmt: skip
         return row is not None
 
     def go() -> bool:
-        if not held():  # cheap first: a retry of a deleted record never loads
+        if not present():  # cheap first: a retry of a deleted record never loads
             return False
         store = es.load(tx)  # the exclusive lock; then check again under it
-        if not held():
+        if not present():
             return False
         row = tx.conn.execute("SELECT clock_timestamp()").fetchone()
         assert row is not None

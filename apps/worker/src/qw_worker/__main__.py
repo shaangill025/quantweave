@@ -16,7 +16,7 @@ experiment-pool worker runs no timer. The record key comes from QW_RECORD_KEY_FI
 (`config.record_key_from_env`, decision 107; inline QW_RECORD_KEY or a short key
 refuses the start, exit 2, also under --check-config). A standard-pool worker with
 the key handles `retention.delete` (`deletion_job`) over its store `Target`s
-(`deletion_job.TARGETS`: simulation; evidence waits on owner decision 124); with
+(`deletion_job.TARGETS`: evidence and simulation); with
 none it would register no deletion handler and those jobs would stay queued.
 Beside that handler, and only then, it runs the hourly retention-sweep timer
 (`deletion_job.timer`, owner decision 113). No publish target is passed, so the

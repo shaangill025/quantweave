@@ -18,6 +18,10 @@ a new member, a lost member or a revision reopens it. No mutation may be backdat
 within a tenant. `snapshot` and `restore` carry one tenant's records to and from
 storage (qw_adapters.evidence_store); `restore` re-checks every rule that does not
 need the rights in force at ingest or resolution time.
+Deleting a source (owner decision 124) also redacts the readings of its passages:
+only ids, offsets, hashes, citations (replay-limited) and the source metadata
+remain. A passage holds a reading exactly when its source is not deleted; its
+citations are then re-checked by link time and usability, not by value.
 LIMITATIONS: non-fact claim kinds refused; no T027 binding. Stdlib only.
 """
 
@@ -26,7 +30,7 @@ import json
 import re
 from collections import Counter
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import date, datetime
 from decimal import Decimal, InvalidOperation
 from enum import StrEnum
@@ -148,7 +152,7 @@ class Passage:
     start: int
     end: int
     text_hash: str
-    reading: Reading
+    reading: Reading | None  # None: redacted with its deleted source (decision 124)
     known_at: datetime
 
 
@@ -242,7 +246,7 @@ def _fact_passage(src: Source, text: str, p: Passage) -> bool:
     except (ValueError, TypeError, IndexError, KeyError, InvalidOperation):
         return False
     r = p.reading
-    return stated == (r.attribute, r.unit, r.value, r.period)
+    return r is not None and stated == (r.attribute, r.unit, r.value, r.period)
 
 
 class EvidenceStore:
@@ -448,6 +452,8 @@ class EvidenceStore:
         if src.kind is SourceKind.SOCIAL:
             raise EvidenceError("social_lead", "a social source is not evidence")
         mine, theirs = rev.stated, p.reading
+        if theirs is None:  # redacted: its source is deleted
+            raise EvidenceError("evidence_unavailable", Invalid.DELETED.value)
         for name in ("entity", "attribute", "period", "unit", "value"):
             if getattr(mine, name) != getattr(theirs, name):
                 raise EvidenceError(f"{name}_mismatch", passage_id)
@@ -473,11 +479,15 @@ class EvidenceStore:
         self._clock[tenant_id] = at
 
     def delete(self, tenant_id: str, source_id: str, at: datetime) -> None:
-        """Tombstone one copy and drop its content; hashes and history remain."""
+        """Tombstone one copy, drop its content and redact its passages' readings
+        (owner decision 124); ids, hashes, citations and history remain."""
         at = self._time(tenant_id, at)
         self._get(self._sources, tenant_id, source_id)
         self._deleted.setdefault((tenant_id, source_id), at)
         self._content.pop((tenant_id, source_id), None)
+        for key, p in self._passages.items():
+            if key[0] == tenant_id and p.source_id == source_id:
+                self._passages[key] = replace(p, reading=None)
         self._clock[tenant_id] = at
 
     def purge_expired(self, tenant_id: str, at: datetime) -> None:
@@ -657,7 +667,9 @@ class EvidenceStore:
         resolution members, and the live store's chronology: events after receipt,
         withdrawals of known groups, passages known before their citations and
         before their text was removed, resolutions while their members were
-        current. Ingest and resolution rights are not replayed.
+        current. A passage holds a reading iff its source is not deleted; a
+        redacted one's citations are replay-limited (not matched by value).
+        Ingest and resolution rights are not replayed.
         Any failure raises EvidenceError("integrity")."""
 
         def need(ok: bool, what: str) -> None:
@@ -704,8 +716,9 @@ class EvidenceStore:
             removed = [m[k] for m in (snap.deleted, snap.purged)
                        if (k := p.source_id) in m]  # fmt: skip
             need(all(p.known_at <= at for at in removed), "passage after removal")
+            need((p.reading is None) is (p.source_id in snap.deleted), "redaction")
             text = snap.content.get(p.source_id)
-            if text is not None:
+            if text is not None and p.reading is not None:  # held: not deleted
                 quote = text[p.start : p.end]
                 need(p.end <= len(text) and _sha(quote) == p.text_hash, p.passage_id)
                 fact = _fact_passage(src, text, p)
@@ -732,7 +745,8 @@ class EvidenceStore:
             body = [t, c.claim_id, c.revision, c.passage_id]
             need(c.citation_id == f"cit-{_sha(json.dumps(body))[:32]}", "citation id")
             need(p.known_at <= c.linked_at, "passage after citation")
-            need(rev.stated == p.reading and src.kind is not SourceKind.SOCIAL
+            replayed = p.reading is None or rev.stated == p.reading  # 124
+            need(replayed and src.kind is not SourceKind.SOCIAL
                  and rev.known_at <= c.linked_at
                  and (not later or c.linked_at < later[0].known_at)
                  and s._unusable(src, c.linked_at) is None, c.citation_id)  # fmt: skip

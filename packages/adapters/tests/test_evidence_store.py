@@ -16,12 +16,14 @@ from collections.abc import Callable
 from dataclasses import replace
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
+from pathlib import Path
 
 import psycopg
 import pytest
 from ingest_rights_helper import KEEP, REGION, UNTIL, qualified_registry
 from psycopg import errors
 from psycopg.rows import TupleRow
+from psycopg.types.json import Jsonb
 from qw_adapters import evidence_store as es
 from qw_adapters import tenancy as tn
 from qw_domain.evidence import (
@@ -176,6 +178,125 @@ def test_round_trip_rebuilds_the_same_store(
         "SELECT count(*) FROM app.evidence_record WHERE tenant_id = %s", (a,)
     ).fetchone()
     assert rows == (5,)  # every passage row, with its hash, remains
+    assert redacted(conn, a) == ["p-wire"]  # decision 124: the deleted copy's
+
+
+def redacted(c: Conn, t: uuid.UUID) -> list[str]:
+    """The passages stored without a reading."""
+    got = c.execute("SELECT id FROM app.evidence_record WHERE tenant_id = %s AND "
+                    "reading IS NULL ORDER BY id", (t,)).fetchall()  # fmt: skip
+    return [r[0] for r in got]
+
+
+@pytest.mark.db
+def test_only_the_worker_redacts_and_only_a_deleted_sources_readings(
+    app_conn: Conn, worker_conn: Conn, conn: Conn
+) -> None:
+    """0065: a deletion after the first save stores the readings as NULL through
+    qw_worker's guarded UPDATE; no other change, role or source can, and a
+    tombstone cannot commit while its source keeps a reading."""
+    a = tenant(app_conn)
+    ta, later = str(a), T0 + timedelta(days=3)
+    stored(app_conn, a)
+    for role, may in (("qw_app", False), ("qw_worker", True)):
+        row = conn.execute("SELECT has_column_privilege(%s, 'app.evidence_record', "
+                           "'reading', 'UPDATE')", (role,)).fetchone()  # fmt: skip
+        assert row == (may,), role
+    gone = get(app_conn, a)
+    gone.delete(ta, "s-release", later)
+    with pytest.raises(es.EvidenceStoreError, match="database"):
+        put(app_conn, a, gone)  # qw_app may not redact, so it cannot delete
+    assert redacted(conn, a) == ["p-wire"]
+    put(worker_conn, a, gone)
+    assert redacted(conn, a) == ["p-release", "p-wire"]
+    assert get(app_conn, a).snapshot(ta) == gone.snapshot(ta)
+    for sql, why in (
+        ("UPDATE app.evidence_record SET reading = NULL WHERE id = 'p-note'",
+         "append-only"),  # its source is not deleted
+        ("UPDATE app.evidence_record SET hash = repeat('0', 64), reading = NULL "
+         "WHERE id = 'p-wire'", "permission denied"),  # another column changes
+        ("UPDATE app.evidence_record SET reading = '{}' WHERE id = 'p-wire'",
+         "append-only"),  # a reading is never written back
+    ):  # fmt: skip
+        with pytest.raises(psycopg.Error, match=why), \
+                tn.tenant_transaction(worker_conn, a) as tx:  # fmt: skip
+            tx.conn.execute(sql)
+    with (
+        pytest.raises(psycopg.Error, match="keeps a passage reading"),
+        tn.tenant_transaction(worker_conn, a) as tx,
+    ):  # a tombstone, unredacted
+        tx.conn.execute(
+            "INSERT INTO app.evidence_event (tenant_id, kind, subject, "
+            "at) VALUES (%s, 'deleted', 's-note', %s)",
+            (a, later),
+        )
+        tx.conn.execute("DELETE FROM app.evidence_content WHERE source_id = 's-note'")
+    for who in ("", "SET LOCAL SESSION AUTHORIZATION qw_migrate"):  # never the owner
+        with pytest.raises(errors.RaiseException, match="append-only"), \
+                conn.transaction():  # fmt: skip
+            if who:  # the owner is under forced RLS: name the tenant
+                conn.execute(who)
+                conn.execute("SELECT set_config('app.tenant_id', %s, true)", (ta,))
+            # a tombstoned source, so only the role is refused
+            for sql, args in (
+                ("INSERT INTO app.evidence_event (tenant_id, kind, subject, at) "
+                 "VALUES (%s, 'deleted', 's-note', %s)", (a, later)),
+                ("DELETE FROM app.evidence_content WHERE tenant_id = %s "
+                 "AND source_id = 's-note'", (a,)),
+                ("UPDATE app.evidence_record SET reading = NULL WHERE "
+                 "tenant_id = %s AND id = 'p-note'", (a,)),
+            ):  # fmt: skip
+                conn.execute(sql, args)
+    assert redacted(conn, a) == ["p-release", "p-wire"]
+    assert get(app_conn, a).snapshot(ta) == gone.snapshot(ta)
+
+
+@pytest.mark.db
+def test_a_reading_is_missing_only_with_its_tombstone(
+    app_conn: Conn, conn: Conn
+) -> None:
+    """A new passage without a reading cannot commit unless its source is deleted;
+    0065's backfill redacts passages of sources deleted before it."""
+    a = tenant(app_conn)
+    stored(app_conn, a)
+    copy = "INSERT INTO app.{0} ({1}) SELECT {2} FROM app.{0} WHERE id = %s"
+    src = (
+        "tenant_id, id, kind, feed_id, feed_hash, content_hash, origin, "
+        "published_at, received_at, retain_until, scope, jurisdiction"
+    )
+    rec = "tenant_id, id, source_id, start_offset, end_offset, hash, reading, known_at"
+    with pytest.raises(psycopg.Error, match="has no reading"), \
+            tn.tenant_transaction(app_conn, a) as tx:  # fmt: skip
+        tx.conn.execute(copy.format("evidence_source", src, src.replace(
+            " id,", " 's-x',")), ("s-note",))  # fmt: skip
+        tx.conn.execute("INSERT INTO app.evidence_content (tenant_id, source_id, "
+                        "content) VALUES (%s, 's-x', %s)", (a, NOTE))  # fmt: skip
+        tx.conn.execute(copy.format("evidence_record", rec, rec.replace(
+            " id, source_id", " 'p-x', 's-x'").replace("reading", "NULL")),
+            ("p-note",))  # fmt: skip
+    b = tenant(app_conn)  # two tenants: the runner sets none
+    stored(app_conn, b)
+    sql = (Path(es.__file__).parent / "sql" / "0065_evidence_redaction.sql").read_text()
+    backfill = sql[sql.index("-- backfill begin") : sql.index("-- backfill end")]
+    conn.execute("SET session_replication_role = replica")  # the pre-0065 state
+    conn.execute("UPDATE app.evidence_record SET reading = %s WHERE id = 'p-wire'",
+                 (Jsonb(es.reading_json(reading("100"))),))  # fmt: skip
+    conn.execute("SET session_replication_role = origin")
+    assert redacted(conn, a) == redacted(conn, b) == []
+    with pytest.raises(es.EvidenceStoreError, match="redaction"):
+        get(app_conn, a)
+    with conn.transaction():  # as the runner: qw_migrate, NOBYPASSRLS, no tenant,
+        for trigger in ("redact_guard", "unredacted"):  # neither exists yet
+            conn.execute(f"ALTER TABLE app.evidence_record DISABLE TRIGGER {trigger}")
+        conn.execute("SET LOCAL SESSION AUTHORIZATION qw_migrate")
+        conn.execute(backfill)
+    for trigger in ("redact_guard", "unredacted"):
+        conn.execute(f"ALTER TABLE app.evidence_record ENABLE TRIGGER {trigger}")
+    assert redacted(conn, a) == redacted(conn, b) == ["p-wire"]
+    assert get(app_conn, a) is not None and get(app_conn, b) is not None
+    policies = conn.execute("SELECT count(*) FROM pg_policies WHERE policyname LIKE "
+                            "'redaction_backfill%%'").fetchone()  # fmt: skip
+    assert policies == (0,)  # dropped again
 
 
 @pytest.mark.db

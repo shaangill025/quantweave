@@ -7,6 +7,11 @@ sources, and reads everything back: the stored snapshot must equal the store's,
 else `EvidenceStoreError("integrity")` (another writer's row, a forgery, or a
 differing row under one key) and the transaction rolls back. `load` rebuilds the
 store with `EvidenceStore.restore`, which re-checks every stored invariant.
+The one update (0065, owner decision 124): a deletion after the first save sets
+its source's passage readings to NULL. Only qw_worker may (the retention.delete
+job's evidence target), so a qw_app `save` of a newly deleted source fails
+(`database`) and rolls back; a source deleted before its first save is inserted
+already redacted.
 Database failures are `EvidenceStoreError("database")`. On any EvidenceStoreError
 the caller must roll back the transaction (leave the `tenant_transaction` block by
 the exception); its partial inserts must never be committed.
@@ -99,7 +104,7 @@ def _read(tx: TenantTx) -> Snapshot:
     content = dict(sorted(_rows(tx, "SELECT source_id, content FROM "
                                     "app.evidence_content" + where)))  # fmt: skip
     passages = tuple(sorted(
-        (Passage(t, i, s, a, b, hh, reading_of(rd), _utc(k))
+        (Passage(t, i, s, a, b, hh, None if rd is None else reading_of(rd), _utc(k))
          for i, s, a, b, hh, rd, k in _rows(tx,
             "SELECT id, source_id, start_offset, end_offset, hash, reading, known_at"
             " FROM app.evidence_record" + where)),
@@ -188,7 +193,8 @@ def _save(tx: TenantTx, store: EvidenceStore) -> None:
     _insert(tx, "evidence_record", "id, source_id, start_offset, end_offset, hash, "
             "reading, known_at",
             [(p.passage_id, p.source_id, p.start, p.end, p.text_hash,
-              Jsonb(reading_json(p.reading)), p.known_at)
+              None if p.reading is None else Jsonb(reading_json(p.reading)),
+              p.known_at)
              for p in snap.passages])  # fmt: skip
     _insert(tx, "claim", "id, revision, kind, stated, known_at",
             [(r.claim_id, r.revision, r.kind.value, Jsonb(reading_json(r.stated)),
@@ -212,5 +218,13 @@ def _save(tx: TenantTx, store: EvidenceStore) -> None:
         "DELETE FROM app.evidence_content WHERE tenant_id = %s AND source_id = ANY(%s)",
         (t, removed),
     )
+    redact = [p.passage_id for p in snap.passages if p.reading is None]
+    held = tx.conn.execute(  # stored readings to redact (none: no UPDATE at all)
+        "SELECT id FROM app.evidence_record WHERE tenant_id = %s AND id = ANY(%s) "
+        "AND reading IS NOT NULL", (t, redact)).fetchall()  # fmt: skip
+    if held:
+        tx.conn.execute("UPDATE app.evidence_record SET reading = NULL WHERE "
+                        "tenant_id = %s AND id = ANY(%s)",
+                        (t, [r[0] for r in held]))  # fmt: skip
     if _snapshot(tx) != snap:
         raise EvidenceStoreError("integrity", "the stored records differ")

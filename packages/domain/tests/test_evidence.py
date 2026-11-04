@@ -205,6 +205,37 @@ def test_deleting_one_copy_leaves_an_independent_copy_and_limits_replay() -> Non
     assert status(store, h(6)) is Status.SUPPORTED
 
 
+def test_deletion_redacts_the_readings_and_the_citations_stay_replay_limited() -> (
+    None
+):  # fmt: skip
+    """Owner decision 124: a deleted source's passages keep ids, offsets, hashes
+    and their citations, but no reading; restore accepts exactly that state."""
+    store = EvidenceStore()
+    claimed(store)
+    a, b = sourced(store, "s-a", RELEASE), sourced(store, "s-b", OTHER)
+    store.cite(TENANT, "c-1", a, h(1))
+    kept = store.passage(TENANT, a)
+    store.delete(TENANT, "s-a", h(5))
+    store.delete(TENANT, "s-a", h(6))  # again: still redacted, first time kept
+    assert store.passage(TENANT, a) == replace(kept, reading=None)
+    assert store.passage(TENANT, b).reading == fact()
+    early = store.support(TENANT, "c-1", h(2), REG)
+    assert (early.status, early.replay_limited) == (Status.SUPPORTED, True)
+    assert store.support(TENANT, "c-1", h(6), REG).invalid != {}
+    with pytest.raises(EvidenceError, match="evidence_unavailable: deleted"):
+        store.cite(TENANT, "c-1", a, h(7))
+    snap = store.snapshot(TENANT)
+    assert snap.deleted == {"s-a": h(5)}
+    assert EvidenceStore.restore(snap).snapshot(TENANT) == snap
+    unredacted = replace(snap, passages=tuple(replace(p, reading=fact())
+                                              for p in snap.passages))  # fmt: skip
+    hidden = replace(snap, passages=tuple(replace(p, reading=None)
+                                          for p in snap.passages))  # fmt: skip
+    for bad in (unredacted, hidden):  # a reading iff its source is not deleted
+        with pytest.raises(EvidenceError, match="integrity"):
+            EvidenceStore.restore(bad)
+
+
 def test_retention_expiry_makes_claim_unsupported_at_that_time() -> None:
     store = EvidenceStore()
     claimed(store)

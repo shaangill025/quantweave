@@ -120,7 +120,8 @@ def read_evidence(
         "retrieved_at": format_instant(src.received_at),
         "rights_profile_id": src.feed_id, "availability": availability,
         "source_relationship_group": src.origin, "retention_class": "evidence",
-        "instrument_ids": [p.reading.entity.to_wire()],
+        "instrument_ids": [] if p.reading is None  # redacted (decision 124)
+        else [p.reading.entity.to_wire()],
         "coverage": _coverage(reasons),
     })  # fmt: skip
 
