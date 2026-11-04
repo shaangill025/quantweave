@@ -953,3 +953,56 @@ below waives a test, gate or spec requirement. Numbering continues from
     readings. Keep only hashes, ids and citations, which become
     replay-limited, plus minimal source metadata (type, recorded_at)."
     Implemented by: T058 (evidence deletion target, increment 7).
+
+125. **Session recorded on imported watchlist revisions (T057).**
+    Question: "T057 watchlist import: the watchlist store requires a live
+    session of the principal for every revision, but the import runs
+    without one. Which session should imported watchlist revisions record?"
+    Selected label: "Importing owner's session (Recommended)".
+    Option text as presented: "Pass the importing owner's current,
+    step-up-verified session into the import. Each imported revision
+    records that session, matching decision 116 (attributed to the
+    importing owner)."
+    Implemented by: T057 (watchlist import increment).
+
+126. **Idempotency key of imported watchlist revisions (T057).**
+    Question: "T057 watchlist import idempotency key: decision 116's example
+    'import:<export_id>:<watchlist_id>:<revision>' fails the store's key
+    format (16-128 chars of letters, digits, '_' or '-'). Is 'imp' plus the
+    hex SHA-256 of that string acceptable?"
+    Selected label: "imp + SHA-256 hex (Recommended)".
+    Option text as presented: "Deterministic, derived from the archive,
+    fits the format (67 characters), and a retry of the same import reuses
+    the same key."
+    Implemented by: T057 (watchlist import increment); refines 116.
+
+127. **Deletion requests for a class without a target (T058).**
+    Question: "T058: a deletion request may name a data class that has no
+    deletion target yet (research, policy, improvement, evidence until
+    decision 124 lands). What should happen to such a request?"
+    Selected label: "Refuse at the route (Recommended)".
+    Option text as presented: "The request API refuses classes without a
+    registered target, with a clear 'not yet supported' reason, so no
+    request is accepted that can't be honored. Requests for supported
+    classes proceed."
+    Implemented by: T058 (deletion request route).
+
+128. **Deleting identity in the security/operations class (T058).**
+    Question: "T058 security/operations class: deleting identity rows
+    (principals, memberships) amounts to closing the account, since most
+    tables reference them. How should a deletion request treat that class?"
+    Selected label: "Only via account closure (Recommended)".
+    Option text as presented: "Identity is never deleted by a per-class
+    request. It is removed only by a separate, step-up-verified
+    account-closure flow after all other classes are deleted, leaving
+    tombstones. Jobs, outbox and idempotency rows keep their purge
+    windows."
+    Implemented by: T058 (account-closure flow).
+
+---
+
+**Orchestrator note on decision 124 (not an owner decision).** The evidence
+passage-reading redaction did not fit increment 7, so increment 7 leaves the
+evidence class unregistered and a later T058 increment implements 124 (see
+docs/receipts/T058.md). This supersedes only 124's "increment 7" planning
+label, not its content.
