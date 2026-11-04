@@ -1006,3 +1006,42 @@ passage-reading redaction did not fit increment 7, so increment 7 leaves the
 evidence class unregistered and a later T058 increment implements 124 (see
 docs/receipts/T058.md). This supersedes only 124's "increment 7" planning
 label, not its content.
+
+---
+
+129. **What a watchlist import recreates (T057).**
+    Question: "T057 watchlist import: decision 116 said imported revisions
+    keep their original revision numbers, content and times, recreated in
+    order. But the export format (qw-export-1.0) only carries each
+    watchlist's latest state, with no history and no times. What should the
+    import do?"
+    Selected label: "Latest state, local clock (Recommended)".
+    Option text as presented: "Import each list as a single 'import' row
+    that keeps its revision number and content, stamped with the
+    destination's clock. No invented history. The export format stays
+    unchanged. Amends 116 for watchlists."
+    Implemented by: T057 (watchlist import, increment 9); amends 116 and
+    narrows 112 for watchlists (no original stamps exist to keep).
+
+130. **Owner session required on every import (T057).**
+    Question: "T057: the import checks the owner's step-up-verified session
+    on every apply, so even an archive without watchlists needs one. Keep
+    that?"
+    Selected label: "Always require (Recommended)".
+    Option text as presented: "Every import is a high-impact owner action,
+    so always require a live owner session stepped up within the hour,
+    consistent with other destructive or bulk operations."
+    Implemented by: T057 (watchlist import, increment 9).
+
+131. **Source metadata kept after evidence deletion (T058).**
+    Question: "T058 evidence deletion: decision 124 said to keep only
+    'minimal source metadata (type, recorded_at)'. Deleted sources currently
+    still keep feed id, publication/receipt/retention times, scope,
+    jurisdiction, content hash and origin, because replay uses them for
+    time, origin and rights checks. Can these stay as the 'minimal
+    metadata'?"
+    Selected label: "Keep them (Recommended)".
+    Option text as presented: "Treat these as the minimal metadata. They
+    contain no source content, only provenance, and they keep replay and
+    rights checks fail-closed. Text and readings are removed."
+    Implemented by: T058 (evidence redaction, increment 8); clarifies 124.
