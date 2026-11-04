@@ -30,8 +30,14 @@ addWatchlistEntry, updateWatchlistEntry, deleteWatchlistEntry).
 - `export_watchlists` is the T057 `research/watchlists.json` section: every live
   list's latest verified state, in a read-only snapshot. Deleted lists, the revision
   history, principals, sessions and idempotency keys are not exported.
-Times are the DB clock. Lock `watchlist:<tenant>` (shared to read) comes after every
-other lock. Research state only: nothing here reads or writes accounts or holdings.
+  `read_watchlists` gives the same rows in any transaction (the T057 apply's check).
+- An `import` row (0064, T057; owner decisions 116, 125, 126) starts a chain at the
+  archive's revision n with no previous hash, written only by
+  `app.portability_import_watchlists`; it replays as the list's state at n and
+  later revisions count on from it (n + 1).
+Times are the DB clock. Locks: `import:<tenant>` shared first (0064's guard does
+the same), then `watchlist:<tenant>` (shared to read), after every other lock.
+Research state only: nothing here reads or writes accounts or holdings.
 """
 
 from __future__ import annotations
@@ -54,7 +60,7 @@ from qw_adapters.tenancy import TenantTx, require_snapshot
 
 __all__ = ["MAX_ENTRIES", "Revision", "WatchlistStoreError", "add_entry", "create",
            "delete", "entry_json", "export_watchlists", "load", "page",
-           "remove_entry", "revision_hash", "tombstone", "update",
+           "read_watchlists", "remove_entry", "revision_hash", "tombstone", "update",
            "update_entry"]  # fmt: skip
 
 MAX_ENTRIES = 500  # per list; 0023 refuses a larger snapshot
@@ -111,6 +117,10 @@ def _editable(e: W.Entry | None) -> tuple[Any, ...] | None:
 
 
 def _lock(tx: TenantTx, shared: bool) -> None:
+    """The tenant's import lock shared, then 'watchlist:<tenant>' (0064's order):
+    no read or write runs inside an import, and none holds a lock it needs."""
+    tx.conn.execute("SELECT pg_advisory_xact_lock_shared(hashtextextended(%s, 0))",
+                    (f"import:{tx.tenant_id}",))  # fmt: skip
     fn = "pg_advisory_xact_lock_shared" if shared else "pg_advisory_xact_lock"
     tx.conn.execute(f"SELECT {fn}(hashtextextended(%s, 0))",
                     (f"watchlist:{tx.tenant_id}",))  # fmt: skip
@@ -161,8 +171,10 @@ def _chains(
         ) in rows:
             chain = out.setdefault(str(w), [])
             last, at = (chain[-1] if chain else None), ensure_aware_utc(at)
+            first = rev if action == "import" and last is None else 1  # 0064
             ok = (
-                rev == len(chain) + 1 and prev == (last.digest if last else None)
+                rev == (last.revision + 1 if last else first)
+                and prev == (last.digest if last else None)
                 and (last is None or (at >= last.recorded_at and not last.deleted))
                 and (i is not None) == (action in _ENTRY_ACTIONS)
                 and (not flag or action == "update_entry")
@@ -175,6 +187,9 @@ def _chains(
             by = W.Who(str(tx.tenant_id), str(who), at)
             if action == "create":
                 state = domain.create(by, str(w), name, text)
+            elif action == "import" and last is None:
+                state = domain.restore(by, str(w), rev, name, text,
+                                       tuple(map(_entry, entries)))  # fmt: skip
             elif action == "update":
                 state = domain.rename(by, str(w), rev - 1, name, text)
             elif action == "delete" and last is not None:
@@ -243,6 +258,11 @@ def export_watchlists(tx: TenantTx) -> list[dict[str, Any]]:
     contract entry plus `needs`). Every chain is verified first (`integrity`). Needs
     `tenant_transaction(..., snapshot=True)`, else `tenancy.SnapshotRequired`."""
     require_snapshot(tx)
+    return read_watchlists(tx)
+
+
+def read_watchlists(tx: TenantTx) -> list[dict[str, Any]]:
+    """`export_watchlists`' rows, verified, in any transaction."""
     _lock(tx, shared=True)
     tenant = str(tx.tenant_id)
     return [{"id": w, "tenant_id": tenant, "revision": c[-1].watchlist.revision,
@@ -260,7 +280,8 @@ def create(
     _lock(tx, shared=False)
     row = tx.conn.execute(
         "SELECT watchlist_id FROM app.watchlist_revision WHERE tenant_id = %s AND "
-        "principal_id = %s AND idempotency_key = %s AND revision = 1",
+        "principal_id = %s AND idempotency_key = %s AND revision = 1 AND "
+        "action = 'create'",
         (tx.tenant_id, principal, key),
     ).fetchone()
     if row is not None:
@@ -415,7 +436,7 @@ def _insert(
     snapshot: tuple[str, str, tuple[W.Entry, ...]], instrument: uuid.UUID | None,
     at: datetime | None = None, review_set: bool = False,
 ) -> Revision:  # fmt: skip
-    at, rev = at or _now(tx), len(chain) + 1
+    at, rev = at or _now(tx), chain[-1].revision + 1 if chain else 1
     name, description, entries = snapshot
     stored = [entry_json(e) for e in entries]
     previous = chain[-1].digest if chain else None

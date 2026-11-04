@@ -617,7 +617,8 @@ def test_security_definer_functions_are_hardened(conn: Conn) -> None:
     imports = [r for r in rows if r[0].startswith("portability_import_")]
     assert imports == [(f"portability_import_{n}", "qw_migrate", True,
                         ["search_path=pg_catalog, pg_temp"], ["qw_app", "qw_migrate"])
-                       for n in ("accounts", "journal")]  # 0062, 0060  # fmt: skip
+                       for n in ("accounts", "journal",
+                                 "watchlists")]  # 0062, 0060, 0064  # fmt: skip
     jobs = [r for r in rows if not r[0].startswith("throttle_")
             and r not in guard + history + budget + imports]  # fmt: skip
     assert [r[0] for r in jobs] == [

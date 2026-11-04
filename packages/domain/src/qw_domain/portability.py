@@ -205,6 +205,7 @@ _VERSION = re.compile(r"qw-export-([1-9][0-9]{0,3})\.(0|[1-9][0-9]{0,3})", re.AS
 _SEGMENT = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_.-]*", re.ASCII)
 _DRIVE = re.compile(r"[A-Za-z]:", re.ASCII)
 _HEX64 = re.compile(r"[a-f0-9]{64}", re.ASCII)
+_UUID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
 _REASON = re.compile(r"[a-z][a-z_]*(:[A-Za-z0-9][A-Za-z0-9_.:-]*)?", re.ASCII)
 _KEYS = sorted(("id", "format_version", "created_at", "scope_id", "files", "omissions",
                 "contains_credentials", "contains_executable_code", "content_hash",
@@ -502,20 +503,32 @@ def _tombstones(body: object, scope_id: str | None) -> None:
         raise _refuse(code, f"{TOMBSTONES_PATH}: {e}") from None
 
 
+def _nul(v: object) -> bool:  # a NUL in any string or key
+    if isinstance(v, dict):
+        v = [*v.keys(), *v.values()]
+    if isinstance(v, str):
+        return "\x00" in v
+    return isinstance(v, list) and any(map(_nul, v))
+
+
 def _watchlists(rows: list[dict[str, Any]], scope_id: str | None) -> None:
-    """Unique ids in order; each entry rebuilds (`qw_domain.watchlists`) and
+    """Unique canonical UUID ids in order, 0022's bounds and no NUL (as 0064's
+    `portability_watchlist_row`); each entry rebuilds (`qw_domain.watchlists`) and
     re-encodes exactly, entries in strict instrument order."""
     for n, r in enumerate(rows):
         if r["tenant_id"] != scope_id:
             raise _refuse(Refusal.SCOPE_MISMATCH, f"{WATCHLISTS_PATH}: row {n}")
         try:
-            entries = [wl.entry_from_json(e) for e in r["entries"]]
-            order = [e.instrument_id for e in entries]
-            ok = (isinstance(r["id"], str) and ID_PATTERN.fullmatch(r["id"])
-                  and type(r["revision"]) is int and r["revision"] >= 1
-                  and isinstance(r["name"], str) and r["name"] != ""
+            ok = (isinstance(r["id"], str) and _UUID.fullmatch(r["id"]) is not None
+                  and type(r["revision"]) is int and 1 <= r["revision"] <= 2147483646
+                  and isinstance(r["name"], str) and 1 <= len(r["name"]) <= 200
                   and isinstance(r["description"], str)
-                  and order == sorted(set(order))
+                  and len(r["description"]) <= 4000
+                  and isinstance(r["entries"], list) and len(r["entries"]) <= 500
+                  and not _nul(r))  # fmt: skip
+            entries = [wl.entry_from_json(e) for e in r["entries"]] if ok else []
+            order = [e.instrument_id for e in entries]
+            ok = (ok and order == sorted(set(order))
                   and canonical([wl.entry_json(e) for e in entries])
                   == canonical(r["entries"]))  # fmt: skip
         except (KeyError, TypeError, ValueError, ArithmeticError, AttributeError):

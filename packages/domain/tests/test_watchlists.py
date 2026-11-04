@@ -188,3 +188,23 @@ def test_watch_demands_feed_the_stream_plan_by_user_priority() -> None:
     assert {x.instrument_id for x in plan.subscriptions} == {inst(1), inst(3)}
     assert plan.scheduled_discovery == (inst(2), inst(4))
     assert {u.reasons for u in plan.uncovered} == {((IEX, "capacity_exhausted"),)}
+
+
+def test_an_imported_list_keeps_its_revision_and_continues() -> None:
+    """T057 (decision 116): `restore` puts an imported list's latest state in at
+    its archive revision, with no history; later changes count on from it."""
+    s = WatchlistStore()
+    got = s.restore(A, "wl-1", 7, "Imported", "SYNTHETIC", (entry(),))
+    assert (got.revision, got.entries) == (7, (entry(),))
+    assert s.rename(A, "wl-1", 7, "Renamed", "").revision == 8
+    assert [(r.revision, r.action) for r in s.audit(T)] == [
+        (7, "import"),
+        (8, "rename"),
+    ]
+    for wid, rev, entries in (("wl-1", 1, ()), ("wl-2", 0, ()), ("wl-2", True, ()),
+                              ("wl-2", 1, (entry(), entry())),
+                              ("wl-2", 1, (entry(SYN2), entry(SYN))),
+                              ("wl-2", 1, [entry()])):  # fmt: skip
+        with pytest.raises(WatchlistError):  # id used, revision, entry order, type
+            s.restore(A, wid, rev, "Imported", "", entries)  # type: ignore[arg-type]
+    assert [w.watchlist_id for w in s.list(T)] == ["wl-1"]
