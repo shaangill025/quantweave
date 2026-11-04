@@ -132,9 +132,28 @@ def seed_journal(tx: tn.TenantTx) -> None:
                         Money.of("50", "CAD")))  # fmt: skip
 
 
+def seed_accounts(tx: tn.TenantTx) -> None:
+    """SYN-A (non-ASCII broker), SYN-B and SYN-OLD (archived), a broker source and a
+    mirror, and four mapping revisions, through the store (SYNTHETIC)."""
+    v0, v1 = datetime(2025, 1, 1, tzinfo=UTC), datetime(2025, 6, 1, tzinfo=UTC)
+    for aid, broker in (("SYN-A", "Soci\u00e9t\u00e9 G\u00e9n\u00e9rale"),
+                        ("SYN-B", "SYN"), ("SYN-OLD", "SYN")):  # fmt: skip
+        a = st.account_from_text(tx, aid, broker, "cash", "USD")
+        st.register_account(tx, a, f"SYNTHETIC '{aid}' \"x\"", "complete_declared")
+    t = str(tx.tenant_id)
+    st.add_source(tx, src.Source("SYN-BRK", t, src.SourceKind.BROKER_EXPORT), "syn")
+    st.add_source(tx, src.Source("SYN-YAHOO", t, src.SourceKind.MIRROR), "yahoo")
+    for sid, ref, aid in (("SYN-BRK", "1001", "SYN-A"), ("SYN-YAHOO", "pf-1", "SYN-A"),
+                          ("SYN-BRK", "1002", "SYN-OLD")):  # fmt: skip
+        st.remap(tx, sid, ref, (src.MappedInterval(aid, v0),), 0)
+    st.remap(tx, "SYN-BRK", "1002", (src.MappedInterval("SYN-OLD", v0, v1),
+                                     src.MappedInterval("SYN-B", v1)), 1)  # fmt: skip
+    st.archive_account(tx, "SYN-OLD", 1)
+
+
 def seed(app_conn: Conn) -> tuple[uuid.UUID, uuid.UUID, uuid.UUID]:
-    """Policy a: v1 adopted, then v2; policy b: v1; the `seed_journal` events
-    (SYNTHETIC). Nothing else."""
+    """Policy a: v1 adopted, then v2; policy b: v1; the `seed_journal` events and
+    the `seed_accounts` rows (SYNTHETIC). Nothing else."""
     tenant = uuid.uuid4()
     owner, session = owner_of(app_conn, tenant)
     a, b = sorted((uuid.uuid4(), uuid.uuid4()))
@@ -154,6 +173,7 @@ def seed(app_conn: Conn) -> tuple[uuid.UUID, uuid.UUID, uuid.UUID]:
         ps.propose(tx, a, draft("income", str(tenant)), owner)
         ps.propose(tx, b, draft("income", str(tenant)), owner)
         seed_journal(tx)
+        seed_accounts(tx)
     return tenant, a, b
 
 
@@ -226,6 +246,7 @@ def test_an_empty_destination_receives_the_same_state(app_conn: Conn,
     assert history is not None and history.receipts == ()  # re-adopt at the destination
     assert by == {who}  # the importing owner, not the source's principal
     assert got.journal_events == 5 and state(dest, tenant) == (3, 0, 5, 1)
+    assert got.account_rows == 10  # 3 accounts, 1 archive, 2 sources, 4 mappings
     assert refused(dest, tenant, data, who) is R.DESTINATION_NOT_EMPTY  # only once
 
 
@@ -244,8 +265,8 @@ def _watchlist(tx: tn.TenantTx, who: uuid.UUID, session: uuid.UUID) -> None:
 
 
 def _account(tx: tn.TenantTx, *_: uuid.UUID) -> None:
-    a = st.account_from_text(tx, "SYN-A", "Interactive Brokers", "margin", "USD")
-    st.register_account(tx, a, "SYNTHETIC SYN-A", "complete_declared")
+    a = st.account_from_text(tx, "SYN-NEW", "Interactive Brokers", "margin", "USD")
+    st.register_account(tx, a, "SYNTHETIC SYN-NEW", "complete_declared")
 
 
 def _simulation(tx: tn.TenantTx, *_: uuid.UUID) -> None:
@@ -475,7 +496,8 @@ def test_a_failed_write_leaves_nothing(
     for writer, code in (
         (version, R.APPLY_VERIFY),
         (_journal, R.DESTINATION_NOT_EMPTY),  # 0060 finds the journal occupied
-        (_account, R.DESTINATION_NOT_EMPTY),  # the post-write check
+        (_account, R.DESTINATION_NOT_EMPTY),  # 0062 finds the accounts occupied
+        (_preview, R.DESTINATION_NOT_EMPTY),  # the post-write check
     ):
 
         def racing(*args: Any, writer: Callable[..., None] = writer) -> Any:
@@ -546,18 +568,19 @@ def test_journal_writers_on_other_connections_and_the_import_exclude_each_other(
     """The hard gate: every journal insert shares the tenant's import lock (0060's
     stamp trigger), so no writer can commit between the import's emptiness check
     and its commit, and an open writer holds the import off."""
-    tenant, *_ = seed(app_conn)
-    data = archive(app_conn, tenant)
-    who, _ = owner_of(dest, tenant)
-    with psycopg.connect(dest_urls["qw_app"], autocommit=True) as other:
-        with tn.tenant_transaction(other, tenant) as tx:  # an open writer first
-            _journal(tx)
-            with (pytest.raises(errors.LockNotAvailable),
-                  tn.tenant_transaction(dest, tenant) as dtx):  # fmt: skip
-                dest.execute("SET LOCAL lock_timeout = '300ms'")
-                di.apply_archive(dtx, data, who)
-        assert refused(dest, tenant, data, who) is R.DESTINATION_NOT_EMPTY
-    for writer in (_journal, _simulation):  # a simulation takes the account lock
+    for first in (_journal, _account):
+        tenant, *_ = seed(app_conn)
+        data = archive(app_conn, tenant)
+        who, _ = owner_of(dest, tenant)
+        with psycopg.connect(dest_urls["qw_app"], autocommit=True) as other:
+            with tn.tenant_transaction(other, tenant) as tx:  # an open writer first
+                first(tx)
+                with (pytest.raises(errors.LockNotAvailable),
+                      tn.tenant_transaction(dest, tenant) as dtx):  # fmt: skip
+                    dest.execute("SET LOCAL lock_timeout = '300ms'")
+                    di.apply_archive(dtx, data, who)
+            assert refused(dest, tenant, data, who) is R.DESTINATION_NOT_EMPTY
+    for writer in (_journal, _simulation, _account):  # a simulation: account lock
         tenant, *_ = seed(app_conn)
         data = archive(app_conn, tenant)
         who, _ = owner_of(dest, tenant)
@@ -573,14 +596,16 @@ def test_journal_writers_on_other_connections_and_the_import_exclude_each_other(
 
 
 @pytest.mark.db
+@pytest.mark.parametrize("store", ["journal", "accounts"])
 def test_a_writer_of_an_archive_account_waits_for_the_import_without_deadlock(
-    app_conn: Conn, dest: Conn, dest_urls: dict[str, str]
+    app_conn: Conn, dest: Conn, dest_urls: dict[str, str], store: str
 ) -> None:
     """The review's deadlock (40P01): the import holds `import:<tenant>` exclusive
     while a writer of an archive account posts. Every taker of an account lock
     shares the import lock first (`journal_store.lock_account`, 0060's triggers), so
     the writer waits holding nothing the import needs, the import completes, and
-    then the writer appends after it."""
+    then the writer appends after it. Increment 8: likewise an account-store
+    writer (`account_store._lock`, 0062's guard: import, then `source_map`)."""
     tenant, *_ = seed(app_conn)
     data = archive(app_conn, tenant)
     who, _ = owner_of(dest, tenant)
@@ -590,7 +615,10 @@ def test_a_writer_of_an_archive_account_waits_for_the_import_without_deadlock(
         h = Header("SYN-J1", datetime.now(UTC) - DAY, SourceRef("SYN-BROKER", "w0"))
         try:
             with tn.tenant_transaction(other, tenant) as tx:
-                js.post(tx, deposit(h, Money.of("5", "USD")))
+                if store == "journal":
+                    js.post(tx, deposit(h, Money.of("5", "USD")))
+                else:
+                    st.archive_account(tx, "SYN-A", 1)
         except BaseException as e:  # reported below, not lost in the thread
             failures.append(e)
 
@@ -612,7 +640,11 @@ def test_a_writer_of_an_archive_account_waits_for_the_import_without_deadlock(
             applied = di.apply_archive(dtx, data, who)
         thread.join(30)
     assert not thread.is_alive() and failures == []
-    assert applied.journal_events == 5 and state(dest, tenant) == (3, 0, 6, 1)
+    assert applied.journal_events == 5 and applied.account_rows == 10
+    with tn.tenant_transaction(dest, tenant) as tx:  # appended after the import
+        got = st.load(tx).accounts["SYN-A"]
+    assert state(dest, tenant) == (3, 0, 6 if store == "journal" else 5, 1)
+    assert got.revision == (1 if store == "journal" else 2)
 
 
 @pytest.mark.db
@@ -630,6 +662,27 @@ def test_a_deadlock_in_the_apply_is_a_typed_refusal(
 
     monkeypatch.setattr(ps, "propose", deadlocked)
     assert refused(dest, tenant, data, who) is R.DESTINATION_NOT_EMPTY
+
+
+@pytest.mark.db
+def test_an_audit_failure_names_no_section(
+    app_conn: Conn, dest: Conn, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A failure after both import functions returned is not the accounts'."""
+    tenant, *_ = seed(app_conn)
+    data = archive(app_conn, tenant)
+    who, _ = owner_of(dest, tenant)
+
+    def audit_fails(*_: Any, **__: Any) -> None:
+        raise errors.CheckViolation("SYNTHETIC audit failure")
+
+    monkeypatch.setattr(tn, "append_audit_event", audit_fails)
+    with (pytest.raises(pt.PortabilityError) as e,
+          tn.tenant_transaction(dest, tenant) as tx):  # fmt: skip
+        di.apply_archive(tx, data, who)
+    assert e.value.code is R.APPLY_VERIFY
+    assert str(e.value) == f"{R.APPLY_VERIFY.value}: {di.AUDIT_ACTION}"
+    assert state(dest, tenant) == (0, 0, 0, 0)
 
 
 @pytest.mark.db

@@ -1,4 +1,4 @@
-"""Apply a verified export to an empty destination tenant (T057 increments 6 and 7;
+"""Apply a verified export to an empty destination tenant (T057 increments 6 to 8;
 spec §2 Journey E; R006, R051, R052, R087, R096, R097).
 
 `provision(conn, data, display_name, login, verifier, key, *, claim_installation)`
@@ -36,11 +36,16 @@ granted to qw_app only):
    which checks the lock and the journal's emptiness itself, keeps each
    `account_rev` and `recorded_at`, and recomputes every event id and the chain
    header over the tenant's whole journal in SQL (`destination_not_empty` or
-   `apply_verify`); then the other stores must still be empty; then one
+   `apply_verify`); then the accounts section through
+   `app.portability_import_accounts` (0062), which likewise checks the lock and
+   the four tables' emptiness, keeps each `recorded_at`, and recomputes every
+   content hash and seal and checks both chains and the lifecycle in SQL; then the
+   other stores must still be empty; then one
    `portability.imported` audit event. Any failure rolls the savepoint back, so a
    caller that catches it still holds no write.
-Source facts are kept: policy ids, version numbers, content and hashes, and each
-journal event with its revision and knowledge time, as exported. A policy's
+Source facts are kept: policy ids, version numbers, content and hashes, each
+journal event with its revision and knowledge time, and every account, source,
+mapping and lifecycle row with its stamps and hashes, as exported. A policy's
 `created_at` (the destination's clock) and `created_by` (the importing owner) are
 destination provenance, not source facts: neither is in the archive.
 Nothing is adopted (no receipt is exported) and no credential is read:
@@ -48,14 +53,18 @@ Nothing is adopted (no receipt is exported) and no credential is read:
 `apply_archive` sets 0007's `app.balanced` back to DEFERRED after the journal
 call, overriding a caller's `SET CONSTRAINTS ... IMMEDIATE` for the rest of the
 transaction.
-LIMITATIONS: accounts, watchlists and tombstones are applied only while empty
+LIMITATIONS: watchlists and tombstones are applied only while empty
 (`portability_apply.APPLIED`); evidence and learned state likewise. Every journal
-insert shares the import lock (0060), so no journal writer commits inside an
-import; the other stores' writers do not take it yet, and their emptiness is
-checked before and after the writes at READ COMMITTED, so the /exports job must
-keep the destination closed to them while it runs. The audit event carries no
-export id, archive hash or section list: `app.audit_event` has no detail column,
-and `correlation_id` does not admit every export id.
+and account-store insert shares the import lock (0060, 0062), so no such writer
+commits inside an import; the other stores' writers do not take it yet, and their
+emptiness is checked before and after the writes at READ COMMITTED, so the
+/exports job must keep the destination closed to them while it runs. Lock order,
+a rule for new callers (not machine-enforced): import, then account (`ledger:`,
+`source_map:`), then policy; a path that takes an account or policy lock before
+the import lock can deadlock with an import (40P01, `destination_not_empty`).
+The audit event carries no export id, archive hash or section list:
+`app.audit_event` has no detail column, and `correlation_id` does not admit every
+export id.
 """
 
 from __future__ import annotations
@@ -138,6 +147,11 @@ EXCLUDED = {
 }  # fmt: skip
 
 
+# written by the apply itself, so not re-checked after the writes
+_IMPORTED = frozenset({"policy_version", "ledger_event", "account", "account_revision",
+                       "data_source", "source_mapping_revision"})  # fmt: skip
+
+
 @dataclass(frozen=True, slots=True)
 class Applied:
     export_id: str
@@ -145,6 +159,7 @@ class Applied:
     sections: tuple[str, ...]
     policy_versions: int
     journal_events: int
+    account_rows: int  # accounts, lifecycle revisions, sources and mappings
     omissions: tuple[pt.Omission, ...]
     required_reconnections: tuple[str, ...]  # the caller reconnects; none imported
 
@@ -271,9 +286,10 @@ def apply_archive(tx: tn.TenantTx, data: bytes, principal: uuid.UUID,
                     (f"import:{tx.tenant_id}",))  # fmt: skip
     if table := _occupied(tx):
         raise pt.PortabilityError(pt.Refusal.DESTINATION_NOT_EMPTY, table)
+    stage = [pt.JOURNAL_PATH]  # the refusal's detail: what was running
     try:
         with tx.conn.transaction():  # a savepoint: all of it or none
-            events = _write(tx, plan, principal)
+            events, accounts = _write(tx, plan, principal, stage)
     except psycopg.Error as e:
         state = e.sqlstate or ""
         code = _SQLSTATE.get(state)
@@ -281,12 +297,18 @@ def apply_archive(tx: tn.TenantTx, data: bytes, principal: uuid.UUID,
             code = pt.Refusal.APPLY_VERIFY
         if code is None:
             raise
-        raise pt.PortabilityError(code, pt.JOURNAL_PATH) from None
+        raise pt.PortabilityError(code, stage[0]) from None
     return Applied(plan.export_id, plan.scope_id, plan.sections, len(plan.policies),
-                   events, plan.omissions, plan.required_reconnections)  # fmt: skip
+                   events, accounts, plan.omissions,
+                   plan.required_reconnections)  # fmt: skip
 
 
-def _write(tx: tn.TenantTx, plan: pa.ApplyPlan, principal: uuid.UUID) -> int:
+def _count(row: Any) -> int:
+    return 0 if row is None else int(row[0])
+
+
+def _write(tx: tn.TenantTx, plan: pa.ApplyPlan, principal: uuid.UUID,
+           stage: list[str]) -> tuple[int, int]:  # fmt: skip
     for row in plan.policies:
         ps.propose(tx, row.policy_id, row.draft, principal)
     count = tx.conn.execute(
@@ -301,8 +323,12 @@ def _write(tx: tn.TenantTx, plan: pa.ApplyPlan, principal: uuid.UUID) -> int:
     # every event or a refusal: the chain it checks covers the whole tenant journal
     got = tx.conn.execute("SELECT app.portability_import_journal(%s, %s)",
                           (Jsonb(events), Jsonb(chains))).fetchone()  # fmt: skip
-    if table := _occupied(tx, frozenset({"policy_version", "ledger_event"})):
+    stage[0] = pt.ACCOUNTS_PATH  # the whole verified section, as exported
+    rows = tx.conn.execute("SELECT app.portability_import_accounts(%s)",
+                           (Jsonb(dict(plan.accounts)),)).fetchone()  # fmt: skip
+    stage[0] = AUDIT_ACTION  # no section's function is running any more
+    if table := _occupied(tx, _IMPORTED):
         raise pt.PortabilityError(pt.Refusal.DESTINATION_NOT_EMPTY, table)
     tn.append_audit_event(tx, AUDIT_ACTION, actor_user_id=principal,
                           target_id=tx.tenant_id)  # fmt: skip
-    return 0 if got is None else int(got[0])
+    return _count(got), _count(rows)
