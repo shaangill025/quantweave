@@ -260,6 +260,9 @@ def test_the_import_functions_are_hardened(conn: Conn) -> None:
     assert rows == [
         ("portability_account_content", "qw_migrate", False, PATH,  # 0062
          ["qw_migrate"]),
+        ("portability_ascii", "qw_migrate", False, PATH, ["qw_migrate"]),  # 0064
+        ("portability_ascii_json", "qw_migrate", False, PATH,  # 0064
+         ["qw_migrate"]),
         ("portability_chain", "qw_migrate", False, PATH,
          ["qw_migrate"]),
         ("portability_event_id", "qw_migrate", False, PATH,
@@ -269,11 +272,17 @@ def test_the_import_functions_are_hardened(conn: Conn) -> None:
         ("portability_import_journal", "qw_migrate", True,
          PATH,
          ["qw_app", "qw_migrate"]),
+        ("portability_import_watchlists", "qw_migrate", True, PATH,  # 0064
+         ["qw_app", "qw_migrate"]),
         ("portability_instant", "qw_migrate", False, PATH,
          ["qw_migrate"]),
         ("portability_json", "qw_migrate", False, PATH,
          ["qw_migrate"]),
         ("portability_lock_held", "qw_migrate", False, PATH,  # 0062
+         ["qw_migrate"]),
+        ("portability_watchlist_hash", "qw_migrate", False, PATH,  # 0064
+         ["qw_migrate"]),
+        ("portability_watchlist_row", "qw_migrate", False, PATH,  # 0064
          ["qw_migrate"]),
     ]  # fmt: skip
 

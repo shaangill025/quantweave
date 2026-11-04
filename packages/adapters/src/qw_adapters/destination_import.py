@@ -1,4 +1,4 @@
-"""Apply a verified export to an empty destination tenant (T057 increments 6 to 8;
+"""Apply a verified export to an empty destination tenant (T057 increments 6 to 9;
 spec §2 Journey E; R006, R051, R052, R087, R096, R097).
 
 `provision(conn, data, display_name, login, verifier, key, *, claim_installation)`
@@ -16,17 +16,19 @@ operator applies into again (a second provision is refused). It is an operator
 path like `qw-bootstrap`, not an HTTP route (its command is not built). No
 identity of the source is imported.
 
-`apply_archive(tx, data, principal, key)` runs in the caller's `tenant_transaction`
-as the qw_app login (RLS; `policy_version` INSERT and 0060's import function are
-granted to qw_app only):
+`apply_archive(tx, data, principal, key, *, session)` runs in the caller's
+`tenant_transaction` as the qw_app login (RLS; `policy_version` INSERT and the
+import functions are granted to qw_app only):
 1. `read_archive(data)`: the whole container and manifest re-verification, from
    the bytes, so a manifest or an earlier `ImportReport` is never trusted;
 2. `portability_apply.plan`: the exact format, the destination tenant is the
    archive's scope, the record key (`check_key`) and every section applicable,
    all before any write;
 3. the principal is this tenant's owner (`apply_principal`). This module does
-   not authenticate it: the route must derive it from an authenticated session,
-   and must also require a fresh step-up and record the session (deferred);
+   not authenticate it: the route must derive it from an authenticated session.
+   `session` must be that owner's live session, stepped up within the hour
+   (decision 125); 0064 checks it in SQL (`apply_principal`) and records it on
+   every imported watchlist revision;
 4. under a tenant import lock, every portable store of the tenant is empty
    (`EMPTY_TABLES`, `destination_not_empty`);
 5. in one savepoint: each policy version through `policy_store.propose` (its lock,
@@ -40,28 +42,36 @@ granted to qw_app only):
    `app.portability_import_accounts` (0062), which likewise checks the lock and
    the four tables' emptiness, keeps each `recorded_at`, and recomputes every
    content hash and seal and checks both chains and the lifecycle in SQL; then the
-   other stores must still be empty; then one
-   `portability.imported` audit event. Any failure rolls the savepoint back, so a
-   caller that catches it still holds no write.
+   watchlists through `app.portability_import_watchlists` (0064), which checks
+   the lock, emptiness, session and every row's shape, and writes one `import`
+   row per live list at its revision, by `principal` in `session`, keyed from the
+   archive (decisions 116, 126), sealed in SQL; the store must then re-verify and
+   give exactly the archive's lists (`apply_verify`); then the other stores must
+   still be empty; then one `portability.imported` audit event. Any failure
+   rolls the savepoint back, so a caller that catches it still holds no write.
 Source facts are kept: policy ids, version numbers, content and hashes, each
-journal event with its revision and knowledge time, and every account, source,
-mapping and lifecycle row with its stamps and hashes, as exported. A policy's
-`created_at` (the destination's clock) and `created_by` (the importing owner) are
-destination provenance, not source facts: neither is in the archive.
+journal event with its revision and knowledge time, every account, source,
+mapping and lifecycle row with its stamps and hashes, and each live list's id,
+revision and content, as exported. A policy's `created_at` (the destination's
+clock) and `created_by` (the importing owner), and a watchlist row's principal,
+session, key and `recorded_at` (the destination's clock), are destination
+provenance, not source facts: none is in the archive.
 Nothing is adopted (no receipt is exported) and no credential is read:
 `required_reconnections` is returned for the caller to reconnect.
 `apply_archive` sets 0007's `app.balanced` back to DEFERRED after the journal
 call, overriding a caller's `SET CONSTRAINTS ... IMMEDIATE` for the rest of the
 transaction.
-LIMITATIONS: watchlists and tombstones are applied only while empty
-(`portability_apply.APPLIED`); evidence and learned state likewise. Every journal
-and account-store insert shares the import lock (0060, 0062), so no such writer
+LIMITATIONS: tombstones are applied only while empty
+(`portability_apply.APPLIED`); evidence and learned state likewise. Every journal,
+account-store and watchlist insert shares the import lock (0060, 0062, 0064), so
+no such writer
 commits inside an import; the other stores' writers do not take it yet, and their
 emptiness is checked before and after the writes at READ COMMITTED, so the
 /exports job must keep the destination closed to them while it runs. Lock order,
 a rule for new callers (not machine-enforced): import, then account (`ledger:`,
-`source_map:`), then policy; a path that takes an account or policy lock before
-the import lock can deadlock with an import (40P01, `destination_not_empty`).
+`source_map:`), then policy, then `watchlist:`; a path that takes an account,
+policy or watchlist lock before the import lock can deadlock with an import
+(40P01, `destination_not_empty`).
 The audit event carries no export id, archive hash or section list:
 `app.audit_event` has no detail column, and `correlation_id` does not admit every
 export id.
@@ -82,6 +92,7 @@ from qw_domain.retention import RecordKey
 
 from qw_adapters import policy_store as ps
 from qw_adapters import tenancy as tn
+from qw_adapters import watchlist_store as ws
 from qw_adapters.export_archive import DEFAULT_LIMITS, Limits, read_archive
 
 AUDIT_ACTION = "portability.imported"
@@ -91,7 +102,10 @@ PROVISION_ACTION = "portability.provisioned"
 # can only be with a concurrent writer of this tenant: `destination_not_empty`.
 _SQLSTATE = {"QI001": pt.Refusal.DESTINATION_NOT_EMPTY,
              "40P01": pt.Refusal.DESTINATION_NOT_EMPTY,
-             "QI003": pt.Refusal.APPLY_VERIFY}  # fmt: skip
+             "QI003": pt.Refusal.APPLY_VERIFY,
+             "22P05": pt.Refusal.APPLY_VERIFY,  # text PostgreSQL cannot hold (a
+             "22021": pt.Refusal.APPLY_VERIFY,  # NUL), named past the class rule
+             "QI004": pt.Refusal.APPLY_PRINCIPAL}  # 0064: the session  # fmt: skip
 _UNITS = frozenset({"position", "unit_clearing", "corporate_action_clearing"})
 # Every tenant table an import must find empty: each store a section is exported
 # from, and every record bound to the journal, a policy or holdings (source
@@ -149,7 +163,8 @@ EXCLUDED = {
 
 # written by the apply itself, so not re-checked after the writes
 _IMPORTED = frozenset({"policy_version", "ledger_event", "account", "account_revision",
-                       "data_source", "source_mapping_revision"})  # fmt: skip
+                       "data_source", "source_mapping_revision",
+                       "watchlist_revision"})  # fmt: skip
 
 
 @dataclass(frozen=True, slots=True)
@@ -160,6 +175,7 @@ class Applied:
     policy_versions: int
     journal_events: int
     account_rows: int  # accounts, lifecycle revisions, sources and mappings
+    watchlist_rows: int  # one `import` revision per live list
     omissions: tuple[pt.Omission, ...]
     required_reconnections: tuple[str, ...]  # the caller reconnects; none imported
 
@@ -272,12 +288,13 @@ def provision(
 
 
 def apply_archive(tx: tn.TenantTx, data: bytes, principal: uuid.UUID,
-                  key: RecordKey | None = None,
-                  limits: Limits = DEFAULT_LIMITS) -> Applied:  # fmt: skip
-    """Write the archive into this empty tenant, all or nothing; every refusal is
-    a typed `PortabilityError`."""
-    if type(data) is not bytes or type(principal) is not uuid.UUID:
-        raise TypeError("apply_archive takes the archive bytes and a uuid.UUID")
+                  key: RecordKey | None = None, limits: Limits = DEFAULT_LIMITS, *,
+                  session: uuid.UUID) -> Applied:  # fmt: skip
+    """Write the archive into this empty tenant, all or nothing, as `principal` in
+    its step-up `session`; every refusal is a typed `PortabilityError`."""
+    if type(data) is not bytes or type(principal) is not uuid.UUID or type(
+            session) is not uuid.UUID:  # fmt: skip
+        raise TypeError("apply_archive takes the archive bytes and uuid.UUIDs")
     plan = pa.plan(read_archive(data, limits), str(tx.tenant_id), key)
     member = tn.get_membership(tx, principal)
     if member is None or member.role is not tn.MembershipRole.TENANT_OWNER:
@@ -289,7 +306,7 @@ def apply_archive(tx: tn.TenantTx, data: bytes, principal: uuid.UUID,
     stage = [pt.JOURNAL_PATH]  # the refusal's detail: what was running
     try:
         with tx.conn.transaction():  # a savepoint: all of it or none
-            events, accounts = _write(tx, plan, principal, stage)
+            events, accounts, lists = _write(tx, plan, principal, session, stage)
     except psycopg.Error as e:
         state = e.sqlstate or ""
         code = _SQLSTATE.get(state)
@@ -299,7 +316,7 @@ def apply_archive(tx: tn.TenantTx, data: bytes, principal: uuid.UUID,
             raise
         raise pt.PortabilityError(code, stage[0]) from None
     return Applied(plan.export_id, plan.scope_id, plan.sections, len(plan.policies),
-                   events, accounts, plan.omissions,
+                   events, accounts, lists, plan.omissions,
                    plan.required_reconnections)  # fmt: skip
 
 
@@ -308,7 +325,7 @@ def _count(row: Any) -> int:
 
 
 def _write(tx: tn.TenantTx, plan: pa.ApplyPlan, principal: uuid.UUID,
-           stage: list[str]) -> tuple[int, int]:  # fmt: skip
+           session: uuid.UUID, stage: list[str]) -> tuple[int, int, int]:  # fmt: skip
     for row in plan.policies:
         ps.propose(tx, row.policy_id, row.draft, principal)
     count = tx.conn.execute(
@@ -326,9 +343,20 @@ def _write(tx: tn.TenantTx, plan: pa.ApplyPlan, principal: uuid.UUID,
     stage[0] = pt.ACCOUNTS_PATH  # the whole verified section, as exported
     rows = tx.conn.execute("SELECT app.portability_import_accounts(%s)",
                            (Jsonb(dict(plan.accounts)),)).fetchone()  # fmt: skip
+    stage[0] = pt.WATCHLISTS_PATH  # decisions 116, 125, 126: in SQL
+    lists = tx.conn.execute(
+        "SELECT app.portability_import_watchlists(%s, %s, %s, %s)",
+        (Jsonb([dict(w) for w in plan.watchlists]), plan.export_id, principal,
+         session)).fetchone()  # fmt: skip
+    try:  # the store re-hashes and replays what SQL sealed
+        same = _order(ws.read_watchlists(tx)) == _order(plan.watchlists)
+    except ws.WatchlistStoreError:
+        same = False
+    if not same:
+        raise pt.PortabilityError(pt.Refusal.APPLY_VERIFY, pt.WATCHLISTS_PATH)
     stage[0] = AUDIT_ACTION  # no section's function is running any more
     if table := _occupied(tx, _IMPORTED):
         raise pt.PortabilityError(pt.Refusal.DESTINATION_NOT_EMPTY, table)
     tn.append_audit_event(tx, AUDIT_ACTION, actor_user_id=principal,
                           target_id=tx.tenant_id)  # fmt: skip
-    return _count(got), _count(rows)
+    return _count(got), _count(rows), _count(lists)

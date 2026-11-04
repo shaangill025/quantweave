@@ -3,6 +3,7 @@ refusals before any write, in the docstring's order, and the policy versions it
 lists. Every tenant, policy and answer is SYNTHETIC; the oracle is the archive
 itself (`verify_import`) and the domain policy history."""
 
+import json
 import uuid
 from datetime import UTC, datetime
 from functools import partial
@@ -16,6 +17,7 @@ from qw_domain import tombstone_wire as tw
 from qw_domain.instants import format_instant
 from qw_domain.retention import RecordKey
 from qw_domain.sources import MappedInterval, Source, SourceKind, UnderlyingAccount
+from test_learned_state import exported
 from test_portability_tenant_sections import (
     AT,
     journal,
@@ -23,6 +25,7 @@ from test_portability_tenant_sections import (
     policy_rows,
     watchlist_rows,
 )
+from test_trial_ledger import TENANT as LS_TENANT  # the learned state's tenant
 
 R = pt.Refusal
 TENANT = "00000000-0000-4000-8000-0000000000a1"  # SYNTHETIC scope (a tenant id)
@@ -155,10 +158,21 @@ def test_any_format_but_the_written_one_is_refused() -> None:
         assert refused(rep) is R.APPLY_FORMAT  # but it is not applied
 
 
-def test_a_section_that_would_be_re_stamped_is_refused() -> None:
-    rep = report({pt.POLICIES_PATH: policies(), pt.WATCHLISTS_PATH:
-                  watchlist_rows(TENANT)})  # fmt: skip
-    assert refused(rep) is R.SECTION_NOT_APPLICABLE  # the policies are not written
+def test_a_section_with_no_destination_store_is_refused() -> None:
+    learned, _ = exported()  # the T052 learned-state files: no destination writer
+    b = pt.build_export("export-synth-1", LS_TENANT, AT, {
+        pt.POLICIES_PATH: policy_rows(LS_TENANT),
+        **{p: json.loads(raw) for p, raw in learned.files.items()}})  # fmt: skip
+    rep = pt.verify_import(pt.canonical(b.manifest.to_wire()), b.files)
+    assert refused(rep, LS_TENANT) is R.SECTION_NOT_APPLICABLE  # nothing written
+
+
+def test_the_watchlists_are_planned_as_verified() -> None:
+    """Increment 9: the watchlists are applied (0064's import function), so the
+    plan carries the verified section; with no section, an empty one."""
+    rows = watchlist_rows(TENANT)
+    got = pa.plan(report({pt.WATCHLISTS_PATH: rows}), TENANT, None).watchlists
+    assert list(got) == rows and pa.plan(report({}), TENANT, None).watchlists == ()
 
 
 def test_the_journal_is_planned_as_verified() -> None:

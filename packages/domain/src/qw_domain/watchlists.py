@@ -175,6 +175,25 @@ class WatchlistStore:
         self._audit.append(AuditRecord(who, wid, 1, "create"))
         return w
 
+    def restore(self, who: Who, wid: str, revision: int, name: str, description: str,
+                entries: tuple[Entry, ...]) -> Watchlist:  # fmt: skip
+        """An imported list (T057, owner decision 116): its latest state at its
+        archive revision, with no history; the id must be unused here."""
+        _id(wid, "watchlist id")
+        _name(name, description)
+        ok = (type(revision) is int and revision >= 1 and type(entries) is tuple
+              and all(type(e) is Entry for e in entries))  # fmt: skip
+        order = [e.instrument_id for e in entries] if ok else []
+        if not ok or order != sorted(set(order)):  # strict instrument order
+            raise WatchlistError("malformed", "revision or entries")
+        if (who.tenant_id, wid) in self._used:
+            raise WatchlistError("id_used", safe_repr(wid))
+        w = Watchlist(who.tenant_id, wid, revision, name, description, entries)
+        self._lists[(who.tenant_id, wid)] = w
+        self._used.add((who.tenant_id, wid))
+        self._audit.append(AuditRecord(who, wid, revision, "import"))
+        return w
+
     def _current(self, who: Who, wid: str, expected: int) -> Watchlist:
         current = self.get(who.tenant_id, wid)
         if type(expected) is not int or expected != current.revision:

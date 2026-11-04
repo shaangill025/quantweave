@@ -9,6 +9,7 @@ same sections. The superuser only creates and migrates the second database.
 from __future__ import annotations
 
 import dataclasses
+import hashlib
 import io
 import threading
 import time
@@ -39,9 +40,11 @@ from qw_domain import csv_import as ci
 from qw_domain import portability as pt
 from qw_domain import retention as rt
 from qw_domain import sources as src
+from qw_domain import watchlists as wl
 from qw_domain.corporate_actions import SourceRef
 from qw_domain.decimals import Money, PositiveQuantity, Price
 from qw_domain.identity import InstrumentId, Listing, Mic, SecurityMaster, Ticker
+from qw_domain.monitoring import Condition
 from qw_domain.postings import Header, buy, deposit
 from qw_domain.simulation import VirtualPortfolio
 from test_portability_tenant_sections import draft  # SYNTHETIC answers
@@ -151,9 +154,31 @@ def seed_accounts(tx: tn.TenantTx) -> None:
     st.archive_account(tx, "SYN-OLD", 1)
 
 
+def seed_watchlists(tx: tn.TenantTx, who: uuid.UUID, session: uuid.UUID) -> None:
+    """A list edited to revision 5 (a non-ASCII name and thesis, a review time),
+    an empty one, and a deleted one that is not exported, through the store
+    (SYNTHETIC)."""
+    cond = Condition("price_cross", "gt", ("100",), "feed-synth-iex", "SYNTHETIC")
+    e = wl.Entry(SYN, 'SYNTHETIC thèse "q" \U0001f600', ("syn",), None, 10,
+                 (cond,), "SYNTHETIC: below 80")  # fmt: skip
+    k = (f"synthetic-key-wl-{n:04d}" for n in range(9))
+    wid = ws.create(tx, who, session, next(k), "SYNTHETIC é", "SYN")[0
+                    ].watchlist.watchlist_id  # fmt: skip
+    ws.add_entry(tx, wid, who, session, next(k), 1, e)
+    later = dataclasses.replace(e, instrument_id=InstrumentId.from_wire(
+        "00000000-0000-4000-8000-00000000005b"),
+        review_at=datetime(2026, 12, 1, tzinfo=UTC))  # fmt: skip
+    ws.add_entry(tx, wid, who, session, next(k), 2, later)
+    ws.remove_entry(tx, wid, who, session, next(k), 3, SYN)
+    ws.update(tx, wid, who, session, next(k), 4, "SYNTHETIC é 2", "")
+    ws.create(tx, who, session, next(k), "SYNTHETIC empty", "")
+    gone = ws.create(tx, who, session, next(k), "SYNTHETIC gone", "")[0]
+    ws.delete(tx, gone.watchlist.watchlist_id, who, session, next(k), 1)
+
+
 def seed(app_conn: Conn) -> tuple[uuid.UUID, uuid.UUID, uuid.UUID]:
-    """Policy a: v1 adopted, then v2; policy b: v1; the `seed_journal` events and
-    the `seed_accounts` rows (SYNTHETIC). Nothing else."""
+    """Policy a: v1 adopted, then v2; policy b: v1; the `seed_journal` events,
+    the `seed_accounts` rows and the `seed_watchlists` lists (SYNTHETIC)."""
     tenant = uuid.uuid4()
     owner, session = owner_of(app_conn, tenant)
     a, b = sorted((uuid.uuid4(), uuid.uuid4()))
@@ -174,6 +199,7 @@ def seed(app_conn: Conn) -> tuple[uuid.UUID, uuid.UUID, uuid.UUID]:
         ps.propose(tx, b, draft("income", str(tenant)), owner)
         seed_journal(tx)
         seed_accounts(tx)
+        seed_watchlists(tx, owner, session)
     return tenant, a, b
 
 
@@ -206,17 +232,36 @@ def state(conn: Conn, tenant: uuid.UUID) -> tuple[int, ...]:
     return tuple(int(n) for n in row)
 
 
+def sid(tx: tn.TenantTx, who: uuid.UUID) -> uuid.UUID:
+    """A fresh step-up session of `who` (decision 125), or an unknown id when `who`
+    is not a member here."""
+    if tn.get_membership(tx, who) is None:
+        return uuid.uuid4()
+    session, _ = tn.create_session(tx, who, timedelta(hours=1))
+    tn.mark_step_up(tx, session)
+    return session
+
+
 def apply(conn: Conn, tenant: uuid.UUID, data: bytes, who: uuid.UUID,
-          key: rt.RecordKey | None = None) -> di.Applied:  # fmt: skip
+          key: rt.RecordKey | None = None,
+          session: uuid.UUID | None = None) -> di.Applied:  # fmt: skip
     with tn.tenant_transaction(conn, tenant) as tx:
-        return di.apply_archive(tx, data, who, key)
+        return di.apply_archive(tx, data, who, key, session=session or sid(tx, who))
+
+
+def keys(conn: Conn, tenant: uuid.UUID) -> list[tuple[Any, ...]]:
+    with tn.tenant_transaction(conn, tenant) as tx:
+        return [tuple(r) for r in tx.conn.execute(
+            "SELECT watchlist_id::text, revision, principal_id, session_id, "
+            "idempotency_key FROM app.watchlist_revision ORDER BY 1")]  # fmt: skip
 
 
 def refused(conn: Conn, tenant: uuid.UUID, data: bytes, who: uuid.UUID,
-            key: rt.RecordKey | None = None) -> pt.Refusal:  # fmt: skip
+            key: rt.RecordKey | None = None,
+            session: uuid.UUID | None = None) -> pt.Refusal:  # fmt: skip
     before = state(conn, tenant)
     with pytest.raises(pt.PortabilityError) as e:
-        apply(conn, tenant, data, who, key)
+        apply(conn, tenant, data, who, key, session)
     assert state(conn, tenant) == before  # nothing written
     return e.value.code
 
@@ -226,8 +271,8 @@ def test_an_empty_destination_receives_the_same_state(app_conn: Conn,
                                                       dest: Conn) -> None:  # fmt: skip
     tenant, a, _ = seed(app_conn)
     data = archive(app_conn, tenant)
-    who, _ = owner_of(dest, tenant)
-    got = apply(dest, tenant, data, who)
+    who, session = owner_of(dest, tenant)
+    got = apply(dest, tenant, data, who, session=session)
     assert (got.export_id, got.scope_id, got.policy_versions) == (
         "export-synth-1",
         str(tenant),
@@ -247,6 +292,12 @@ def test_an_empty_destination_receives_the_same_state(app_conn: Conn,
     assert by == {who}  # the importing owner, not the source's principal
     assert got.journal_events == 5 and state(dest, tenant) == (3, 0, 5, 1)
     assert got.account_rows == 10  # 3 accounts, 1 archive, 2 sources, 4 mappings
+    lists = export(app_conn, tenant)[W]
+    assert got.watchlist_rows == 2 and [w["revision"] for w in lists] != [1, 1]
+    assert keys(dest, tenant) == [  # decisions 116, 125 and 126
+        (w["id"], w["revision"], who, session, "imp" + hashlib.sha256(
+            f"import:export-synth-1:{w['id']}:{w['revision']}".encode()).hexdigest())
+        for w in lists]  # fmt: skip
     assert refused(dest, tenant, data, who) is R.DESTINATION_NOT_EMPTY  # only once
 
 
@@ -355,7 +406,7 @@ def test_every_tenant_table_is_checked_or_excluded_with_a_reason(
 
 @pytest.mark.db
 def test_scope_principal_and_sections_are_checked_before_any_write(
-    app_conn: Conn, dest: Conn
+    app_conn: Conn, worker_conn: Conn, dest: Conn
 ) -> None:
     tenant, *_ = seed(app_conn)
     data = archive(app_conn, tenant)
@@ -366,11 +417,14 @@ def test_scope_principal_and_sections_are_checked_before_any_write(
     member, _ = owner_of(dest, tenant, tn.MembershipRole.TENANT_MEMBER, new=False)
     assert refused(dest, tenant, data, member) is R.APPLY_PRINCIPAL
     assert refused(dest, tenant, data, stranger) is R.APPLY_PRINCIPAL  # not here
-    user, session = owner_of(app_conn, tenant, new=False)
-    with tn.tenant_transaction(app_conn, tenant) as tx:
-        _watchlist(tx, user, session)
+    _, theirs = owner_of(dest, tenant, tn.MembershipRole.TENANT_MEMBER, new=False)
+    with tn.tenant_transaction(dest, tenant) as tx:  # decision 125
+        plain, _ = tn.create_session(tx, who, timedelta(hours=1))
+    for session in (theirs, plain, uuid.uuid4()):  # another's, no step-up, none
+        assert refused(dest, tenant, data, who, session=session) is R.APPLY_PRINCIPAL
+    _tombstone(worker_conn, tenant)
     listed = archive(app_conn, tenant)  # the policies and journal travel with it
-    assert refused(dest, tenant, listed, who) is R.SECTION_NOT_APPLICABLE
+    assert refused(dest, tenant, listed, who, KEY) is R.SECTION_NOT_APPLICABLE
 
 
 def _zip(files: dict[str, bytes]) -> bytes:
@@ -472,7 +526,7 @@ def test_a_failed_write_leaves_nothing(
     monkeypatch.setattr(ps, "propose", flaky)
     with tn.tenant_transaction(dest, tenant) as tx:
         with pytest.raises(ps.PolicyStoreError):
-            di.apply_archive(tx, data, who)
+            di.apply_archive(tx, data, who, session=sid(tx, who))
         # the caller's transaction is still usable, and holds none of the writes
         assert tx.conn.execute("SELECT count(*) FROM app.policy_version"
                                ).fetchone() == (0,)  # fmt: skip
@@ -528,7 +582,7 @@ VERIFIER = "$argon2id$v=19$SYNTHETIC"  # not a real verifier
 
 @pytest.mark.db
 def test_provisioning_creates_the_archive_tenant_once(
-    app_conn: Conn, dest: Conn, dest_worker: Conn
+    app_conn: Conn, worker_conn: Conn, dest: Conn, dest_worker: Conn
 ) -> None:
     """Decision 111: the destination tenant gets the archive's id and a new owner;
     an existing id is refused, and so is an archive the apply would refuse."""
@@ -550,12 +604,11 @@ def test_provisioning_creates_the_archive_tenant_once(
     assert apply(dest, tenant, data, who).journal_events == 5
     assert export(dest, tenant) == export(app_conn, tenant)
     other, *_ = seed(app_conn)
-    seeded = owner_of(app_conn, other, new=False)
-    with tn.tenant_transaction(app_conn, other) as tx:
-        _watchlist(tx, *seeded)
+    _tombstone(worker_conn, other)
     with pytest.raises(pt.PortabilityError) as e:  # not applicable: no tenant made
         di.provision(dest, archive(app_conn, other), "SYNTHETIC owner",
-                     "synthetic-three", VERIFIER, claim_installation=False)  # fmt: skip
+                     "synthetic-three", VERIFIER, KEY,
+                     claim_installation=False)  # fmt: skip
     assert e.value.code is R.SECTION_NOT_APPLICABLE
     with tn.tenant_transaction(dest, other) as tx:
         assert tx.conn.execute("SELECT count(*) FROM app.tenant").fetchone() == (0,)
@@ -568,35 +621,35 @@ def test_journal_writers_on_other_connections_and_the_import_exclude_each_other(
     """The hard gate: every journal insert shares the tenant's import lock (0060's
     stamp trigger), so no writer can commit between the import's emptiness check
     and its commit, and an open writer holds the import off."""
-    for first in (_journal, _account):
+    for first in (_journal, _account, _watchlist):
         tenant, *_ = seed(app_conn)
         data = archive(app_conn, tenant)
-        who, _ = owner_of(dest, tenant)
+        who, s = owner_of(dest, tenant)
         with psycopg.connect(dest_urls["qw_app"], autocommit=True) as other:
             with tn.tenant_transaction(other, tenant) as tx:  # an open writer first
-                first(tx)
+                first(tx, who, s)
                 with (pytest.raises(errors.LockNotAvailable),
                       tn.tenant_transaction(dest, tenant) as dtx):  # fmt: skip
                     dest.execute("SET LOCAL lock_timeout = '300ms'")
-                    di.apply_archive(dtx, data, who)
+                    di.apply_archive(dtx, data, who, session=s)
             assert refused(dest, tenant, data, who) is R.DESTINATION_NOT_EMPTY
-    for writer in (_journal, _simulation, _account):  # a simulation: account lock
-        tenant, *_ = seed(app_conn)
+    for writer in (_journal, _simulation, _account, _watchlist):  # a simulation
+        tenant, *_ = seed(app_conn)  # takes an account lock
         data = archive(app_conn, tenant)
-        who, _ = owner_of(dest, tenant)
+        who, s = owner_of(dest, tenant)
         with (psycopg.connect(dest_urls["qw_app"], autocommit=True) as other,
               tn.tenant_transaction(dest, tenant) as dtx):  # import first  # fmt: skip
-            di.apply_archive(dtx, data, who)
+            di.apply_archive(dtx, data, who, session=s)
             with (pytest.raises((errors.LockNotAvailable, ss.SimulationStoreError),
                                 match=r"lock timeout|LockNotAvailable"),
                   tn.tenant_transaction(other, tenant) as tx):  # fmt: skip
                 other.execute("SET LOCAL lock_timeout = '300ms'")
-                writer(tx)
+                writer(tx, who, s)
         assert state(dest, tenant) == (3, 0, 5, 1)
 
 
 @pytest.mark.db
-@pytest.mark.parametrize("store", ["journal", "accounts"])
+@pytest.mark.parametrize("store", ["journal", "accounts", "watchlists"])
 def test_a_writer_of_an_archive_account_waits_for_the_import_without_deadlock(
     app_conn: Conn, dest: Conn, dest_urls: dict[str, str], store: str
 ) -> None:
@@ -605,10 +658,12 @@ def test_a_writer_of_an_archive_account_waits_for_the_import_without_deadlock(
     shares the import lock first (`journal_store.lock_account`, 0060's triggers), so
     the writer waits holding nothing the import needs, the import completes, and
     then the writer appends after it. Increment 8: likewise an account-store
-    writer (`account_store._lock`, 0062's guard: import, then `source_map`)."""
+    writer (`account_store._lock`, 0062's guard: import, then `source_map`).
+    Increment 9: likewise a watchlist writer (`watchlist_store._lock`, 0064's
+    guard: import, then `watchlist:`)."""
     tenant, *_ = seed(app_conn)
     data = archive(app_conn, tenant)
-    who, _ = owner_of(dest, tenant)
+    who, s = owner_of(dest, tenant)
     failures: list[BaseException] = []
 
     def write(other: Conn) -> None:
@@ -617,8 +672,10 @@ def test_a_writer_of_an_archive_account_waits_for_the_import_without_deadlock(
             with tn.tenant_transaction(other, tenant) as tx:
                 if store == "journal":
                     js.post(tx, deposit(h, Money.of("5", "USD")))
-                else:
+                elif store == "accounts":
                     st.archive_account(tx, "SYN-A", 1)
+                else:
+                    _watchlist(tx, who, s)
         except BaseException as e:  # reported below, not lost in the thread
             failures.append(e)
 
@@ -637,14 +694,17 @@ def test_a_writer_of_an_archive_account_waits_for_the_import_without_deadlock(
                 time.sleep(0.05)
             else:
                 pytest.fail("the writer never waited")
-            applied = di.apply_archive(dtx, data, who)
+            applied = di.apply_archive(dtx, data, who, session=s)
         thread.join(30)
     assert not thread.is_alive() and failures == []
     assert applied.journal_events == 5 and applied.account_rows == 10
+    assert applied.watchlist_rows == 2
     with tn.tenant_transaction(dest, tenant) as tx:  # appended after the import
         got = st.load(tx).accounts["SYN-A"]
+        lists = len(ws.page(tx, 10, None))
+    assert lists == (3 if store == "watchlists" else 2)
     assert state(dest, tenant) == (3, 0, 6 if store == "journal" else 5, 1)
-    assert got.revision == (1 if store == "journal" else 2)
+    assert got.revision == (2 if store == "accounts" else 1)
 
 
 @pytest.mark.db
@@ -656,12 +716,29 @@ def test_a_deadlock_in_the_apply_is_a_typed_refusal(
     tenant, *_ = seed(app_conn)
     data = archive(app_conn, tenant)
     who, _ = owner_of(dest, tenant)
+    for error, code in ((errors.DeadlockDetected, R.DESTINATION_NOT_EMPTY),
+                        (errors.UntranslatableCharacter, R.APPLY_VERIFY),  # a NUL
+                        (errors.CharacterNotInRepertoire, R.APPLY_VERIFY)):  # fmt: skip
 
-    def deadlocked(*_: Any) -> Any:
-        raise errors.DeadlockDetected("SYNTHETIC deadlock")
+        def failed(*_: Any, error: type[psycopg.Error] = error) -> Any:
+            raise error("SYNTHETIC failure")
 
-    monkeypatch.setattr(ps, "propose", deadlocked)
-    assert refused(dest, tenant, data, who) is R.DESTINATION_NOT_EMPTY
+        monkeypatch.setattr(ps, "propose", failed)
+        assert refused(dest, tenant, data, who) is code
+
+
+@pytest.mark.db
+def test_a_seal_the_store_does_not_reproduce_is_refused(
+    app_conn: Conn, dest: Conn, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The store re-hashes what 0064 sealed in SQL before the apply commits: a
+    disagreement (here a SYNTHETIC store formula) is `apply_verify`, no rows."""
+    tenant, *_ = seed(app_conn)
+    data = archive(app_conn, tenant)
+    who, _ = owner_of(dest, tenant)
+    monkeypatch.setattr(ws, "revision_hash", lambda *_, **__: "0" * 64)
+    assert refused(dest, tenant, data, who) is R.APPLY_VERIFY
+    assert keys(dest, tenant) == []
 
 
 @pytest.mark.db
@@ -679,10 +756,16 @@ def test_an_audit_failure_names_no_section(
     monkeypatch.setattr(tn, "append_audit_event", audit_fails)
     with (pytest.raises(pt.PortabilityError) as e,
           tn.tenant_transaction(dest, tenant) as tx):  # fmt: skip
-        di.apply_archive(tx, data, who)
+        di.apply_archive(tx, data, who, session=sid(tx, who))
     assert e.value.code is R.APPLY_VERIFY
     assert str(e.value) == f"{R.APPLY_VERIFY.value}: {di.AUDIT_ACTION}"
-    assert state(dest, tenant) == (0, 0, 0, 0)
+    assert state(dest, tenant) == (0, 0, 0, 0) and keys(dest, tenant) == []
+    monkeypatch.undo()  # a retry in another session records the same keys (126)
+    apply(dest, tenant, data, who)
+    assert [k[4] for k in keys(dest, tenant)] == [
+        "imp" + hashlib.sha256(f"import:export-synth-1:{w['id']}:{w['revision']}"
+                               .encode()).hexdigest()
+        for w in export(app_conn, tenant)[W]]  # fmt: skip
 
 
 @pytest.mark.db

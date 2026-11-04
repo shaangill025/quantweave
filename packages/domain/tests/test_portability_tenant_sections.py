@@ -314,6 +314,13 @@ WATCHLIST_CASES = [  # row, dotted path, new value (KeyError deletes), refusal
     (0, "revision", True, R.MALFORMED),
     (0, "name", "", R.MALFORMED),
     (0, "id", "not an id", R.MALFORMED),
+    (0, "id", "00000000-0000-4000-8000-0000000000A1", R.MALFORMED),  # not canonical
+    (0, "id", "wl-synth-1", R.MALFORMED),  # 0022: a UUID
+    (0, "name", "n" * 201, R.MALFORMED),  # 0022's bounds
+    (0, "name", "SYN\x00", R.MALFORMED),  # no NUL anywhere
+    (0, "entries.0.thesis", "SYN\x00", R.MALFORMED),
+    (0, "description", "d" * 4001, R.MALFORMED),
+    (0, "revision", 2147483647, R.MALFORMED),
     (0, "entries.0.instrument_id", "SYN", R.MALFORMED),
     (0, "entries.0.instrument_id", SECOND, R.MALFORMED),  # a repeated instrument
     (0, "entries.0.review_at", "2026-11-08T13:00:00+01:00", R.MALFORMED),
@@ -341,6 +348,11 @@ def test_watchlist_order_and_repeats_are_refused() -> None:
     swapped = {**a, "entries": a["entries"][::-1]}
     assert refused(build, {W: [swapped, b]}) is R.MALFORMED
     assert refused(build, {W: {"lists": [a]}}) is R.MALFORMED
+    many = [{**a["entries"][0], "instrument_id": f"00000000-0000-4000-8000-{n:012x}"}
+            for n in range(501)]  # fmt: skip
+    edge = {**a, "name": "n" * 200, "description": "d" * 4000, "entries": many[:500]}
+    assert build({W: [edge, b]})  # 0022's bounds themselves pass
+    assert refused(build, {W: [{**a, "entries": many}, b]}) is R.MALFORMED
 
 
 POLICY_CASES = [
