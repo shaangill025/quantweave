@@ -1,4 +1,4 @@
-"""The destination's apply plan for a verified export (T057 increments 6 and 7; spec §2
+"""The destination's apply plan for a verified export (T057 increments 6 to 8; spec §2
 Journey E; R006, R051, R052, R087, R096, R097). Domain, stdlib only, no I/O; the
 store-side apply is `qw_adapters.destination_import`, which builds the
 `ImportReport` from the archive bytes itself (`read_archive`, the full
@@ -18,8 +18,9 @@ re-verification), so a manifest is never trusted alone.
   without re-stamping its source facts (see `APPLIED`);
 - `malformed`: a policy id that is not a canonical UUID (the store's key).
 The plan then lists each policy version, in archive order, rebuilt as its draft,
-and carries the verified journal section (`{chains, events}`; an empty one when
-the archive has none) for the store's import function (owner decision 112).
+and carries the verified journal section (`{chains, events}`) and accounts section
+(`account_wire`'s four lists), each an empty one when the archive has none, for
+the stores' import functions (owner decision 112).
 It carries nothing adoptable: adoption receipts are never exported, and the
 destination re-adopts. Reconnections are listed for the caller; no credential is
 read or imported.
@@ -36,13 +37,13 @@ from qw_domain import tombstone_wire as tw
 from qw_domain.retention import RecordKey
 
 R = pt.Refusal
-# Sections written. The journal goes through 0060's import function, which keeps
-# its stamps (decision 112). The others are applied only while empty: their
-# stores stamp `recorded_at` (accounts, tombstones) or number revisions from 1
-# under the DB clock (watchlists) by trigger, so writing them would re-stamp
-# source facts until their import functions exist. Evidence and the T052
-# learned-state files have no destination store yet.
-APPLIED = frozenset({pt.POLICIES_PATH, pt.JOURNAL_PATH})
+# Sections written. The journal and the accounts go through 0060's and 0062's
+# import functions, which keep their stamps (decision 112). The others are applied
+# only while empty: their stores stamp `recorded_at` (tombstones) or number
+# revisions from 1 under the DB clock (watchlists) by trigger, so writing them
+# would re-stamp source facts until their import functions exist. Evidence and the
+# T052 learned-state files have no destination store yet.
+APPLIED = frozenset({pt.POLICIES_PATH, pt.JOURNAL_PATH, pt.ACCOUNTS_PATH})
 
 
 @dataclass(frozen=True, slots=True)
@@ -61,6 +62,7 @@ class ApplyPlan:
     policies: tuple[PolicyRow, ...]
     policy_rows: tuple[Mapping[str, Any], ...]  # as in the archive, for the check
     journal: Mapping[str, Any]  # the verified `{chains, events}` section
+    accounts: Mapping[str, Any]  # the verified accounts section
     omissions: tuple[pt.Omission, ...]
     required_reconnections: tuple[str, ...]
 
@@ -117,5 +119,8 @@ def plan(report: pt.ImportReport, destination: str,
         for r in rows
     )  # fmt: skip
     journal: Any = data.get(pt.JOURNAL_PATH, {"chains": [], "events": []})
+    accounts: Any = data.get(pt.ACCOUNTS_PATH, {k: [] for k in (
+        "accounts", "account_revisions", "sources", "mappings")})  # fmt: skip
     return ApplyPlan(m.id, m.scope_id, tuple(sorted(data)), policies, tuple(rows),
-                     journal, m.omissions, m.required_reconnections)  # fmt: skip
+                     journal, accounts, m.omissions,
+                     m.required_reconnections)  # fmt: skip

@@ -11,6 +11,7 @@ import hashlib
 import json
 import uuid
 from collections.abc import Callable
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import psycopg
@@ -24,7 +25,7 @@ from qw_adapters import tenancy as tn
 from qw_domain import ledger_wire as lw
 from qw_domain.corporate_actions import SourceRef
 from qw_domain.decimals import Money
-from qw_domain.instants import parse_instant
+from qw_domain.instants import format_instant, parse_instant
 from qw_domain.postings import Header, deposit
 from test_portability_tenant_sections import journal_rows  # SYNTHETIC rows
 
@@ -224,6 +225,27 @@ def test_qw_worker_and_unknown_arguments_are_refused(
 
 
 @pytest.mark.db
+def test_a_stamp_beyond_the_clock_is_refused(app_conn: Conn) -> None:
+    """0062's replaced stamp trigger: an imported recorded_at more than five minutes
+    past the database clock is QI003 (the chains re-computed, so only the bound can
+    refuse it); one minute ahead is accepted."""
+    now = datetime.now(UTC).replace(microsecond=0)
+    for at, ok in ((now + timedelta(minutes=10), False),
+                   (datetime(2999, 1, 1, tzinfo=UTC), False),
+                   (now + timedelta(minutes=1), True)):  # fmt: skip
+        tenant = tenant_of(app_conn)
+
+        def late(rows: list[dict[str, Any]], at: datetime = at) -> None:
+            rows[-1]["recorded_at"] = format_instant(at)  # SYN-ACCT-2's latest
+
+        args = di.journal_args(body(tenant, late))
+        if ok:
+            assert run(app_conn, tenant, args) == 5
+        else:
+            assert failing(app_conn, tenant, args) == "QI003", at
+
+
+@pytest.mark.db
 def test_the_import_functions_are_hardened(conn: Conn) -> None:
     from qw_adapters.migrations import migrate
 
@@ -236,16 +258,22 @@ def test_the_import_functions_are_hardened(conn: Conn) -> None:
         "AND p.proname LIKE 'portability%%' ORDER BY 1"
     ).fetchall()
     assert rows == [
+        ("portability_account_content", "qw_migrate", False, PATH,  # 0062
+         ["qw_migrate"]),
         ("portability_chain", "qw_migrate", False, PATH,
          ["qw_migrate"]),
         ("portability_event_id", "qw_migrate", False, PATH,
          ["qw_migrate"]),
+        ("portability_import_accounts", "qw_migrate", True, PATH,  # 0062
+         ["qw_app", "qw_migrate"]),
         ("portability_import_journal", "qw_migrate", True,
          PATH,
          ["qw_app", "qw_migrate"]),
         ("portability_instant", "qw_migrate", False, PATH,
          ["qw_migrate"]),
         ("portability_json", "qw_migrate", False, PATH,
+         ["qw_migrate"]),
+        ("portability_lock_held", "qw_migrate", False, PATH,  # 0062
          ["qw_migrate"]),
     ]  # fmt: skip
 

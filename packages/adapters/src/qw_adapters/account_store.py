@@ -28,11 +28,17 @@ owner decisions 101, 102 and 103).
   or relaxes those rules.
 - Knowledge time: 0055 stamps recorded_at (the database clock under the exclusive
   'source_map:<tenant>' lock, never before an earlier row; a caller cannot supply
-  it) and seals `row_hash = sha256(content_hash | recorded_at)`, where
+  it; only 0062's import function keeps an archive's) and seals
+  `row_hash = sha256(content_hash | recorded_at)`, where
   `content_hash` is this module's digest of every other column. Reads take the
   lock shared, so load(T) for a T before the read does not change later, except
   in a snapshot transaction whose snapshot predates a write in flight at T.
   Hash-only, as watchlist_store: removing a chain's latest rows is not detected.
+- Lock order, a rule for new callers (not machine-enforced): import, then
+  account, then policy. `_lock` and 0062's guard share `import:<tenant>` before
+  `source_map:<tenant>`; a caller that already holds an account lock
+  (`source_map:`, `ledger:`) or a policy lock must not then read or write this
+  store for the same tenant, or it can deadlock with an import.
 - Lifecycle (owner decision 101): `archive_account` appends the account's next
   revision (0056) with compare-and-set on `expected_revision` (`stale`; the same
   archive at `expected_revision + 1` is a retry, `wrote` False). Archive is the
@@ -173,6 +179,10 @@ def _lifecycle_content(tx: TenantTx, aid: str, rev: int, life: str,
 
 
 def _lock(tx: TenantTx, shared: bool) -> None:
+    """The tenant's import lock shared, then 'source_map:<tenant>' (0062's order):
+    no read or write runs inside an import, and none holds a lock it needs."""
+    tx.conn.execute("SELECT pg_advisory_xact_lock_shared(hashtextextended(%s, 0))",
+                    (f"import:{tx.tenant_id}",))  # fmt: skip
     fn = "pg_advisory_xact_lock_shared" if shared else "pg_advisory_xact_lock"
     tx.conn.execute(f"SELECT {fn}(hashtextextended(%s, 0))",
                     (f"source_map:{tx.tenant_id}",))  # fmt: skip
