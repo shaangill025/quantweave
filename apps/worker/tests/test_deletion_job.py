@@ -518,12 +518,15 @@ def test_the_entry_point_runs_the_sweep_timer_only_with_the_deletion_handler(
     f.write_bytes(RAW)
     f.chmod(0o600)
     monkeypatch.setenv("QW_RECORD_KEY_FILE", str(f))
+    assert set(dj.TARGETS) == {C.SIMULATION}  # evidence waits on decision 124
+    assert entry.main() == 0  # registered: the handler and the sweep timer
+    monkeypatch.setattr(dj, "TARGETS", {})
     assert entry.main() == 0  # no store target: no handler, no timer
     monkeypatch.setattr(dj, "TARGETS", TARGETS)
-    assert entry.main() == 0
     monkeypatch.setenv("QW_WORKER_POOL", "experiment")
     assert entry.main() == 0
     names = [sorted(t.name for t in w.timers) for w in started]
-    assert names == [["budget.expire_due"],
-                     ["budget.expire_due", dj.KIND], []]  # fmt: skip
-    assert dj.KIND in started[1].handlers and dj.KIND not in started[0].handlers
+    assert names == [["budget.expire_due", dj.KIND],
+                     ["budget.expire_due"], []]  # fmt: skip
+    assert dj.KIND in started[0].handlers and dj.KIND not in started[1].handlers
+    assert dj.KIND not in started[2].handlers

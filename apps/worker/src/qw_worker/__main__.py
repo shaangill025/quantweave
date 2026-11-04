@@ -15,12 +15,13 @@ standard-pool worker also runs the budget-sweep timer (owner decision 100) every
 experiment-pool worker runs no timer. The record key comes from QW_RECORD_KEY_FILE
 (`config.record_key_from_env`, decision 107; inline QW_RECORD_KEY or a short key
 refuses the start, exit 2, also under --check-config). A standard-pool worker with
-the key handles `retention.delete` (`deletion_job`) once a store `Target` exists;
-none does yet, so no deletion handler is registered and those jobs stay queued
-rather than failing. Beside that handler, and only then, it runs the hourly
-retention-sweep timer (`deletion_job.timer`, owner decision 113). No publish
-target is passed, so the outbox relay is off and events stay pending: a real
-transport needs explicit owner authorisation.
+the key handles `retention.delete` (`deletion_job`) over its store `Target`s
+(`deletion_job.TARGETS`: simulation; evidence waits on owner decision 124); with
+none it would register no deletion handler and those jobs would stay queued.
+Beside that handler, and only then, it runs the hourly retention-sweep timer
+(`deletion_job.timer`, owner decision 113). No publish target is passed, so the
+outbox relay is off and events stay pending: a real transport needs explicit
+owner authorisation.
 
 `qw-worker --check-config` checks the same configuration as the user it runs as
 and never connects: exit 0 and `config ok: qw-worker`, or exit 2 and the reason.
@@ -68,7 +69,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         with tenancy.runtime_connection(conninfo, role="qw_worker") as conn:
             handlers = {**optimizer_cycle.HANDLERS, **budget_sweep.HANDLERS}
-            targets = deletion_job.TARGETS  # empty until a store handler exists
+            targets = deletion_job.TARGETS  # the store targets (simulation)
             standard = settings.pool is Pool.STANDARD
             timers: tuple[Timer, ...] = (
                 (budget_sweep.timer(settings.budget_sweep_every),) if standard else ()
