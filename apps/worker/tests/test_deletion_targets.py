@@ -1,11 +1,11 @@
-"""The store deletion targets (T058; `qw_adapters.deletion_targets`, migration 0063)
-and the `retention.delete` job over the registered one (simulation; the evidence
-functions are tested directly and are NOT registered until owner decision 124's
-passage-reading redaction lands), on a real PostgreSQL 16 as the
-non-owner, NOBYPASSRLS qw_worker login. qw_app saves the SYNTHETIC simulations and
-evidence through their own stores and places holds; the superuser `conn` only
-observes, or plays a tampering owner where a test says so. Tenants, simulations,
-evidence texts, holds, principals, receipts and the record key are SYNTHETIC."""
+"""The store deletion targets (T058; `qw_adapters.deletion_targets`, migrations 0063
+and 0065) and the `retention.delete` job over the registered ones (evidence, with
+owner decision 124's reading redaction, and simulation), on a real PostgreSQL 16
+as the non-owner, NOBYPASSRLS qw_worker login. qw_app saves the SYNTHETIC
+simulations and evidence through their own stores and places holds; the
+superuser `conn` only observes, or plays a tampering owner where a test says so.
+Tenants, simulations, evidence texts, holds, principals, receipts and the record
+key are SYNTHETIC."""
 
 from __future__ import annotations
 
@@ -71,7 +71,9 @@ def simulation(sid: str) -> ss.Simulation:
                               at(13, 29))), LATE)  # fmt: skip
 
 
-def evidence(app: Conn, t: uuid.UUID) -> None:
+def evidence(app: Conn, t: uuid.UUID, purged: bool = False) -> None:
+    """s-one (with p-one) and s-two, held; with `purged`, also s-old (with
+    p-old), kept one day and purged: no text, its reading still held."""
     now = app.execute("SELECT clock_timestamp()").fetchone()
     assert now is not None
     t0 = now[0].astimezone(UTC).replace(microsecond=0) - timedelta(days=30)
@@ -85,6 +87,13 @@ def evidence(app: Conn, t: uuid.UUID) -> None:
                     Period(None, t0.date()), "USD", Decimal("100"))  # fmt: skip
     store.add_passage(str(t), "p-one", "s-one", TEXTS["s-one"].index("revenue"),
                       "revenue 100 USD", value, t0)  # fmt: skip
+    if purged:
+        day = IngestRights(reg, str(t), "feed-a", t0, UseScope.PERSONAL, REGION,
+                           timedelta(days=1))  # fmt: skip
+        store.add_source(day, "s-old", SourceKind.PRIMARY, TEXTS["s-one"], t0)
+        store.add_passage(str(t), "p-old", "s-old", TEXTS["s-one"].index("revenue"),
+                          "revenue 100 USD", value, t0)  # fmt: skip
+        store.purge_expired(str(t), t0 + timedelta(days=2))
     with tn.tenant_transaction(app, t) as tx:
         es.save(tx, store)
 
@@ -101,7 +110,8 @@ def tenant(app: Conn, *sims: str, with_evidence: bool = True) -> uuid.UUID:
 
 
 def rows(su: Conn, t: uuid.UUID) -> dict[str, int]:
-    """Rows of each simulation table, held texts and evidence deletions."""
+    """Rows of each simulation table, held texts, evidence deletions and the
+    passages that still hold a reading."""
     got = {}
     for table in (*ss.TABLES, "evidence_content", "evidence_source"):
         row = su.execute(f"SELECT count(*) FROM app.{table} WHERE tenant_id = %s",
@@ -112,6 +122,10 @@ def rows(su: Conn, t: uuid.UUID) -> dict[str, int]:
                      "AND kind = 'deleted'", (t,)).fetchone()  # fmt: skip
     assert row is not None
     got["deleted"] = int(row[0])
+    row = su.execute("SELECT count(*) FROM app.evidence_record WHERE tenant_id = %s "
+                     "AND reading IS NOT NULL", (t,)).fetchone()  # fmt: skip
+    assert row is not None
+    got["readings"] = int(row[0])
     return got
 
 
@@ -156,24 +170,21 @@ def tombs(c: Conn, t: uuid.UUID) -> tuple[rt.Tombstone, ...]:
         return ts.load(tx).entries
 
 
-def test_only_the_simulation_target_is_registered() -> None:
-    assert set(dj.TARGETS) == {C.SIMULATION}
+def test_the_evidence_and_simulation_targets_are_registered() -> None:
+    assert set(dj.TARGETS) == {C.EVIDENCE, C.SIMULATION}
     assert all(type(t) is dj.Target and t.cls is c for c, t in dj.TARGETS.items())
-    # every other class the policy deletes on request still has no store target;
-    # evidence among them until decision 124's passage-reading redaction lands
+    # every other class the policy deletes on request still has no store target
     missing = {c for c in C if c not in dj.TARGETS
                and POLICY.rule(c).on_request is rt.OnRequest.DELETE}  # fmt: skip
-    assert {C.EVIDENCE, C.RESEARCH} <= missing and C.FINANCIAL not in missing
+    assert C.RESEARCH in missing and C.FINANCIAL not in missing
 
 
-def test_a_request_naming_evidence_fails_no_target_before_anything_runs(
+def test_a_request_naming_a_class_without_a_target_deletes_nothing(
         app_conn: Conn, worker_conn: Conn, conn: Conn) -> None:  # fmt: skip
     t = tenant(app_conn, *SIMS)
     before = rows(conn, t)
-    for i, classes in enumerate((frozenset({C.EVIDENCE}),
-                                 frozenset({C.SIMULATION, C.EVIDENCE}))):  # fmt: skip
-        assert handle(worker_conn, job(app_conn, t, classes,
-                                       f"del-opaque-e{i}")) == "no_target"  # fmt: skip
+    classes = frozenset({C.SIMULATION, C.EVIDENCE, C.RESEARCH})
+    assert handle(worker_conn, job(app_conn, t, classes)) == "no_target"
     assert rows(conn, t) == before and before["evidence_content"] == 2
     assert before["simulation"] == 2 and tombs(worker_conn, t) == ()
 
@@ -221,36 +232,37 @@ def test_created_at_round_trips_exactly(app_conn: Conn, worker_conn: Conn,
     assert rows(conn, t) == {"simulation": 0, "simulation_entry": 0,
                              "simulation_order": 0, "simulation_fill": 0,
                              "simulation_digest": 0, "evidence_content": 1,
-                             "evidence_source": 2, "deleted": 1}  # fmt: skip
+                             "evidence_source": 2, "deleted": 1,
+                             "readings": 0}  # p-one is s-one's  # fmt: skip
 
 
 def test_a_request_deletes_each_record_with_one_tombstone_and_retries(
         app_conn: Conn, worker_conn: Conn, conn: Conn) -> None:  # fmt: skip
     t = tenant(app_conn, *SIMS)
     items = listed(worker_conn, t)
-    j = job(app_conn, t, frozenset({C.SIMULATION}))
+    j = job(app_conn, t, frozenset({C.SIMULATION, C.EVIDENCE}))
     assert handle(worker_conn, j) is None
     left = rows(conn, t)
-    assert left["evidence_content"] == 2 and left["deleted"] == 0  # unregistered
+    assert (left["evidence_content"], left["deleted"], left["readings"]) == (0, 2, 0)
     assert all(left[x] == 0 for x in ss.TABLES) and left["evidence_source"] == 2
     got = tombs(worker_conn, t)
-    assert [g.cls for g in got] == [C.SIMULATION, C.SIMULATION]
+    assert sorted(g.cls for g in got) == [C.EVIDENCE] * 2 + [C.SIMULATION] * 2
     assert all(g.backups_unknown for g in got)
     with tn.tenant_transaction(worker_conn, t) as tx:  # each exact incarnation
-        for it in items["simulation"]:
+        for it in (*items["evidence"], *items["simulation"]):
             assert ts.find(tx, KEY, it) is not None
         assert ss.load(tx, "SIM-1") is None and ss.page(tx, 10, None) == []
         store = es.load(tx, for_write=False)
-        assert store.passage_text(str(t), "p-one") is not None  # evidence kept
+        assert store.passage_text(str(t), "p-one") is None  # decision 124:
+        assert store.passage(str(t), "p-one").reading is None  # text and reading
     assert handle(worker_conn, j) is None and tombs(worker_conn, t) == got  # retry
-    assert listed(worker_conn, t) == {"simulation": [],
-                                      "evidence": items["evidence"]}  # fmt: skip
+    assert listed(worker_conn, t) == {"simulation": [], "evidence": []}
     # a re-created SIM-1 is a new incarnation: a new request deletes it anew
     with tn.tenant_transaction(app_conn, t) as tx:
         ss.save(tx, simulation("SIM-1"))
     assert handle(worker_conn, job(app_conn, t, frozenset({C.SIMULATION}),
                                    "del-opaque-t2")) is None  # fmt: skip
-    assert len(tombs(worker_conn, t)) == 3 and rows(conn, t)["simulation"] == 0
+    assert len(tombs(worker_conn, t)) == 5 and rows(conn, t)["simulation"] == 0
 
 
 def test_held_records_are_never_deleted(app_conn: Conn, worker_conn: Conn,
@@ -259,14 +271,16 @@ def test_held_records_are_never_deleted(app_conn: Conn, worker_conn: Conn,
     with tn.tenant_transaction(app_conn, t) as tx:
         hs.place(tx, "hold-1", {C.SIMULATION}, ("SIM-1",), "litigation",
                  "counsel-1", R.TENANT_OWNER, "owner-synth-1")  # fmt: skip
+        hs.place(tx, "hold-2", {C.EVIDENCE}, (), "regulator", "counsel-1",
+                 R.TENANT_OWNER, "owner-synth-1")  # class-wide  # fmt: skip
     with tn.tenant_transaction(app_conn, t) as tx:
         before = ss.load(tx, "SIM-1")
-    j = job(app_conn, t, frozenset({C.SIMULATION}))
+    j = job(app_conn, t, frozenset({C.SIMULATION, C.EVIDENCE}))
     assert handle(worker_conn, j) == "deletion_suspended"
     with tn.tenant_transaction(app_conn, t) as tx:
         assert ss.load(tx, "SIM-1") == before and ss.load(tx, "SIM-2") is None
     left = rows(conn, t)
-    assert left["evidence_content"] == 2 and left["deleted"] == 0
+    assert (left["evidence_content"], left["deleted"], left["readings"]) == (2, 0, 1)
     assert [g.cls for g in tombs(worker_conn, t)] == [C.SIMULATION]  # SIM-2 only
 
 
@@ -331,11 +345,8 @@ def test_a_corrupt_evidence_store_fails_only_its_own_deletions(
     conn.execute("UPDATE app.evidence_content SET content = 'SYNTHETIC forged' "
                  "WHERE tenant_id = %s AND source_id = 's-two'", (t,))  # fmt: skip
     conn.execute("SET session_replication_role = origin")
-    with tn.tenant_transaction(worker_conn, t) as tx:  # listed; verified per delete
-        for it in dt.evidence_items(tx, frozenset()):
-            with pytest.raises(dt.TargetStoreError, match="integrity"):
-                dt.evidence_delete(tx, it)
-    assert handle(worker_conn, job(app_conn, t, frozenset({C.SIMULATION}))) is None
+    both = frozenset({C.SIMULATION, C.EVIDENCE})  # listed; verified per delete
+    assert handle(worker_conn, job(app_conn, t, both)) == "deletion_refused"
     left = rows(conn, t)
     assert left["simulation"] == 0 and left["evidence_content"] == 2
     assert [g.cls for g in tombs(worker_conn, t)] == [C.SIMULATION]
@@ -373,9 +384,9 @@ def test_listing_holds_each_store_lock_before_any_tombstone_lock(
         assert free("deletion_tombstone")  # none taken yet
     assert free("evidence") and free("simulation")
     with tn.tenant_transaction(worker_conn, t) as tx:  # the registered path
-        for c in sorted(dj.TARGETS):
+        for c in sorted(dj.TARGETS):  # evidence, then simulation
             dj.TARGETS[c].items(tx, frozenset())
-        assert free("evidence") and not free("simulation")
+            assert not free("evidence") and free("simulation") is (c is C.EVIDENCE)
         assert free("deletion_tombstone")
 
 
@@ -383,8 +394,8 @@ def test_two_jobs_of_one_tenant_do_not_deadlock(
         app_conn: Conn, worker_conn: Conn, conn: Conn,
         runtime_urls: dict[str, str]) -> None:  # fmt: skip
     t = tenant(app_conn, *SIMS)
-    sims = frozenset({C.SIMULATION})
-    jobs = [job(app_conn, t, sims, "del-opaque-c1"), job(app_conn, t, sims,
+    both = frozenset({C.SIMULATION, C.EVIDENCE})
+    jobs = [job(app_conn, t, both, "del-opaque-c1"), job(app_conn, t, both,
                                                          "del-opaque-c2")]  # fmt: skip
     got: dict[int, str | None] = {}
     start = threading.Barrier(2)
@@ -404,8 +415,9 @@ def test_two_jobs_of_one_tenant_do_not_deadlock(
             r.join(timeout=60)
         assert not any(r.is_alive() for r in runs)
     assert got == {0: None, 1: None}  # neither deadlocked nor timed out
-    assert len(tombs(worker_conn, t)) == 2  # each record once
-    assert rows(conn, t)["simulation"] == 0 and rows(conn, t)["evidence_content"] == 2
+    assert len(tombs(worker_conn, t)) == 4  # each record once
+    left = rows(conn, t)
+    assert left["simulation"] == left["evidence_content"] == left["readings"] == 0
 
 
 def test_a_deleted_record_is_absent_before_the_store_is_verified(
@@ -422,6 +434,23 @@ def test_a_deleted_record_is_absent_before_the_store_is_verified(
         assert not dt.evidence_delete(tx, one)
         with pytest.raises(dt.TargetStoreError, match="integrity"):
             dt.evidence_delete(tx, listed_one(tx, "s-two"))
+
+
+def test_a_purged_source_is_deleted_and_its_reading_redacted(
+        app_conn: Conn, worker_conn: Conn, conn: Conn) -> None:  # fmt: skip
+    """Review M1: a source whose text retention purged is still an evidence
+    record until deleted; deletion tombstones it and redacts its reading."""
+    with tn.provision_tenant(app_conn) as tx:
+        t = tx.tenant_id
+    evidence(app_conn, t, purged=True)
+    assert rows(conn, t)["readings"] == 2 and rows(conn, t)["evidence_content"] == 2
+    assert [i.record_id for i in listed(worker_conn, t)["evidence"]] == [
+        "s-old", "s-one", "s-two"]  # fmt: skip
+    assert handle(worker_conn, job(app_conn, t, frozenset({C.EVIDENCE}))) is None
+    left = rows(conn, t)
+    assert (left["evidence_content"], left["deleted"], left["readings"]) == (0, 3, 0)
+    assert [g.cls for g in tombs(worker_conn, t)] == [C.EVIDENCE] * 3
+    assert listed(worker_conn, t)["evidence"] == []
 
 
 def listed_one(tx: tn.TenantTx, sid: str) -> rt.Item:

@@ -249,8 +249,10 @@ def snapshot(
         found[pid] = (p, kind, _why_not(m, store, p, reg, scope, juris, at))
     missing: set[str] = set()
     for need in m.needs:
-        cands = [(k, why) for p, k, why in found.values() if (p.reading.entity,
-                 p.reading.attribute) == (need.entity, need.attribute)]  # fmt: skip
+        # a redacted passage (decision 124: deleted source) has no reading to match
+        cands = [(k, why) for p, k, why in found.values() if p.reading is not None
+                 and (p.reading.entity, p.reading.attribute)
+                 == (need.entity, need.attribute)]  # fmt: skip
         if not any(k is not SourceKind.SOCIAL and why is None for k, why in cands):
             whys = {w for k, w in cands if k is not SourceKind.SOCIAL and w}
             missing |= {f"{w}:{need.attribute}" for w in whys or {"missing"}}
@@ -258,8 +260,8 @@ def snapshot(
         return Abstention(Why.INSUFFICIENT_INPUT, tuple(sorted(missing)))
     items, excluded = [], []
     for pid, (p, kind, why) in found.items():
-        if why is not None:
-            excluded.append((pid, why))
+        if why is not None or p.reading is None:  # redacted: its text is gone too
+            excluded.append((pid, why or "evidence_unavailable"))
             continue
         src = store.source(m.tenant_id, p.source_id)
         text = store.passage_text(m.tenant_id, pid) or ""

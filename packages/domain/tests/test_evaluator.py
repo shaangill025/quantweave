@@ -413,6 +413,30 @@ def test_code_scans_the_snapshot_for_conflicts() -> None:
     assert rv.decision is ev.Decision.REVISE
 
 
+def test_deleted_evidence_has_no_reading_for_research_or_review() -> None:
+    """Owner decision 124: a deleted source's passage keeps no reading. The
+    research snapshot excludes it and matches no need with it; the evaluator's
+    re-frozen snapshot fails the thesis re-check, as for a withdrawal."""
+    res, store = researched(), store_with()
+    store.delete(TENANT, "fact", AT + timedelta(seconds=30))
+    assert store.passage(TENANT, "p-fact").reading is None
+    snap = rs.snapshot(mandate(), store, REG, UseScope.PERSONAL, REGION, LATER)
+    assert isinstance(snap, rs.Snapshot) and dict(snap.excluded) == {
+        "p-fact": "deleted"}  # fmt: skip
+    assert [i.passage_id for i in snap.items] == ["p-wire"]
+    for at in (AT, LATER):  # as of before the deletion too: no reading to match
+        got = rs.snapshot(mandate(passage_ids=("p-fact",)), store, REG,
+                          UseScope.PERSONAL, REGION, at)  # fmt: skip
+        assert got == rs.Abstention(rs.Why.INSUFFICIENT_INPUT, (f"missing:{REV}",))
+    rv = review(evaluate(Fake(blind(), compare()), res, store=store))
+    assert rv.decision is ev.Decision.REVISE
+    assert rv.material == ("recheck:c-rev:not_read", "recheck:c-read:not_read",
+                           "no_supported_fact")  # fmt: skip
+    store.delete(TENANT, "wire", AT + timedelta(seconds=31))
+    e = evaluate(Fake(blind(), compare()), res, store=store)
+    assert abstained(e) == (rs.Why.INSUFFICIENT_INPUT, (f"missing:{REV}",))
+
+
 def test_thesis_without_a_supported_fact_is_not_approved() -> None:
     res = researched()
     assert isinstance(res.outcome, rs.Thesis)

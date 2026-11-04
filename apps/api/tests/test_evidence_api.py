@@ -27,6 +27,7 @@ from jsonschema import (  # type: ignore[import-untyped]
     Draft202012Validator,
     FormatChecker,
 )
+from qw_domain import portability as pt
 from qw_domain.instants import format_instant, parse_instant
 from qw_domain.rights import Registry, Use
 
@@ -145,6 +146,11 @@ def test_claims_and_evidence_are_served_tenant_scoped(
         assert (body["availability"], body["passage"]) == (availability, None)
         assert body["coverage"] == {"status": "partial", "reasons": [why]}
         assert text not in got.text
+        # decision 124: the deleted copy's reading is gone, so it names no
+        # instrument; the record still passes the export's Evidence check
+        named = [] if pid == "p-wire" else [str(ev.E1.uuid)]
+        assert body["instrument_ids"] == named
+        assert pt.evidence_ids([body]) == [pid]
     assert body["source_relationship_group"] == release["source_relationship_group"]
 
     login(world.client, "carol")  # tenant B is served its own c-1
