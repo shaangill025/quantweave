@@ -615,10 +615,12 @@ def test_security_definer_functions_are_hardened(conn: Conn) -> None:
         ),
     ]
     imports = [r for r in rows if r[0].startswith("portability_import_")]
+    fresh = {"tombstones": ["plan_cache_mode=force_custom_plan"]}  # 0066
     assert imports == [(f"portability_import_{n}", "qw_migrate", True,
-                        ["search_path=pg_catalog, pg_temp"], ["qw_app", "qw_migrate"])
-                       for n in ("accounts", "journal",
-                                 "watchlists")]  # 0062, 0060, 0064  # fmt: skip
+                        ["search_path=pg_catalog, pg_temp", *fresh.get(n, [])],
+                        ["qw_app", "qw_migrate"])
+                       for n in ("accounts", "journal", "tombstones",
+                                 "watchlists")]  # 0062, 0060, 0066, 0064  # fmt: skip
     jobs = [r for r in rows if not r[0].startswith("throttle_")
             and r not in guard + history + budget + imports]  # fmt: skip
     assert [r[0] for r in jobs] == [

@@ -195,6 +195,15 @@ def test_the_accounts_are_planned_as_verified() -> None:
     assert pa.plan(report({}), TENANT, None).accounts == EMPTY[pt.ACCOUNTS_PATH]
 
 
+def test_the_tombstones_are_planned_as_verified() -> None:
+    """Increment 10: the tombstone ledger is applied (0066's import function), so
+    the plan carries the verified section; with no section, an empty ledger."""
+    body = EMPTY[pt.TOMBSTONES_PATH]
+    assert pt.TOMBSTONES_PATH in pa.APPLIED
+    assert pa.plan(report({pt.TOMBSTONES_PATH: body}), TENANT, None).tombstones == body
+    assert pa.plan(report({}), TENANT, None).tombstones == body
+
+
 def test_a_policy_id_that_is_not_a_store_key_is_refused() -> None:
     for pid in ("pol-synth-1", PID.upper()):
         assert refused(report({pt.POLICIES_PATH: policies(pid)})) is R.MALFORMED
