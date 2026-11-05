@@ -24,7 +24,7 @@ import hashlib
 import re
 import secrets
 import uuid
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -34,6 +34,7 @@ from typing import Literal
 import psycopg
 from psycopg import pq
 from psycopg.rows import TupleRow
+from psycopg.types.json import Jsonb
 
 Conn = psycopg.Connection[TupleRow]
 TOKEN_BYTES = 32
@@ -171,13 +172,17 @@ def append_audit_event(
     actor_user_id: uuid.UUID | None = None,
     target_id: uuid.UUID | None = None,
     correlation_id: str | None = None,
+    detail: Mapping[str, str | list[str]] | None = None,
 ) -> uuid.UUID:
-    event_id = uuid.uuid4()
+    """`detail` (0067, owner decision 136): an optional JSON object written once
+    with the event, for a record the action itself must keep."""
+    event_id, body = uuid.uuid4(), None if detail is None else Jsonb(dict(detail))
     tx.conn.execute(
         "INSERT INTO app.audit_event (id, tenant_id, actor_user_id, action, "
-        "target_id, correlation_id) VALUES (%s, %s, %s, %s, %s, %s)",
-        (event_id, tx.tenant_id, actor_user_id, action, target_id, correlation_id),
-    )
+        "target_id, correlation_id, detail) VALUES (%s, %s, %s, %s, %s, %s, %s)",
+        (event_id, tx.tenant_id, actor_user_id, action, target_id, correlation_id,
+         body),
+    )  # fmt: skip
     return event_id
 
 

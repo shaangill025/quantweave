@@ -27,6 +27,8 @@ from qw_adapters.file_secrets import ConfigError, InlineSecretError
 from qw_adapters.migrations import migrate
 from qw_api import serve
 from qw_domain.release import Edition
+from qw_domain.retention import OnRequest, RetentionClass, owner_defaults
+from qw_domain.retention_config import parse
 
 _path = Path(__file__).parents[3] / "packages" / "adapters" / "tests" / "conftest.py"
 _spec = importlib.util.spec_from_file_location("qw_pg_harness", _path)
@@ -83,6 +85,25 @@ def test_settings_come_from_files_and_plain_variables(
     assert (default.host, default.port) == ("127.0.0.1", 8000)
     assert default.settings.notification_keys is None
     assert default.settings.deployment is Edition.HOSTED
+
+
+def test_the_retention_policy_is_the_workers_file(
+    env: dict[str, str], tmp_path: Path
+) -> None:  # owner decision 137: the deletion route checks the worker's policy
+    assert serve.config_from_env(env).settings.retention_policy == owner_defaults()
+    keep = {"policy_id": "synthetic-ops-3", "version": 3, "classes": {"simulation": {
+        "on_request": "retain", "authority_id": "synthetic-authority",
+        "basis": "synthetic-basis"}}}  # fmt: skip
+    path = tmp_path / "retention.json"
+    path.write_text(json.dumps(keep))
+    env["QW_RETENTION_CONFIG"] = str(path)
+    policy = serve.config_from_env(env).settings.retention_policy
+    assert policy == parse(path.read_text()).policy  # the worker's own parser
+    assert policy.rule(RetentionClass.SIMULATION).on_request is OnRequest.RETAIN
+    path.write_text(json.dumps({**keep, "policy_id": "retention-defaults"}))
+    assert refused(env).startswith("QW_RETENTION_CONFIG")
+    env["QW_RETENTION_CONFIG"] = str(tmp_path / "missing.json")
+    assert "unreadable" in refused(env)
 
 
 def refused(env: dict[str, str], error: type[ConfigError] = ConfigError) -> str:

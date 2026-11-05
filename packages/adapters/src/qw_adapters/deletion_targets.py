@@ -1,7 +1,8 @@
 """Store deletion targets for the `retention.delete` job (T058; spec §4, §12, §15;
 R052, R086-R088): for each retention class the job deletes, list the tenant's
 records with their exact `created_at` and delete one record by (id, created_at).
-The worker wraps them as `deletion_job.Target`s (both registered);
+`HANDLERS` registers them (the worker's `deletion_job.Target`s and the request
+route's `SUPPORTED` classes both come from it);
 everything runs as qw_worker in the job's tenant transaction, under forced RLS,
 and every statement also names the tenant.
 
@@ -39,7 +40,8 @@ and every statement also names the tenant.
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
+from types import MappingProxyType
 from typing import Any
 
 import psycopg
@@ -51,8 +53,9 @@ from qw_domain.instants import ensure_aware_utc
 from qw_adapters import evidence_store as es
 from qw_adapters.tenancy import TenantTx
 
-__all__ = ["DELETE_ORDER", "TargetStoreError", "evidence_delete", "evidence_items",
-           "simulation_delete", "simulation_items"]  # fmt: skip
+__all__ = ["DELETE_ORDER", "HANDLERS", "SUPPORTED", "TargetStoreError",
+           "evidence_delete", "evidence_items", "simulation_delete",
+           "simulation_items"]  # fmt: skip
 # Children first (fills reference orders and entries); the definition last.
 DELETE_ORDER = ("simulation_fill", "simulation_entry", "simulation_order",
                 "simulation_digest")  # fmt: skip
@@ -191,3 +194,16 @@ def evidence_delete(tx: TenantTx, item: rt.Item) -> bool:
         return True
 
     return _guarded(go)
+
+
+type ItemsFn = Callable[[TenantTx, frozenset[str]], list[rt.Item]]
+type DeleteFn = Callable[[TenantTx, rt.Item], bool]
+# The registry (owner decision 127): one (listing, deletion) per class these stores
+# delete completely to the owner's required scope. The worker's `TARGETS` is built
+# from it and the request route accepts exactly its classes (`SUPPORTED`), so the
+# two cannot disagree. Identity (security) is never here (decision 128).
+HANDLERS: Mapping[rt.RetentionClass, tuple[ItemsFn, DeleteFn]] = MappingProxyType({
+    rt.RetentionClass.EVIDENCE: (evidence_items, evidence_delete),
+    rt.RetentionClass.SIMULATION: (simulation_items, simulation_delete),
+})  # fmt: skip
+SUPPORTED = frozenset(HANDLERS)

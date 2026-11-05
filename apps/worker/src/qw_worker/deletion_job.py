@@ -1,8 +1,9 @@
 """The `retention.delete` job (T058 PR B; spec §4, §12, §15; R052, R086-R088): one
 deletion request or expiry sweep of one tenant, on qw_worker in its transaction.
 
-- `submit_request` enqueues a `DeletionRequest` once per request id; `submit_sweep`
-  an `ExpirySweep` once per hour of the database clock. The payload carries the
+- `submit_request` (`qw_adapters.deletion_requests`, shared with the request
+  route) enqueues a `DeletionRequest` once per request id; `submit_sweep` an
+  `ExpirySweep` once per hour of the database clock. The payload carries the
   trigger time (a retry or a resume never resets it) and never the acknowledgement
   text.
 - `schedule(conn)` / `timer()` (decision 113's hourly backstop): every
@@ -16,11 +17,12 @@ deletion request or expiry sweep of one tenant, on qw_worker in its transaction.
   (`config.record_key_from_env`, a file, never the database) and one `Target` per
   class (a store's handler: list records with their exact `created_at`; delete
   one). A request for a class the policy deletes but no target handles is
-  `no_target`, before anything runs. `TARGETS` holds the installation's:
-  evidence (with owner decision 124's reading redaction, 0065) and simulation
-  (`qw_adapters.deletion_targets`). A listing takes its store's lock, in sorted
-  class order (evidence, then simulation), so every store lock precedes the
-  first tombstone lock.
+  `no_target`, before anything runs (the route refuses it first: decision 127).
+  `TARGETS` holds the installation's, built from the shared registry
+  `qw_adapters.deletion_targets.HANDLERS`: evidence (with owner decision 124's
+  reading redaction, 0065) and simulation. A listing takes its store's lock, in
+  sorted class order (evidence, then simulation), so every store lock precedes
+  the first tombstone lock.
 - Lock order: the first lock is `import:<tenant>` shared (T057 increment 10,
   `tombstone_store.share_import`), so an open destination import holds the job
   off before it takes any other lock (a failure is a retryable `database`); then
@@ -59,10 +61,12 @@ from types import MappingProxyType
 from qw_adapters import deletion_targets as dt
 from qw_adapters import legal_hold_store as hs
 from qw_adapters import tombstone_store as ts
-from qw_adapters.jobs import ClaimedJob, Json, enqueue
+from qw_adapters.deletion_requests import ACK, payload, submit_request
+from qw_adapters.deletion_requests import now as _now
+from qw_adapters.jobs import ClaimedJob, enqueue
 from qw_adapters.tenancy import Conn, TenantTx, tenant_transaction
 from qw_domain import retention as rt
-from qw_domain.instants import ensure_aware_utc, format_instant
+from qw_domain.instants import ensure_aware_utc
 from qw_domain.jobs import Priority, check_error_code
 
 from qw_worker.loop import Handler, HandlerFailed, Timer
@@ -70,7 +74,6 @@ from qw_worker.loop import Handler, HandlerFailed, Timer
 log = logging.getLogger("qw_worker.deletion_job")
 KIND = hs.DELETION_KIND
 SWEEP_EVERY = timedelta(minutes=5)  # each hour's sweep is queued once (revision)
-ACK = "recorded-by-the-request-route"  # the planner never reads the text
 _RETRY = frozenset({"database", "stale_clock", "time_order"})
 _REQUEST = frozenset({"trigger", "request_id", "scope_id", "classes", "record_ids",
                       "requested_at", "reauthentication_receipt_id"})  # fmt: skip
@@ -119,52 +122,19 @@ def _store_target(cls: rt.RetentionClass,
     return Target(cls, listed, deleted)
 
 
-# The installation's store handlers (`qw_adapters.deletion_targets`), one per class
-# whose stores they delete completely to the owner's required scope; the entry
-# point registers the handler and the sweep timer because one exists. Evidence
-# deletion removes the text and the passage readings (owner decision 124); a class
-# is never reported deleted when it is not fully deleted. A request naming a class
-# the policy deletes but no target covers (research, security, policy, ...) is
-# `no_target` before anything runs.
+# The installation's store handlers, one per class of the shared registry
+# (`qw_adapters.deletion_targets.HANDLERS`, which the request route also reads:
+# decision 127), whose stores they delete completely to the owner's required
+# scope; the entry point registers the handler and the sweep timer because one
+# exists. Evidence deletion removes the text and the passage readings (owner
+# decision 124). A request naming a class the policy deletes but no target covers
+# (research, security, policy, ...) is refused at the route; here it is
+# `no_target` before anything runs, as a backstop.
 TARGETS: Mapping[rt.RetentionClass, Target] = MappingProxyType(
-    {
-        rt.RetentionClass.EVIDENCE: _store_target(
-            rt.RetentionClass.EVIDENCE, dt.evidence_items, dt.evidence_delete
-        ),
-        rt.RetentionClass.SIMULATION: _store_target(
-            rt.RetentionClass.SIMULATION, dt.simulation_items, dt.simulation_delete
-        ),
-    }
+    {c: _store_target(c, *fns) for c, fns in dt.HANDLERS.items()}
 )
-
-
-def _now(tx: TenantTx) -> datetime:
-    row = tx.conn.execute("SELECT clock_timestamp()").fetchone()
-    assert row is not None
-    return ensure_aware_utc(row[0])
-
-
-def payload(trig: rt.Trigger) -> dict[str, Json]:
-    if isinstance(trig, rt.ExpirySweep):
-        return {"trigger": "sweep", "sweep_id": trig.sweep_id,
-                "triggered_at": format_instant(trig.triggered_at)}  # fmt: skip
-    return {"trigger": "request", "request_id": trig.request_id,
-            "scope_id": trig.scope_id,
-            "classes": sorted(c.value for c in trig.classes),
-            "record_ids": sorted(trig.record_ids),
-            "requested_at": format_instant(trig.requested_at),
-            "reauthentication_receipt_id":
-                trig.reauthentication_receipt_id}  # fmt: skip
-
-
-def submit_request(tx: TenantTx, req: rt.DeletionRequest) -> tuple[uuid.UUID, bool]:
-    """Enqueue `req` for `tx`'s tenant once: (job id, created)."""
-    if type(req) is not rt.DeletionRequest or req.tenant_id != str(tx.tenant_id):
-        raise ValueError("a DeletionRequest of this tenant")
-    if req.requested_at > _now(tx):
-        raise ValueError("requested_at is in the future")
-    return enqueue(tx, KIND, f"request:{req.request_id}", Priority.SAFETY,
-                   payload(req))  # fmt: skip
+__all__ = ["ACK", "KIND", "TARGETS", "Target", "TargetError", "handlers", "payload",
+           "schedule", "submit_request", "submit_sweep", "timer"]  # fmt: skip
 
 
 def submit_sweep(tx: TenantTx) -> tuple[uuid.UUID, bool]:

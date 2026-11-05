@@ -24,6 +24,7 @@ from qw_adapters import rights_store
 from qw_adapters.notification_store import Keyring
 from qw_adapters.tenancy import MAX_SESSION_TTL, Conn, TenantTx, ThrottlePolicy
 from qw_domain.release import Edition, Verifier
+from qw_domain.retention import Policy, owner_defaults
 from qw_domain.rights import Registry
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.staticfiles import StaticFiles
@@ -72,7 +73,10 @@ class Settings:
     secret. Unset, the server belongs to no recorded deployment.
     `web_dir` (owner decision 109): an absolute directory of the built web app,
     served on the API's origin for GET/HEAD paths outside /api; unset, nothing
-    static is served."""
+    static is served.
+    `retention_policy` (owner decision 137): the retention policy the deletion
+    request route checks, the worker's own (`QW_RETENTION_CONFIG`, else
+    `owner_defaults`); a class it does not delete on request is refused."""
 
     allowed_origins: frozenset[str]
     secret_key: bytes = field(repr=False)  # never in repr/str or logs
@@ -88,8 +92,11 @@ class Settings:
     notification_keys: Keyring | None = None
     release_deployment_id: str | None = None
     web_dir: str | None = None
+    retention_policy: Policy = field(default_factory=owner_defaults)
 
     def __post_init__(self) -> None:
+        if type(self.retention_policy) is not Policy:
+            raise ValueError("retention_policy must be a Policy")
         if self.web_dir is not None and not os.path.isabs(self.web_dir):
             raise ValueError("web_dir must be an absolute path")
         if self.release_deployment_id is not None and not _DEPLOYMENT_ID.fullmatch(
@@ -343,6 +350,7 @@ def create_app(
     from qw_api.jobs import router as jobs
     from qw_api.notifications import router as notifications
     from qw_api.policies import router as policies
+    from qw_api.privacy import router as privacy
     from qw_api.reads import router as reads
     from qw_api.releases import router as releases
     from qw_api.research import router as research
@@ -371,6 +379,7 @@ def create_app(
     app.include_router(jobs)
     app.include_router(notifications)
     app.include_router(policies)
+    app.include_router(privacy)
     app.include_router(reads)
     app.include_router(releases)
     app.include_router(research)
