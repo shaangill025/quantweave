@@ -1045,3 +1045,83 @@ label, not its content.
     contain no source content, only provenance, and they keep replay and
     rights checks fail-closed. Text and readings are removed."
     Implemented by: T058 (evidence redaction, increment 8); clarifies 124.
+
+132. **Upper bound on an imported backup-expiry date (T057).**
+    Question: "T057 deletion-record import: imported deletion records keep
+    their original timestamps, and every timestamp is refused if it is more
+    than 5 minutes past the destination's clock. The exception is the
+    backup-expiry date, which is normally in the future. Should the
+    backup-expiry date have an upper bound?"
+    Selected label: "Cap at backup period (Recommended)".
+    Option text as presented: "Refuse an expiry later than the deletion
+    time plus the configured backup retention period (plus 5 minutes of
+    slack). This blocks a forged archive from claiming backups expire far
+    in the future."
+    Implemented by: T057 (deletion-record import, increment 10).
+
+133. **Import lock first for the deletion job (T057, T058).**
+    Question: "T057/T058 lock order: the deletion job now takes the import
+    lock (shared) first, then the legal-hold lock, then the store locks,
+    then the deletion-record lock, so it can never run during an import.
+    This changes the documented T058 order, which put legal hold first.
+    Accept?"
+    Selected label: "Accept import-first (Recommended)".
+    Option text as presented: "One global rule, 'import first, then
+    everything else', for every tenant writer. Deletion simply waits while
+    an import is running. Documented in both receipts."
+    Implemented by: T057 (increment 10); amends T058's documented lock order.
+
+134. **Readers wait during an import (T057).**
+    Question: "T057: anything that reads deletion records (and watchlists)
+    now waits while an import into that tenant is running, so reads briefly
+    block during an import. Acceptable?"
+    Selected label: "Accept (Recommended)".
+    Option text as presented: "Imports only run into an empty, newly set-up
+    tenant, so there is nothing to read anyway. Waiting guarantees nobody
+    ever sees a half-imported state."
+    Implemented by: T057 (increments 9 and 10).
+
+135. **Reauthentication receipt id on deletion requests (T058).**
+    Question: "T058 deletion-request endpoint: the API contract requires a
+    'reauthentication receipt id', but no receipt store exists yet. For now
+    the endpoint ignores the value the client sends and records an id
+    derived on the server from the session and its step-up time. What
+    should happen?"
+    Selected label: "Keep server-derived id (Recommended)".
+    Option text as presented: "The server derives the id from the verified
+    step-up. A client can't forge it and nothing new is needed. Note in the
+    contract that the client's value is ignored until a receipt store
+    exists."
+    Implemented by: T058 (deletion request route, increment 9).
+
+136. **Storing the deletion acknowledgement (T058).**
+    Question: "T058: a deletion request carries the owner's acknowledgement
+    text. It is checked, but it isn't saved anywhere, even though the domain
+    describes it as 'recorded'. Should it be saved?"
+    Selected label: "Store it (Recommended)".
+    Option text as presented: "Save the acknowledgement with the request,
+    for example in the audit event detail, so there is a record of what the
+    owner agreed to. Use the existing audit store if it can hold it; add a
+    migration only if it can't."
+    Implemented by: T058 (deletion request route, increment 9).
+
+137. **Classes the retention policy retains (T058).**
+    Question: "T058: the endpoint checks that a deletion target exists for
+    each requested class, but not the retention policy. If the operator has
+    configured a supported class as 'retained', the job keeps the data and
+    the status still reads 'done'. What should happen?"
+    Selected label: "Refuse at the route (Recommended)".
+    Option text as presented: "Also refuse a class that the current policy
+    doesn't delete on request, with a clear reason. A 'done' status then
+    always means the data was deleted."
+    Implemented by: T058 (deletion request route, increment 9).
+
+138. **Deletion request status read (T058).**
+    Question: "T058: the new endpoint that reads a deletion request's status
+    (pending / done / suspended by legal hold / refused) is owner-only and
+    its response format is my own design. Approve?"
+    Selected label: "Approve as designed (Recommended)".
+    Option text as presented: "Owner-only read with state, classes, request
+    time and reasons. Also hide deletion job details from non-owner members
+    on the general jobs endpoint."
+    Implemented by: T058 (deletion request route, increment 9).
