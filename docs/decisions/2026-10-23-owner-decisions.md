@@ -1125,3 +1125,17 @@ label, not its content.
     time and reasons. Also hide deletion job details from non-owner members
     on the general jobs endpoint."
     Implemented by: T058 (deletion request route, increment 9).
+
+139. **How the imported backup-expiry cap gets its period (T057).**
+    Question: "Decision 132 (cap imported backup-expiry dates at deletion
+    time + backup period) can't be built as stated: the backup period is
+    operator-configurable on each install, and the archive doesn't say what
+    period the source used. A source with a longer period would have its
+    genuine records refused. How should the cap work?"
+    Selected label: "Archive carries the period (Recommended)".
+    Option text as presented: "The export records the source's configured
+    backup period in the deletion-record section, and the import caps each
+    expiry at deletion time + that period + 5 min. Exact and never refuses
+    genuine data, but it changes the export format (needs a format-version
+    note). Until then the cap is deferred."
+    Implemented by: T057 (a later export-format increment); amends 132.
