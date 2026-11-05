@@ -13,7 +13,9 @@ and other members' ids are the same 404; an id naming two jobs is 409. A durable
 job shows no payload, input revision, lease or worker: `attempt` is
 `total_attempts` (never reset by a requeue), `result_reference` is null (no result
 is stored), `last_error` is a short-code reason, and `dead_letter` (absent from the
-schema) reads as `failed` with a blocking `dead_letter` reason."""
+schema) reads as `failed` with a blocking `dead_letter` reason. A deletion request's
+`retention.delete` job is the tenant owner's only (owner decision 138): to a
+member it is the same 404."""
 
 from __future__ import annotations
 
@@ -26,7 +28,8 @@ from fastapi import APIRouter, Path, Response
 from qw_adapters import feedback_store as fs
 from qw_adapters import jobs as qj
 from qw_adapters import watchlist_store as ws
-from qw_adapters.tenancy import TenantTx
+from qw_adapters.legal_hold_store import DELETION_KIND
+from qw_adapters.tenancy import MembershipRole, TenantTx
 from qw_domain.instants import format_instant
 from qw_domain.jobs import JobState
 
@@ -105,6 +108,7 @@ def read_job(principal: Reader, job_id: JobId) -> Response:
         if exc.code != "integrity":
             raise  # database: a crash (500), never a client answer
         raise ApiError(409, "integrity", "Stored records failed checks.") from None
-    if job is None:
+    owner = principal.session.role is MembershipRole.TENANT_OWNER
+    if job is None or (job["kind"] == DELETION_KIND and not owner):  # decision 138
         raise ApiError(404, "not_found", "No such job.")
     return Response(json.dumps(job).encode(), 200, media_type="application/json")

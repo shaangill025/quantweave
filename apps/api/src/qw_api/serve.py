@@ -8,10 +8,13 @@ is a passfile-only libpq connection string for exactly a qw_app login, checked
 once before serving (unreachable: `refused: database unavailable (<class or
 SQLSTATE>)`, exit 2). Plain settings: QW_ALLOWED_ORIGINS and QW_TRUSTED_PROXIES
 (comma-separated), QW_EDITION (hosted | self_hosted, default hosted),
-QW_JURISDICTION, QW_RELEASE_DEPLOYMENT_ID, QW_API_HOST (an IP address, default
-127.0.0.1), QW_API_PORT (default 8000; 0 picks a free port) and QW_WEB_DIR (owner
-decision 109: the built web app, an absolute directory with an index.html,
-served on the API's origin; unset, nothing static is served). uvicorn runs with
+QW_JURISDICTION, QW_RELEASE_DEPLOYMENT_ID, QW_RETENTION_CONFIG (owner decision
+137: the worker's retention file, read with the same parser; its policy decides
+which classes a deletion request may name; unset, `owner_defaults`),
+QW_API_HOST (an IP address, default 127.0.0.1), QW_API_PORT (default 8000; 0
+picks a free port) and QW_WEB_DIR (owner decision 109: the built web app, an
+absolute directory with an index.html, served on the API's origin; unset,
+nothing static is served). uvicorn runs with
 no reload, no proxy-header rewriting (the app applies trusted_proxies itself), no
 access log (it would hold query strings) and no server header.
 
@@ -45,6 +48,8 @@ from qw_adapters.file_secrets import (
 )
 from qw_adapters.notification_store import Keyring
 from qw_domain.release import Edition
+from qw_domain.retention import Policy, owner_defaults
+from qw_domain.retention_config import parse
 
 from qw_api.app import Settings, create_app
 from qw_api.security import LocalPasswordAuthenticator
@@ -101,6 +106,23 @@ def _web_dir(environ: Mapping[str, str]) -> str | None:
     return path
 
 
+def _retention_policy(environ: Mapping[str, str]) -> Policy:
+    """The worker's retention policy: QW_RETENTION_CONFIG parsed exactly as
+    `qw_worker.config.settings_from_env` parses it, else `owner_defaults`."""
+    name, path = "QW_RETENTION_CONFIG", environ.get("QW_RETENTION_CONFIG")
+    if path is None:
+        return owner_defaults()
+    try:
+        with open(path, encoding="utf-8") as fh:
+            text = fh.read(1 << 17)
+    except OSError as exc:
+        raise ConfigError(name, f"unreadable: {exc.strerror}") from None
+    try:
+        return parse(text).policy
+    except ValueError as exc:  # RetentionError: a code and its context, no secret
+        raise ConfigError(name, str(exc)) from None
+
+
 def config_from_env(environ: Mapping[str, str] = os.environ) -> ServeConfig:
     refuse_inline(environ, INLINE_SECRETS + LIBPQ_INLINE)
     raw_key = read_secret_file(environ, "QW_SECRET_KEY_FILE") or b""
@@ -112,7 +134,7 @@ def config_from_env(environ: Mapping[str, str] = os.environ) -> ServeConfig:
         ipaddress.ip_address(host)
     except ValueError:
         raise ConfigError("QW_API_HOST", "must be an IP address") from None
-    web_dir = _web_dir(environ)
+    web_dir, policy = _web_dir(environ), _retention_policy(environ)
     port_text = environ.get("QW_API_PORT", str(DEFAULT_PORT))
     if not (port_text.isascii() and port_text.isdigit() and int(port_text) < 65536):
         raise ConfigError("QW_API_PORT", "must be a port number")
@@ -130,6 +152,7 @@ def config_from_env(environ: Mapping[str, str] = os.environ) -> ServeConfig:
             notification_keys=None if keys is None else _keyring(keys),
             release_deployment_id=environ.get("QW_RELEASE_DEPLOYMENT_ID") or None,
             web_dir=web_dir,
+            retention_policy=policy,
         )
     except ValueError as exc:  # Settings' messages name no secret
         raise ConfigError("settings", str(exc)) from None
