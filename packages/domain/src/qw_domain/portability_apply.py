@@ -1,4 +1,4 @@
-"""The destination's apply plan for a verified export (T057 increments 6 to 9; spec §2
+"""The destination's apply plan for a verified export (T057 increments 6 to 10; spec §2
 Journey E; R006, R051, R052, R087, R096, R097). Domain, stdlib only, no I/O; the
 store-side apply is `qw_adapters.destination_import`, which builds the
 `ImportReport` from the archive bytes itself (`read_archive`, the full
@@ -19,8 +19,9 @@ re-verification), so a manifest is never trusted alone.
 - `malformed`: a policy id that is not a canonical UUID (the store's key).
 The plan then lists each policy version, in archive order, rebuilt as its draft,
 and carries the verified journal section (`{chains, events}`) and accounts section
-(`account_wire`'s four lists) and the live watchlists, each an empty one when the
-archive has none, for the stores' import functions (owner decision 112).
+(`account_wire`'s four lists), the live watchlists and the tombstone ledger, each an
+empty one when the archive has none, for the stores' import functions (owner
+decision 112).
 It carries nothing adoptable: adoption receipts are never exported, and the
 destination re-adopts. Reconnections are listed for the caller; no credential is
 read or imported.
@@ -37,14 +38,13 @@ from qw_domain import tombstone_wire as tw
 from qw_domain.retention import RecordKey
 
 R = pt.Refusal
-# Sections written. The journal, the accounts and the watchlists go through 0060's,
-# 0062's and 0064's import functions, which keep their stamps and revisions
-# (decisions 112, 116). The others are applied only while empty: the tombstone
-# store stamps `recorded_at` by trigger, so writing it would re-stamp source facts
-# until its import function exists. Evidence and the T052 learned-state files have
-# no destination store yet.
+# Sections written. The journal, the accounts, the watchlists and the tombstones go
+# through 0060's, 0062's, 0064's and 0066's import functions, which keep their
+# stamps, seals and revisions (decisions 112, 116, 129). The others are applied only
+# while empty: evidence and the T052 learned-state files have no destination store
+# yet.
 APPLIED = frozenset({pt.POLICIES_PATH, pt.JOURNAL_PATH, pt.ACCOUNTS_PATH,
-                     pt.WATCHLISTS_PATH})  # fmt: skip
+                     pt.WATCHLISTS_PATH, pt.TOMBSTONES_PATH})  # fmt: skip
 
 
 @dataclass(frozen=True, slots=True)
@@ -65,6 +65,7 @@ class ApplyPlan:
     journal: Mapping[str, Any]  # the verified `{chains, events}` section
     accounts: Mapping[str, Any]  # the verified accounts section
     watchlists: tuple[Mapping[str, Any], ...]  # the verified live lists
+    tombstones: Mapping[str, Any]  # the verified `{ledger, tombstones, checkpoints}`
     omissions: tuple[pt.Omission, ...]
     required_reconnections: tuple[str, ...]
 
@@ -124,6 +125,9 @@ def plan(report: pt.ImportReport, destination: str,
     accounts: Any = data.get(pt.ACCOUNTS_PATH, {k: [] for k in (
         "accounts", "account_revisions", "sources", "mappings")})  # fmt: skip
     lists: Any = data.get(pt.WATCHLISTS_PATH, [])
+    empty = {"ledger": tw.header(m.scope_id, []), "tombstones": [],
+             "checkpoints": []}  # fmt: skip
+    ledger: Any = data.get(pt.TOMBSTONES_PATH, empty)
     return ApplyPlan(m.id, m.scope_id, tuple(sorted(data)), policies, tuple(rows),
-                     journal, accounts, tuple(lists), m.omissions,
+                     journal, accounts, tuple(lists), ledger, m.omissions,
                      m.required_reconnections)  # fmt: skip

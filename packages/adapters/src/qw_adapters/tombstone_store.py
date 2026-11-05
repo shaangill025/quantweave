@@ -41,6 +41,12 @@ LedgerCheckpoint; R052, R087, R088).
   (`qw_domain.tombstone_wire`): every stored row of both tables, re-verified
   first, and the closed `ledger` header (length, head, scheme and `key_id`);
   read-only, only in a snapshot transaction (`tenancy.require_snapshot`).
+- Locks (T057 increment 10): every read and write shares `import:<tenant>`
+  (`share_import`) before `deletion_tombstone:<tenant>`, as 0066's guard does,
+  so no tombstone is written or read inside a destination import and an open
+  writer holds the import off. Lock order: import, then legal_hold, then the
+  stores' locks, then deletion_tombstone; the retention.delete job takes the
+  import lock first.
 - Errors: `forbidden` (no grant: only qw_worker writes; qw_app and qw_worker
   read), `argument`, `database`, `integrity` and the codes above.
 """
@@ -76,7 +82,7 @@ from qw_domain.tombstone_wire import header
 from qw_adapters.tenancy import TenantTx, require_snapshot
 
 __all__ = ["StoredLedger", "TombstoneStoreError", "append", "export_tombstones",
-           "find", "load", "seal"]  # fmt: skip
+           "find", "load", "seal", "share_import"]  # fmt: skip
 
 
 class TombstoneStoreError(Exception):
@@ -120,7 +126,17 @@ def _database(exc: psycopg.Error) -> TombstoneStoreError:
     return TombstoneStoreError("database", type(exc).__name__)
 
 
+def share_import(tx: TenantTx) -> None:
+    """`import:<tenant>` in shared mode, to the end of the transaction."""
+    try:
+        tx.conn.execute("SELECT pg_advisory_xact_lock_shared(hashtextextended(%s, 0))",
+                        (f"import:{tx.tenant_id}",))  # fmt: skip
+    except psycopg.Error as exc:
+        raise _database(exc) from None
+
+
 def _lock(tx: TenantTx, shared: bool) -> None:
+    share_import(tx)  # import first (0066), then the ledger
     fn = "pg_advisory_xact_lock_shared" if shared else "pg_advisory_xact_lock"
     try:
         tx.conn.execute(f"SELECT {fn}(hashtextextended(%s, 0))",

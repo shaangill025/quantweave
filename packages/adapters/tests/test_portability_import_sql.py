@@ -272,6 +272,8 @@ def test_the_import_functions_are_hardened(conn: Conn) -> None:
         ("portability_import_journal", "qw_migrate", True,
          PATH,
          ["qw_app", "qw_migrate"]),
+        ("portability_import_tombstones", "qw_migrate", True,  # 0066
+         [*PATH, "plan_cache_mode=force_custom_plan"], ["qw_app", "qw_migrate"]),
         ("portability_import_watchlists", "qw_migrate", True, PATH,  # 0064
          ["qw_app", "qw_migrate"]),
         ("portability_instant", "qw_migrate", False, PATH,
@@ -279,6 +281,8 @@ def test_the_import_functions_are_hardened(conn: Conn) -> None:
         ("portability_json", "qw_migrate", False, PATH,
          ["qw_migrate"]),
         ("portability_lock_held", "qw_migrate", False, PATH,  # 0062
+         ["qw_migrate"]),
+        ("portability_tombstone_row", "qw_migrate", False, PATH,  # 0066
          ["qw_migrate"]),
         ("portability_watchlist_hash", "qw_migrate", False, PATH,  # 0064
          ["qw_migrate"]),

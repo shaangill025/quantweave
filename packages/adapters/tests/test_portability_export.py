@@ -872,6 +872,9 @@ CASES: list[tuple[str, Callable[[Body], Body], R]] = [
     ("checkpoint before its entry", _set("checkpoints.0.recorded_at",
                                          "2020-01-01T00:00:00Z", rechain=True),
      R.TOMBSTONE_CHECKPOINT),
+    ("tombstone recorded before the previous checkpoint", _set(  # 0066's guard
+        "checkpoints.0.recorded_at", lambda b: b["checkpoints"][1]["recorded_at"],
+        rechain=True), R.TOMBSTONE_CHECKPOINT),
     ("mixed key id", _set("tombstones.1.key_id", OTHER.key_id, rechain=True),
      R.TOMBSTONE_KEY),
     ("unknown scheme", _scheme, R.TOMBSTONE_SCHEME),

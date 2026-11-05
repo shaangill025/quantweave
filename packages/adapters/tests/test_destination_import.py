@@ -38,6 +38,7 @@ from qw_adapters.export_archive import write_archive
 from qw_adapters.migrations import migrate
 from qw_domain import csv_import as ci
 from qw_domain import portability as pt
+from qw_domain import portability_apply as pa
 from qw_domain import retention as rt
 from qw_domain import sources as src
 from qw_domain import watchlists as wl
@@ -267,12 +268,15 @@ def refused(conn: Conn, tenant: uuid.UUID, data: bytes, who: uuid.UUID,
 
 
 @pytest.mark.db
-def test_an_empty_destination_receives_the_same_state(app_conn: Conn,
-                                                      dest: Conn) -> None:  # fmt: skip
+def test_an_empty_destination_receives_the_same_state(
+    app_conn: Conn, worker_conn: Conn, dest: Conn
+) -> None:
     tenant, a, _ = seed(app_conn)
+    _tombstone(worker_conn, tenant)  # increment 10: the ledger travels and applies
     data = archive(app_conn, tenant)
     who, session = owner_of(dest, tenant)
-    got = apply(dest, tenant, data, who, session=session)
+    got = apply(dest, tenant, data, who, KEY, session)
+    assert got.tombstone_rows == 2 and export(dest, tenant)[T]["tombstones"] != []
     assert (got.export_id, got.scope_id, got.policy_versions) == (
         "export-synth-1",
         str(tenant),
@@ -298,7 +302,7 @@ def test_an_empty_destination_receives_the_same_state(app_conn: Conn,
         (w["id"], w["revision"], who, session, "imp" + hashlib.sha256(
             f"import:export-synth-1:{w['id']}:{w['revision']}".encode()).hexdigest())
         for w in lists]  # fmt: skip
-    assert refused(dest, tenant, data, who) is R.DESTINATION_NOT_EMPTY  # only once
+    assert refused(dest, tenant, data, who, KEY) is R.DESTINATION_NOT_EMPTY  # once
 
 
 def _policy(tx: tn.TenantTx, who: uuid.UUID, _: uuid.UUID) -> None:
@@ -406,7 +410,7 @@ def test_every_tenant_table_is_checked_or_excluded_with_a_reason(
 
 @pytest.mark.db
 def test_scope_principal_and_sections_are_checked_before_any_write(
-    app_conn: Conn, worker_conn: Conn, dest: Conn
+    app_conn: Conn, worker_conn: Conn, dest: Conn, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     tenant, *_ = seed(app_conn)
     data = archive(app_conn, tenant)
@@ -424,6 +428,9 @@ def test_scope_principal_and_sections_are_checked_before_any_write(
         assert refused(dest, tenant, data, who, session=session) is R.APPLY_PRINCIPAL
     _tombstone(worker_conn, tenant)
     listed = archive(app_conn, tenant)  # the policies and journal travel with it
+    # every section with records is applied now; evidence and learned state are
+    # not (the domain test refuses them): a section without a writer, standing in
+    monkeypatch.setattr(pa, "APPLIED", pa.APPLIED - {T})
     assert refused(dest, tenant, listed, who, KEY) is R.SECTION_NOT_APPLICABLE
 
 
@@ -573,8 +580,9 @@ def test_the_record_key_is_checked_before_anything(
     who, _ = owner_of(dest, tenant)
     assert refused(dest, tenant, data, who) is R.KEY_UNAVAILABLE
     assert refused(dest, tenant, data, who, OTHER) is R.KEY_MISMATCH
-    # with the right key, the ledger itself still needs an insert path (0057 stamps)
-    assert refused(dest, tenant, data, who, KEY) is R.SECTION_NOT_APPLICABLE
+    # with the right key, the ledger applies with its stamps and seals (0066)
+    assert apply(dest, tenant, data, who, KEY).tombstone_rows == 2
+    assert export(dest, tenant)[T] == export(app_conn, tenant)[T]
 
 
 VERIFIER = "$argon2id$v=19$SYNTHETIC"  # not a real verifier
@@ -605,11 +613,11 @@ def test_provisioning_creates_the_archive_tenant_once(
     assert export(dest, tenant) == export(app_conn, tenant)
     other, *_ = seed(app_conn)
     _tombstone(worker_conn, other)
-    with pytest.raises(pt.PortabilityError) as e:  # not applicable: no tenant made
+    with pytest.raises(pt.PortabilityError) as e:  # no record key: no tenant made
         di.provision(dest, archive(app_conn, other), "SYNTHETIC owner",
-                     "synthetic-three", VERIFIER, KEY,
+                     "synthetic-three", VERIFIER, None,
                      claim_installation=False)  # fmt: skip
-    assert e.value.code is R.SECTION_NOT_APPLICABLE
+    assert e.value.code is R.KEY_UNAVAILABLE
     with tn.tenant_transaction(dest, other) as tx:
         assert tx.conn.execute("SELECT count(*) FROM app.tenant").fetchone() == (0,)
 
@@ -649,9 +657,14 @@ def test_journal_writers_on_other_connections_and_the_import_exclude_each_other(
 
 
 @pytest.mark.db
-@pytest.mark.parametrize("store", ["journal", "accounts", "watchlists"])
+@pytest.mark.parametrize("store", ["journal", "accounts", "watchlists",
+                                   "tombstones"])  # fmt: skip
 def test_a_writer_of_an_archive_account_waits_for_the_import_without_deadlock(
-    app_conn: Conn, dest: Conn, dest_urls: dict[str, str], store: str
+    app_conn: Conn,
+    worker_conn: Conn,
+    dest: Conn,
+    dest_urls: dict[str, str],
+    store: str,
 ) -> None:
     """The review's deadlock (40P01): the import holds `import:<tenant>` exclusive
     while a writer of an archive account posts. Every taker of an account lock
@@ -660,8 +673,10 @@ def test_a_writer_of_an_archive_account_waits_for_the_import_without_deadlock(
     then the writer appends after it. Increment 8: likewise an account-store
     writer (`account_store._lock`, 0062's guard: import, then `source_map`).
     Increment 9: likewise a watchlist writer (`watchlist_store._lock`, 0064's
-    guard: import, then `watchlist:`)."""
+    guard: import, then `watchlist:`). Increment 10: likewise a deletion
+    (`tombstone_store._lock`, 0066's guard: import, then `deletion_tombstone:`)."""
     tenant, *_ = seed(app_conn)
+    _tombstone(worker_conn, tenant)
     data = archive(app_conn, tenant)
     who, s = owner_of(dest, tenant)
     failures: list[BaseException] = []
@@ -669,6 +684,9 @@ def test_a_writer_of_an_archive_account_waits_for_the_import_without_deadlock(
     def write(other: Conn) -> None:
         h = Header("SYN-J1", datetime.now(UTC) - DAY, SourceRef("SYN-BROKER", "w0"))
         try:
+            if store == "tombstones":  # a worker's deletion, after the import's
+                _tombstone(other, tenant)
+                return
             with tn.tenant_transaction(other, tenant) as tx:
                 if store == "journal":
                     js.post(tx, deposit(h, Money.of("5", "USD")))
@@ -679,7 +697,8 @@ def test_a_writer_of_an_archive_account_waits_for_the_import_without_deadlock(
         except BaseException as e:  # reported below, not lost in the thread
             failures.append(e)
 
-    with psycopg.connect(dest_urls["qw_app"], autocommit=True) as other:
+    login = "qw_worker" if store == "tombstones" else "qw_app"
+    with psycopg.connect(dest_urls[login], autocommit=True) as other:
         pid = other.info.backend_pid
         with tn.tenant_transaction(dest, tenant) as dtx:
             dest.execute("SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
@@ -694,12 +713,13 @@ def test_a_writer_of_an_archive_account_waits_for_the_import_without_deadlock(
                 time.sleep(0.05)
             else:
                 pytest.fail("the writer never waited")
-            applied = di.apply_archive(dtx, data, who, session=s)
+            applied = di.apply_archive(dtx, data, who, KEY, session=s)
         thread.join(30)
     assert not thread.is_alive() and failures == []
     assert applied.journal_events == 5 and applied.account_rows == 10
-    assert applied.watchlist_rows == 2
+    assert applied.watchlist_rows == 2 and applied.tombstone_rows == 2
     with tn.tenant_transaction(dest, tenant) as tx:  # appended after the import
+        assert len(tb.load(tx).entries) == (2 if store == "tombstones" else 1)
         got = st.load(tx).accounts["SYN-A"]
         lists = len(ws.page(tx, 10, None))
     assert lists == (3 if store == "watchlists" else 2)
@@ -729,15 +749,19 @@ def test_a_deadlock_in_the_apply_is_a_typed_refusal(
 
 @pytest.mark.db
 def test_a_seal_the_store_does_not_reproduce_is_refused(
-    app_conn: Conn, dest: Conn, monkeypatch: pytest.MonkeyPatch
+    app_conn: Conn, worker_conn: Conn, dest: Conn, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The store re-hashes what 0064 sealed in SQL before the apply commits: a
-    disagreement (here a SYNTHETIC store formula) is `apply_verify`, no rows."""
+    """The store re-hashes what 0064 and 0066 sealed in SQL before the apply
+    commits: a disagreement (here a SYNTHETIC store formula) is `apply_verify`,
+    no rows."""
     tenant, *_ = seed(app_conn)
+    _tombstone(worker_conn, tenant)
     data = archive(app_conn, tenant)
     who, _ = owner_of(dest, tenant)
-    monkeypatch.setattr(ws, "revision_hash", lambda *_, **__: "0" * 64)
-    assert refused(dest, tenant, data, who) is R.APPLY_VERIFY
+    for store, name in ((ws, "revision_hash"), (tb, "seal")):
+        with monkeypatch.context() as m:
+            m.setattr(store, name, lambda *_, **__: "0" * 64)
+            assert refused(dest, tenant, data, who, KEY) is R.APPLY_VERIFY
     assert keys(dest, tenant) == []
 
 

@@ -174,7 +174,7 @@ def test_request_deletes_marks_backups_unknown_and_retries_idempotently(
     with pytest.raises(IdempotencyConflict):  # a later trigger never replaces it
         submit(app_conn, t, ago=timedelta(0))
     calls: list[str] = []  # PR A review M2: holds (shared) before any tombstone lock
-    for mod, name in ((hs, "load"), (ts, "append")):
+    for mod, name in ((ts, "share_import"), (hs, "load"), (ts, "append")):
         real = getattr(mod, name)
 
         def spy(*a: Any, _r: Any = real, _n: str = name, **k: Any) -> Any:
@@ -185,7 +185,8 @@ def test_request_deletes_marks_backups_unknown_and_retries_idempotently(
     for name in ("place", "release"):  # never in the job's transaction
         monkeypatch.setattr(hs, name, lambda *a, **k: pytest.fail("hold write"))
     assert worker(worker_conn).tick().jobs == [(job.id, JobState.SUCCEEDED)]
-    assert calls == ["load", "append", "append"]
+    assert calls[:2] == ["share_import", "load"]  # T057 i10: import first
+    assert [c for c in calls if c != "share_import"] == ["load", "append", "append"]
     assert left(conn, t) == []
     got = tombs(worker_conn, t)
     trigger = datetime.fromisoformat(job.payload["requested_at"])  # type: ignore
@@ -197,6 +198,35 @@ def test_request_deletes_marks_backups_unknown_and_retries_idempotently(
                  (t, orig[0]))  # a SYNTHETIC restored copy  # fmt: skip
     assert run(worker_conn, job) is None  # deleted again under its first tombstone
     assert left(conn, t) == [] and tombs(worker_conn, t) == got
+
+
+def test_an_open_import_holds_the_job_off_before_any_other_lock(
+        app_conn: Conn, worker_conn: Conn, conn: Conn,
+        notes: None, monkeypatch: pytest.MonkeyPatch) -> None:  # fmt: skip
+    """T057 increment 10: the job shares `import:<tenant>` before `legal_hold`, so
+    while an import of the tenant is open it waits before any other lock (a
+    retryable `database` at the lock timeout, holds never read, nothing deleted),
+    and runs after it."""
+    t = tenant(app_conn, conn, "rec-a")
+    job = submit(app_conn, t)
+    loads: list[tuple[Any, ...]] = []
+    real = hs.load
+
+    def spy(*a: Any) -> Any:
+        loads.append(a)
+        return real(*a)
+
+    monkeypatch.setattr(hs, "load", spy)
+    with tn.tenant_transaction(app_conn, t) as tx:  # an open import
+        tx.conn.execute("SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
+                        (f"import:{t}",))  # fmt: skip
+        worker_conn.execute("SET lock_timeout = '300ms'")
+        try:
+            assert run(worker_conn, job) == "database"
+        finally:
+            worker_conn.execute("RESET lock_timeout")
+        assert loads == [] and left(conn, t) == ["rec-a"]
+    assert run(worker_conn, job) is None and left(conn, t) == [] and len(loads) == 1
 
 
 def test_a_release_requeues_suspended_requests_with_their_first_time(

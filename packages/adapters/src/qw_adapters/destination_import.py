@@ -1,4 +1,4 @@
-"""Apply a verified export to an empty destination tenant (T057 increments 6 to 9;
+"""Apply a verified export to an empty destination tenant (T057 increments 6 to 10;
 spec §2 Journey E; R006, R051, R052, R087, R096, R097).
 
 `provision(conn, data, display_name, login, verifier, key, *, claim_installation)`
@@ -46,32 +46,42 @@ import functions are granted to qw_app only):
    the lock, emptiness, session and every row's shape, and writes one `import`
    row per live list at its revision, by `principal` in `session`, keyed from the
    archive (decisions 116, 126), sealed in SQL; the store must then re-verify and
-   give exactly the archive's lists (`apply_verify`); then the other stores must
-   still be empty; then one `portability.imported` audit event. Any failure
-   rolls the savepoint back, so a caller that catches it still holds no write.
+   give exactly the archive's lists (`apply_verify`); then the tombstone ledger
+   through `app.portability_import_tombstones` (0066), which checks the lock,
+   emptiness and every row's shape and clock bound, keeps each `recorded_at`,
+   re-checks every entry hash, link and checkpoint in the replaced guard, and
+   requires each seal and the ledger header to reproduce; `tombstone_store.load`
+   must then re-verify exactly the archive's chain (`apply_verify`); then the
+   other stores must still be empty; then one `portability.imported` audit event.
+   Any failure rolls the savepoint back, so a caller that catches it still holds
+   no write.
 Source facts are kept: policy ids, version numbers, content and hashes, each
 journal event with its revision and knowledge time, every account, source,
-mapping and lifecycle row with its stamps and hashes, and each live list's id,
-revision and content, as exported. A policy's `created_at` (the destination's
-clock) and `created_by` (the importing owner), and a watchlist row's principal,
-session, key and `recorded_at` (the destination's clock), are destination
-provenance, not source facts: none is in the archive.
+mapping and lifecycle row with its stamps and hashes, each live list's id,
+revision and content, and every tombstone and checkpoint with its stamp and seal
+(decision 114's `residual_backups_unknown` marker included), as exported. The
+record key never travels: `portability_apply.plan` checks it first. A policy's
+`created_at` (the destination's clock) and `created_by` (the importing owner),
+and a watchlist row's principal, session, key and `recorded_at` (the
+destination's clock), are destination provenance, not source facts: none is in
+the archive.
 Nothing is adopted (no receipt is exported) and no credential is read:
 `required_reconnections` is returned for the caller to reconnect.
 `apply_archive` sets 0007's `app.balanced` back to DEFERRED after the journal
 call, overriding a caller's `SET CONSTRAINTS ... IMMEDIATE` for the rest of the
 transaction.
-LIMITATIONS: tombstones are applied only while empty
-(`portability_apply.APPLIED`); evidence and learned state likewise. Every journal,
-account-store and watchlist insert shares the import lock (0060, 0062, 0064), so
-no such writer
-commits inside an import; the other stores' writers do not take it yet, and their
-emptiness is checked before and after the writes at READ COMMITTED, so the
-/exports job must keep the destination closed to them while it runs. Lock order,
-a rule for new callers (not machine-enforced): import, then account (`ledger:`,
-`source_map:`), then policy, then `watchlist:`; a path that takes an account,
-policy or watchlist lock before the import lock can deadlock with an import
-(40P01, `destination_not_empty`).
+LIMITATIONS: evidence and learned state are applied only while empty
+(`portability_apply.APPLIED`). Every journal, account-store, watchlist and
+tombstone insert shares the import lock (0060, 0062, 0064, 0066), so no such
+writer commits inside an import; the other stores' writers do not take it yet,
+and their emptiness is checked before and after the writes at READ COMMITTED, so
+the /exports job must keep the destination closed to them while it runs. Lock
+order, a rule for new callers (not machine-enforced): import, then account
+(`ledger:`, `source_map:`), then policy, then `watchlist:`, then
+`deletion_tombstone:` (the deletion job: import, legal_hold, the stores,
+`deletion_tombstone:`); a path that takes an account, policy, watchlist or
+tombstone lock before the import lock can deadlock with an import (40P01,
+`destination_not_empty`).
 The audit event carries no export id, archive hash or section list:
 `app.audit_event` has no detail column, and `correlation_id` does not admit every
 export id.
@@ -88,10 +98,12 @@ from psycopg.types.json import Jsonb
 from qw_domain import policy as dp
 from qw_domain import portability as pt
 from qw_domain import portability_apply as pa
+from qw_domain import tombstone_wire as tw
 from qw_domain.retention import RecordKey
 
 from qw_adapters import policy_store as ps
 from qw_adapters import tenancy as tn
+from qw_adapters import tombstone_store as tb
 from qw_adapters import watchlist_store as ws
 from qw_adapters.export_archive import DEFAULT_LIMITS, Limits, read_archive
 
@@ -164,7 +176,8 @@ EXCLUDED = {
 # written by the apply itself, so not re-checked after the writes
 _IMPORTED = frozenset({"policy_version", "ledger_event", "account", "account_revision",
                        "data_source", "source_mapping_revision",
-                       "watchlist_revision"})  # fmt: skip
+                       "watchlist_revision", "deletion_tombstone",
+                       "deletion_tombstone_checkpoint"})  # fmt: skip
 
 
 @dataclass(frozen=True, slots=True)
@@ -176,6 +189,7 @@ class Applied:
     journal_events: int
     account_rows: int  # accounts, lifecycle revisions, sources and mappings
     watchlist_rows: int  # one `import` revision per live list
+    tombstone_rows: int  # tombstones and checkpoints, stamps and seals kept
     omissions: tuple[pt.Omission, ...]
     required_reconnections: tuple[str, ...]  # the caller reconnects; none imported
 
@@ -306,7 +320,7 @@ def apply_archive(tx: tn.TenantTx, data: bytes, principal: uuid.UUID,
     stage = [pt.JOURNAL_PATH]  # the refusal's detail: what was running
     try:
         with tx.conn.transaction():  # a savepoint: all of it or none
-            events, accounts, lists = _write(tx, plan, principal, session, stage)
+            counts = _write(tx, plan, principal, session, stage)
     except psycopg.Error as e:
         state = e.sqlstate or ""
         code = _SQLSTATE.get(state)
@@ -316,8 +330,7 @@ def apply_archive(tx: tn.TenantTx, data: bytes, principal: uuid.UUID,
             raise
         raise pt.PortabilityError(code, stage[0]) from None
     return Applied(plan.export_id, plan.scope_id, plan.sections, len(plan.policies),
-                   events, accounts, lists, plan.omissions,
-                   plan.required_reconnections)  # fmt: skip
+                   *counts, plan.omissions, plan.required_reconnections)  # fmt: skip
 
 
 def _count(row: Any) -> int:
@@ -325,7 +338,8 @@ def _count(row: Any) -> int:
 
 
 def _write(tx: tn.TenantTx, plan: pa.ApplyPlan, principal: uuid.UUID,
-           session: uuid.UUID, stage: list[str]) -> tuple[int, int, int]:  # fmt: skip
+           session: uuid.UUID,
+           stage: list[str]) -> tuple[int, int, int, int]:  # fmt: skip
     for row in plan.policies:
         ps.propose(tx, row.policy_id, row.draft, principal)
     count = tx.conn.execute(
@@ -354,9 +368,20 @@ def _write(tx: tn.TenantTx, plan: pa.ApplyPlan, principal: uuid.UUID,
         same = False
     if not same:
         raise pt.PortabilityError(pt.Refusal.APPLY_VERIFY, pt.WATCHLISTS_PATH)
+    stage[0] = pt.TOMBSTONES_PATH  # decisions 104, 112, 114: in SQL
+    tombs = tx.conn.execute("SELECT app.portability_import_tombstones(%s)",
+                            (Jsonb(dict(plan.tombstones)),)).fetchone()  # fmt: skip
+    want = tw.parse_section(plan.scope_id, plan.tombstones)
+    try:  # the store re-verifies every seal, link and checkpoint SQL kept
+        stored = tb.load(tx)
+        same = (stored.entries, stored.checkpoint) == (want.entries, want.checkpoint)
+    except tb.TombstoneStoreError:
+        same = False
+    if not same:
+        raise pt.PortabilityError(pt.Refusal.APPLY_VERIFY, pt.TOMBSTONES_PATH)
     stage[0] = AUDIT_ACTION  # no section's function is running any more
     if table := _occupied(tx, _IMPORTED):
         raise pt.PortabilityError(pt.Refusal.DESTINATION_NOT_EMPTY, table)
     tn.append_audit_event(tx, AUDIT_ACTION, actor_user_id=principal,
                           target_id=tx.tenant_id)  # fmt: skip
-    return _count(got), _count(rows), _count(lists)
+    return _count(got), _count(rows), _count(lists), _count(tombs)

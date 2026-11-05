@@ -21,7 +21,10 @@ deletion request or expiry sweep of one tenant, on qw_worker in its transaction.
   (`qw_adapters.deletion_targets`). A listing takes its store's lock, in sorted
   class order (evidence, then simulation), so every store lock precedes the
   first tombstone lock.
-- Lock order (PR A review M2): the first lock is `legal_hold` shared, through
+- Lock order: the first lock is `import:<tenant>` shared (T057 increment 10,
+  `tombstone_store.share_import`), so an open destination import holds the job
+  off before it takes any other lock (a failure is a retryable `database`); then
+  (PR A review M2) `legal_hold` shared, through
   `legal_hold_store.load` (READ COMMITTED only); every tombstone lock comes after
   it, inside `tombstone_store.append`. The job never places or releases a hold.
   Any failure to load the holds is `hold_state_unknown` and deletes nothing.
@@ -264,7 +267,11 @@ def handlers(key: rt.RecordKey, policy: rt.Policy,
                 raise HandlerFailed("no_target", retryable=False)
         else:
             classes, asked = frozenset(targets), frozenset()
-        try:  # the job's first lock: legal_hold shared, to the end (M2)
+        try:  # the job's first lock: import shared, to the end (T057 i10)
+            ts.share_import(tx)
+        except ts.TombstoneStoreError as exc:
+            raise HandlerFailed(exc.code, retryable=True) from None
+        try:  # then legal_hold shared, to the end (M2)
             holds = hs.load(tx, solo)
             if isinstance(trig, rt.ExpirySweep):
                 hs.resume_suspended(tx)  # decision 113's backstop

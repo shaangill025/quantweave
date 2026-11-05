@@ -22,8 +22,9 @@ known `hash_scheme` (`scheme`) and one `key_id` (`key`) per chain; each
 `prev_hash` linking (`chain`), deletion times in order; one tombstone per record
 hash (`duplicate`, 0057's UNIQUE); `deleted_at` not after `recorded_at` (`time`, as
 0057 stamps); each seal and its stamp order (`seal`); every checkpoint the chain's
-entry at its length, the latest covering the ledger (`checkpoint`); then the header
-(`header`). Hashes are
+entry at its length, stamped before the next entry (0066's guard stamps the two
+tables in one knowledge order), the latest covering the ledger (`checkpoint`); then
+the header (`header`). Hashes are
 integrity, not authenticity: whoever rewrites every row and recomputes every hash
 verifies, and so does a dropped tail with its checkpoint (signing is T060).
 """
@@ -197,7 +198,8 @@ def _parse(tenant: str, body: Mapping[str, Any]) -> Parsed:
             c["recorded_at"])  # fmt: skip
         if not length < n <= len(entries) or h != entries[n - 1].entry_hash or (
                 c["row_hash"] != seal(h, at) or at < stamps[n - 1]
-                or (last is not None and at < last)):  # fmt: skip
+                or (last is not None and at < last)
+                or (n < len(entries) and stamps[n] < at)):  # fmt: skip
             raise WireError("checkpoint", f"checkpoint {n}")
         length, head, last = n, h, at
     if length != len(entries):
